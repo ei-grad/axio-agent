@@ -81,13 +81,20 @@ transport = AnthropicTransport(
 
 ## Models
 
-| Model ID | Context | Max output | Notes |
-|---|---|---|---|
-| `claude-opus-4-6` | 1 M | 128 k | Most capable |
-| `claude-sonnet-4-6` | 1 M | 64 k | Balanced (default) |
-| `claude-haiku-4-5-20251001` | 200 k | 64 k | Fastest / cheapest |
-| `claude-opus-4-5` | 200 k | 64 k | — |
-| `claude-sonnet-4-5` | 200 k | 64 k | — |
+| Model ID | Context | Max output | Price (in/out per M tokens) | Notes |
+|---|---|---|---|---|
+| `claude-fable-5` | 1 M | 128 k | $10 / $50 | Most capable |
+| `claude-opus-5` | 1 M | 128 k | $5 / $25 | — |
+| `claude-sonnet-5` | 1 M | 128 k | $2 / $10 | Introductory rate through 2026-08-31, then $3 / $15 |
+| `claude-opus-4-8` | 1 M | 128 k | $5 / $25 | — |
+| `claude-opus-4-7` | 1 M | 128 k | $5 / $25 | — |
+| `claude-opus-4-6` | 1 M | 128 k | $5 / $25 | — |
+| `claude-sonnet-4-6` | 1 M | 64 k | $3 / $15 | Balanced (default) |
+| `claude-haiku-4-5` | 200 k | 64 k | $1 / $5 | Fastest / cheapest (also as `claude-haiku-4-5-20251001`) |
+| `claude-opus-4-5` | 200 k | 64 k | $5 / $25 | — |
+| `claude-sonnet-4-5` | 200 k | 64 k | $3 / $15 | — |
+
+All of these support text, vision, reasoning and tool use.
 
 ## Configuration
 

@@ -38,6 +38,49 @@ class _RefreshableCredentials(Protocol):
 
 ANTHROPIC_MODELS: ModelRegistry = ModelRegistry(
     {
+        # Claude 5 family (latest)
+        ModelSpec(
+            id="claude-fable-5",
+            context_window=1_000_000,
+            max_output_tokens=128_000,
+            capabilities=_RT,
+            input_cost=10.0,
+            output_cost=50.0,
+        ),
+        ModelSpec(
+            id="claude-opus-5",
+            context_window=1_000_000,
+            max_output_tokens=128_000,
+            capabilities=_RT,
+            input_cost=5.0,
+            output_cost=25.0,
+        ),
+        ModelSpec(
+            id="claude-sonnet-5",
+            context_window=1_000_000,
+            max_output_tokens=128_000,
+            capabilities=_RT,
+            # introductory rate through 2026-08-31, then 3.0 / 15.0
+            input_cost=2.0,
+            output_cost=10.0,
+        ),
+        # Claude 4 family
+        ModelSpec(
+            id="claude-opus-4-8",
+            context_window=1_000_000,
+            max_output_tokens=128_000,
+            capabilities=_RT,
+            input_cost=5.0,
+            output_cost=25.0,
+        ),
+        ModelSpec(
+            id="claude-opus-4-7",
+            context_window=1_000_000,
+            max_output_tokens=128_000,
+            capabilities=_RT,
+            input_cost=5.0,
+            output_cost=25.0,
+        ),
         ModelSpec(
             id="claude-opus-4-6",
             context_window=1_000_000,
