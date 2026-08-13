@@ -40,13 +40,25 @@ async def peer_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
     set_spawn_agent_factory(None)
 
 
+# Owners are only known at run time — a peer id is generated per test — so the
+# helpers that hand one out record it here for the fixture to clean up. None is
+# always in: it owns everything spawned without a peer identity.
+_bus_owners: list[str | None] = [None]
+
+
+def _watch_bus_owner(owner: str | None) -> str | None:
+    _bus_owners.append(owner)
+    return owner
+
+
 @pytest.fixture(autouse=True)
 def clean_notification_bus() -> Iterator[None]:
-    # Owner buckets live for the process, so a queue or listener left by one
-    # test would be drained by the next one.
-    notify._buckets.clear()
+    # Queues and listeners live for the process, so what one test leaves behind
+    # would be delivered to the next one.
     yield
-    notify._buckets.clear()
+    for owner in _bus_owners:
+        notify.discard(owner)
+    del _bus_owners[1:]
 
 
 async def _noop_handler(message: PeerMessage) -> None:
@@ -411,11 +423,15 @@ class _AnsweringTransport:
 
 
 def _spawn_id(result: str) -> str:
-    return result.split("agent_id=", 1)[1].split(" ", 1)[0]
+    agent_id = result.split("agent_id=", 1)[1].split(" ", 1)[0]
+    _watch_bus_owner(agent_id)
+    return agent_id
 
 
 async def _start_parent(tmp_path: Path, name: str = "parent") -> PeerServer:
-    return await PeerServer(name, kind="test", handler=_noop_handler, project=str(tmp_path)).start()
+    peer = await PeerServer(name, kind="test", handler=_noop_handler, project=str(tmp_path)).start()
+    _watch_bus_owner(peer.id)
+    return peer
 
 
 async def test_a_finished_child_turn_is_announced_to_its_parent_once(tmp_path: Path) -> None:
@@ -468,6 +484,31 @@ async def test_a_failed_child_turn_carries_the_error_to_its_parent(tmp_path: Pat
 
         assert "turn failed" in received[0]
         assert "2 iterations" in received[0]
+    finally:
+        await parent.close()
+
+
+async def test_an_interrupted_child_turn_is_not_announced_as_finished(tmp_path: Path) -> None:
+    # Nothing raises out of a cancelled turn, so the agent went idle with no
+    # error to show: reported as "finished", an interrupt would read as an answer.
+    transport = _InterruptibleTransport()
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        agent_id = _spawn_id(await spawn_agent(task="block"))
+        await asyncio.wait_for(transport.started.wait(), timeout=1)
+
+        assert (await interrupt_agent(agent_id=agent_id, reason="enough")).startswith("Sent interrupt")
+        await _wait_for(lambda: len(received) == 1)
+
+        assert "turn was interrupted" in received[0]
+        assert "finished its turn" not in received[0]
     finally:
         await parent.close()
 

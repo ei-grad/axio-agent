@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from axio.blocks import TextBlock
+from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.messages import Message
 from axio.models import ModelRegistry
 
@@ -28,6 +28,26 @@ def test_convert_messages_basic() -> None:
     assert len(result) == 2
     assert result[0]["role"] == "user"
     assert result[1]["role"] == "assistant"
+
+
+def test_convert_messages_adjacent_user_messages_stay_separate() -> None:
+    """The agent loop can inject a follow-up user message (e.g. a notification) as its
+    own Message right after a tool-results message. The Messages API accepts
+    consecutive same-role messages (master already ships this shape on the interrupt
+    path), so both must come through as their own dict, in order — no merging."""
+    messages = [
+        Message(role="assistant", content=[ToolUseBlock(id="call_1", name="get_weather", input={})]),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="call_1", content="22C")]),
+        Message(role="user", content=[TextBlock(text="Notification: background task finished")]),
+    ]
+    result = _convert_messages(messages)
+    assert len(result) == 3
+    assert result[0]["role"] == "assistant"
+    assert result[1]["role"] == "user"
+    assert result[1]["content"][0]["type"] == "tool_result"
+    assert result[1]["content"][0]["tool_use_id"] == "call_1"
+    assert result[2]["role"] == "user"
+    assert result[2]["content"] == [{"type": "text", "text": "Notification: background task finished"}]
 
 
 # ---------------------------------------------------------------------------

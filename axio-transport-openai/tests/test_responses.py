@@ -86,6 +86,22 @@ def test_tool_result_mixed_with_text_emits_both_in_order() -> None:
     assert items[2]["content"] == [{"type": "input_text", "text": "and then?"}]
 
 
+def test_tool_result_message_then_separate_user_text_message() -> None:
+    """A follow-up user message (e.g. an injected notification) arriving as its own
+    Message right after the tool-results message must still emit tool output first,
+    then the user text as its own item, in order."""
+    messages = [
+        Message(role="assistant", content=[ToolUseBlock(id="call-1", name="echo", input={"text": "x"})]),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="call-1", content="x")]),
+        Message(role="user", content=[TextBlock(text="Notification: background task finished")]),
+    ]
+    items = _convert_messages(messages)
+    assert items[0]["type"] == "function_call"
+    assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "x"}
+    assert items[2]["role"] == "user"
+    assert items[2]["content"] == [{"type": "input_text", "text": "Notification: background task finished"}]
+
+
 def test_unanswered_call_gets_a_placeholder_output() -> None:
     # The API rejects the whole request when a call has no output, which is what
     # an interrupted turn leaves behind.

@@ -120,6 +120,9 @@ class _BackgroundAgent:
     # Who already received this turn's answer text, so the parent is not told
     # "finished its turn" right after reading the answer itself.
     reported_to: str | None = None
+    # A cancelled turn raises nothing the agent records, so without this an
+    # interrupted agent reports the same "finished" as one that answered.
+    interrupted: bool = False
 
 
 _background_agents: dict[str, _BackgroundAgent] = {}
@@ -220,11 +223,17 @@ def _notify_parent_of_turn_end(background: _BackgroundAgent) -> None:
     """
     if background.stopping or not _is_background_idle(background):
         return
+    # None means two things here: a parent that never got the report, and a
+    # parent with no peer identity. Comparing without the first check would
+    # confuse them and swallow the only signal a child of an agent without peer
+    # messaging produces.
     if background.reported_to is not None and background.reported_to == background.parent_id:
         return
     peer = background.peer
     if background.last_error:
         text = f"[agent {peer.name} ({peer.id})] turn failed: {background.last_error}"
+    elif background.interrupted:
+        text = f"[agent {peer.name} ({peer.id})] turn was interrupted."
     else:
         text = f"[agent {peer.name} ({peer.id})] finished its turn and is idle."
     notify.post(text, owner=background.parent_id)
@@ -693,6 +702,7 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
             background.current_turn = turn
             background.last_error = None
             background.reported_to = None
+            background.interrupted = False
             try:
                 await turn
             except asyncio.CancelledError:
@@ -751,6 +761,7 @@ async def _start_background_agent(
     async def _on_interrupt(_from_id: str, _reason: str) -> None:
         async with accept_lock:
             if background.current_turn is not None and not background.current_turn.done():
+                background.interrupted = True
                 background.current_turn.cancel()
 
     peer = await PeerServer(

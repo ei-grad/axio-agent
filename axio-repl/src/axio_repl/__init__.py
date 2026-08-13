@@ -329,12 +329,17 @@ def build_system_prompt(
                 "to inspect all local agent ids. Use send_message(agent_id=..., message=...) for IPC by global id.",
                 "- A spawned child's completion or failure is announced to you automatically — injected into your "
                 "turn if you are still working, or as your next prompt if you have already finished — so you "
-                "never need to poll or monitor just to learn a child is done. Call monitor(agents=[...], "
+                "never need to poll or monitor just to learn a child is done. The announcement tells you the "
+                "child is done — it does not carry the child's answer; that still arrives only through "
+                "send_message or the REPL focus/follow path described above. Call monitor(agents=[...], "
                 "wait_all=true) only when you must join a swarm within this turn before proceeding; it reports a "
                 "crashed child as finished, with its error. monitor(messages=true) waits for a child's PEER "
                 "MESSAGE (sent via send_message) — those are still delivered only as your next prompt, never "
                 "injected mid-turn. Use paths=/pids= to wait on files or processes. A timeout returns what is "
                 "still outstanding rather than failing — so decide from that report whether to wait again.",
+                "- An idle notification is information, not a request for a reply: do not send_message back to a "
+                "child just because it went idle. Only message it again when you actually need something from "
+                "it — otherwise a reply wakes its next turn, which can notify you again, and so on.",
                 "- Use interrupt_agent(agent_id=...) to cancel a spawned agent's current response while keeping it "
                 "alive. Use stop_agent(agent_id=...) only when the child should exit. A parent may interrupt or "
                 "stop its own children by id.",
@@ -705,8 +710,15 @@ class ReplRenderer:
 
 
 async def run_prompt(agent: Agent, ctx: MemoryContextStore, prompt: str, renderer: ReplRenderer) -> None:
-    async for event in agent.run_stream(prompt, ctx):
-        await renderer.render("main", event)
+    stream = agent.run_stream(prompt, ctx)
+    try:
+        async for event in stream:
+            await renderer.render("main", event)
+    finally:
+        # Deterministic close on cancellation: without it, a task cancelled while
+        # the generator is suspended at a yield leaves turn_scope's exit (and its
+        # notify listener flush) to the async-gen finalizer instead of running now.
+        await stream.aclose()
 
 
 def _clone_transport_for_spawn(transport: Any) -> Any:

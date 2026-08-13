@@ -640,6 +640,30 @@ def test_build_payload_tool_result_mixed_with_text() -> None:
     assert msgs[1]["content"] == "Thanks, what about tomorrow?"
 
 
+def test_build_payload_tool_result_message_then_separate_user_text_message() -> None:
+    """The agent loop can inject a follow-up user message (e.g. a notification) as its
+    own Message right after a tool-results message, rather than mixed into the same
+    one. Both must still come through in order: tool output(s), then the user text."""
+    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="get_weather", input={"location": "Paris"})],
+        ),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="call_1", content="22C")]),
+        Message(role="user", content=[TextBlock(text="Notification: background task finished")]),
+    ]
+    payload = t.build_payload(messages, [], "")
+    msgs = payload["messages"]
+    assert len(msgs) == 3
+    assert msgs[0]["role"] == "assistant"
+    assert msgs[1]["role"] == "tool"
+    assert msgs[1]["tool_call_id"] == "call_1"
+    assert msgs[1]["content"] == "22C"
+    assert msgs[2]["role"] == "user"
+    assert msgs[2]["content"] == "Notification: background task finished"
+
+
 def test_build_payload_tool_schema() -> None:
     t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     tool: Tool[Any] = Tool(name="get_weather", description="Get weather", handler=get_weather)

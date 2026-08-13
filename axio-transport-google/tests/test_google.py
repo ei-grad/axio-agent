@@ -246,6 +246,30 @@ def test_convert_tool_result_mixed_with_text() -> None:
     assert parts[1] == {"text": "And tomorrow?"}
 
 
+def test_convert_tool_result_message_then_separate_user_text_message() -> None:
+    """A follow-up user message (e.g. an injected notification) arriving as its own
+    Message right after the tool-results message is a separate Content entry with the
+    same "user" role, so the alternating-role merge step (see below) folds it into the
+    tool-result Content — same shape and ordering as text mixed into one Message."""
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="get_weather", input={"location": "Paris"})],
+        ),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="call_1", content="22°C sunny")],
+        ),
+        Message(role="user", content=[TextBlock(text="Notification: background task finished")]),
+    ]
+    contents = _build_contents_json(messages)
+    # Merged: assistant content, then a single merged user content (tool_result + text).
+    assert len(contents) == 2
+    parts = contents[1]["parts"]
+    assert parts[0]["functionResponse"]["response"]["result"] == "22°C sunny"
+    assert parts[1] == {"text": "Notification: background task finished"}
+
+
 def test_convert_tool_result_error() -> None:
     messages = [
         Message(

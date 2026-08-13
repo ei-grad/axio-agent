@@ -462,6 +462,25 @@ def test_convert_tool_result_mixed_with_text_emits_both_in_order() -> None:
     assert items[1]["content"] == [{"type": "input_text", "text": "And tomorrow?"}]
 
 
+def test_convert_tool_result_message_then_separate_user_text_message() -> None:
+    """A follow-up user message (e.g. an injected notification) arriving as its own
+    Message right after the tool-results message must still emit tool output first,
+    then the user text as its own item, in order."""
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="get_weather", input={"location": "Paris"})],
+        ),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="call_1", content="22C")]),
+        Message(role="user", content=[TextBlock(text="Notification: background task finished")]),
+    ]
+    _, items = _convert_messages(messages, "")
+    assert items[0]["type"] == "function_call"
+    assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": "22C"}
+    assert items[2]["role"] == "user"
+    assert items[2]["content"] == [{"type": "input_text", "text": "Notification: background task finished"}]
+
+
 def test_convert_assistant_text() -> None:
     messages = [
         Message(role="assistant", content=[TextBlock(text="Sure, I can help.")]),

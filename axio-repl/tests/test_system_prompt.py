@@ -157,6 +157,19 @@ class TestNotificationGuidance:
         assert "announced to you automatically" in prompt
         assert "never need to poll or monitor just to learn a child is done" in prompt
 
+    def test_spawn_agent_bullet_clarifies_notification_carries_no_answer(self) -> None:
+        """The turn-end ping must not be mistaken for the child's actual answer text."""
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
+        assert "does not carry the child's answer" in prompt
+
+    def test_spawn_agent_bullet_warns_against_reply_ping_pong(self) -> None:
+        """An idle notification must not be treated as a cue to send_message back."""
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
+        assert "not a request for a reply" in prompt
+        assert "do not send_message back" in prompt
+
     def test_spawn_agent_bullet_keeps_monitor_join_guidance(self) -> None:
         model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
         prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
