@@ -18,8 +18,8 @@ import os
 import shutil
 import signal
 import sys
-from collections.abc import Callable
-from contextlib import AsyncExitStack, suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -29,7 +29,7 @@ import aiohttp
 from axio import notify
 from axio.agent import Agent
 from axio.blocks import TextBlock
-from axio.context import MemoryContextStore
+from axio.context import ContextStore, MemoryContextStore
 from axio.events import (
     AudioOutput,
     Error,
@@ -80,14 +80,21 @@ from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     AgentStarted,
     AgentStopped,
+    ConfigurationChanged,
+    ContextCleared,
+    ContextForked,
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
+    InputReceived,
+    MessageCommitted,
+    ObservedContextStore,
     OutcomeDelivered,
     SessionEventHub,
     TurnFinished,
     TurnOutcome,
     TurnStarted,
+    TurnStatus,
     new_turn_identity,
     observe_agent_turn,
 )
@@ -97,7 +104,7 @@ from axio_tools_local.read_file import read_file
 from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
-from axio_repl import _panel, _sandbox, _search
+from axio_repl import _journal, _panel, _sandbox, _search
 
 LAST_ITERATION_HINT = Message(
     role="system",
@@ -749,7 +756,18 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
             await renderer.enter_foreground(envelope.agent_id)
         case ForegroundExited():
             await renderer.exit_foreground(envelope.agent_id)
-        case AgentStarted() | AgentStopped() | TurnStarted() | TurnFinished() | OutcomeDelivered():
+        case (
+            AgentStarted()
+            | AgentStopped()
+            | TurnStarted()
+            | TurnFinished()
+            | OutcomeDelivered()
+            | InputReceived()
+            | ConfigurationChanged()
+            | MessageCommitted()
+            | ContextForked()
+            | ContextCleared()
+        ):
             return
         case event:
             await renderer.render(envelope.agent_id, event)
@@ -757,18 +775,22 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
 
 async def run_prompt(
     agent: Agent,
-    ctx: MemoryContextStore,
+    ctx: ContextStore,
     prompt: str,
     event_hub: SessionEventHub,
     run_id: str,
-) -> None:
+    *,
+    source: str,
+) -> TurnOutcome:
     identity = new_turn_identity(
         agent_id="main",
         parent_agent_id=None,
         execution_mode=ExecutionMode.FOREGROUND,
         run_id=run_id,
+        context_id=ctx.session_id,
     )
-    await observe_agent_turn(agent=agent, context=ctx, prompt=prompt, identity=identity, hub=event_hub)
+    await event_hub.publish_for(identity, InputReceived(text=prompt, source=source))
+    return await observe_agent_turn(agent=agent, context=ctx, prompt=prompt, identity=identity, hub=event_hub)
 
 
 def _clone_transport_for_spawn(transport: Any) -> Any:
@@ -1160,6 +1182,109 @@ def _apply_debug(transport: Any, arg: str) -> None:
         print("Usage: /debug on|off")
 
 
+# ── Session journal ──
+
+
+_JOURNAL_EVENT_KINDS: dict[type[object], str] = {
+    AgentStarted: "agent_started",
+    AgentStopped: "agent_stopped",
+    TurnStarted: "turn_started",
+    TurnFinished: "turn_finished",
+    ForegroundEntered: "foreground_entered",
+    ForegroundExited: "foreground_exited",
+    OutcomeDelivered: "outcome_delivered",
+    InputReceived: "input_received",
+    ConfigurationChanged: "configuration_changed",
+    MessageCommitted: "message_committed",
+    ContextForked: "context_forked",
+    ContextCleared: "context_cleared",
+}
+
+
+async def _write_runtime_event(journal: _journal.SessionJournal, envelope: AgentEventEnvelope) -> None:
+    event = envelope.event
+    kind = _JOURNAL_EVENT_KINDS.get(type(event), "stream_event")
+    payload: object
+    if isinstance(event, MessageCommitted):
+        payload = {
+            "hub_seq": envelope.seq,
+            "run_id": envelope.run_id,
+            "message": event.message,
+        }
+    else:
+        payload = {
+            "hub_seq": envelope.seq,
+            "run_id": envelope.run_id,
+            "event": event,
+        }
+    await journal.publish(
+        kind,
+        payload,
+        agent_id=envelope.agent_id,
+        parent_agent_id=envelope.parent_agent_id,
+        turn_id=envelope.turn_id,
+        context_id=envelope.context_id,
+        execution_mode=envelope.execution_mode.value,
+        parent_tool_use_id=envelope.parent_tool_use_id,
+    )
+
+
+@asynccontextmanager
+async def _session_journal(
+    event_hub: SessionEventHub,
+    *,
+    disabled: bool,
+    root: Path | None,
+    one_shot: bool,
+    cwd: Path,
+) -> AsyncIterator[_journal.SessionJournal | None]:
+    if disabled:
+        yield None
+        return
+
+    def warn_degraded(error: BaseException) -> None:
+        print(
+            f"Session journal degraded; subsequent records may be missing: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+
+    try:
+        journal = await _journal.SessionJournal.open(
+            session_id=event_hub.session_id,
+            root=root,
+            start_payload={
+                "application": AGENT_NAME,
+                "version": AGENT_VERSION,
+                "cwd": cwd,
+                "mode": "one-shot" if one_shot else "interactive",
+            },
+            on_degraded=warn_degraded,
+        )
+    except OSError as error:
+        warn_degraded(error)
+        yield None
+        return
+
+    print(f"Session log: {journal.events_path}", file=sys.stderr if one_shot else sys.stdout)
+
+    async def record(envelope: AgentEventEnvelope) -> None:
+        await _write_runtime_event(journal, envelope)
+
+    unsubscribe = event_hub.subscribe(record)
+    end_payload: object = {"status": "complete"}
+    try:
+        yield journal
+    except asyncio.CancelledError:
+        end_payload = {"status": "cancelled"}
+        raise
+    except BaseException as error:
+        end_payload = {"status": "error", "exception": error}
+        raise
+    finally:
+        unsubscribe()
+        await journal.close(end_payload)
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
@@ -1175,6 +1300,13 @@ async def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
     parser.add_argument("--debug", action="store_true", help="Log request/response bodies to stderr")
+    parser.add_argument("--no-session-log", action="store_true", help="Do not write the session JSONL journal")
+    parser.add_argument(
+        "--session-log-dir",
+        type=Path,
+        default=None,
+        help="Root directory for session journals (default: XDG state directory)",
+    )
     parser.add_argument(
         "--sandbox",
         choices=("auto", "docker", "none"),
@@ -1185,11 +1317,24 @@ async def main() -> None:
     args = parser.parse_args()
 
     setup_logging(args.debug)
-    transport_cls, _ = _select_transport(args.transport)
     root = Path.cwd().resolve()
-    agents_text = load_agents_instructions(root)
+    event_hub = SessionEventHub()
+    main_run_id = uuid4().hex
+    journal_root = args.session_log_dir.expanduser().resolve() if args.session_log_dir is not None else None
 
-    async with aiohttp.ClientSession() as session, AsyncExitStack() as stack:
+    async with (
+        _session_journal(
+            event_hub,
+            disabled=args.no_session_log,
+            root=journal_root,
+            one_shot=args.prompt is not None,
+            cwd=root,
+        ),
+        aiohttp.ClientSession() as session,
+        AsyncExitStack() as stack,
+    ):
+        transport_cls, _ = _select_transport(args.transport)
+        agents_text = load_agents_instructions(root)
         transport = transport_cls(session=session)
         try:
             await transport.fetch_models()
@@ -1228,18 +1373,60 @@ async def main() -> None:
             max_iterations=args.max_iterations,
             last_iteration_message=LAST_ITERATION_HINT,
         )
-        ctx = MemoryContextStore()
-        event_hub = SessionEventHub()
+        ctx = ObservedContextStore(MemoryContextStore(), event_hub)
         set_session_event_hub(event_hub)
-        main_run_id = uuid4().hex
         parent_peer_id: str | None = None
+
+        async def _publish_main_event(event: Any) -> None:
+            await event_hub.publish(
+                event,
+                run_id=main_run_id,
+                agent_id="main",
+                parent_agent_id=None,
+                turn_id=None,
+                execution_mode=ExecutionMode.FOREGROUND,
+                context_id=ctx.session_id,
+            )
+
+        await _publish_main_event(AgentStarted(name=AGENT_NAME, kind="repl-agent"))
+        for config_name, config_value in (
+            ("transport", getattr(transport, "name", type(transport).__name__)),
+            ("model", transport.model.id),
+            ("sandbox", sandbox_desc),
+            ("max_iterations", agent.max_iterations),
+            ("max_output_tokens", getattr(transport, "max_output_tokens", None)),
+            ("temperature", getattr(transport, "temperature", None)),
+            ("thinking_level", getattr(transport, "thinking_level", None)),
+            ("thinking_budget", getattr(transport, "thinking_budget", None)),
+        ):
+            await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
+
+        def _command_configuration(command_name: str) -> object:
+            match command_name:
+                case "/model":
+                    return transport.model.id
+                case "/iterations":
+                    return agent.max_iterations
+                case "/thinking":
+                    return {
+                        "level": getattr(transport, "thinking_level", None),
+                        "budget": getattr(transport, "thinking_budget", None),
+                    }
+                case "/temperature":
+                    return getattr(transport, "temperature", None)
+                case "/max-tokens":
+                    return getattr(transport, "max_output_tokens", None)
+                case "/debug":
+                    return getattr(transport, "debug", False)
+                case _:
+                    return None
 
         async def _make_child_agent(
             inherit_context: bool,
             *,
             foreground: bool,
-        ) -> tuple[Agent, MemoryContextStore]:
-            child_ctx = await ctx.fork() if inherit_context else MemoryContextStore()
+        ) -> tuple[Agent, ContextStore]:
+            child_ctx = await ctx.fork() if inherit_context else ObservedContextStore(MemoryContextStore(), event_hub)
             child_transport = _clone_transport_for_spawn(agent.transport)
             child_tools = _clone_tools_for_child(agent.tools, foreground=foreground)
             child_system = build_system_prompt(
@@ -1257,10 +1444,10 @@ async def main() -> None:
                 last_iteration_message=LAST_ITERATION_HINT,
             ), child_ctx
 
-        async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, ContextStore]:
             return await _make_child_agent(inherit_context, foreground=False)
 
-        async def _make_run_agent(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        async def _make_run_agent(inherit_context: bool) -> tuple[Agent, ContextStore]:
             return await _make_child_agent(inherit_context, foreground=True)
 
         set_spawn_agent_factory(_make_spawn_agent)
@@ -1306,9 +1493,10 @@ async def main() -> None:
             lambda: _panel.status_line(transport.model, stats),
             on_interrupt=lambda: _on_sigint(),
         )
-        prompt_task: asyncio.Task[None] | None = None
+        prompt_task: asyncio.Task[TurnOutcome] | None = None
         input_task: asyncio.Task[str] | None = None
         inbox_task: asyncio.Task[str] | None = None
+        main_status = TurnStatus.SUCCEEDED
         # Lets monitor() see messages that arrived but have not been read:
         # they cannot be delivered until the current turn finishes.
         set_pending_message_probe(peer_queue.qsize)
@@ -1317,12 +1505,14 @@ async def main() -> None:
         async def _on_peer_message(message: PeerMessage) -> None:
             await peer_queue.put(format_message_for_dialog(message))
 
-        async def _run_turn(prompt: str) -> None:
-            nonlocal prompt_task
-            prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, event_hub, main_run_id))
+        async def _run_turn(prompt: str, *, source: str) -> None:
+            nonlocal main_status, prompt_task
+            prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, event_hub, main_run_id, source=source))
             try:
-                await prompt_task
+                outcome = await prompt_task
+                main_status = outcome.status
             except asyncio.CancelledError:
+                main_status = TurnStatus.CANCELLED
                 # Keep the half-written answer. The agent stores an iteration
                 # once the model stops talking, so an interrupted one is on
                 # screen and nowhere else - and the next turn would be answered
@@ -1373,7 +1563,7 @@ async def main() -> None:
             prompts = _collect_queued(first)
             for prompt in prompts:
                 await renderer.incoming(prompt)
-            await _run_turn("\n\n".join(prompts))
+            await _run_turn("\n\n".join(prompts), source="peer")
 
         async def _drain_peer_messages() -> None:
             try:
@@ -1413,7 +1603,7 @@ async def main() -> None:
                 notify.add_listener(None, peer_queue.put_nowait)
 
             if args.prompt:
-                await _run_turn(args.prompt)
+                await _run_turn(args.prompt, source="one-shot")
                 await _run_one_shot_background_agents()
                 renderer.set_focus("main")
                 await _drain_peer_messages()
@@ -1460,6 +1650,8 @@ async def main() -> None:
                 if not user_input:
                     continue
                 lowered = user_input.lower()
+                if lowered.startswith("/"):
+                    await _publish_main_event(InputReceived(text=user_input, source="interactive-command"))
                 if lowered in {"/quit", "/exit", "/q"}:
                     break
                 if lowered == "/help":
@@ -1481,6 +1673,9 @@ async def main() -> None:
                         continue
                     renderer.set_focus(agent_id)
                     print(f"Focused agent: {BOLD}{agent_id}{RESET}")
+                    await _publish_main_event(
+                        ConfigurationChanged(name="input_target", value=agent_id, source="interactive")
+                    )
                     continue
                 if lowered == "/agent-stop" or lowered.startswith("/agent-stop "):
                     arg = user_input[len("/agent-stop") :].strip() or renderer.focused_agent
@@ -1518,14 +1713,24 @@ async def main() -> None:
                         if cmd_arg is None:
                             cmd.show()
                         else:
+                            previous_value = _command_configuration(prefix)
                             cmd.apply(cmd_arg)
+                            current_value = _command_configuration(prefix)
+                            if current_value != previous_value:
+                                await _publish_main_event(
+                                    ConfigurationChanged(
+                                        name=prefix.removeprefix("/"),
+                                        value=current_value,
+                                        source="interactive",
+                                    )
+                                )
                         matched = True
                         break
                 if matched:
                     continue
 
                 if renderer.focused_agent == "main":
-                    await _run_turn(user_input)
+                    await _run_turn(user_input, source="interactive")
                 elif is_local_background_agent(renderer.focused_agent):
                     delivered = await enqueue_local_agent_prompt(renderer.focused_agent, user_input, wait=True)
                     await renderer.mark_idle()
@@ -1535,11 +1740,19 @@ async def main() -> None:
                 else:
                     print(f"Agent {renderer.focused_agent!r} is no longer local; focusing main.")
                     renderer.set_focus("main")
+        except asyncio.CancelledError:
+            main_status = TurnStatus.CANCELLED
+            raise
+        except BaseException:
+            main_status = TurnStatus.FAILED
+            raise
         finally:
             for task in (input_task, inbox_task):
                 if task is not None and not task.done():
                     task.cancel()
             await stop_local_background_agents()
+            await ctx.close()
+            await _publish_main_event(AgentStopped(status=main_status))
             notify.remove_listener(peer_server.id if peer_server is not None else None)
             if peer_server is not None:
                 await peer_server.close()
@@ -1548,6 +1761,7 @@ async def main() -> None:
             set_run_agent_factory(None)
             set_spawn_agent_factory(None)
             set_session_event_hub(None)
+            set_pending_message_probe(None)
             loop.remove_signal_handler(signal.SIGINT)
 
 

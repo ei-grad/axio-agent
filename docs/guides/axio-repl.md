@@ -70,6 +70,32 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--max-tokens` | transport default | Max output tokens |
 | `--max-iterations` | 30 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
+| `--session-log-dir` | XDG state directory | Root for session JSONL journals |
+| `--no-session-log` | off | Disable the default session journal |
+
+## Session journals
+
+The REPL writes an append-only JSONL journal by default. Each invocation creates:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/events.jsonl
+```
+
+The printed `Session log:` line gives the exact path. It is sent to stderr in
+single-prompt mode so stdout remains the agent's streamed answer. Choose another
+root with `--session-log-dir <directory>`, or disable the journal explicitly
+with `--no-session-log`.
+
+The log is independent of terminal focus and display filtering. It includes the
+main agent and hidden foreground/background subagents: user input, stream
+events, successfully committed context messages, lifecycle events, configuration
+changes, and the correlation between child outcomes and their delivery routes.
+Media bytes are stored by content hash in an adjacent `attachments/` directory.
+
+Session directories use mode `0700` and journal or attachment files use `0600`.
+Known secret-shaped fields and common token formats are redacted recursively,
+but a secret embedded in arbitrary prose or tool output cannot always be
+recognized. Treat journals as sensitive local data.
 
 ## REPL commands
 

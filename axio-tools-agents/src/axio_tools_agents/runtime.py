@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import copy
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from uuid import uuid4
 
 from axio.agent import Agent
-from axio.context import ContextStore
+from axio.context import ContextStore, SessionInfo
 from axio.events import Error, SessionEndEvent, StreamEvent, TextDelta
+from axio.messages import Message
 from axio.types import StopReason
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,35 @@ class OutcomeDelivered:
     route: str
 
 
+@dataclass(frozen=True, slots=True)
+class InputReceived:
+    text: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationChanged:
+    name: str
+    value: object
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageCommitted:
+    message: Message
+
+
+@dataclass(frozen=True, slots=True)
+class ContextForked:
+    source_context_id: str
+    child_context_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCleared:
+    pass
+
+
 type RuntimeEvent = (
     StreamEvent
     | AgentStarted
@@ -76,6 +108,11 @@ type RuntimeEvent = (
     | ForegroundEntered
     | ForegroundExited
     | OutcomeDelivered
+    | InputReceived
+    | ConfigurationChanged
+    | MessageCommitted
+    | ContextForked
+    | ContextCleared
 )
 
 
@@ -90,6 +127,7 @@ class AgentEventEnvelope:
     execution_mode: ExecutionMode
     parent_tool_use_id: str | None
     event: RuntimeEvent
+    context_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +138,7 @@ class TurnIdentity:
     turn_id: str
     execution_mode: ExecutionMode
     parent_tool_use_id: str | None = None
+    context_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +156,17 @@ class TurnOutcome:
 
 EventSubscriber = Callable[[AgentEventEnvelope], Awaitable[None]]
 Unsubscribe = Callable[[], None]
+
+_current_turn_identity: contextvars.ContextVar[TurnIdentity | None] = contextvars.ContextVar(
+    "axio_tools_agents_current_turn_identity",
+    default=None,
+)
+
+
+def current_turn_identity() -> TurnIdentity | None:
+    """Return the turn whose agent code is executing in this task context."""
+
+    return _current_turn_identity.get()
 
 
 class SessionEventHub:
@@ -149,6 +199,7 @@ class SessionEventHub:
         turn_id: str | None,
         execution_mode: ExecutionMode,
         parent_tool_use_id: str | None = None,
+        context_id: str | None = None,
     ) -> AgentEventEnvelope:
         async with self._publish_lock:
             self._seq += 1
@@ -162,6 +213,7 @@ class SessionEventHub:
                 execution_mode=execution_mode,
                 parent_tool_use_id=parent_tool_use_id,
                 event=event,
+                context_id=context_id,
             )
             subscribers = tuple(self._subscribers)
             if subscribers:
@@ -183,6 +235,7 @@ class SessionEventHub:
             turn_id=identity.turn_id,
             execution_mode=identity.execution_mode,
             parent_tool_use_id=identity.parent_tool_use_id,
+            context_id=identity.context_id,
         )
 
 
@@ -193,6 +246,7 @@ def new_turn_identity(
     execution_mode: ExecutionMode,
     parent_tool_use_id: str | None = None,
     run_id: str | None = None,
+    context_id: str | None = None,
 ) -> TurnIdentity:
     return TurnIdentity(
         run_id=run_id or uuid4().hex,
@@ -201,7 +255,68 @@ def new_turn_identity(
         turn_id=uuid4().hex,
         execution_mode=execution_mode,
         parent_tool_use_id=parent_tool_use_id,
+        context_id=context_id,
     )
+
+
+class ObservedContextStore(ContextStore):
+    """Publish successful context mutations through a session event hub."""
+
+    def __init__(self, store: ContextStore, hub: SessionEventHub) -> None:
+        self._store = store
+        self._hub = hub
+        self._default_identity: TurnIdentity | None = None
+
+    @property
+    def session_id(self) -> str:
+        return self._store.session_id
+
+    def bind_identity(self, identity: TurnIdentity) -> None:
+        self._default_identity = replace(identity, context_id=self.session_id)
+
+    def _identity(self) -> TurnIdentity | None:
+        identity = current_turn_identity() or self._default_identity
+        if identity is None:
+            return None
+        return replace(identity, context_id=self.session_id)
+
+    async def _publish(self, event: RuntimeEvent) -> None:
+        identity = self._identity()
+        if identity is not None:
+            await self._hub.publish_for(identity, event)
+
+    async def append(self, message: Message) -> None:
+        await self._store.append(message)
+        await self._publish(MessageCommitted(message=copy.deepcopy(message)))
+
+    async def get_history(self) -> list[Message]:
+        return await self._store.get_history()
+
+    async def clear(self) -> None:
+        await self._store.clear()
+        await self._publish(ContextCleared())
+
+    async def fork(self) -> ObservedContextStore:
+        child = ObservedContextStore(await self._store.fork(), self._hub)
+        await self._publish(
+            ContextForked(
+                source_context_id=self.session_id,
+                child_context_id=child.session_id,
+            )
+        )
+        return child
+
+    async def set_context_tokens(self, input_tokens: int, output_tokens: int) -> None:
+        await self._store.set_context_tokens(input_tokens, output_tokens)
+
+    async def get_context_tokens(self) -> tuple[int, int]:
+        return await self._store.get_context_tokens()
+
+    async def close(self) -> None:
+        await self._store.close()
+
+    async def list_sessions(self) -> list[SessionInfo]:
+        return await self._store.list_sessions()
 
 
 async def observe_agent_turn(
@@ -214,6 +329,29 @@ async def observe_agent_turn(
 ) -> TurnOutcome:
     """Consume a complete turn and derive its outcome after the iterator closes."""
 
+    if isinstance(context, ObservedContextStore):
+        context.bind_identity(identity)
+    identity_token = _current_turn_identity.set(identity)
+    try:
+        return await _observe_agent_turn_current(
+            agent=agent,
+            context=context,
+            prompt=prompt,
+            identity=identity,
+            hub=hub,
+        )
+    finally:
+        _current_turn_identity.reset(identity_token)
+
+
+async def _observe_agent_turn_current(
+    *,
+    agent: Agent,
+    context: ContextStore,
+    prompt: str,
+    identity: TurnIdentity,
+    hub: SessionEventHub,
+) -> TurnOutcome:
     await hub.publish_for(identity, TurnStarted(prompt=prompt))
     stream = agent.run_stream(prompt, context)
     text: list[str] = []

@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from axio.agent import Agent
+from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     IterationEnd,
@@ -23,11 +24,15 @@ from axio.types import StopReason, Usage
 
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
+    ContextForked,
     ExecutionMode,
+    MessageCommitted,
+    ObservedContextStore,
     SessionEventHub,
     TurnFinished,
     TurnStarted,
     TurnStatus,
+    current_turn_identity,
     new_turn_identity,
     observe_agent_turn,
 )
@@ -126,6 +131,76 @@ async def test_observed_turn_forwards_full_stream_and_finishes_with_typed_outcom
         stop_reason=StopReason.end_turn,
         error=None,
     )
+
+
+async def test_observed_context_publishes_commits_and_forks_with_context_ids() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    envelopes: list[AgentEventEnvelope] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        envelopes.append(envelope)
+
+    hub.subscribe(collect)
+    context = ObservedContextStore(MemoryContextStore(), hub)
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="run-1",
+        context_id=context.session_id,
+    )
+
+    await observe_agent_turn(
+        agent=Agent(system="main", transport=StubTransport([make_text_response("answer")])),
+        context=context,
+        prompt="question",
+        identity=identity,
+        hub=hub,
+    )
+    child = await context.fork()
+
+    committed = [envelope for envelope in envelopes if isinstance(envelope.event, MessageCommitted)]
+    committed_events = [envelope.event for envelope in committed]
+    assert all(isinstance(event, MessageCommitted) for event in committed_events)
+    assert [event.message.role for event in committed_events if isinstance(event, MessageCommitted)] == [
+        "user",
+        "assistant",
+    ]
+    assert all(envelope.context_id == context.session_id for envelope in committed)
+    forked = next(envelope for envelope in envelopes if isinstance(envelope.event, ContextForked))
+    assert isinstance(forked.event, ContextForked)
+    assert forked.context_id == context.session_id
+    assert forked.event.source_context_id == context.session_id
+    assert forked.event.child_context_id == child.session_id
+
+
+async def test_failed_context_append_is_not_reported_as_committed() -> None:
+    class FailingContext(MemoryContextStore):
+        async def append(self, message: Message) -> None:
+            del message
+            raise OSError("storage unavailable")
+
+    hub = SessionEventHub()
+    events: list[object] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        events.append(envelope.event)
+
+    hub.subscribe(collect)
+    context = ObservedContextStore(FailingContext(), hub)
+    context.bind_identity(
+        new_turn_identity(
+            agent_id="main",
+            parent_agent_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            context_id=context.session_id,
+        )
+    )
+
+    with pytest.raises(OSError, match="storage unavailable"):
+        await context.append(Message(role="user", content=[TextBlock(text="not stored")]))
+
+    assert not any(isinstance(event, MessageCommitted) for event in events)
 
 
 async def test_observed_turn_forwards_child_tool_arguments_output_and_result_in_order() -> None:
@@ -267,3 +342,4 @@ async def test_cancel_closes_child_stream_and_records_cancelled_turn() -> None:
 
     assert transport.closed.is_set()
     assert finished[-1].status is TurnStatus.CANCELLED
+    assert current_turn_identity() is None

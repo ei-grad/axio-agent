@@ -4,16 +4,34 @@ import asyncio
 import json
 import stat
 import threading
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
-from axio.events import Error, ImageOutput, IterationEnd, TextDelta
+from axio.blocks import TextBlock
+from axio.context import MemoryContextStore
+from axio.events import Error, ImageOutput, IterationEnd, StreamEvent, TextDelta
+from axio.messages import Message
+from axio.models import Capability, ModelRegistry, ModelSpec
+from axio.testing import make_text_response, make_tool_use_response
+from axio.tool import Tool
 from axio.types import StopReason, Usage
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    ExecutionMode,
+    ObservedContextStore,
+    OutcomeDelivered,
+    SessionEventHub,
+    TurnFinished,
+    TurnStatus,
+    new_turn_identity,
+)
 
 from axio_repl import _journal as journal_module
+from axio_repl import _session_journal, main
 from axio_repl._journal import (
     JournalQueueFullError,
     SessionJournal,
@@ -28,6 +46,111 @@ def _read_records(events_path: Path) -> list[dict[str, Any]]:
     lines = raw.splitlines()
     assert all(line for line in lines)
     return [json.loads(line.decode("utf-8")) for line in lines]
+
+
+def _only_events_path(root: Path) -> Path:
+    paths = list(root.glob("*/*/*/*/events.jsonl"))
+    assert len(paths) == 1
+    return paths[0]
+
+
+class _OneShotTransport:
+    name = "stub"
+
+    def __init__(self, **kwargs: object) -> None:
+        del kwargs
+        self.model = ModelSpec(
+            id="stub/model",
+            capabilities=frozenset({Capability.text, Capability.tool_use}),
+        )
+        self.models = ModelRegistry([self.model])
+        self.temperature: float | None = None
+        self.max_output_tokens: int | None = None
+        self.thinking_level: str | None = None
+        self.thinking_budget: int | None = None
+        self.debug = False
+
+    async def fetch_models(self) -> None:
+        pass
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools, system
+        yield TextDelta(index=0, delta="stub answer")
+        yield IterationEnd(
+            iteration=1,
+            stop_reason=StopReason.end_turn,
+            usage=Usage(input_tokens=2, output_tokens=3),
+        )
+
+
+async def _run_stub_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *extra_args: str,
+) -> None:
+    import axio_repl
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (_OneShotTransport, ""))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["axio-repl", "test prompt", "--sandbox", "none", *extra_args],
+    )
+    await main()
+
+
+async def _run_agent_tool_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    tool_name: str,
+) -> None:
+    import axio_repl
+
+    class AgentToolTransport(_OneShotTransport):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.calls = 0
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            self.calls += 1
+            events = (
+                make_tool_use_response(
+                    tool_name,
+                    tool_id=f"{tool_name}-call",
+                    tool_input={"task": "complete child task", "name": "journal-child"},
+                )
+                if self.calls == 1
+                else make_text_response(f"answer from call {self.calls}")
+            )
+            for event in events:
+                yield event
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (AgentToolTransport, ""))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "axio-repl",
+            "delegate work",
+            "--sandbox",
+            "none",
+            "--session-log-dir",
+            str(tmp_path / "journals"),
+        ],
+    )
+    await main()
 
 
 def test_default_root_and_session_directory_follow_xdg() -> None:
@@ -66,6 +189,245 @@ async def test_open_creates_private_storage_and_lifecycle_records(tmp_path: Path
     assert records[0]["payload"] == {"model": "test-model"}
     assert records[1]["payload"] == {"status": "complete"}
     assert journal.closed
+
+
+async def test_default_one_shot_writes_complete_main_session_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    await _run_stub_one_shot(monkeypatch, tmp_path)
+
+    events_path = _only_events_path(state_home / "axio" / "sessions")
+    records = _read_records(events_path)
+    kinds = [record["kind"] for record in records]
+    assert kinds[0] == "session_start"
+    assert kinds[-1] == "session_end"
+    assert "agent_started" in kinds
+    assert "input_received" in kinds
+    assert "turn_started" in kinds
+    assert "stream_event" in kinds
+    assert "turn_finished" in kinds
+    assert "agent_stopped" in kinds
+    input_record = next(record for record in records if record["kind"] == "input_received")
+    assert input_record["payload"]["event"]["text"] == "test prompt"
+    assert input_record["payload"]["event"]["source"] == "one-shot"
+    configurations = {
+        record["payload"]["event"]["name"]: record["payload"]["event"]["value"]
+        for record in records
+        if record["kind"] == "configuration_changed"
+    }
+    assert configurations["transport"] == "stub"
+    assert configurations["model"] == "stub/model"
+    assert configurations["sandbox"] == "host — tools run directly on this machine"
+
+    committed = [record for record in records if record["kind"] == "message_committed"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
+    assert all(record["agent_id"] == "main" for record in committed)
+    assert all(record["context_id"] for record in committed)
+    assert committed[0]["payload"]["message"]["content"][0]["text"].endswith("] test prompt")
+    assert committed[1]["payload"]["message"]["content"][0]["text"] == "stub answer"
+
+    captured = capsys.readouterr()
+    assert "Session log:" not in captured.out
+    assert str(events_path) in captured.err
+
+
+async def test_one_shot_session_log_can_be_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    await _run_stub_one_shot(monkeypatch, tmp_path, "--no-session-log")
+
+    assert not (state_home / "axio" / "sessions").exists()
+    assert "Session log:" not in capsys.readouterr().err
+
+
+async def test_one_shot_session_log_honours_custom_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom_root = tmp_path / "custom-journals"
+
+    await _run_stub_one_shot(
+        monkeypatch,
+        tmp_path,
+        "--session-log-dir",
+        str(custom_root),
+    )
+
+    records = _read_records(_only_events_path(custom_root))
+    assert records[0]["kind"] == "session_start"
+    assert records[-1]["kind"] == "session_end"
+
+
+async def test_journal_open_failure_warns_once_and_does_not_abort_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail_open(**kwargs: object) -> SessionJournal:
+        del kwargs
+        raise PermissionError("journal root is read-only")
+
+    monkeypatch.setattr(journal_module.SessionJournal, "open", fail_open)
+    hub = SessionEventHub(session_id="unwritable")
+
+    async with _session_journal(
+        hub,
+        disabled=False,
+        root=tmp_path,
+        one_shot=True,
+        cwd=tmp_path,
+    ) as journal:
+        assert journal is None
+        await hub.publish(
+            TextDelta(index=0, delta="session continues"),
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="turn",
+            execution_mode=ExecutionMode.FOREGROUND,
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("Session journal degraded") == 1
+    assert "PermissionError: journal root is read-only" in captured.err
+
+
+async def test_journal_records_hidden_agents_and_delivery_before_display_filtering(tmp_path: Path) -> None:
+    hub = SessionEventHub(session_id="all-agents")
+    displayed: list[str] = []
+
+    async with _session_journal(
+        hub,
+        disabled=False,
+        root=tmp_path,
+        one_shot=True,
+        cwd=tmp_path,
+    ) as journal:
+        assert journal is not None
+
+        async def active_only(envelope: AgentEventEnvelope) -> None:
+            if envelope.execution_mode is ExecutionMode.FOREGROUND:
+                displayed.append(envelope.agent_id)
+
+        hub.subscribe(active_only)
+        await hub.publish(
+            TextDelta(index=0, delta="hidden output"),
+            run_id="background-run",
+            agent_id="hidden-child",
+            parent_agent_id="main",
+            turn_id="background-turn",
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            context_id="background-context",
+        )
+        foreground = new_turn_identity(
+            agent_id="foreground-child",
+            parent_agent_id="main",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id="run-call",
+            run_id="foreground-run",
+            context_id="foreground-context",
+        )
+        await hub.publish_for(foreground, TextDelta(index=0, delta="visible output"))
+        await hub.publish_for(
+            foreground,
+            OutcomeDelivered(recipient_agent_id="main", route="parent_tool_result"),
+        )
+        events_path = journal.events_path
+
+    records = _read_records(events_path)
+    stream_records = [record for record in records if record["kind"] == "stream_event"]
+    assert [record["agent_id"] for record in stream_records] == ["hidden-child", "foreground-child"]
+    assert displayed == ["foreground-child", "foreground-child"]
+    delivered = next(record for record in records if record["kind"] == "outcome_delivered")
+    assert delivered["parent_agent_id"] == "main"
+    assert delivered["parent_tool_use_id"] == "run-call"
+    assert delivered["payload"]["event"]["route"] == "parent_tool_result"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "execution_mode", "delivery_route"),
+    [
+        ("run_agent", "foreground", "parent_tool_result"),
+        ("spawn_agent", "background", "background_outcome_handler"),
+    ],
+)
+async def test_one_shot_journal_captures_actual_local_subagent_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    execution_mode: str,
+    delivery_route: str,
+) -> None:
+    await _run_agent_tool_one_shot(monkeypatch, tmp_path, tool_name=tool_name)
+
+    records = _read_records(_only_events_path(tmp_path / "journals"))
+    child_started = next(
+        record for record in records if record["kind"] == "agent_started" and record["agent_id"] != "main"
+    )
+    child_id = child_started["agent_id"]
+    assert child_started["parent_agent_id"] == "main"
+    child_records = [record for record in records if record["agent_id"] == child_id]
+    assert child_records
+    assert all(record["execution_mode"] == execution_mode for record in child_records)
+    assert all(record["parent_tool_use_id"] == f"{tool_name}-call" for record in child_records)
+    assert any(record["kind"] == "stream_event" for record in child_records)
+    committed = [record for record in child_records if record["kind"] == "message_committed"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
+    assert len({record["context_id"] for record in child_records if record["context_id"]}) == 1
+    delivered = next(record for record in child_records if record["kind"] == "outcome_delivered")
+    assert delivered["payload"]["event"]["route"] == delivery_route
+    stopped_index = max(index for index, record in enumerate(records) if record["kind"] == "agent_stopped")
+    assert stopped_index < len(records) - 1
+    assert records[-1]["kind"] == "session_end"
+
+
+async def test_partial_message_commit_after_cancelled_turn_is_journalled(tmp_path: Path) -> None:
+    hub = SessionEventHub(session_id="cancelled")
+    context = ObservedContextStore(MemoryContextStore(), hub)
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="main-run",
+        context_id=context.session_id,
+    )
+    context.bind_identity(identity)
+
+    async with _session_journal(
+        hub,
+        disabled=False,
+        root=tmp_path,
+        one_shot=True,
+        cwd=tmp_path,
+    ) as journal:
+        assert journal is not None
+        await hub.publish_for(
+            identity,
+            TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="turn cancelled"),
+        )
+        await context.append(Message(role="assistant", content=[TextBlock(text="partial answer")]))
+        events_path = journal.events_path
+
+    records = _read_records(events_path)
+    finished_index = next(index for index, record in enumerate(records) if record["kind"] == "turn_finished")
+    committed_index = next(index for index, record in enumerate(records) if record["kind"] == "message_committed")
+    assert committed_index > finished_index
+    committed = records[committed_index]
+    assert committed["turn_id"] == identity.turn_id
+    assert committed["context_id"] == context.session_id
+    assert committed["payload"]["message"]["content"][0]["text"] == "partial answer"
 
 
 async def test_concurrent_publishers_keep_one_strict_global_order(tmp_path: Path) -> None:

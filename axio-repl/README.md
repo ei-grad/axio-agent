@@ -49,6 +49,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
 - **Graceful interruption** — Ctrl-C cancels the running agent loop, preserving
   partial tool output in conversation context so the model knows what happened.
 - **Readline history** — persisted across sessions in `~/.axio_repl_history`.
+- **Session journals** — every main, foreground, and background agent event is
+  written to a private JSONL journal for later inspection.
 - **Single-prompt mode** — pass a prompt as argument for scripting and non-interactive use.
 
 ## Install
@@ -87,7 +89,35 @@ axio-repl --transport google --model gemini-3.1-pro-preview
 
 # Custom temperature and iteration limit
 axio-repl --temperature 0.5 --max-iterations 100
+
+# Choose another journal root, or explicitly opt out
+axio-repl --session-log-dir ./axio-session-logs
+axio-repl --no-session-log
 ```
+
+## Session journals and privacy
+
+Session journaling is enabled by default. Each invocation creates one journal at:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/events.jsonl
+```
+
+The REPL prints the exact path when the session starts. In single-prompt mode it
+prints the path to stderr, leaving the streamed answer on stdout. Use
+`--session-log-dir <directory>` to select another root or `--no-session-log` to
+disable journaling.
+
+The append-only journal contains user input, model stream events, committed
+context messages, configuration changes, agent lifecycle events, subagent
+output, and outcome-delivery correlation. Binary media is stored by hash under
+the session's `attachments/` directory. Directories are created with mode
+`0700` and files with `0600`.
+
+Known secret-shaped fields and common token formats are redacted before writing,
+but arbitrary secrets embedded in prose or tool output cannot be identified
+reliably. Treat the journal as sensitive local session data and apply an
+appropriate retention policy.
 
 ## REPL Commands
 

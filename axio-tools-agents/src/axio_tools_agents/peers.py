@@ -26,9 +26,14 @@ from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     AgentStarted,
     AgentStopped,
+    ConfigurationChanged,
+    ContextCleared,
+    ContextForked,
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
+    InputReceived,
+    MessageCommitted,
     OutcomeDelivered,
     SessionEventHub,
     TurnFinished,
@@ -36,6 +41,7 @@ from axio_tools_agents.runtime import (
     TurnOutcome,
     TurnStarted,
     TurnStatus,
+    current_turn_identity,
     new_turn_identity,
     observe_agent_turn,
 )
@@ -140,6 +146,9 @@ class _BackgroundAgent:
     # A failed turn leaves the agent alive and waiting, so without this the
     # parent cannot tell a crashed agent from one that finished its work.
     last_error: str | None = None
+    # Runtime identity used for observation and journal correlation. This is
+    # distinct from the peer id used to route notifications.
+    parent_agent_id: str | None = None
     parent_id: str | None = None
     # Who already received this turn's answer text, so the parent is not told
     # "finished its turn" right after reading the answer itself.
@@ -271,7 +280,7 @@ async def _deliver_background_turn(
     background.reported_to = background.parent_id
     await _session_event_hub.publish_for(
         outcome.identity if outcome is not None else identity,
-        OutcomeDelivered(recipient_agent_id=background.parent_id, route=route),
+        OutcomeDelivered(recipient_agent_id=background.parent_agent_id, route=route),
     )
 
 
@@ -414,6 +423,11 @@ def _subscribe_legacy_event_handler() -> None:
                 ForegroundEntered,
                 ForegroundExited,
                 OutcomeDelivered,
+                InputReceived,
+                ConfigurationChanged,
+                MessageCommitted,
+                ContextForked,
+                ContextCleared,
             ),
         ):
             return
@@ -785,10 +799,11 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                 break
             identity = new_turn_identity(
                 agent_id=background.peer.id,
-                parent_agent_id=background.parent_id,
+                parent_agent_id=background.parent_agent_id,
                 execution_mode=ExecutionMode.BACKGROUND,
                 parent_tool_use_id=queued.parent_tool_use_id,
                 run_id=background.run_id,
+                context_id=background.context.session_id,
             )
             turn = asyncio.create_task(_run_agent_turn(background=background, queued=queued, identity=identity))
             background.current_turn = turn
@@ -822,22 +837,26 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
             if background.last_error
             else TurnStatus.SUCCEEDED
         )
-        await _session_event_hub.publish(
-            AgentStopped(status=status),
-            run_id=background.run_id,
-            agent_id=background.peer.id,
-            parent_agent_id=background.parent_id,
-            turn_id=None,
-            execution_mode=ExecutionMode.BACKGROUND,
-            parent_tool_use_id=background.parent_tool_use_id,
-        )
-        _finish_pending_prompts(background)
-        _background_agents.pop(background.peer.id, None)
-        # A detached call started by this agent can still complete after it is
-        # gone; without this its notification would sit in a queue nobody drains.
-        # The output stays collectable with monitor(tasks=[handle]).
-        notify.discard(background.peer.id)
-        await background.peer.close()
+        try:
+            await background.context.close()
+        finally:
+            await _session_event_hub.publish(
+                AgentStopped(status=status),
+                run_id=background.run_id,
+                agent_id=background.peer.id,
+                parent_agent_id=background.parent_agent_id,
+                turn_id=None,
+                execution_mode=ExecutionMode.BACKGROUND,
+                parent_tool_use_id=background.parent_tool_use_id,
+                context_id=background.context.session_id,
+            )
+            _finish_pending_prompts(background)
+            _background_agents.pop(background.peer.id, None)
+            # A detached call started by this agent can still complete after it is
+            # gone; without this its notification would sit in a queue nobody drains.
+            # The output stays collectable with monitor(tasks=[handle]).
+            notify.discard(background.peer.id)
+            await background.peer.close()
 
 
 async def _start_background_agent(
@@ -848,6 +867,7 @@ async def _start_background_agent(
     name: str,
     project: str,
     cwd: str,
+    parent_agent_id: str | None,
     parent_id: str | None,
     parent_tool_use_id: str | None,
 ) -> _BackgroundAgent:
@@ -886,6 +906,7 @@ async def _start_background_agent(
         agent=agent,
         context=context,
         peer=peer,
+        parent_agent_id=parent_agent_id,
         parent_id=parent_id,
         parent_tool_use_id=parent_tool_use_id,
     )
@@ -898,10 +919,11 @@ async def _start_background_agent(
         AgentStarted(name=peer.name, kind=peer.kind),
         run_id=background.run_id,
         agent_id=peer.id,
-        parent_agent_id=parent_id,
+        parent_agent_id=parent_agent_id,
         turn_id=None,
         execution_mode=ExecutionMode.BACKGROUND,
         parent_tool_use_id=parent_tool_use_id,
+        context_id=context.session_id,
     )
     background.inbox.put_nowait(_QueuedPrompt(initial_task, parent_tool_use_id=parent_tool_use_id))
     background.runner = asyncio.create_task(_run_background_agent(background))
@@ -985,6 +1007,8 @@ async def spawn_agent(
         parent_tool_use_id = None
     agent, context = await _spawn_agent_factory(inherit_context)
     parent = current_peer()
+    parent_turn = current_turn_identity()
+    parent_agent_id = parent_turn.agent_id if parent_turn is not None else parent.id if parent is not None else None
     project = parent.project if parent is not None else _current_project()
     cwd = parent.cwd if parent is not None else _normalize_project(None)
     base_name = name or generate_name()
@@ -995,6 +1019,7 @@ async def spawn_agent(
         name=base_name,
         project=project,
         cwd=cwd,
+        parent_agent_id=parent_agent_id,
         parent_id=parent.id if parent is not None else None,
         parent_tool_use_id=parent_tool_use_id,
     )
@@ -1028,7 +1053,8 @@ async def run_agent(
     except LookupError:
         parent_tool_use_id = None
     parent = current_peer()
-    parent_id = parent.id if parent is not None else None
+    parent_turn = current_turn_identity()
+    parent_agent_id = parent_turn.agent_id if parent_turn is not None else parent.id if parent is not None else None
     base_name = name or generate_name()
     agent_id = f"{_safe_slug(base_name)}-foreground-{uuid4().hex[:8]}"
     project = parent.project if parent is not None else _current_project()
@@ -1045,15 +1071,16 @@ async def run_agent(
         cwd=cwd,
         peer_id=agent_id,
     )
+    agent, context = await _run_agent_factory(inherit_context)
     identity = new_turn_identity(
         agent_id=agent_id,
-        parent_agent_id=parent_id,
+        parent_agent_id=parent_agent_id,
         execution_mode=ExecutionMode.FOREGROUND,
         parent_tool_use_id=parent_tool_use_id,
+        context_id=context.session_id,
     )
-    agent, context = await _run_agent_factory(inherit_context)
     await _session_event_hub.publish_for(identity, AgentStarted(name=base_name, kind="foreground-agent"))
-    await _session_event_hub.publish_for(identity, ForegroundEntered(parent_agent_id=parent_id))
+    await _session_event_hub.publish_for(identity, ForegroundEntered(parent_agent_id=parent_agent_id))
 
     outcome: TurnOutcome | None = None
     status = TurnStatus.FAILED
@@ -1080,7 +1107,7 @@ async def run_agent(
 
     await _session_event_hub.publish_for(
         identity,
-        OutcomeDelivered(recipient_agent_id=parent_id, route="parent_tool_result"),
+        OutcomeDelivered(recipient_agent_id=parent_agent_id, route="parent_tool_result"),
     )
     if not outcome.succeeded:
         raise RuntimeError(outcome.error or "foreground agent failed")
