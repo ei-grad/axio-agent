@@ -18,7 +18,7 @@ import os
 import shutil
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -90,6 +90,7 @@ from axio_tools_agents.runtime import (
     MessageCommitted,
     ObservedContextStore,
     OutcomeDelivered,
+    RuntimeEvent,
     SessionEventHub,
     TurnFinished,
     TurnOutcome,
@@ -105,6 +106,7 @@ from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
 from axio_repl import _journal, _panel, _sandbox, _search
+from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, DisplayModeChange
 
 LAST_ITERATION_HINT = Message(
     role="system",
@@ -378,7 +380,8 @@ def build_system_prompt(
                 "stop its own children by id.",
                 "- In axio-repl, the user can switch the active local agent with /agent-focus, list them with "
                 "/agents, interrupt with /agent-interrupt, and stop with /agent-stop. Only the focused agent "
-                "streams fully; background agents are summarized between focused streams.",
+                "streams fully. /agent-actions on shows framed tool and lifecycle actions from every other agent "
+                "between complete paragraphs or tool calls without exposing their prose or reasoning.",
             ]
         if parent_peer_id is not None and any(t.name == "send_message" for t in tools):
             lines.append(
@@ -404,6 +407,7 @@ class _AgentRenderState:
         self.in_text = False
         self.in_reasoning = False
         self.arg_streams: dict[str, ToolArgStream] = {}
+        self.active_tool_ids: set[str] = set()
         self.streamed_tool_ids: set[str] = set()
         self.field_first_delta = True
         self.field_key: str | None = None
@@ -413,6 +417,7 @@ class _AgentRenderState:
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
         self.background_events: list[StreamEvent] = []
+        self.paragraph_newline_pending = False
 
 
 class ReplRenderer:
@@ -422,6 +427,10 @@ class ReplRenderer:
         buffer_background_events: bool = False,
         stats: _panel.SessionStats | None = None,
         current_model: Callable[[], ModelSpec | None] | None = None,
+        display_mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
+        action_multiplexer: ActionMultiplexer | None = None,
+        action_boundary_frames: int = 4,
+        action_boundary_bytes: int = 16 * 1024,
     ) -> None:
         self._lock = asyncio.Lock()
         self._buffer_background_events = buffer_background_events
@@ -433,9 +442,15 @@ class ReplRenderer:
         self._active_agent: str | None = None
         self._focused_agent = "main"
         self._foreground_stack: list[str] = []
+        self._foreground_parent_calls: dict[str, str] = {}
+        self._streamed_foreground_calls: dict[str, TurnStatus] = {}
         self._foreground_streaming = False
+        self._safe_boundary_open = False
         self._background_pending: set[str] = set()
         self._input_active = False
+        self._actions = action_multiplexer or ActionMultiplexer(display_mode)
+        self._action_boundary_frames = action_boundary_frames
+        self._action_boundary_bytes = action_boundary_bytes
 
     @property
     def focused_agent(self) -> str:
@@ -445,22 +460,52 @@ class ReplRenderer:
     def foreground_agent(self) -> str:
         return self._foreground_stack[-1] if self._foreground_stack else self._focused_agent
 
-    async def enter_foreground(self, agent_id: str) -> None:
+    @property
+    def display_mode(self) -> DisplayMode:
+        return self._actions.mode
+
+    @property
+    def queued_action_count(self) -> int:
+        return self._actions.queued_count
+
+    def action_status(self) -> str:
+        status = f"actions: {self.display_mode.value}"
+        if self.queued_action_count:
+            status += f" ({self.queued_action_count} queued)"
+        return status
+
+    async def set_display_mode(self, mode: DisplayMode) -> DisplayModeChange:
+        async with self._lock:
+            return self._actions.set_mode(mode)
+
+    async def enter_foreground(self, agent_id: str, parent_tool_use_id: str | None = None) -> None:
         async with self._lock:
             self._foreground_stack.append(agent_id)
+            self._safe_boundary_open = False
+            self._actions.discard_agent(agent_id)
+            if parent_tool_use_id is not None:
+                self._foreground_parent_calls[agent_id] = parent_tool_use_id
 
-    async def exit_foreground(self, agent_id: str) -> None:
+    async def exit_foreground(self, agent_id: str, status: TurnStatus) -> None:
         async with self._lock:
             if self._foreground_stack and self._foreground_stack[-1] == agent_id:
                 self._foreground_stack.pop()
             else:
                 with suppress(ValueError):
                     self._foreground_stack.remove(agent_id)
-            self._foreground_streaming = False
-            self._flush_background_summaries_locked()
+            parent_tool_use_id = self._foreground_parent_calls.pop(agent_id, None)
+            if parent_tool_use_id is not None:
+                self._streamed_foreground_calls[parent_tool_use_id] = status
+            self._safe_boundary_open = False
+            resumed = self._state(self.foreground_agent)
+            self._foreground_streaming = bool(
+                resumed.in_text or resumed.in_reasoning or resumed.active_tool_ids or resumed.arg_streams
+            )
 
     def set_focus(self, agent_id: str) -> None:
         self._focused_agent = agent_id
+        self._safe_boundary_open = True
+        self._actions.discard_agent(agent_id)
         state = self._state(agent_id)
         buffered = state.background_events
         state.background_events = []
@@ -514,16 +559,33 @@ class ReplRenderer:
                 self._render_locked(agent_id, event)
                 if isinstance(event, Error | SessionEndEvent):
                     self._foreground_streaming = False
-                    self._flush_background_summaries_locked()
+                    if self.display_mode is DisplayMode.ACTIVE_ONLY:
+                        self._flush_background_summaries_locked()
                 elif not isinstance(event, IterationEnd):
                     self._foreground_streaming = True
             else:
+                self._actions.observe(agent_id, event)
                 self._record_background_event_locked(agent_id, event)
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                    self._drain_safe_boundary_locked(max_frames=1)
+                elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
+                    self._flush_background_summaries_locked()
+
+    async def observe_runtime_event(self, agent_id: str, event: RuntimeEvent) -> None:
+        async with self._lock:
+            if agent_id != self.foreground_agent:
+                self._actions.observe(agent_id, event)
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                    self._drain_safe_boundary_locked(max_frames=1)
 
     async def mark_idle(self) -> None:
         async with self._lock:
             self._foreground_streaming = False
-            self._flush_background_summaries_locked()
+            self._safe_boundary_open = True
+            if self.display_mode is DisplayMode.ALL_ACTIONS:
+                self._drain_all_actions_locked()
+            else:
+                self._flush_background_summaries_locked()
 
     async def incoming(self, text: str) -> None:
         """Put an arriving message on screen, not only into the model's prompt.
@@ -537,6 +599,8 @@ class ReplRenderer:
                 print()
                 self._state(self._active_agent).in_text = False
             print(f"\n{DIM}{'─' * 3} incoming {'─' * 3}{RESET}\n{text}\n")
+            self._safe_boundary_open = True
+            self._drain_safe_boundary_locked()
 
     async def notice(self, text: str) -> None:
         async with self._lock:
@@ -544,6 +608,8 @@ class ReplRenderer:
                 print()
                 self._state(self._active_agent).in_text = False
             print(f"{DIM}{text}{RESET}")
+            self._safe_boundary_open = True
+            self._drain_safe_boundary_locked()
 
     def _state(self, agent_id: str) -> _AgentRenderState:
         return self._states.setdefault(agent_id, _AgentRenderState())
@@ -566,6 +632,8 @@ class ReplRenderer:
 
     def _render_locked(self, agent_id: str, event: StreamEvent) -> None:  # noqa: C901
         state = self._switch_agent(agent_id)
+        if not isinstance(event, TextDelta):
+            state.paragraph_newline_pending = False
         # Reasoning streams in as one delta per token, so the quote marker and
         # the colour reset belong to the run as a whole, not to every delta.
         # Closing it here covers every kind of event that can follow.
@@ -573,8 +641,11 @@ class ReplRenderer:
             sys.stdout.write(f"{RESET}\n")
             self._flush()
             state.in_reasoning = False
+            self._safe_boundary_open = True
+            self._drain_safe_boundary_locked()
         match event:
             case ReasoningDelta(delta=delta):
+                self._safe_boundary_open = False
                 if state.in_text:
                     print()
                     state.in_text = False
@@ -596,40 +667,54 @@ class ReplRenderer:
                 if "[Output truncated:" in delta:
                     sys.stdout.write(f"\n{RED}{delta.strip()}{RESET}\n")
                     state.in_text = False
+                    state.paragraph_newline_pending = False
+                    self._safe_boundary_open = True
+                    self._drain_safe_boundary_locked()
                 else:
-                    sys.stdout.write(delta)
-                self._flush()
+                    self._render_text_delta_locked(state, delta)
 
             case ImageOutput(data=data, media_type=mt):
+                self._safe_boundary_open = False
                 if state.in_text:
                     print()
                     state.in_text = False
                 path = _save_media(data, mt)
                 print(f"{GREEN}[image saved: {path}]{RESET}")
+                self._safe_boundary_open = True
+                self._drain_safe_boundary_locked()
 
             case AudioOutput(data=data, media_type=mt):
+                self._safe_boundary_open = False
                 if state.in_text:
                     print()
                     state.in_text = False
                 path = _save_media(data, mt)
                 print(f"{GREEN}[audio saved: {path}]{RESET}")
+                self._safe_boundary_open = True
+                self._drain_safe_boundary_locked()
 
             case VideoOutput(data=data, media_type=mt):
+                self._safe_boundary_open = False
                 if state.in_text:
                     print()
                     state.in_text = False
                 path = _save_media(data, mt)
                 print(f"{GREEN}[video saved: {path}]{RESET}")
+                self._safe_boundary_open = True
+                self._drain_safe_boundary_locked()
 
             case ToolUseStart(index=index, tool_use_id=tid, name=name):
+                self._safe_boundary_open = False
                 if state.in_text:
                     print()
                     state.in_text = False
                 sys.stdout.write(f"\n{BOLD}{CYAN}\u25b6 {name}{RESET}")
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
+                state.active_tool_ids.add(tid)
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
+                self._safe_boundary_open = False
                 stream = state.arg_streams.get(tid)
                 if stream:
                     for fe in stream.feed(pj):
@@ -640,6 +725,7 @@ class ReplRenderer:
                         del state.arg_streams[tid]
 
             case ToolOutputDelta(tool_use_id=tid, key=key, delta=delta):
+                self._safe_boundary_open = False
                 if tid not in state.streamed_tool_ids:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
@@ -648,17 +734,32 @@ class ReplRenderer:
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
-                if is_error:
+                foreground_status = self._streamed_foreground_calls.pop(tid, None)
+                if foreground_status is not None:
+                    if foreground_status is TurnStatus.SUCCEEDED:
+                        content = "[foreground agent returned its result to the parent]"
+                    elif foreground_status is TurnStatus.CANCELLED:
+                        content = "[foreground agent was cancelled; the outcome was returned to the parent]"
+                    else:
+                        content = "[foreground agent failed; the outcome was returned to the parent]"
+                    color = GREEN if foreground_status is TurnStatus.SUCCEEDED else RED
+                    sys.stdout.write(f"{RESET}\n{color}{content}{RESET}\n")
+                elif is_error:
                     sys.stdout.write(f"{RESET}\n{RED}{content}{RESET}\n")
                 elif name in {"run_agent", "spawn_agent"}:
-                    if name == "run_agent":
-                        content = "[foreground agent returned its result to the parent]"
                     sys.stdout.write(f"{RESET}\n{GREEN}{content}{RESET}\n")
                 elif tid in state.streamed_tool_ids:
                     sys.stdout.write(f"{RESET}\n")
                 else:
                     sys.stdout.write(f"{RESET}\n{GREEN}{content}{RESET}\n")
                 self._flush()
+                state.active_tool_ids.discard(tid)
+                state.arg_streams.pop(tid, None)
+                if not state.active_tool_ids and not state.arg_streams:
+                    self._safe_boundary_open = True
+                    self._drain_safe_boundary_locked()
+                else:
+                    self._safe_boundary_open = False
 
             case IterationEnd():
                 # The agent has written this iteration into the context itself;
@@ -667,12 +768,17 @@ class ReplRenderer:
 
             case Error(exception=exc):
                 print(f"\n{RED}Error: {exc}{RESET}", file=sys.stderr)
+                self._safe_boundary_open = True
+                self._drain_safe_boundary_locked()
 
             case SessionEndEvent(total_usage=usage):
                 if state.in_text:
                     print()
                     state.in_text = False
                 print(f"{DIM}[{usage.input_tokens}in/{usage.output_tokens}out tokens]{RESET}")
+                state.paragraph_newline_pending = False
+                self._safe_boundary_open = True
+                self._drain_safe_boundary_locked()
 
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
         state = self._state(agent_id)
@@ -688,14 +794,10 @@ class ReplRenderer:
                 state.background_errors.append(str(exc))
                 if not self._buffer_background_events:
                     self._background_pending.add(agent_id)
-                    if not self._foreground_streaming:
-                        self._flush_background_summaries_locked()
             case SessionEndEvent():
                 self._finish_background_report_locked(agent_id)
                 if not self._buffer_background_events:
                     self._background_pending.add(agent_id)
-                    if not self._foreground_streaming:
-                        self._flush_background_summaries_locked()
             case _:
                 pass
 
@@ -727,6 +829,53 @@ class ReplRenderer:
             state.background_errors.clear()
         self._background_pending.clear()
 
+    def _discard_background_summaries_locked(self) -> None:
+        for agent_id in self._background_pending:
+            state = self._state(agent_id)
+            state.background_reported_chars = 0
+            state.background_tools.clear()
+            state.background_errors.clear()
+        self._background_pending.clear()
+
+    def _drain_safe_boundary_locked(self, *, max_frames: int | None = None) -> None:
+        if self.display_mode is DisplayMode.ALL_ACTIONS:
+            self._discard_background_summaries_locked()
+            for frame in self._actions.drain(
+                max_frames=max_frames or self._action_boundary_frames,
+                max_bytes=self._action_boundary_bytes,
+            ):
+                sys.stdout.write(frame)
+            self._flush()
+
+    def _drain_all_actions_locked(self) -> None:
+        while self._actions.queued_count:
+            before = self._actions.queued_count
+            self._drain_safe_boundary_locked()
+            if self._actions.queued_count >= before:
+                break
+
+    def _render_text_delta_locked(self, state: _AgentRenderState, delta: str) -> None:
+        if delta:
+            self._safe_boundary_open = False
+        start = 0
+        for index, character in enumerate(delta):
+            if character == "\n":
+                if state.paragraph_newline_pending:
+                    sys.stdout.write(delta[start : index + 1])
+                    self._flush()
+                    self._safe_boundary_open = True
+                    self._drain_safe_boundary_locked()
+                    start = index + 1
+                    state.paragraph_newline_pending = False
+                else:
+                    state.paragraph_newline_pending = True
+            else:
+                state.paragraph_newline_pending = False
+        if start < len(delta):
+            self._safe_boundary_open = False
+            sys.stdout.write(delta[start:])
+            self._flush()
+
     def _render_field_event(
         self,
         state: _AgentRenderState,
@@ -753,9 +902,9 @@ class ReplRenderer:
 async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvelope) -> None:
     match envelope.event:
         case ForegroundEntered():
-            await renderer.enter_foreground(envelope.agent_id)
-        case ForegroundExited():
-            await renderer.exit_foreground(envelope.agent_id)
+            await renderer.enter_foreground(envelope.agent_id, envelope.parent_tool_use_id)
+        case ForegroundExited(status=status):
+            await renderer.exit_foreground(envelope.agent_id, status)
         case (
             AgentStarted()
             | AgentStopped()
@@ -768,7 +917,8 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
             | ContextForked()
             | ContextCleared()
         ):
-            return
+            if envelope.execution_mode is ExecutionMode.BACKGROUND:
+                await renderer.observe_runtime_event(envelope.agent_id, envelope.event)
         case event:
             await renderer.render(envelope.agent_id, event)
 
@@ -904,6 +1054,30 @@ def _show_agents(renderer: ReplRenderer) -> None:
     for record in records:
         marker = "*" if record.id == renderer.focused_agent else " "
         print(f"{marker} {record.id} name={record.name!r} kind={record.kind} pid={record.pid}")
+
+
+async def _handle_agent_actions(
+    renderer: ReplRenderer,
+    value: str,
+    publish: Callable[[RuntimeEvent], Awaitable[None]] | None = None,
+) -> bool:
+    """Show or update the observation-only background action policy."""
+    if not value:
+        print(f"Agent actions: {BOLD}{renderer.display_mode.value}{RESET}; {renderer.queued_action_count} queued")
+        return True
+    try:
+        mode = DisplayMode.parse(value)
+    except ValueError as exc:
+        print(str(exc))
+        return False
+    change = await renderer.set_display_mode(mode)
+    detail = ""
+    if change.discarded_frames:
+        detail = f"; discarded {change.discarded_frames} queued frame(s) ({change.discarded_bytes} bytes)"
+    print(f"Agent actions: {BOLD}{mode.value}{RESET}{detail}")
+    if change.current is not change.previous and publish is not None:
+        await publish(ConfigurationChanged(name="agent_actions", value=mode.value, source="interactive"))
+    return True
 
 
 # ── REPL commands ────────────────────────────────────────────────────
@@ -1288,7 +1462,7 @@ async def _session_journal(
 # ── Main ─────────────────────────────────────────────────────────────
 
 
-async def main() -> None:
+def _build_argument_parser() -> Any:
     import argparse
 
     parser = argparse.ArgumentParser(description="REPL coding assistant (axio)")
@@ -1300,6 +1474,12 @@ async def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
     parser.add_argument("--debug", action="store_true", help="Log request/response bodies to stderr")
+    parser.add_argument(
+        "--agent-actions",
+        choices=(DisplayMode.ACTIVE_ONLY.value, DisplayMode.ALL_ACTIONS.value),
+        default=DisplayMode.ACTIVE_ONLY.value,
+        help="Show framed actions from non-active agents (default: off)",
+    )
     parser.add_argument("--no-session-log", action="store_true", help="Do not write the session JSONL journal")
     parser.add_argument(
         "--session-log-dir",
@@ -1314,7 +1494,11 @@ async def main() -> None:
         help="Run file and shell tools inside a Docker container (default: auto — used when a daemon is reachable)",
     )
     parser.add_argument("--sandbox-image", default="python:3.12-slim", help="Image for --sandbox docker")
-    args = parser.parse_args()
+    return parser
+
+
+async def main() -> None:
+    args = _build_argument_parser().parse_args()
 
     setup_logging(args.debug)
     root = Path.cwd().resolve()
@@ -1398,6 +1582,7 @@ async def main() -> None:
             ("temperature", getattr(transport, "temperature", None)),
             ("thinking_level", getattr(transport, "thinking_level", None)),
             ("thinking_budget", getattr(transport, "thinking_budget", None)),
+            ("agent_actions", args.agent_actions),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
 
@@ -1483,6 +1668,7 @@ async def main() -> None:
             buffer_background_events=args.prompt is not None,
             stats=stats,
             current_model=lambda: transport.model,
+            display_mode=DisplayMode.parse(args.agent_actions),
         )
 
         async def _render_envelope(envelope: AgentEventEnvelope) -> None:
@@ -1490,7 +1676,7 @@ async def main() -> None:
 
         unsubscribe_renderer = event_hub.subscribe(_render_envelope)
         prompt_session = _panel.make_session(
-            lambda: _panel.status_line(transport.model, stats),
+            lambda: _panel.status_line(transport.model, stats, renderer.action_status()),
             on_interrupt=lambda: _on_sigint(),
         )
         prompt_task: asyncio.Task[TurnOutcome] | None = None
@@ -1533,6 +1719,11 @@ async def main() -> None:
         async def _run_one_shot_background_agents() -> None:
             records = local_background_agent_records()
             if not records:
+                return
+            if renderer.display_mode is DisplayMode.ALL_ACTIONS:
+                await renderer.notice(f"[waiting for {len(records)} background agent(s)]")
+                await wait_local_background_agents_idle([record.id for record in records])
+                await renderer.mark_idle()
                 return
             if len(records) == 1:
                 renderer.set_focus(records[0].id)
@@ -1609,7 +1800,7 @@ async def main() -> None:
                 await _drain_peer_messages()
                 return
 
-            agent_commands = ["/agents", "/agent-focus", "/agent-interrupt", "/agent-stop"]
+            agent_commands = ["/agents", "/agent-actions", "/agent-focus", "/agent-interrupt", "/agent-stop"]
             commands_list = ", ".join(["/help", *commands, *agent_commands, "/quit"])
             label = getattr(transport, "name", "unknown")
             print(f"REPL ready ({label}). Enter sends, Esc interrupts and sends, Up recalls.")
@@ -1661,6 +1852,10 @@ async def main() -> None:
                     continue
                 if lowered == "/agents":
                     _show_agents(renderer)
+                    continue
+                if lowered == "/agent-actions" or lowered.startswith("/agent-actions "):
+                    raw_mode = user_input[len("/agent-actions") :].strip()
+                    await _handle_agent_actions(renderer, raw_mode, _publish_main_event)
                     continue
                 if lowered == "/agent-focus" or lowered.startswith("/agent-focus "):
                     arg = user_input[len("/agent-focus") :].strip()

@@ -93,6 +93,9 @@ axio-repl --temperature 0.5 --max-iterations 100
 # Choose another journal root, or explicitly opt out
 axio-repl --session-log-dir ./axio-session-logs
 axio-repl --no-session-log
+
+# Show framed tool and lifecycle actions from background agents
+axio-repl --agent-actions on
 ```
 
 ## Session journals and privacy
@@ -124,9 +127,34 @@ appropriate retention policy.
 | Command              | Description                                    |
 |----------------------|------------------------------------------------|
 | `/help`              | Show available tools and commands               |
+| `/agent-actions`     | Show whether other agents' actions are visible  |
+| `/agent-actions on\|off` | Toggle framed actions from other agents    |
+| `/agents`            | List local background agents                    |
+| `/agent-focus <id>`  | Change the input target                         |
 | `/model`             | Show current model and list available models    |
 | `/model <query>`     | Switch to a model matching the query            |
 | `/quit` `/exit` `/q` | Exit the REPL                                   |
+
+## Foreground and background agents
+
+`run_agent` executes one bounded child turn in the foreground. Its reasoning,
+text, tool arguments, and streaming tool output use the same immediate terminal
+path as the parent. The input target does not change, and the child's final text
+is returned to the parent exactly once as the `run_agent` tool result.
+
+`spawn_agent` starts a persistent background peer. By default, its prose and
+actions stay out of the active stream and the REPL prints a completion summary.
+Use `/agent-actions on` (or start with `--agent-actions on`) to show its complete
+tool calls, line-grouped tool output, results, errors, and lifecycle changes.
+These labelled frames appear only after a complete active paragraph, after
+reasoning closes, after media, or after every active parallel tool call has
+finished. Background prose and reasoning remain hidden.
+
+The action toggle changes terminal presentation only. It neither changes which
+agent receives input nor affects execution, outcome delivery, context, or the
+session journal. Queues are bounded; overload is represented by a labelled
+suppression frame rather than delaying the active stream. Enabling the mode does
+not replay actions that occurred while it was off.
 
 ## Tools
 

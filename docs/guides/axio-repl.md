@@ -70,6 +70,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--max-tokens` | transport default | Max output tokens |
 | `--max-iterations` | 30 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
+| `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
 
@@ -108,8 +109,34 @@ recognized. Treat journals as sensitive local data.
 | `/max-tokens [val]` | Show or set max output tokens |
 | `/iterations [val]` | Show or set max agent iterations |
 | `/debug [on\|off]` | Toggle request/response debug logging |
+| `/agent-actions [on\|off]` | Show or toggle actions from non-active agents |
+| `/agents` | List local background agents |
+| `/agent-focus <id>` | Change the input target without changing execution mode |
 | `/help` | List all tools and commands |
 | `/quit`, `/exit`, `/q` | Exit the REPL |
+
+## Foreground delegation and agent actions
+
+The `run_agent` tool runs a one-shot child in the foreground. The parent tool
+call waits, while the child's reasoning, text, tool arguments, output, media,
+and errors stream through the same immediate renderer path as the active parent.
+The user's input target remains unchanged. When the child finishes, its full
+answer is returned to the parent as a single tool result and is not printed a
+second time.
+
+`spawn_agent` creates a persistent background agent. `/agent-actions on` makes
+its tool and lifecycle activity visible without mixing its free-form prose or
+reasoning into the active answer. Every background action is a labelled,
+newline-terminated frame. Frames are inserted only at safe boundaries: after a
+complete active paragraph, after reasoning or media, or after all parallel
+active tool calls complete. They never split streamed tool JSON or active tool
+output.
+
+The queues are bounded and drained round-robin, so a noisy agent cannot block
+the active stream or monopolize a boundary. Overflow produces an explicit
+suppression marker. Switching the mode off discards queued presentation frames;
+switching it on does not replay old activity. Display mode is independent of
+input focus, scheduling, parent delivery, context, and the JSONL session log.
 
 ## Tools
 

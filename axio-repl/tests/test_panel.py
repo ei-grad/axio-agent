@@ -169,6 +169,14 @@ def test_the_toolbar_is_not_reverse_video() -> None:
         assert attrs.bgcolor == "default", cls
 
 
+def test_status_line_reports_action_visibility_and_backlog() -> None:
+    from axio.models import ModelSpec
+
+    status = _panel.status_line(ModelSpec(id="test"), _panel.SessionStats(), "actions: on (3 queued)")
+
+    assert "actions: on (3 queued)" in status
+
+
 async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> None:
     # The prompt is up for the whole session now, and it puts the terminal in
     # raw mode - so Ctrl+C arrives as a keypress, not as SIGINT, and the handler

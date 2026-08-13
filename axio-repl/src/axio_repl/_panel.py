@@ -111,7 +111,7 @@ def agent_summary(now: float | None = None) -> str:
     return SEPARATOR.join(parts)
 
 
-def status_line(model: ModelSpec | None, stats: SessionStats) -> str:
+def status_line(model: ModelSpec | None, stats: SessionStats, action_status: str = "") -> str:
     """The whole line: which model, how full, how much spent, what is running."""
     parts: list[str] = []
     if model is not None:
@@ -123,6 +123,8 @@ def status_line(model: ModelSpec | None, stats: SessionStats) -> str:
     agents = agent_summary()
     if agents:
         parts.append(agents)
+    if action_status:
+        parts.append(action_status)
     return SEPARATOR.join(parts)
 
 
