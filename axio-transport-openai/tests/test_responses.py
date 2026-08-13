@@ -68,6 +68,24 @@ def test_tool_calls_and_results_become_top_level_items() -> None:
     assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "x"}
 
 
+def test_tool_result_mixed_with_text_emits_both_in_order() -> None:
+    messages = [
+        Message(role="assistant", content=[ToolUseBlock(id="call-1", name="echo", input={"text": "x"})]),
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="call-1", content="x"),
+                TextBlock(text="and then?"),
+            ],
+        ),
+    ]
+    items = _convert_messages(messages)
+    assert items[0]["type"] == "function_call"
+    assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "x"}
+    assert items[2]["role"] == "user"
+    assert items[2]["content"] == [{"type": "input_text", "text": "and then?"}]
+
+
 def test_unanswered_call_gets_a_placeholder_output() -> None:
     # The API rejects the whole request when a call has no output, which is what
     # an interrupted turn leaves behind.

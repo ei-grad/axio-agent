@@ -222,6 +222,30 @@ def test_convert_tool_result_with_audio() -> None:
     assert base64.b64decode(parts[1]["inlineData"]["data"]) == audio_data
 
 
+def test_convert_tool_result_mixed_with_text() -> None:
+    """A user message mixing a ToolResultBlock with a TextBlock must emit the tool
+    output (merged into the same content, since Gemini merges consecutive same-role
+    parts) followed by the trailing user text, in that order."""
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="get_weather", input={"location": "Paris"})],
+        ),
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="call_1", content="22°C sunny"),
+                TextBlock(text="And tomorrow?"),
+            ],
+        ),
+    ]
+    contents = _build_contents_json(messages)
+    assert len(contents) == 2
+    parts = contents[1]["parts"]
+    assert parts[0]["functionResponse"]["response"]["result"] == "22°C sunny"
+    assert parts[1] == {"text": "And tomorrow?"}
+
+
 def test_convert_tool_result_error() -> None:
     messages = [
         Message(

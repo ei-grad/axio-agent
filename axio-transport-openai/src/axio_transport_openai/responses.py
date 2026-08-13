@@ -59,13 +59,15 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
     for msg in messages:
         if msg.role == "user":
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            if tool_results and len(tool_results) == len(msg.content):
+            if tool_results:
                 for tr in tool_results:
                     content = tr.content if isinstance(tr.content, str) else json.dumps(tr.content)
                     items.append({"type": "function_call_output", "call_id": tr.tool_use_id, "output": content})
-                continue
+                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
+            else:
+                remaining_blocks = msg.content
             parts: list[dict[str, Any]] = []
-            for b in msg.content:
+            for b in remaining_blocks:
                 if isinstance(b, TextBlock):
                     parts.append({"type": "input_text", "text": b.text})
                 elif isinstance(b, ImageBlock):

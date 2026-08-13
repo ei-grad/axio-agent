@@ -270,7 +270,7 @@ def _build_contents_json(
     for msg in messages:
         if msg.role == "user":
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            if tool_results and len(tool_results) == len(msg.content):
+            if tool_results:
                 tool_result_parts: list[Part] = []
                 for tr in tool_results:
                     if isinstance(tr.content, str):
@@ -295,15 +295,18 @@ def _build_contents_json(
                             if isinstance(content_block, (ImageBlock, AudioBlock, VideoBlock)):
                                 tool_result_parts.append(_inline_data_part(content_block))
                 contents.append({"role": "user", "parts": tool_result_parts})
+                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
             else:
-                user_parts: list[Part] = []
-                for message_block in msg.content:
-                    if isinstance(message_block, TextBlock):
-                        user_parts.append({"text": message_block.text})
-                    elif isinstance(message_block, (ImageBlock, AudioBlock, VideoBlock)):
-                        user_parts.append(_inline_data_part(message_block))
-                if user_parts:
-                    contents.append({"role": "user", "parts": user_parts})
+                remaining_blocks = msg.content
+
+            user_parts: list[Part] = []
+            for message_block in remaining_blocks:
+                if isinstance(message_block, TextBlock):
+                    user_parts.append({"text": message_block.text})
+                elif isinstance(message_block, (ImageBlock, AudioBlock, VideoBlock)):
+                    user_parts.append(_inline_data_part(message_block))
+            if user_parts:
+                contents.append({"role": "user", "parts": user_parts})
 
         elif msg.role == "assistant":
             assistant_parts: list[Part] = []

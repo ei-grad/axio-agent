@@ -92,9 +92,8 @@ def _convert_messages(messages: list[Message], system: str) -> tuple[str, list[d
 
     for msg in messages:
         if msg.role == "user":
-            # Check if this is purely tool results
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            if tool_results and len(tool_results) == len(msg.content):
+            if tool_results:
                 for tr in tool_results:
                     content = tr.content if isinstance(tr.content, str) else json.dumps(tr.content)
                     items.append(
@@ -104,17 +103,19 @@ def _convert_messages(messages: list[Message], system: str) -> tuple[str, list[d
                             "output": content,
                         }
                     )
+                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
             else:
-                content_parts: list[dict[str, Any]] = []
-                for b in msg.content:
-                    if isinstance(b, TextBlock):
-                        content_parts.append({"type": "input_text", "text": b.text})
-                    elif isinstance(b, ImageBlock):
-                        encoded = base64.b64encode(b.data).decode("ascii")
-                        data_uri = f"data:{b.media_type};base64,{encoded}"
-                        content_parts.append({"type": "input_image", "image_url": data_uri})
-                if content_parts:
-                    items.append({"role": "user", "content": content_parts})
+                remaining_blocks = msg.content
+            content_parts: list[dict[str, Any]] = []
+            for b in remaining_blocks:
+                if isinstance(b, TextBlock):
+                    content_parts.append({"type": "input_text", "text": b.text})
+                elif isinstance(b, ImageBlock):
+                    encoded = base64.b64encode(b.data).decode("ascii")
+                    data_uri = f"data:{b.media_type};base64,{encoded}"
+                    content_parts.append({"type": "input_image", "image_url": data_uri})
+            if content_parts:
+                items.append({"role": "user", "content": content_parts})
 
         elif msg.role == "assistant":
             # Collect text and tool uses

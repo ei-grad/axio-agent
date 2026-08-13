@@ -291,7 +291,7 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
     for msg in messages:
         if msg.role == "user":
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            if tool_results and len(tool_results) == len(msg.content):
+            if tool_results:
                 for tr in tool_results:
                     result.append(
                         {
@@ -305,11 +305,15 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
                 image_parts = _collect_tool_result_images(tool_results)
                 if image_parts:
                     result.append({"role": "user", "content": image_parts})
+                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
             else:
-                has_images = any(isinstance(b, ImageBlock) for b in msg.content)
+                remaining_blocks = msg.content
+
+            if remaining_blocks:
+                has_images = any(isinstance(b, ImageBlock) for b in remaining_blocks)
                 if has_images:
                     content_parts: list[dict[str, Any]] = []
-                    for b in msg.content:
+                    for b in remaining_blocks:
                         if isinstance(b, TextBlock):
                             content_parts.append({"type": "text", "text": b.text})
                         elif isinstance(b, ImageBlock):
@@ -320,7 +324,7 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
                         result.append({"role": "user", "content": content_parts})
                 else:
                     text_parts_u: list[str] = []
-                    for b in msg.content:
+                    for b in remaining_blocks:
                         if isinstance(b, TextBlock):
                             text_parts_u.append(b.text)
                     if text_parts_u:

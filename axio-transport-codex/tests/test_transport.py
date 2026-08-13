@@ -443,6 +443,25 @@ def test_convert_tool_results() -> None:
     assert items[0]["output"] == "22C"
 
 
+def test_convert_tool_result_mixed_with_text_emits_both_in_order() -> None:
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="call_1", content="22C"),
+                TextBlock(text="And tomorrow?"),
+            ],
+        ),
+    ]
+    _, items = _convert_messages(messages, "")
+    assert len(items) == 2
+    assert items[0]["type"] == "function_call_output"
+    assert items[0]["call_id"] == "call_1"
+    assert items[0]["output"] == "22C"
+    assert items[1]["role"] == "user"
+    assert items[1]["content"] == [{"type": "input_text", "text": "And tomorrow?"}]
+
+
 def test_convert_assistant_text() -> None:
     messages = [
         Message(role="assistant", content=[TextBlock(text="Sure, I can help.")]),

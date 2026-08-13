@@ -617,6 +617,29 @@ def test_build_payload_tool_result_no_image_no_injection() -> None:
     assert msgs[0]["role"] == "tool"
 
 
+def test_build_payload_tool_result_mixed_with_text() -> None:
+    """A user message mixing a ToolResultBlock with a TextBlock must emit both the
+    tool message and a follow-up user message with the trailing text, in that order."""
+    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="call_1", content="22C"),
+                TextBlock(text="Thanks, what about tomorrow?"),
+            ],
+        ),
+    ]
+    payload = t.build_payload(messages, [], "")
+    msgs = payload["messages"]
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "tool"
+    assert msgs[0]["tool_call_id"] == "call_1"
+    assert msgs[0]["content"] == "22C"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"] == "Thanks, what about tomorrow?"
+
+
 def test_build_payload_tool_schema() -> None:
     t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     tool: Tool[Any] = Tool(name="get_weather", description="Get weather", handler=get_weather)
