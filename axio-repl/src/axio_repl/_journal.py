@@ -1,0 +1,533 @@
+"""Durable, append-only JSONL journals for REPL sessions."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import time
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from types import TracebackType
+
+SCHEMA_VERSION = 1
+REDACTED = "[REDACTED]"
+
+_LOGGER = logging.getLogger(__name__)
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_AUTH_PATTERN = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9+/._~=-]{6,}")
+_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret)\b\s*[:=]\s*)"
+    r"[^\s,;]+"
+)
+_PREFIXED_TOKEN_PATTERN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})\b")
+_JWT_PATTERN = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+type DegradedCallback = Callable[[BaseException], None]
+
+
+class JournalQueueFullError(RuntimeError):
+    """The bounded journal queue could not accept another record."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRecord:
+    seq: int
+    timestamp: str
+    monotonic_ns: int
+    kind: str
+    payload: object
+    agent_id: str | None
+    parent_agent_id: str | None
+    turn_id: str | None
+    context_id: str | None
+    execution_mode: str | None
+    parent_tool_use_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SyncRequest:
+    result: asyncio.Future[bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseRequest:
+    pass
+
+
+type _QueueItem = _PendingRecord | _SyncRequest | _CloseRequest
+
+
+def default_journal_root(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    """Return the XDG-compatible root used for session journals."""
+
+    values = os.environ if environ is None else environ
+    configured = values.get("XDG_STATE_HOME", "")
+    configured_root = Path(configured).expanduser() if configured else None
+    if configured_root is not None and configured_root.is_absolute():
+        state_home = configured_root
+    else:
+        state_home = (Path.home() if home is None else home) / ".local" / "state"
+    return state_home / "axio" / "sessions"
+
+
+def session_directory(
+    session_id: str,
+    *,
+    root: Path | None = None,
+    started_at: datetime | None = None,
+) -> Path:
+    """Return the date-partitioned directory for one session."""
+
+    if _SAFE_SESSION_ID.fullmatch(session_id) is None:
+        raise ValueError("session_id must contain only letters, digits, dots, underscores, and hyphens")
+    if started_at is not None and started_at.tzinfo is None:
+        raise ValueError("started_at must be timezone-aware")
+    timestamp = datetime.now(UTC) if started_at is None else started_at.astimezone(UTC)
+    journal_root = default_journal_root() if root is None else root
+    return journal_root / timestamp.strftime("%Y") / timestamp.strftime("%m") / timestamp.strftime("%d") / session_id
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    compact = normalized.replace("_", "")
+    exact = {
+        "apikey",
+        "authorization",
+        "clientsecret",
+        "cookie",
+        "credential",
+        "idtoken",
+        "password",
+        "passwd",
+        "privatekey",
+        "proxyauthorization",
+        "refreshtoken",
+        "secret",
+        "sessiontoken",
+        "setcookie",
+        "token",
+    }
+    if compact in exact:
+        return True
+    parts = normalized.split("_")
+    if "password" in parts or "passwd" in parts or "secret" in parts or "credential" in parts:
+        return True
+    return normalized.endswith(("_api_key", "_access_token", "_refresh_token", "_private_key"))
+
+
+def _redact_string(value: str) -> str:
+    redacted = _PRIVATE_KEY_PATTERN.sub(REDACTED, value)
+    redacted = _AUTH_PATTERN.sub(lambda match: f"{match.group(1)} {REDACTED}", redacted)
+    redacted = _PREFIXED_TOKEN_PATTERN.sub(REDACTED, redacted)
+    redacted = _JWT_PATTERN.sub(REDACTED, redacted)
+    return _ASSIGNMENT_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", redacted)
+
+
+def _write_all(file_descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(file_descriptor, view)
+        if written == 0:
+            raise OSError("journal write returned zero bytes")
+        view = view[written:]
+
+
+def _append_line(file_descriptor: int, line: bytes) -> None:
+    _write_all(file_descriptor, line)
+
+
+def _sync_file(file_descriptor: int) -> None:
+    os.fsync(file_descriptor)
+
+
+def _sync_and_close(file_descriptor: int) -> None:
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _open_storage(directory: Path) -> tuple[int, Path]:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    events_path = directory / "events.jsonl"
+    file_descriptor = os.open(events_path, os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+    except OSError:
+        os.close(file_descriptor)
+        raise
+    return file_descriptor, events_path
+
+
+class _AttachmentStore:
+    def __init__(self, session_dir: Path) -> None:
+        self._session_dir = session_dir
+        self._directory = session_dir / "attachments"
+        self._ready = False
+
+    def put(self, data: bytes, media_type: str | None) -> dict[str, JsonValue]:
+        digest = hashlib.sha256(data).hexdigest()
+        if not self._ready:
+            self._directory.mkdir(mode=0o700, exist_ok=True)
+            self._directory.chmod(0o700)
+            self._ready = True
+        target = self._directory / digest
+        try:
+            file_descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if target.stat().st_size != len(data):
+                raise OSError(f"attachment {digest} exists with an unexpected size") from None
+        else:
+            try:
+                os.fchmod(file_descriptor, 0o600)
+                _write_all(file_descriptor, data)
+                os.fsync(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+        return {
+            "type": "attachment",
+            "sha256": digest,
+            "size": len(data),
+            "media_type": _redact_string(media_type) if media_type is not None else "application/octet-stream",
+            "path": f"attachments/{digest}",
+        }
+
+
+class _JournalSerializer:
+    def __init__(self, session_dir: Path) -> None:
+        self._attachments = _AttachmentStore(session_dir)
+
+    def convert(self, value: object, *, media_type: str | None = None) -> JsonValue:
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, str):
+            return _redact_string(value)
+        if isinstance(value, Enum):
+            return self.convert(value.value)
+        if isinstance(value, BaseException):
+            return {
+                "exception_type": type(value).__name__,
+                "message": _redact_string(str(value)),
+            }
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return self._attachments.put(bytes(value), media_type)
+        if isinstance(value, Path):
+            return _redact_string(str(value))
+        if is_dataclass(value) and not isinstance(value, type):
+            result: dict[str, JsonValue] = {"record_type": type(value).__name__}
+            object_media_type = getattr(value, "media_type", None)
+            for item in fields(value):
+                key = item.name
+                raw_value = getattr(value, key)
+                if _is_secret_key(key):
+                    result[key] = REDACTED
+                    continue
+                field_media_type = object_media_type if key == "data" and isinstance(object_media_type, str) else None
+                result[key] = self.convert(raw_value, media_type=field_media_type)
+            return result
+        if isinstance(value, Mapping):
+            result = {}
+            raw_media_type = value.get("media_type")
+            object_media_type = raw_media_type if isinstance(raw_media_type, str) else None
+            for raw_key, raw_value in value.items():
+                key = str(raw_key)
+                if _is_secret_key(key):
+                    result[key] = REDACTED
+                    continue
+                field_media_type = object_media_type if key == "data" else None
+                result[key] = self.convert(raw_value, media_type=field_media_type)
+            return result
+        if isinstance(value, (set, frozenset)):
+            return [self.convert(item) for item in sorted(value, key=repr)]
+        if isinstance(value, Sequence):
+            return [self.convert(item) for item in value]
+        return _redact_string(str(value))
+
+
+class SessionJournal:
+    """A bounded, non-blocking publisher backed by one JSONL writer task."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        session_dir: Path,
+        events_path: Path,
+        file_descriptor: int,
+        queue_size: int,
+        on_degraded: DegradedCallback | None,
+    ) -> None:
+        self.session_id = session_id
+        self.session_dir = session_dir
+        self.events_path = events_path
+        self.attachments_dir = session_dir / "attachments"
+        self._file_descriptor = file_descriptor
+        self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue(maxsize=queue_size)
+        self._serializer = _JournalSerializer(session_dir)
+        self._on_degraded = on_degraded
+        self._degraded_reason: BaseException | None = None
+        self._next_seq = 1
+        self._accepting = True
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+        self._writer_task = asyncio.create_task(self._writer_loop(), name=f"axio-journal-{session_id}")
+
+    @classmethod
+    async def open(
+        cls,
+        *,
+        session_id: str | None = None,
+        root: Path | None = None,
+        started_at: datetime | None = None,
+        start_payload: object = None,
+        queue_size: int = 4096,
+        on_degraded: DegradedCallback | None = None,
+    ) -> SessionJournal:
+        """Create a new session directory and enqueue ``session_start``."""
+
+        if queue_size < 1:
+            raise ValueError("queue_size must be at least 1")
+        resolved_session_id = uuid.uuid4().hex if session_id is None else session_id
+        resolved_started_at = datetime.now(UTC) if started_at is None else started_at
+        directory = session_directory(resolved_session_id, root=root, started_at=resolved_started_at)
+        file_descriptor, events_path = await asyncio.to_thread(_open_storage, directory)
+        journal = cls(
+            session_id=resolved_session_id,
+            session_dir=directory,
+            events_path=events_path,
+            file_descriptor=file_descriptor,
+            queue_size=queue_size,
+            on_degraded=on_degraded,
+        )
+        journal._enqueue_nowait("session_start", start_payload)
+        return journal
+
+    @property
+    def degraded(self) -> bool:
+        return self._degraded_reason is not None
+
+    @property
+    def degraded_reason(self) -> BaseException | None:
+        return self._degraded_reason
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def publish(
+        self,
+        kind: str,
+        payload: object = None,
+        *,
+        agent_id: str | None = None,
+        parent_agent_id: str | None = None,
+        turn_id: str | None = None,
+        context_id: str | None = None,
+        execution_mode: str | None = None,
+        parent_tool_use_id: str | None = None,
+    ) -> bool:
+        """Queue one record without waiting for serialization or filesystem I/O."""
+
+        if not kind:
+            raise ValueError("kind must not be empty")
+        return self._enqueue_nowait(
+            kind,
+            payload,
+            agent_id=agent_id,
+            parent_agent_id=parent_agent_id,
+            turn_id=turn_id,
+            context_id=context_id,
+            execution_mode=execution_mode,
+            parent_tool_use_id=parent_tool_use_id,
+        )
+
+    async def sync(self) -> bool:
+        """Wait until prior records are processed and synchronize valid data."""
+
+        async with self._close_lock:
+            if self._closed or not self._accepting:
+                return False
+            result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            await self._queue.put(_SyncRequest(result))
+            return await result
+
+    async def close(self, end_payload: object = None) -> None:
+        """Drain accepted records, append ``session_end``, fsync, and close."""
+
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._accepting = False
+            if not self.degraded:
+                record = self._make_record("session_end", end_payload)
+                await self._queue.put(record)
+                self._next_seq += 1
+            await self._queue.put(_CloseRequest())
+            await self._writer_task
+            self._closed = True
+
+    async def __aenter__(self) -> SessionJournal:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, traceback
+        if exc_value is None:
+            await self.close({"status": "ok"})
+        else:
+            await self.close({"status": "error", "exception": exc_value})
+
+    def _enqueue_nowait(
+        self,
+        kind: str,
+        payload: object,
+        *,
+        agent_id: str | None = None,
+        parent_agent_id: str | None = None,
+        turn_id: str | None = None,
+        context_id: str | None = None,
+        execution_mode: str | None = None,
+        parent_tool_use_id: str | None = None,
+    ) -> bool:
+        if not self._accepting or self.degraded:
+            return False
+        record = self._make_record(
+            kind,
+            payload,
+            agent_id=agent_id,
+            parent_agent_id=parent_agent_id,
+            turn_id=turn_id,
+            context_id=context_id,
+            execution_mode=execution_mode,
+            parent_tool_use_id=parent_tool_use_id,
+        )
+        try:
+            self._queue.put_nowait(record)
+        except asyncio.QueueFull:
+            self._mark_degraded(JournalQueueFullError(f"journal queue reached its {self._queue.maxsize}-record limit"))
+            return False
+        self._next_seq += 1
+        return True
+
+    def _make_record(
+        self,
+        kind: str,
+        payload: object,
+        *,
+        agent_id: str | None = None,
+        parent_agent_id: str | None = None,
+        turn_id: str | None = None,
+        context_id: str | None = None,
+        execution_mode: str | None = None,
+        parent_tool_use_id: str | None = None,
+    ) -> _PendingRecord:
+        return _PendingRecord(
+            seq=self._next_seq,
+            timestamp=datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            monotonic_ns=time.monotonic_ns(),
+            kind=kind,
+            payload=payload,
+            agent_id=agent_id,
+            parent_agent_id=parent_agent_id,
+            turn_id=turn_id,
+            context_id=context_id,
+            execution_mode=execution_mode,
+            parent_tool_use_id=parent_tool_use_id,
+        )
+
+    def _encode_record(self, pending: _PendingRecord) -> bytes:
+        record: dict[str, JsonValue] = {
+            "schema_version": SCHEMA_VERSION,
+            "seq": pending.seq,
+            "timestamp": pending.timestamp,
+            "monotonic_ns": pending.monotonic_ns,
+            "session_id": self.session_id,
+            "agent_id": _redact_string(pending.agent_id) if pending.agent_id is not None else None,
+            "parent_agent_id": (
+                _redact_string(pending.parent_agent_id) if pending.parent_agent_id is not None else None
+            ),
+            "turn_id": _redact_string(pending.turn_id) if pending.turn_id is not None else None,
+            "context_id": _redact_string(pending.context_id) if pending.context_id is not None else None,
+            "execution_mode": _redact_string(pending.execution_mode) if pending.execution_mode is not None else None,
+            "parent_tool_use_id": (
+                _redact_string(pending.parent_tool_use_id) if pending.parent_tool_use_id is not None else None
+            ),
+            "kind": _redact_string(pending.kind),
+            "payload": self._serializer.convert(pending.payload),
+        }
+        encoded = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return encoded.encode("utf-8") + b"\n"
+
+    async def _writer_loop(self) -> None:
+        try:
+            should_close = False
+            while not should_close:
+                item = await self._queue.get()
+                try:
+                    if isinstance(item, _PendingRecord):
+                        if not self.degraded:
+                            try:
+                                line = await asyncio.to_thread(self._encode_record, item)
+                                await asyncio.to_thread(_append_line, self._file_descriptor, line)
+                            except Exception as error:
+                                # Serialization and filesystem adapters can raise backend-specific exceptions.
+                                self._mark_degraded(error)
+                    elif isinstance(item, _SyncRequest):
+                        try:
+                            await asyncio.to_thread(_sync_file, self._file_descriptor)
+                        except Exception as error:
+                            # fsync failures are platform- and filesystem-specific.
+                            self._mark_degraded(error)
+                        if not item.result.done():
+                            item.result.set_result(not self.degraded)
+                    else:
+                        should_close = True
+                finally:
+                    self._queue.task_done()
+        finally:
+            try:
+                await asyncio.to_thread(_sync_and_close, self._file_descriptor)
+            except Exception as error:
+                # Closing must remain non-fatal even when the backing filesystem has failed.
+                self._mark_degraded(error)
+
+    def _mark_degraded(self, error: BaseException) -> None:
+        if self._degraded_reason is not None:
+            return
+        self._degraded_reason = error
+        if self._on_degraded is not None:
+            asyncio.get_running_loop().call_soon(self._notify_degraded, error)
+
+    def _notify_degraded(self, error: BaseException) -> None:
+        if self._on_degraded is None:
+            return
+        try:
+            self._on_degraded(error)
+        except Exception:
+            # A UI notification hook is arbitrary application code and must not fail the journal task.
+            _LOGGER.error("session journal degraded callback failed")
