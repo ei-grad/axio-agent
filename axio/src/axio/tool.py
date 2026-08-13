@@ -15,6 +15,7 @@ from dataclasses import replace as dc_replace
 from types import MappingProxyType
 from typing import Any, get_args, get_type_hints
 
+from .background import BACKGROUND_PROPERTY
 from .exceptions import GuardError, HandlerError
 from .field import MISSING, FieldInfo, bare_type, get_field_info
 from .permission import PermissionGuard
@@ -177,15 +178,7 @@ class Tool[T]:
         # worth detaching depends on its arguments, not on the tool.
         properties = schema.setdefault("properties", {})
         if isinstance(properties, dict) and BACKGROUND_PARAM not in properties:
-            properties[BACKGROUND_PARAM] = {
-                "type": "boolean",
-                "default": False,
-                "description": (
-                    "Run detached and return a handle instead of the result. Use it when the call is slow "
-                    "enough to be worth doing while you carry on; collect the output later with "
-                    "monitor(tasks=[handle])."
-                ),
-            }
+            properties[BACKGROUND_PARAM] = copy.deepcopy(BACKGROUND_PROPERTY)
         return schema
 
     @property

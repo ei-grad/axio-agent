@@ -18,14 +18,17 @@ from collections.abc import Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from . import notify
+
 BACKGROUND_PARAM = "background"
 
-_BACKGROUND_PROPERTY = {
+BACKGROUND_PROPERTY: dict[str, Any] = {
     "type": "boolean",
     "default": False,
     "description": (
         "Run detached and return a handle instead of the result. Use it when the call is slow enough "
-        "to be worth doing while you carry on; collect the output later with monitor(tasks=[handle])."
+        "to be worth doing while you carry on: the result reaches you on its own once it lands, and "
+        "monitor(tasks=[handle]) waits for it or returns its full output."
     ),
 }
 
@@ -38,6 +41,7 @@ class BackgroundCall:
     name: str
     started_at: float
     task: asyncio.Task[str]
+    owner: str | None = None
     collected: bool = False
 
     @property
@@ -67,13 +71,32 @@ def _notify(call: BackgroundCall) -> None:
             waiter.set_result(call)
 
 
+def _completion_message(call: BackgroundCall) -> str:
+    # Handle, tool name, state and the way to get the rest come before the
+    # output, so truncating a long result cannot eat them.
+    return (
+        f"[background task {call.id}] {call.name}: {call.state}\n"
+        f'Full output if truncated: monitor(tasks=["{call.id}"])\n'
+        f"{call.output()}"
+    )
+
+
+def _on_done(call: BackgroundCall, task: asyncio.Task[str]) -> None:
+    _notify(call)
+    # A cancelled task means shutdown, and a collected one was already read by
+    # its owner; neither is news worth delivering.
+    if task.cancelled() or call.collected:
+        return
+    notify.post(_completion_message(call), owner=call.owner, tag=call.id)
+
+
 def start(name: str, coro: Coroutine[Any, Any, str]) -> str:
     """Run *coro* detached and return the handle used to collect it later."""
     handle = f"bg-{name}-{uuid.uuid4().hex[:6]}"
     task: asyncio.Task[str] = asyncio.ensure_future(coro)
-    call = BackgroundCall(id=handle, name=name, started_at=time.time(), task=task)
+    call = BackgroundCall(id=handle, name=name, started_at=time.time(), task=task, owner=notify.current_owner())
     _calls[handle] = call
-    task.add_done_callback(lambda _t: _notify(call))
+    task.add_done_callback(lambda t: _on_done(call, t))
     return handle
 
 
@@ -92,6 +115,8 @@ def describe(handle: str) -> str:
     if call.state == "running":
         return f"{handle} ({call.name}): running for {time.time() - call.started_at:.0f}s"
     call.collected = True
+    # Read here, so the automatic delivery of the same result is called off.
+    notify.retract(call.owner, call.id)
     return f"{handle} ({call.name}): {call.state}\n{call.output()}"
 
 
@@ -116,6 +141,6 @@ async def cancel_all() -> None:
 
 def started_message(name: str, handle: str) -> str:
     return (
-        f"{name} started in the background as {handle}. It is still running — "
-        f'collect its output with monitor(tasks=["{handle}"]).'
+        f"{name} runs detached as {handle}. Its result will reach you on its own once it lands — "
+        f'monitor(tasks=["{handle}"]) only if you need to wait for it or want the details.'
     )

@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from axio import background
+from axio import background, notify
 from axio.agent import Agent
 from axio.blocks import ToolUseBlock
 from axio.testing import StubTransport
@@ -15,6 +15,8 @@ from axio.tool import BACKGROUND_PARAM, Tool
 async def clean_registry() -> AsyncGenerator[None, None]:
     yield
     await background.cancel_all()
+    notify.set_owner_resolver(None)
+    notify.discard(None)
 
 
 async def slow_echo(text: str, delay: float = 0.0) -> str:
@@ -54,7 +56,7 @@ async def test_detached_call_returns_a_handle_and_finishes_later() -> None:
     agent = _agent(Tool[Any](name="slow_echo", handler=slow_echo))
     block = ToolUseBlock(id="1", name="slow_echo", input={"text": "later", "delay": 0.05, BACKGROUND_PARAM: True})
     [result] = await agent.dispatch_tools([block], 0)
-    assert "started in the background" in str(result.content)
+    assert "runs detached as" in str(result.content)
 
     [call] = background.snapshot()
     assert not call.task.done()
@@ -95,11 +97,72 @@ async def test_streaming_tool_detaches_instead_of_streaming() -> None:
     block = ToolUseBlock(id="1", name="streamer", input={"text": "x", BACKGROUND_PARAM: True})
     [result] = await agent._dispatch_tools_streaming([block], 0, queue)  # type: ignore[arg-type]
     # Intercepted before the streaming decision, so nothing was streamed.
-    assert "started in the background" in str(result.content)
+    assert "runs detached as" in str(result.content)
     assert queue.empty()
 
     [call] = background.snapshot()
     assert await call.task == "done: x"
+
+
+@pytest.mark.asyncio
+async def test_the_result_reaches_the_owner_that_started_the_call() -> None:
+    notify.set_owner_resolver(lambda: "owner-a")
+    try:
+        handle = background.start("slow_echo", slow_echo("hi"))
+    finally:
+        notify.set_owner_resolver(None)
+
+    call = background.get(handle)
+    assert call is not None
+    assert call.owner == "owner-a"
+    await call.task
+
+    [text] = notify.drain("owner-a")
+    notify.discard("owner-a")
+    assert handle in text
+    assert "slow_echo" in text
+    assert "done" in text
+    assert f'monitor(tasks=["{handle}"])' in text
+    assert text.endswith("echo: hi")
+    assert not notify.drain("owner-a")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_call_notifies_nobody() -> None:
+    handle = background.start("slow_echo", slow_echo("never", 30))
+    call = background.get(handle)
+    assert call is not None
+    call.task.cancel()
+    await asyncio.gather(call.task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert notify.drain(None) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_reports_its_error() -> None:
+    async def boom() -> str:
+        raise RuntimeError("nope")
+
+    handle = background.start("boom", boom())
+    call = background.get(handle)
+    assert call is not None
+    await asyncio.gather(call.task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    [text] = notify.drain(None)
+    assert "failed" in text
+    assert "RuntimeError: nope" in text
+
+
+@pytest.mark.asyncio
+async def test_a_result_collected_by_hand_is_not_delivered_again() -> None:
+    handle = background.start("slow_echo", slow_echo("hi"))
+    call = background.get(handle)
+    assert call is not None
+    await call.task
+
+    assert "echo: hi" in background.describe(handle)
+    assert notify.drain(None) == []
 
 
 @pytest.mark.asyncio

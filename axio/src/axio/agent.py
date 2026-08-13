@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Self
 
-from . import background
+from . import background, notify
 from .blocks import AudioBlock, ContentBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from .context import ContextStore
 from .events import (
@@ -297,239 +297,253 @@ class Agent:
     async def _run_loop(self, user_message: str, context: ContextStore) -> AsyncGenerator[StreamEvent, None]:
         total_usage = Usage(0, 0)
         session_end_emitted = False
+        owner = notify.current_owner()
         ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         await self._append(context, Message(role="user", content=[TextBlock(text=f"[{ts}] {user_message}")]))
 
         try:
-            for iteration in range(1, self.max_iterations + 1):
-                history = await context.get_history()
-                logger.info("Iteration %d, history length=%d", iteration, len(history))
-                effective_history = (
-                    [*history, self.last_iteration_message]
-                    if self.last_iteration_message and iteration == self.max_iterations
-                    else history
-                )
-                model = getattr(self.transport, "model", None)
-                model_caps = getattr(model, "capabilities", None)
-                if model_caps is not None and Capability.tool_use not in model_caps:
-                    active_tools: list[Tool[Any]] = []
-                else:
-                    active_tools = list(await self._select_tools(effective_history, self.tools))
-
-                content: list[TextBlock | ImageBlock | AudioBlock | VideoBlock | ToolUseBlock] = []
-                pending: dict[str, dict[str, Any]] = {}
-                stop_reason = StopReason.end_turn
-                malformed: set[str] = set()
-                repetition_detected = False
-                rep_detector = _RepetitionDetector()
-
-                try:
-                    async for event in self.transport.stream(effective_history, active_tools, self.system):
-                        yield event
-                        match event:
-                            case TextDelta(delta=delta):
-                                self._accumulate_text(content, delta)
-                                if rep_detector.feed(delta):
-                                    note = "\n\n[Output truncated: repetitive content detected]"
-                                    self._accumulate_text(content, note)
-                                    yield TextDelta(index=0, delta=note)
-                                    repetition_detected = True
-                                    break
-                            case ImageOutput(data=data, media_type=mt):
-                                content.append(ImageBlock(media_type=mt, data=data))
-                            case VideoOutput(data=data, media_type=mt):
-                                content.append(VideoBlock(media_type=mt, data=data))
-                            case ToolUseStart(tool_use_id=tid, name=name):
-                                pending[tid] = {"name": name, "json_parts": []}
-                            case ToolInputDelta(tool_use_id=tid, partial_json=pj):
-                                if tid in pending:
-                                    pending[tid]["json_parts"].append(pj)
-                            case IterationEnd(usage=usage, stop_reason=sr):
-                                blocks, malformed = self._finalize_pending_tools(pending, usage)
-                                content.extend(blocks)
-                                pending.clear()
-                                total_usage = total_usage + usage
-                                await context.add_context_tokens(usage.input_tokens, usage.output_tokens)
-                                stop_reason = sr
-                except Exception as exc:
-                    logger.error("Transport error: %s", exc, exc_info=True)
-                    yield Error(exception=exc)
-                    yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
-                    session_end_emitted = True
-                    return
-
-                if repetition_detected:
-                    await self._append(context, Message(role="assistant", content=list(content)))
-                    partial = getattr(self.transport, "last_usage", None)
-                    if partial:
-                        total_usage = total_usage + partial
-                    yield SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=total_usage)
-                    session_end_emitted = True
-                    return
-
-                tool_blocks = [b for b in content if isinstance(b, ToolUseBlock)]
-
-                if tool_blocks:
-                    if stop_reason != StopReason.tool_use:
-                        logger.warning(
-                            "Dispatching %d tool(s) despite stop_reason=%s",
-                            len(tool_blocks),
-                            stop_reason,
-                        )
-
-                    # Dispatch tools BEFORE appending to context - cancellation
-                    # between here and the two appends below cannot leave orphan
-                    # ToolUseBlocks in the persistent context store.
-                    valid = [b for b in tool_blocks if b.id not in malformed]
-                    error_results = [
-                        ToolResultBlock(
-                            tool_use_id=b.id,
-                            content=(
-                                f"Malformed JSON arguments for tool {b.name}."
-                                f" Raw input could not be parsed. Please retry the tool call"
-                                f" with valid JSON arguments."
-                            ),
-                            is_error=True,
-                        )
-                        for b in tool_blocks
-                        if b.id in malformed
-                    ]
-
-                    partial_output: dict[str, list[tuple[float, str, str]]] = {}
-                    t0_map: dict[str, float] = {}
-                    dispatch_task: asyncio.Task[list[ToolResultBlock]] | None = None
-                    try:
-                        if valid:
-                            has_streaming = any(
-                                (t := self._find_tool(b.name)) is not None and t.supports_streaming for b in valid
-                            )
-                            if has_streaming:
-                                output_queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
-
-                                async def _dispatch_and_signal() -> list[ToolResultBlock]:
-                                    result = await self._dispatch_tools_streaming(valid, iteration, output_queue)
-                                    await output_queue.put(None)
-                                    return result
-
-                                dispatch_task = asyncio.create_task(_dispatch_and_signal())
-                                while True:
-                                    ev = await output_queue.get()
-                                    if ev is None:
-                                        break
-                                    if ev.tool_use_id not in t0_map:
-                                        t0_map[ev.tool_use_id] = time.monotonic()
-                                    partial_output.setdefault(ev.tool_use_id, []).append(
-                                        (time.monotonic() - t0_map[ev.tool_use_id], ev.key, ev.delta)
-                                    )
-                                    yield ev
-                                dispatched = await dispatch_task
-                            else:
-                                dispatched = await self.dispatch_tools(valid, iteration)
-                        else:
-                            dispatched = []
-                        results = dispatched + error_results
-                    except asyncio.CancelledError:
-                        if dispatch_task is not None and not dispatch_task.done():
-                            dispatch_task.cancel()
-                            try:
-                                await dispatch_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                        interrupted_results: list[ToolResultBlock] = []
-                        for b in tool_blocks:
-                            chunks = partial_output.get(b.id, [])
-                            tool = self._find_tool(b.name)
-                            if chunks and tool:
-                                msg = tool.format_stream_result(chunks) + "\n[interrupted by user]"
-                            elif chunks:
-                                msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
-                            else:
-                                msg = "[interrupted by user]"
-                            interrupted_results.append(ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True))
-                        await self._append(context, Message(role="assistant", content=list(content)))
-                        await self._append(context, Message(role="user", content=list(interrupted_results)))
-                        raise
-
-                    # Append both messages atomically (assistant + tool results)
-                    await self._append(context, Message(role="assistant", content=list(content)))
-                    await self._append(context, Message(role="user", content=list(results)))
-
-                    # Gemini stops generating (~20 tokens, end_turn) after receiving
-                    # media as sibling inlineData parts alongside functionResponse.
-                    # A "Proceed." user message nudges it to actually analyze the content.
-                    if getattr(self.transport, "nudge_on_media_tool_result", False) and any(
-                        not isinstance(r.content, str)
-                        and any(isinstance(b, (AudioBlock, ImageBlock, VideoBlock)) for b in r.content)
-                        for r in results
-                    ):
+            with notify.turn_scope(owner):
+                for iteration in range(1, self.max_iterations + 1):
+                    # Notifications that arrived mid-turn join the conversation as
+                    # their own user message: appending never rewrites what is
+                    # already there, so no tool_use/tool_result pair is disturbed.
+                    if notifications := notify.drain(owner):
                         await self._append(
                             context,
-                            Message(
-                                role="user",
-                                content=[
-                                    TextBlock(
-                                        text="You now have the media file above in your context. Proceed.",
-                                    )
-                                ],
-                            ),
+                            Message(role="user", content=[TextBlock(text="\n\n".join(notifications))]),
                         )
+                    history = await context.get_history()
+                    logger.info("Iteration %d, history length=%d", iteration, len(history))
+                    effective_history = (
+                        [*history, self.last_iteration_message]
+                        if self.last_iteration_message and iteration == self.max_iterations
+                        else history
+                    )
+                    model = getattr(self.transport, "model", None)
+                    model_caps = getattr(model, "capabilities", None)
+                    if model_caps is not None and Capability.tool_use not in model_caps:
+                        active_tools: list[Tool[Any]] = []
+                    else:
+                        active_tools = list(await self._select_tools(effective_history, self.tools))
 
-                    # Yield ToolResult events + media output events.
-                    # Non-streaming tools return full content (str or list of
-                    # TextBlock/ImageBlock/VideoBlock) — no information is lost.
-                    # Images/videos are yielded as separate ImageOutput/VideoOutput
-                    # events so the REPL can save them to disk; the model sees the
-                    # actual pixel data via ImageBlock/VideoBlock in the tool result.
-                    by_id = {b.id: b for b in tool_blocks}
-                    for r in results:
-                        block = by_id.get(r.tool_use_id)
-                        if isinstance(r.content, str):
-                            result_content = r.content
-                        else:
-                            result_content = "\n".join(b.text for b in r.content if isinstance(b, TextBlock))
-                            for media_block in r.content:
-                                if isinstance(media_block, ImageBlock):
-                                    yield ImageOutput(
-                                        index=0, data=media_block.data, media_type=media_block.media_type
-                                    )
-                                elif isinstance(media_block, AudioBlock):
-                                    yield AudioOutput(
-                                        index=0, data=media_block.data, media_type=media_block.media_type
-                                    )
-                                elif isinstance(media_block, VideoBlock):
-                                    yield VideoOutput(
-                                        index=0, data=media_block.data, media_type=media_block.media_type
-                                    )
-                        yield ToolResult(
-                            tool_use_id=r.tool_use_id,
-                            name=block.name if block else "",
-                            is_error=r.is_error,
-                            content=result_content,
-                            input=block.input if block else {},
-                        )
-                    continue
+                    content: list[TextBlock | ImageBlock | AudioBlock | VideoBlock | ToolUseBlock] = []
+                    pending: dict[str, dict[str, Any]] = {}
+                    stop_reason = StopReason.end_turn
+                    malformed: set[str] = set()
+                    repetition_detected = False
+                    rep_detector = _RepetitionDetector()
 
-                await self._append(context, Message(role="assistant", content=list(content)))
-
-                match stop_reason:
-                    case StopReason.end_turn:
-                        logger.debug("End turn: total_usage=%s", total_usage)
-                        yield SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=total_usage)
-                        session_end_emitted = True
-                        return
-                    case StopReason.max_tokens | StopReason.error:
-                        yield Error(exception=RuntimeError(f"Transport stopped with: {stop_reason}"))
+                    try:
+                        async for event in self.transport.stream(effective_history, active_tools, self.system):
+                            yield event
+                            match event:
+                                case TextDelta(delta=delta):
+                                    self._accumulate_text(content, delta)
+                                    if rep_detector.feed(delta):
+                                        note = "\n\n[Output truncated: repetitive content detected]"
+                                        self._accumulate_text(content, note)
+                                        yield TextDelta(index=0, delta=note)
+                                        repetition_detected = True
+                                        break
+                                case ImageOutput(data=data, media_type=mt):
+                                    content.append(ImageBlock(media_type=mt, data=data))
+                                case VideoOutput(data=data, media_type=mt):
+                                    content.append(VideoBlock(media_type=mt, data=data))
+                                case ToolUseStart(tool_use_id=tid, name=name):
+                                    pending[tid] = {"name": name, "json_parts": []}
+                                case ToolInputDelta(tool_use_id=tid, partial_json=pj):
+                                    if tid in pending:
+                                        pending[tid]["json_parts"].append(pj)
+                                case IterationEnd(usage=usage, stop_reason=sr):
+                                    blocks, malformed = self._finalize_pending_tools(pending, usage)
+                                    content.extend(blocks)
+                                    pending.clear()
+                                    total_usage = total_usage + usage
+                                    await context.add_context_tokens(usage.input_tokens, usage.output_tokens)
+                                    stop_reason = sr
+                    except Exception as exc:
+                        logger.error("Transport error: %s", exc, exc_info=True)
+                        yield Error(exception=exc)
                         yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
                         session_end_emitted = True
                         return
 
-            logger.warning("Max iterations (%d) reached", self.max_iterations)
-            # Announced, not only logged: an agent that ran out of iterations
-            # produced no answer, and a caller watching it from another process
-            # otherwise sees the same "finished" as one that succeeded.
-            yield Error(exception=RuntimeError(f"Stopped after {self.max_iterations} iterations without finishing"))
-            yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
-            session_end_emitted = True
+                    if repetition_detected:
+                        await self._append(context, Message(role="assistant", content=list(content)))
+                        partial = getattr(self.transport, "last_usage", None)
+                        if partial:
+                            total_usage = total_usage + partial
+                        yield SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=total_usage)
+                        session_end_emitted = True
+                        return
+
+                    tool_blocks = [b for b in content if isinstance(b, ToolUseBlock)]
+
+                    if tool_blocks:
+                        if stop_reason != StopReason.tool_use:
+                            logger.warning(
+                                "Dispatching %d tool(s) despite stop_reason=%s",
+                                len(tool_blocks),
+                                stop_reason,
+                            )
+
+                        # Dispatch tools BEFORE appending to context - cancellation
+                        # between here and the two appends below cannot leave orphan
+                        # ToolUseBlocks in the persistent context store.
+                        valid = [b for b in tool_blocks if b.id not in malformed]
+                        error_results = [
+                            ToolResultBlock(
+                                tool_use_id=b.id,
+                                content=(
+                                    f"Malformed JSON arguments for tool {b.name}."
+                                    f" Raw input could not be parsed. Please retry the tool call"
+                                    f" with valid JSON arguments."
+                                ),
+                                is_error=True,
+                            )
+                            for b in tool_blocks
+                            if b.id in malformed
+                        ]
+
+                        partial_output: dict[str, list[tuple[float, str, str]]] = {}
+                        t0_map: dict[str, float] = {}
+                        dispatch_task: asyncio.Task[list[ToolResultBlock]] | None = None
+                        try:
+                            if valid:
+                                has_streaming = any(
+                                    (t := self._find_tool(b.name)) is not None and t.supports_streaming for b in valid
+                                )
+                                if has_streaming:
+                                    output_queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
+
+                                    async def _dispatch_and_signal() -> list[ToolResultBlock]:
+                                        result = await self._dispatch_tools_streaming(valid, iteration, output_queue)
+                                        await output_queue.put(None)
+                                        return result
+
+                                    dispatch_task = asyncio.create_task(_dispatch_and_signal())
+                                    while True:
+                                        ev = await output_queue.get()
+                                        if ev is None:
+                                            break
+                                        if ev.tool_use_id not in t0_map:
+                                            t0_map[ev.tool_use_id] = time.monotonic()
+                                        partial_output.setdefault(ev.tool_use_id, []).append(
+                                            (time.monotonic() - t0_map[ev.tool_use_id], ev.key, ev.delta)
+                                        )
+                                        yield ev
+                                    dispatched = await dispatch_task
+                                else:
+                                    dispatched = await self.dispatch_tools(valid, iteration)
+                            else:
+                                dispatched = []
+                            results = dispatched + error_results
+                        except asyncio.CancelledError:
+                            if dispatch_task is not None and not dispatch_task.done():
+                                dispatch_task.cancel()
+                                try:
+                                    await dispatch_task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                            interrupted_results: list[ToolResultBlock] = []
+                            for b in tool_blocks:
+                                chunks = partial_output.get(b.id, [])
+                                tool = self._find_tool(b.name)
+                                if chunks and tool:
+                                    msg = tool.format_stream_result(chunks) + "\n[interrupted by user]"
+                                elif chunks:
+                                    msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
+                                else:
+                                    msg = "[interrupted by user]"
+                                interrupted_results.append(
+                                    ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
+                                )
+                            await self._append(context, Message(role="assistant", content=list(content)))
+                            await self._append(context, Message(role="user", content=list(interrupted_results)))
+                            raise
+
+                        # Append both messages atomically (assistant + tool results)
+                        await self._append(context, Message(role="assistant", content=list(content)))
+                        await self._append(context, Message(role="user", content=list(results)))
+
+                        # Gemini stops generating (~20 tokens, end_turn) after receiving
+                        # media as sibling inlineData parts alongside functionResponse.
+                        # A "Proceed." user message nudges it to actually analyze the content.
+                        if getattr(self.transport, "nudge_on_media_tool_result", False) and any(
+                            not isinstance(r.content, str)
+                            and any(isinstance(b, (AudioBlock, ImageBlock, VideoBlock)) for b in r.content)
+                            for r in results
+                        ):
+                            await self._append(
+                                context,
+                                Message(
+                                    role="user",
+                                    content=[
+                                        TextBlock(
+                                            text="You now have the media file above in your context. Proceed.",
+                                        )
+                                    ],
+                                ),
+                            )
+
+                        # Yield ToolResult events + media output events.
+                        # Non-streaming tools return full content (str or list of
+                        # TextBlock/ImageBlock/VideoBlock) — no information is lost.
+                        # Images/videos are yielded as separate ImageOutput/VideoOutput
+                        # events so the REPL can save them to disk; the model sees the
+                        # actual pixel data via ImageBlock/VideoBlock in the tool result.
+                        by_id = {b.id: b for b in tool_blocks}
+                        for r in results:
+                            block = by_id.get(r.tool_use_id)
+                            if isinstance(r.content, str):
+                                result_content = r.content
+                            else:
+                                result_content = "\n".join(b.text for b in r.content if isinstance(b, TextBlock))
+                                for media_block in r.content:
+                                    if isinstance(media_block, ImageBlock):
+                                        yield ImageOutput(
+                                            index=0, data=media_block.data, media_type=media_block.media_type
+                                        )
+                                    elif isinstance(media_block, AudioBlock):
+                                        yield AudioOutput(
+                                            index=0, data=media_block.data, media_type=media_block.media_type
+                                        )
+                                    elif isinstance(media_block, VideoBlock):
+                                        yield VideoOutput(
+                                            index=0, data=media_block.data, media_type=media_block.media_type
+                                        )
+                            yield ToolResult(
+                                tool_use_id=r.tool_use_id,
+                                name=block.name if block else "",
+                                is_error=r.is_error,
+                                content=result_content,
+                                input=block.input if block else {},
+                            )
+                        continue
+
+                    await self._append(context, Message(role="assistant", content=list(content)))
+
+                    match stop_reason:
+                        case StopReason.end_turn:
+                            logger.debug("End turn: total_usage=%s", total_usage)
+                            yield SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=total_usage)
+                            session_end_emitted = True
+                            return
+                        case StopReason.max_tokens | StopReason.error:
+                            yield Error(exception=RuntimeError(f"Transport stopped with: {stop_reason}"))
+                            yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
+                            session_end_emitted = True
+                            return
+
+                logger.warning("Max iterations (%d) reached", self.max_iterations)
+                # Announced, not only logged: an agent that ran out of iterations
+                # produced no answer, and a caller watching it from another process
+                # otherwise sees the same "finished" as one that succeeded.
+                yield Error(
+                    exception=RuntimeError(f"Stopped after {self.max_iterations} iterations without finishing")
+                )
+                yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
+                session_end_emitted = True
 
         except GeneratorExit:
             return
