@@ -23,6 +23,7 @@ from contextlib import AsyncExitStack, suppress
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, NamedTuple, cast
+from uuid import uuid4
 
 import aiohttp
 from axio import notify
@@ -63,15 +64,32 @@ from axio_tools_agents.peers import (
     is_local_background_agent,
     list_peers,
     local_background_agent_records,
-    mark_background_report_delivered,
+    run_agent,
     send_message,
-    set_agent_event_handler,
+    set_background_outcome_handler,
     set_pending_message_probe,
+    set_run_agent_factory,
+    set_session_event_hub,
     set_spawn_agent_factory,
     spawn_agent,
     stop_agent,
     stop_local_background_agents,
     wait_local_background_agents_idle,
+)
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    AgentStarted,
+    AgentStopped,
+    ExecutionMode,
+    ForegroundEntered,
+    ForegroundExited,
+    OutcomeDelivered,
+    SessionEventHub,
+    TurnFinished,
+    TurnOutcome,
+    TurnStarted,
+    new_turn_identity,
+    observe_agent_turn,
 )
 from axio_tools_local.list_files import list_files
 from axio_tools_local.patch_file import patch_file
@@ -141,7 +159,8 @@ TOOLS: list[Tool[Any]] = [
     Tool(name="list_peers", handler=list_peers),
     Tool(name="monitor", handler=monitor),
     Tool(name="send_message", handler=send_message),
-    Tool(name="spawn_agent", handler=spawn_agent, concurrency=3),
+    Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False),
+    Tool(name="spawn_agent", handler=spawn_agent, concurrency=3, detachable=False),
     Tool(name="stop_agent", handler=stop_agent),
 ]
 
@@ -304,7 +323,7 @@ def build_system_prompt(
             "- Never use generate_image as a substitute for real UI testing.",
             "- Never run destructive shell commands (rm -rf, git reset --hard) without user confirmation.",
             "- For large files, read specific line ranges instead of the entire file.",
-            "- Any tool call accepts background=true: it returns a handle at once and keeps running. The result is "
+            "- Tools that advertise background=true return a handle at once and keep running. The result is "
             "delivered automatically — injected into your turn if you are still working, or as your next prompt "
             "if you have already finished — so you never need to poll for it. Use monitor(tasks=[handle]) only "
             "when you cannot proceed without the result right now. Use background=true for calls slow enough to "
@@ -312,6 +331,15 @@ def build_system_prompt(
             "need the result to decide your next step, and never for quick reads: the handle costs an extra "
             "round trip.",
         ]
+        if any(t.name == "run_agent" for t in tools):
+            lines += [
+                "- Use run_agent for one bounded delegation whose result you need before continuing. The parent "
+                "waits, the child streams live in the foreground, and its final answer returns as this tool result.",
+                "- A run_agent child is one-shot and has no peer messaging or orchestration tools. Give it a complete "
+                "task; do not ask it to send_message, spawn more agents, or wait for later instructions.",
+                "- Prefer spawn_agent instead when independent work should continue in parallel while you do "
+                "other work.",
+            ]
         if any(t.name == "spawn_agent" for t in tools):
             lines += [
                 "- Use spawn_agent for independent parallel work that can run in the background. It returns "
@@ -321,17 +349,15 @@ def build_system_prompt(
                 "- Write the task you give a spawned agent in English, whatever language this conversation is in. "
                 "Models follow instructions more reliably in English, and the child has none of the context that "
                 "would let it recover from an ambiguous phrasing. Answer the user in their own language as usual.",
-                "- When spawning a child that must report back, tell it exactly how to deliver results: either "
-                "send_message(agent_id=<parent_id>, message=<report>) to the parent when done, or wait for the "
-                "REPL to focus/follow the child and print the child's final response. Do not tell the user that "
-                "results will appear later unless you have arranged one of those delivery paths.",
+                "- A spawned child's final answer is delivered to the parent automatically after each turn. "
+                "send_message is only for additional peer communication, not for repeating the final answer.",
                 "- Use list_peers() to discover running agents in this project, or list_peers(all_projects=true) "
                 "to inspect all local agent ids. Use send_message(agent_id=..., message=...) for IPC by global id.",
                 "- A spawned child's completion or failure is announced to you automatically — injected into your "
-                "turn if you are still working, or as your next prompt if you have already finished — so you "
-                "never need to poll or monitor just to learn a child is done. The announcement tells you the "
-                "child is done — it does not carry the child's answer; that still arrives only through "
-                "send_message or the REPL focus/follow path described above. Call monitor(agents=[...], "
+                "dialog as your next prompt after the current response — so you never need to poll or monitor just "
+                "to learn a child is done. The announcement tells you the "
+                "child is done and its completed answer is delivered with the background report. Call "
+                "monitor(agents=[...], "
                 "wait_all=true) only when you must join a swarm within this turn before proceeding; it reports a "
                 "crashed child as finished, with its error. monitor(messages=true) waits for a child's PEER "
                 "MESSAGE (sent via send_message) — those are still delivered only as your next prompt, never "
@@ -387,15 +413,11 @@ class ReplRenderer:
         self,
         *,
         buffer_background_events: bool = False,
-        on_background_report: Callable[[str, str], None] | None = None,
         stats: _panel.SessionStats | None = None,
         current_model: Callable[[], ModelSpec | None] | None = None,
     ) -> None:
         self._lock = asyncio.Lock()
         self._buffer_background_events = buffer_background_events
-        # Where a background agent's answer goes. Without somewhere to put it,
-        # the only trace of a finished agent is how many characters it wrote.
-        self._on_background_report = on_background_report
         # Every agent's events pass through here, which makes this the one place
         # that sees the whole session's spend.
         self._stats = stats
@@ -403,6 +425,7 @@ class ReplRenderer:
         self._states: dict[str, _AgentRenderState] = {}
         self._active_agent: str | None = None
         self._focused_agent = "main"
+        self._foreground_stack: list[str] = []
         self._foreground_streaming = False
         self._background_pending: set[str] = set()
         self._input_active = False
@@ -410,6 +433,24 @@ class ReplRenderer:
     @property
     def focused_agent(self) -> str:
         return self._focused_agent
+
+    @property
+    def foreground_agent(self) -> str:
+        return self._foreground_stack[-1] if self._foreground_stack else self._focused_agent
+
+    async def enter_foreground(self, agent_id: str) -> None:
+        async with self._lock:
+            self._foreground_stack.append(agent_id)
+
+    async def exit_foreground(self, agent_id: str) -> None:
+        async with self._lock:
+            if self._foreground_stack and self._foreground_stack[-1] == agent_id:
+                self._foreground_stack.pop()
+            else:
+                with suppress(ValueError):
+                    self._foreground_stack.remove(agent_id)
+            self._foreground_streaming = False
+            self._flush_background_summaries_locked()
 
     def set_focus(self, agent_id: str) -> None:
         self._focused_agent = agent_id
@@ -462,7 +503,7 @@ class ReplRenderer:
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
                 self._stats.record(agent_id, event.usage, model)
-            if agent_id == self._focused_agent:
+            if agent_id == self.foreground_agent:
                 self._render_locked(agent_id, event)
                 if isinstance(event, Error | SessionEndEvent):
                     self._foreground_streaming = False
@@ -602,7 +643,9 @@ class ReplRenderer:
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
                 if is_error:
                     sys.stdout.write(f"{RESET}\n{RED}{content}{RESET}\n")
-                elif name == "spawn_agent":
+                elif name in {"run_agent", "spawn_agent"}:
+                    if name == "run_agent":
+                        content = "[foreground agent returned its result to the parent]"
                     sys.stdout.write(f"{RESET}\n{GREEN}{content}{RESET}\n")
                 elif tid in state.streamed_tool_ids:
                     sys.stdout.write(f"{RESET}\n")
@@ -641,7 +684,7 @@ class ReplRenderer:
                     if not self._foreground_streaming:
                         self._flush_background_summaries_locked()
             case SessionEndEvent():
-                self._deliver_background_report_locked(agent_id)
+                self._finish_background_report_locked(agent_id)
                 if not self._buffer_background_events:
                     self._background_pending.add(agent_id)
                     if not self._foreground_streaming:
@@ -649,22 +692,13 @@ class ReplRenderer:
             case _:
                 pass
 
-    def _deliver_background_report_locked(self, agent_id: str) -> None:
-        """Hand a finished background agent's answer to the parent.
-
-        An agent that ran in the background wrote its answer to nobody: the
-        terminal shows another agent, and the text was only ever tallied. The
-        parent then has to ask it to repeat itself through send_message, which
-        is a second full run of an agent that already finished.
-        """
+    def _finish_background_report_locked(self, agent_id: str) -> None:
         state = self._state(agent_id)
         text = "".join(state.background_text).strip()
         state.background_text.clear()
         if not text:
             return
         state.background_reported_chars = len(text)
-        if self._on_background_report is not None:
-            self._on_background_report(agent_id, text)
 
     def _flush_background_summaries_locked(self) -> None:
         if not self._background_pending:
@@ -709,16 +743,32 @@ class ReplRenderer:
                 state.field_key = None
 
 
-async def run_prompt(agent: Agent, ctx: MemoryContextStore, prompt: str, renderer: ReplRenderer) -> None:
-    stream = agent.run_stream(prompt, ctx)
-    try:
-        async for event in stream:
-            await renderer.render("main", event)
-    finally:
-        # Deterministic close on cancellation: without it, a task cancelled while
-        # the generator is suspended at a yield leaves turn_scope's exit (and its
-        # notify listener flush) to the async-gen finalizer instead of running now.
-        await stream.aclose()
+async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvelope) -> None:
+    match envelope.event:
+        case ForegroundEntered():
+            await renderer.enter_foreground(envelope.agent_id)
+        case ForegroundExited():
+            await renderer.exit_foreground(envelope.agent_id)
+        case AgentStarted() | AgentStopped() | TurnStarted() | TurnFinished() | OutcomeDelivered():
+            return
+        case event:
+            await renderer.render(envelope.agent_id, event)
+
+
+async def run_prompt(
+    agent: Agent,
+    ctx: MemoryContextStore,
+    prompt: str,
+    event_hub: SessionEventHub,
+    run_id: str,
+) -> None:
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id=run_id,
+    )
+    await observe_agent_turn(agent=agent, context=ctx, prompt=prompt, identity=identity, hub=event_hub)
 
 
 def _clone_transport_for_spawn(transport: Any) -> Any:
@@ -737,6 +787,28 @@ def _clone_transport_for_spawn(transport: Any) -> Any:
     if hasattr(clone, "_thought_signatures"):
         setattr(clone, "_thought_signatures", {})
     return clone
+
+
+_AGENT_ORCHESTRATION_TOOLS = frozenset(
+    {"run_agent", "spawn_agent", "send_message", "list_peers", "monitor", "interrupt_agent", "stop_agent"}
+)
+
+
+def _clone_tools_for_child(tools: list[Tool[Any]], *, foreground: bool) -> list[Tool[Any]]:
+    excluded = _AGENT_ORCHESTRATION_TOOLS if foreground else {"run_agent", "spawn_agent"}
+    return [
+        Tool(
+            name=tool.name,
+            description=tool.description,
+            handler=tool.handler,
+            guards=tool.guards,
+            context=tool.context,
+            concurrency=tool.concurrency,
+            detachable=tool.detachable and not foreground,
+        )
+        for tool in tools
+        if tool.name not in excluded
+    ]
 
 
 _media_counter = 0
@@ -1157,29 +1229,25 @@ async def main() -> None:
             last_iteration_message=LAST_ITERATION_HINT,
         )
         ctx = MemoryContextStore()
+        event_hub = SessionEventHub()
+        set_session_event_hub(event_hub)
+        main_run_id = uuid4().hex
+        parent_peer_id: str | None = None
 
-        async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
-            child_ctx = await MemoryContextStore.from_context(ctx) if inherit_context else MemoryContextStore()
+        async def _make_child_agent(
+            inherit_context: bool,
+            *,
+            foreground: bool,
+        ) -> tuple[Agent, MemoryContextStore]:
+            child_ctx = await ctx.fork() if inherit_context else MemoryContextStore()
             child_transport = _clone_transport_for_spawn(agent.transport)
-            child_tools = [
-                Tool(
-                    name=t.name,
-                    description=t.description,
-                    handler=t.handler,
-                    guards=t.guards,
-                    context=t.context,
-                    concurrency=t.concurrency,
-                    detachable=t.detachable,
-                )
-                for t in agent.tools
-                if t.name != "spawn_agent"
-            ]
+            child_tools = _clone_tools_for_child(agent.tools, foreground=foreground)
             child_system = build_system_prompt(
                 tool_root,
                 child_transport.model,
                 child_tools,
                 agents_text,
-                parent_peer_id=parent_peer_id,
+                parent_peer_id=None if foreground else parent_peer_id,
             )
             return agent.copy(
                 transport=child_transport,
@@ -1189,7 +1257,14 @@ async def main() -> None:
                 last_iteration_message=LAST_ITERATION_HINT,
             ), child_ctx
 
+        async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+            return await _make_child_agent(inherit_context, foreground=False)
+
+        async def _make_run_agent(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+            return await _make_child_agent(inherit_context, foreground=True)
+
         set_spawn_agent_factory(_make_spawn_agent)
+        set_run_agent_factory(_make_run_agent)
 
         # Agent-dependent commands.
         commands["/model"] = Command(
@@ -1204,18 +1279,29 @@ async def main() -> None:
         loop = asyncio.get_event_loop()
         peer_queue: asyncio.Queue[str] = asyncio.Queue()
 
-        def _queue_background_report(agent_id: str, text: str) -> None:
-            peer_queue.put_nowait(f"Report from background agent {agent_id}:\n\n{text}")
-            mark_background_report_delivered(agent_id, parent_peer_id)
+        async def _queue_background_outcome(outcome: TurnOutcome) -> None:
+            agent_id = outcome.identity.agent_id
+            if outcome.succeeded and outcome.text.strip():
+                text = f"Report from background agent {agent_id}:\n\n{outcome.text.strip()}"
+            elif outcome.succeeded:
+                text = f"[agent {agent_id}] finished its turn and is idle."
+            else:
+                text = f"[agent {agent_id}] turn failed: {outcome.error or 'unknown error'}"
+            peer_queue.put_nowait(text)
+
+        set_background_outcome_handler(_queue_background_outcome)
 
         stats = _panel.SessionStats()
         renderer = ReplRenderer(
             buffer_background_events=args.prompt is not None,
-            on_background_report=_queue_background_report,
             stats=stats,
             current_model=lambda: transport.model,
         )
-        set_agent_event_handler(renderer.render)
+
+        async def _render_envelope(envelope: AgentEventEnvelope) -> None:
+            await render_runtime_event(renderer, envelope)
+
+        unsubscribe_renderer = event_hub.subscribe(_render_envelope)
         prompt_session = _panel.make_session(
             lambda: _panel.status_line(transport.model, stats),
             on_interrupt=lambda: _on_sigint(),
@@ -1227,14 +1313,13 @@ async def main() -> None:
         # they cannot be delivered until the current turn finishes.
         set_pending_message_probe(peer_queue.qsize)
         peer_server: PeerServer | None = None
-        parent_peer_id: str | None = None
 
         async def _on_peer_message(message: PeerMessage) -> None:
             await peer_queue.put(format_message_for_dialog(message))
 
         async def _run_turn(prompt: str) -> None:
             nonlocal prompt_task
-            prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, renderer))
+            prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, event_hub, main_run_id))
             try:
                 await prompt_task
             except asyncio.CancelledError:
@@ -1458,8 +1543,11 @@ async def main() -> None:
             notify.remove_listener(peer_server.id if peer_server is not None else None)
             if peer_server is not None:
                 await peer_server.close()
-            set_agent_event_handler(None)
+            unsubscribe_renderer()
+            set_background_outcome_handler(None)
+            set_run_agent_factory(None)
             set_spawn_agent_factory(None)
+            set_session_event_hub(None)
             loop.remove_signal_handler(signal.SIGINT)
 
 

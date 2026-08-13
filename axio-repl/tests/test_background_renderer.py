@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import pytest
-from axio.events import Error, SessionEndEvent, TextDelta
+from axio.events import (
+    Error,
+    ReasoningDelta,
+    SessionEndEvent,
+    TextDelta,
+    ToolInputDelta,
+    ToolOutputDelta,
+    ToolResult,
+    ToolUseStart,
+)
 from axio.types import StopReason, Usage
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    AgentStarted,
+    ExecutionMode,
+    ForegroundEntered,
+    ForegroundExited,
+    RuntimeEvent,
+    TurnStatus,
+)
 
-from axio_repl import ReplRenderer
+from axio_repl import ReplRenderer, render_runtime_event
 
 
 async def test_one_shot_renderer_replays_buffered_background_output(
@@ -47,37 +65,89 @@ async def test_one_shot_renderer_replays_each_buffered_background_agent(
     assert "second report" in second_output
 
 
-async def test_a_finished_background_agent_reports_its_answer(
+async def test_foreground_child_streams_without_changing_input_focus(capsys: pytest.CaptureFixture[str]) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child",
+            parent_agent_id="main",
+            turn_id="child-turn",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id="call-1",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(AgentStarted(name="child", kind="foreground-agent")))
+    await render_runtime_event(renderer, envelope(ForegroundEntered(parent_agent_id="main")))
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="live child output")))
+
+    assert renderer.focused_agent == "main"
+    assert renderer.foreground_agent == "child"
+    assert "live child output" in capsys.readouterr().out
+
+    await render_runtime_event(renderer, envelope(ForegroundExited(status=TurnStatus.SUCCEEDED)))
+    assert renderer.focused_agent == "main"
+    assert renderer.foreground_agent == "main"
+
+
+async def test_foreground_child_reasoning_and_tool_actions_keep_the_active_streaming_path(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # The failure this closes: the agent wrote 6000 characters, the parent was
-    # told only how many, and had to ask it to say the whole thing again.
-    reports: list[tuple[str, str]] = []
-    renderer = ReplRenderer(on_background_report=lambda agent_id, text: reports.append((agent_id, text)))
+    renderer = ReplRenderer()
 
-    await renderer.render("child", TextDelta(index=0, delta="## Report\n"))
-    await renderer.render("child", TextDelta(index=0, delta="all good"))
-    assert reports == []
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child",
+            parent_agent_id="main",
+            turn_id="child-turn",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id="parent-call",
+            event=event,
+        )
 
-    await renderer.render(
-        "child",
-        SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(input_tokens=1, output_tokens=2)),
+    await render_runtime_event(renderer, envelope(ForegroundEntered(parent_agent_id="main")))
+    await render_runtime_event(renderer, envelope(ReasoningDelta(index=0, delta="checking")))
+    assert "> checking" in capsys.readouterr().out
+
+    await render_runtime_event(
+        renderer,
+        envelope(ToolUseStart(index=0, tool_use_id="child-tool", name="shell")),
     )
+    assert "▶ shell" in capsys.readouterr().out
 
-    assert reports == [("child", "## Report\nall good")]
-    assert "reported 18 chars" in capsys.readouterr().out
-
-
-async def test_a_silent_background_agent_reports_nothing() -> None:
-    reports: list[tuple[str, str]] = []
-    renderer = ReplRenderer(on_background_report=lambda agent_id, text: reports.append((agent_id, text)))
-
-    await renderer.render(
-        "child",
-        SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(input_tokens=1, output_tokens=0)),
+    await render_runtime_event(
+        renderer,
+        envelope(ToolInputDelta(index=0, tool_use_id="child-tool", partial_json='{"command":"echo hi"}')),
     )
+    arguments = capsys.readouterr().out
+    assert "command" in arguments
+    assert "echo hi" in arguments
 
-    assert reports == []
+    await render_runtime_event(
+        renderer,
+        envelope(ToolOutputDelta(tool_use_id="child-tool", name="shell", key="stdout", delta="hi\n")),
+    )
+    assert "hi" in capsys.readouterr().out
+
+    await render_runtime_event(
+        renderer,
+        envelope(
+            ToolResult(
+                tool_use_id="child-tool",
+                name="shell",
+                is_error=False,
+                content="hi\n",
+            )
+        ),
+    )
+    assert "hi" not in capsys.readouterr().out
 
 
 async def test_a_background_failure_is_reported_with_its_reason(

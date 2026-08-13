@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from axio import notify
 from axio.agent import Agent
+from axio.blocks import ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.messages import Message
@@ -23,12 +24,30 @@ from axio_tools_agents.peers import (
     is_local_background_agent,
     list_peers,
     mark_background_report_delivered,
+    peer_context,
+    run_agent,
     send_message,
+    set_agent_event_handler,
+    set_background_outcome_handler,
+    set_run_agent_factory,
+    set_session_event_hub,
     set_spawn_agent_factory,
     spawn_agent,
     stop_agent,
     stop_local_background_agents,
     wait_local_background_agents_idle,
+)
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    AgentStarted,
+    AgentStopped,
+    ExecutionMode,
+    ForegroundEntered,
+    ForegroundExited,
+    OutcomeDelivered,
+    SessionEventHub,
+    TurnOutcome,
+    TurnStatus,
 )
 
 
@@ -37,7 +56,11 @@ async def peer_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
     yield
     await stop_local_background_agents()
+    set_agent_event_handler(None)
+    set_background_outcome_handler(None)
+    set_run_agent_factory(None)
     set_spawn_agent_factory(None)
+    set_session_event_hub(None)
 
 
 # Owners are only known at run time — a peer id is generated per test — so the
@@ -422,6 +445,31 @@ class _AnsweringTransport:
         yield IterationEnd(iteration=len(self.calls), stop_reason=StopReason.end_turn, usage=Usage(0, 0))
 
 
+class _OwnerAnsweringTransport(_AnsweringTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owners: list[str | None] = []
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        self.owners.append(notify.current_owner())
+        async for event in super().stream(messages, tools, system):
+            yield event
+
+
+class _ClosingMemoryContext(MemoryContextStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _spawn_id(result: str) -> str:
     agent_id = result.split("agent_id=", 1)[1].split(" ", 1)[0]
     _watch_bus_owner(agent_id)
@@ -595,3 +643,191 @@ async def test_a_stopped_agent_leaves_no_listener_or_queue_behind() -> None:
     notify.post("[background task t-1] shell: finished", owner=agent_id)
     assert notify.drain(agent_id) == ["[background task t-1] shell: finished"]
     assert len(transport.calls) == 1
+
+
+async def test_run_agent_streams_one_shot_child_with_parent_tool_correlation(tmp_path: Path) -> None:
+    transport = _OwnerAnsweringTransport()
+    parent = await _start_parent(tmp_path)
+    hub = SessionEventHub(session_id="session")
+    envelopes: list[AgentEventEnvelope] = []
+    child_context = _ClosingMemoryContext()
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        envelopes.append(envelope)
+
+    hub.subscribe(collect)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        assert not inherit_context
+        return Agent(system="child", transport=transport), child_context
+
+    set_run_agent_factory(factory)
+    tool: Tool[object] = Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False)
+    caller = Agent(system="parent", transport=transport, tools=[tool])
+    block = ToolUseBlock(id="parent-call", name="run_agent", input={"task": "inspect"})
+
+    try:
+        with peer_context(parent):
+            [result] = await caller.dispatch_tools([block], iteration=3)
+    finally:
+        await parent.close()
+
+    assert not result.is_error
+    assert result.content == "answered"
+    child_ids = {envelope.agent_id for envelope in envelopes}
+    assert len(child_ids) == 1
+    [child_id] = child_ids
+    assert not is_local_background_agent(child_id)
+    assert transport.owners == [child_id]
+    assert child_context.closed
+    assert all(envelope.execution_mode is ExecutionMode.FOREGROUND for envelope in envelopes)
+    assert all(envelope.parent_tool_use_id == "parent-call" for envelope in envelopes)
+    events = [envelope.event for envelope in envelopes]
+    assert isinstance(events[0], AgentStarted)
+    assert isinstance(events[1], ForegroundEntered)
+    assert any(isinstance(event, TextDelta) and event.delta == "answered" for event in events)
+    assert isinstance(events[-3], ForegroundExited)
+    assert isinstance(events[-2], AgentStopped)
+    assert events[-1] == OutcomeDelivered(recipient_agent_id=parent.id, route="parent_tool_result")
+
+
+async def test_run_agent_failure_becomes_one_parent_tool_error(tmp_path: Path) -> None:
+    async def noop() -> str:
+        return "ok"
+
+    parent = await _start_parent(tmp_path)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return (
+            Agent(
+                system="child",
+                transport=_LoopingTransport(),
+                tools=[Tool(name="noop", handler=noop)],
+                max_iterations=1,
+            ),
+            MemoryContextStore(),
+        )
+
+    set_run_agent_factory(factory)
+    caller = Agent(
+        system="parent",
+        transport=_AnsweringTransport(),
+        tools=[Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False)],
+    )
+
+    try:
+        with peer_context(parent):
+            results = await caller.dispatch_tools(
+                [ToolUseBlock(id="parent-call", name="run_agent", input={"task": "loop"})],
+                iteration=1,
+            )
+    finally:
+        await parent.close()
+
+    assert len(results) == 1
+    assert results[0].is_error
+    assert "1 iterations" in str(results[0].content)
+
+
+async def test_cancelling_parent_tool_call_closes_foreground_child_and_restores_lifecycle(tmp_path: Path) -> None:
+    transport = _InterruptibleTransport()
+    parent = await _start_parent(tmp_path)
+    hub = SessionEventHub()
+    events: list[object] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        events.append(envelope.event)
+
+    hub.subscribe(collect)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_run_agent_factory(factory)
+    caller = Agent(
+        system="parent",
+        transport=_AnsweringTransport(),
+        tools=[Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False)],
+    )
+    with peer_context(parent):
+        task = asyncio.create_task(
+            caller.dispatch_tools(
+                [ToolUseBlock(id="parent-call", name="run_agent", input={"task": "block"})],
+                iteration=1,
+            )
+        )
+        await transport.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    await parent.close()
+    await asyncio.wait_for(transport.interrupted.wait(), timeout=1)
+    assert ForegroundExited(status=TurnStatus.CANCELLED) in events
+    assert AgentStopped(status=TurnStatus.CANCELLED) in events
+    assert not any(isinstance(event, OutcomeDelivered) for event in events)
+
+
+class _ConcurrentForegroundTransport:
+    def __init__(self) -> None:
+        self.active = 0
+        self.maximum = 0
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        self.active += 1
+        self.maximum = max(self.maximum, self.active)
+        try:
+            await asyncio.sleep(0.02)
+            yield TextDelta(index=0, delta="done")
+            yield IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(0, 0))
+        finally:
+            self.active -= 1
+
+
+async def test_run_agent_tool_serializes_sibling_foreground_runs() -> None:
+    transport = _ConcurrentForegroundTransport()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_run_agent_factory(factory)
+    tool: Tool[object] = Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False)
+
+    first, second = await asyncio.gather(tool(task="one"), tool(task="two"))
+    assert first == "done"
+    assert second == "done"
+    assert transport.maximum == 1
+
+
+async def test_background_outcome_delivery_does_not_depend_on_renderer(tmp_path: Path) -> None:
+    outcomes: list[TurnOutcome] = []
+    parent = await _start_parent(tmp_path)
+    notifications: list[str] = []
+    notify.add_listener(parent.id, notifications.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=_AnsweringTransport()), MemoryContextStore()
+
+    async def collect_outcome(outcome: TurnOutcome) -> None:
+        outcomes.append(outcome)
+
+    set_spawn_agent_factory(factory)
+    set_background_outcome_handler(collect_outcome)
+    try:
+        with peer_context(parent):
+            agent_id = _spawn_id(await spawn_agent(task="answer without a renderer"))
+        await _wait_for(lambda: len(outcomes) == 1)
+
+        assert outcomes[0].identity.agent_id == agent_id
+        assert outcomes[0].text == "answered"
+        assert outcomes[0].status is TurnStatus.SUCCEEDED
+        assert notifications == []
+    finally:
+        await parent.close()

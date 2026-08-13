@@ -17,10 +17,28 @@ from uuid import uuid4
 from axio import notify
 from axio.agent import Agent
 from axio.context import ContextStore
-from axio.events import Error, StreamEvent
+from axio.events import StreamEvent
 from axio.field import StrictStr
+from axio.tool import CURRENT_TOOL_CALL
 
 from axio_tools_agents.names import generate_name
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    AgentStarted,
+    AgentStopped,
+    ExecutionMode,
+    ForegroundEntered,
+    ForegroundExited,
+    OutcomeDelivered,
+    SessionEventHub,
+    TurnFinished,
+    TurnIdentity,
+    TurnOutcome,
+    TurnStarted,
+    TurnStatus,
+    new_turn_identity,
+    observe_agent_turn,
+)
 
 MAX_MESSAGE_CHARS = 200_000
 MAX_WIRE_BYTES = MAX_MESSAGE_CHARS * 4 + 4096
@@ -88,19 +106,25 @@ MessageHandler = Callable[[PeerMessage], Awaitable[None]]
 StopHandler = Callable[[str, str], Awaitable[None]]
 SpawnAgentFactory = Callable[[bool], Awaitable[tuple[Agent, ContextStore]]]
 AgentEventHandler = Callable[[str, StreamEvent], Awaitable[None]]
+BackgroundOutcomeHandler = Callable[[TurnOutcome], Awaitable[None]]
 
 _current_peer: contextvars.ContextVar[PeerServer | None] = contextvars.ContextVar(
     "axio_tools_agents_current_peer",
     default=None,
 )
 _spawn_agent_factory: SpawnAgentFactory | None = None
+_run_agent_factory: SpawnAgentFactory | None = None
 _agent_event_handler: AgentEventHandler | None = None
+_background_outcome_handler: BackgroundOutcomeHandler | None = None
+_session_event_hub = SessionEventHub()
+_legacy_event_unsubscribe: Callable[[], None] | None = None
 
 
 @dataclass(slots=True)
 class _QueuedPrompt:
     prompt: str | None
     done: asyncio.Future[None] | None = None
+    parent_tool_use_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -111,7 +135,7 @@ class _BackgroundAgent:
     inbox: asyncio.Queue[_QueuedPrompt] = field(default_factory=asyncio.Queue)
     idle_waiters: list[asyncio.Future[None]] = field(default_factory=list)
     runner: asyncio.Task[None] | None = None
-    current_turn: asyncio.Task[None] | None = None
+    current_turn: asyncio.Task[TurnOutcome] | None = None
     stopping: bool = False
     # A failed turn leaves the agent alive and waiting, so without this the
     # parent cannot tell a crashed agent from one that finished its work.
@@ -123,6 +147,8 @@ class _BackgroundAgent:
     # A cancelled turn raises nothing the agent records, so without this an
     # interrupted agent reports the same "finished" as one that answered.
     interrupted: bool = False
+    run_id: str = field(default_factory=lambda: uuid4().hex)
+    parent_tool_use_id: str | None = None
 
 
 _background_agents: dict[str, _BackgroundAgent] = {}
@@ -214,29 +240,39 @@ def mark_background_report_delivered(agent_id: str, recipient_peer_id: str | Non
         background.reported_to = recipient_peer_id
 
 
-def _notify_parent_of_turn_end(background: _BackgroundAgent) -> None:
-    """Tell the parent its child went idle, unless it already knows.
+async def _deliver_background_turn(
+    background: _BackgroundAgent,
+    outcome: TurnOutcome | None,
+    identity: TurnIdentity,
+) -> None:
+    """Deliver a completed turn independently of any presentation subscriber."""
 
-    Every finished turn is news for the parent, including one it prompted
-    itself: it is the answer to that prompt. A stop is the exception — the
-    parent asked for it and gets the outcome from stop_agent.
-    """
-    if background.stopping or not _is_background_idle(background):
+    if background.stopping:
         return
-    # None means two things here: a parent that never got the report, and a
-    # parent with no peer identity. Comparing without the first check would
-    # confuse them and swallow the only signal a child of an agent without peer
-    # messaging produces.
     if background.reported_to is not None and background.reported_to == background.parent_id:
         return
     peer = background.peer
-    if background.last_error:
+    if outcome is not None and outcome.status is TurnStatus.FAILED:
+        text = f"[agent {peer.name} ({peer.id})] turn failed: {outcome.error or 'unknown error'}"
+    elif background.last_error:
         text = f"[agent {peer.name} ({peer.id})] turn failed: {background.last_error}"
+    elif outcome is not None and outcome.text.strip():
+        text = f"[agent {peer.name} ({peer.id})] finished its turn and is idle.\n\nReport:\n\n{outcome.text.strip()}"
     elif background.interrupted:
         text = f"[agent {peer.name} ({peer.id})] turn was interrupted."
     else:
         text = f"[agent {peer.name} ({peer.id})] finished its turn and is idle."
-    notify.post(text, owner=background.parent_id)
+    if outcome is not None and _background_outcome_handler is not None:
+        await _background_outcome_handler(outcome)
+        route = "background_outcome_handler"
+    else:
+        notify.post(text, owner=background.parent_id)
+        route = "notify"
+    background.reported_to = background.parent_id
+    await _session_event_hub.publish_for(
+        outcome.identity if outcome is not None else identity,
+        OutcomeDelivered(recipient_agent_id=background.parent_id, route=route),
+    )
 
 
 def _finish_pending_prompts(background: _BackgroundAgent) -> None:
@@ -345,9 +381,57 @@ def set_spawn_agent_factory(factory: SpawnAgentFactory | None) -> None:
     _spawn_agent_factory = factory
 
 
+def set_run_agent_factory(factory: SpawnAgentFactory | None) -> None:
+    global _run_agent_factory
+    _run_agent_factory = factory
+
+
+def set_background_outcome_handler(handler: BackgroundOutcomeHandler | None) -> None:
+    global _background_outcome_handler
+    _background_outcome_handler = handler
+
+
+def session_event_hub() -> SessionEventHub:
+    return _session_event_hub
+
+
+def _subscribe_legacy_event_handler() -> None:
+    global _legacy_event_unsubscribe
+    if _legacy_event_unsubscribe is not None:
+        _legacy_event_unsubscribe()
+        _legacy_event_unsubscribe = None
+    if _agent_event_handler is None:
+        return
+
+    async def forward(envelope: AgentEventEnvelope) -> None:
+        if isinstance(
+            envelope.event,
+            (
+                AgentStarted,
+                AgentStopped,
+                TurnStarted,
+                TurnFinished,
+                ForegroundEntered,
+                ForegroundExited,
+                OutcomeDelivered,
+            ),
+        ):
+            return
+        await _agent_event_handler(envelope.agent_id, envelope.event)
+
+    _legacy_event_unsubscribe = _session_event_hub.subscribe(forward)
+
+
+def set_session_event_hub(hub: SessionEventHub | None) -> None:
+    global _session_event_hub
+    _session_event_hub = hub or SessionEventHub()
+    _subscribe_legacy_event_handler()
+
+
 def set_agent_event_handler(handler: AgentEventHandler | None) -> None:
     global _agent_event_handler
     _agent_event_handler = handler
+    _subscribe_legacy_event_handler()
 
 
 def format_message_for_dialog(message: PeerMessage) -> str:
@@ -676,18 +760,19 @@ async def interrupt_agent(agent_id: StrictStr, reason: str = "") -> str:
 async def _run_agent_turn(
     *,
     background: _BackgroundAgent,
-    prompt: str,
-) -> None:
+    queued: _QueuedPrompt,
+    identity: TurnIdentity,
+) -> TurnOutcome:
+    if queued.prompt is None:
+        raise RuntimeError("cannot run an empty background prompt")
     with peer_context(background.peer):
-        async for event in background.agent.run_stream(prompt, background.context):
-            if isinstance(event, Error):
-                # A failed turn that did not raise - running out of iterations is
-                # the common one. Unrecorded, it leaves the agent reporting the
-                # same idle as one that answered, and the reason lives only in a
-                # log line in whichever process happened to host it.
-                background.last_error = str(event.exception)
-            if _agent_event_handler is not None:
-                await _agent_event_handler(background.peer.id, event)
+        return await observe_agent_turn(
+            agent=background.agent,
+            context=background.context,
+            prompt=queued.prompt,
+            identity=identity,
+            hub=_session_event_hub,
+        )
 
 
 async def _run_background_agent(background: _BackgroundAgent) -> None:
@@ -698,13 +783,22 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
                 break
-            turn = asyncio.create_task(_run_agent_turn(background=background, prompt=queued.prompt))
+            identity = new_turn_identity(
+                agent_id=background.peer.id,
+                parent_agent_id=background.parent_id,
+                execution_mode=ExecutionMode.BACKGROUND,
+                parent_tool_use_id=queued.parent_tool_use_id,
+                run_id=background.run_id,
+            )
+            turn = asyncio.create_task(_run_agent_turn(background=background, queued=queued, identity=identity))
             background.current_turn = turn
             background.last_error = None
             background.reported_to = None
             background.interrupted = False
+            outcome: TurnOutcome | None = None
             try:
-                await turn
+                outcome = await turn
+                background.last_error = outcome.error
             except asyncio.CancelledError:
                 if background.stopping:
                     break
@@ -712,17 +806,31 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
             # inspect, interrupt, stop, or send a recovery prompt.
             except Exception as exc:
                 background.last_error = f"{type(exc).__name__}: {exc}"
-                if _agent_event_handler is not None:
-                    await _agent_event_handler(background.peer.id, Error(exc))
             finally:
                 background.current_turn = None
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
                 _notify_idle(background)
-                _notify_parent_of_turn_end(background)
+                await _deliver_background_turn(background, outcome, identity)
             if background.stopping:
                 break
     finally:
+        status = (
+            TurnStatus.CANCELLED
+            if background.stopping or background.interrupted
+            else TurnStatus.FAILED
+            if background.last_error
+            else TurnStatus.SUCCEEDED
+        )
+        await _session_event_hub.publish(
+            AgentStopped(status=status),
+            run_id=background.run_id,
+            agent_id=background.peer.id,
+            parent_agent_id=background.parent_id,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id=background.parent_tool_use_id,
+        )
         _finish_pending_prompts(background)
         _background_agents.pop(background.peer.id, None)
         # A detached call started by this agent can still complete after it is
@@ -741,6 +849,7 @@ async def _start_background_agent(
     project: str,
     cwd: str,
     parent_id: str | None,
+    parent_tool_use_id: str | None,
 ) -> _BackgroundAgent:
     accept_lock = asyncio.Lock()
     background: _BackgroundAgent
@@ -773,13 +882,28 @@ async def _start_background_agent(
         project=project,
         cwd=cwd,
     ).start(set_current=False)
-    background = _BackgroundAgent(agent=agent, context=context, peer=peer, parent_id=parent_id)
+    background = _BackgroundAgent(
+        agent=agent,
+        context=context,
+        peer=peer,
+        parent_id=parent_id,
+        parent_tool_use_id=parent_tool_use_id,
+    )
     _background_agents[peer.id] = background
     # Between turns the agent is not draining anything, so its own notifications
     # — a detached call finishing, a child of its own going idle — arrive as the
     # prompt that starts the next turn.
     notify.add_listener(peer.id, lambda text: background.inbox.put_nowait(_QueuedPrompt(text)))
-    background.inbox.put_nowait(_QueuedPrompt(initial_task))
+    await _session_event_hub.publish(
+        AgentStarted(name=peer.name, kind=peer.kind),
+        run_id=background.run_id,
+        agent_id=peer.id,
+        parent_agent_id=parent_id,
+        turn_id=None,
+        execution_mode=ExecutionMode.BACKGROUND,
+        parent_tool_use_id=parent_tool_use_id,
+    )
+    background.inbox.put_nowait(_QueuedPrompt(initial_task, parent_tool_use_id=parent_tool_use_id))
     background.runner = asyncio.create_task(_run_background_agent(background))
     return background
 
@@ -844,9 +968,9 @@ async def spawn_agent(
     default the spawned agent starts with an empty context. Set
     inherit_context=true only when the spawned agent must see the current
     conversation. The spawned agent remains available for IPC until it is
-    explicitly stopped. This returns immediately and never carries the child's
-    answer: the child announces to you on its own, both when it finishes a turn
-    and when one fails, so you do not have to watch it. Call
+    explicitly stopped. This call returns immediately and therefore does not
+    carry the child's answer itself. The runtime delivers the completed answer
+    or failure to the parent after the turn, so you do not have to watch it. Call
     monitor(agents=[id], wait_all=true) only when you cannot continue this turn
     without the child — to join a swarm before summarising it, say. Pass a short
     `name` describing the child's job — "docs-audit", "transport-review" — since
@@ -855,6 +979,10 @@ async def spawn_agent(
     if _spawn_agent_factory is None:
         return "spawn_agent is not configured"
 
+    try:
+        parent_tool_use_id = CURRENT_TOOL_CALL.get().tool_use_id
+    except LookupError:
+        parent_tool_use_id = None
     agent, context = await _spawn_agent_factory(inherit_context)
     parent = current_peer()
     project = parent.project if parent is not None else _current_project()
@@ -868,6 +996,7 @@ async def spawn_agent(
         project=project,
         cwd=cwd,
         parent_id=parent.id if parent is not None else None,
+        parent_tool_use_id=parent_tool_use_id,
     )
     return (
         f"Spawned background agent_id={background.peer.id} name={background.peer.name!r}. "
@@ -876,3 +1005,87 @@ async def spawn_agent(
 
 
 spawn_agent._tool_concurrency = 3  # type: ignore[attr-defined]
+spawn_agent._tool_detachable = False  # type: ignore[attr-defined]
+
+
+async def run_agent(
+    task: StrictStr,
+    inherit_context: bool = False,
+    name: str | None = None,
+) -> str:
+    """Run a one-shot subagent in the foreground and return its final answer.
+
+    The parent tool call waits while the child streams live. The child is scoped
+    to this call and is not registered as a persistent peer. Set
+    inherit_context=true only when it must see the parent's current conversation.
+    """
+
+    if _run_agent_factory is None:
+        raise RuntimeError("run_agent is not configured")
+
+    try:
+        parent_tool_use_id = CURRENT_TOOL_CALL.get().tool_use_id
+    except LookupError:
+        parent_tool_use_id = None
+    parent = current_peer()
+    parent_id = parent.id if parent is not None else None
+    base_name = name or generate_name()
+    agent_id = f"{_safe_slug(base_name)}-foreground-{uuid4().hex[:8]}"
+    project = parent.project if parent is not None else _current_project()
+    cwd = parent.cwd if parent is not None else _normalize_project(None)
+
+    async def reject_message(_message: PeerMessage) -> None:
+        raise RuntimeError("one-shot foreground agents do not accept peer messages")
+
+    child_peer = PeerServer(
+        base_name,
+        kind="foreground-agent",
+        handler=reject_message,
+        project=project,
+        cwd=cwd,
+        peer_id=agent_id,
+    )
+    identity = new_turn_identity(
+        agent_id=agent_id,
+        parent_agent_id=parent_id,
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id=parent_tool_use_id,
+    )
+    agent, context = await _run_agent_factory(inherit_context)
+    await _session_event_hub.publish_for(identity, AgentStarted(name=base_name, kind="foreground-agent"))
+    await _session_event_hub.publish_for(identity, ForegroundEntered(parent_agent_id=parent_id))
+
+    outcome: TurnOutcome | None = None
+    status = TurnStatus.FAILED
+    try:
+        with peer_context(child_peer):
+            outcome = await observe_agent_turn(
+                agent=agent,
+                context=context,
+                prompt=task,
+                identity=identity,
+                hub=_session_event_hub,
+            )
+        status = outcome.status
+    except asyncio.CancelledError:
+        status = TurnStatus.CANCELLED
+        raise
+    finally:
+        try:
+            await context.close()
+        finally:
+            notify.discard(agent_id)
+            await _session_event_hub.publish_for(identity, ForegroundExited(status=status))
+            await _session_event_hub.publish_for(identity, AgentStopped(status=status))
+
+    await _session_event_hub.publish_for(
+        identity,
+        OutcomeDelivered(recipient_agent_id=parent_id, route="parent_tool_result"),
+    )
+    if not outcome.succeeded:
+        raise RuntimeError(outcome.error or "foreground agent failed")
+    return outcome.text
+
+
+run_agent._tool_concurrency = 1  # type: ignore[attr-defined]
+run_agent._tool_detachable = False  # type: ignore[attr-defined]

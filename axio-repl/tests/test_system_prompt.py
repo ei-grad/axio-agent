@@ -8,7 +8,7 @@ from typing import Any
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 
-from axio_repl import build_system_prompt
+from axio_repl import TOOLS, _clone_tools_for_child, build_system_prompt
 
 
 async def _dummy_handler(x: str = "") -> str:
@@ -136,12 +136,10 @@ class TestToolRules:
 
 
 class TestNotificationGuidance:
-    """background=true and spawn_agent results now arrive via the notify bus.
+    """Detached and child outcomes are delivered automatically.
 
-    See axio.notify: a detached call's or child's outcome is delivered
-    automatically (mid-turn injection or next-prompt), not just observable by
-    polling monitor(). These bullets must say so and must not claim monitor is
-    the only way to learn a result is ready.
+    Detached calls use axio.notify; child outcomes use the agent runtime's
+    outcome route. Neither requires polling monitor().
     """
 
     def test_background_bullet_mentions_automatic_delivery(self) -> None:
@@ -157,11 +155,11 @@ class TestNotificationGuidance:
         assert "announced to you automatically" in prompt
         assert "never need to poll or monitor just to learn a child is done" in prompt
 
-    def test_spawn_agent_bullet_clarifies_notification_carries_no_answer(self) -> None:
-        """The turn-end ping must not be mistaken for the child's actual answer text."""
+    def test_spawn_agent_bullet_clarifies_notification_carries_answer(self) -> None:
+        """The runtime now delivers the child's completed answer with the report."""
         model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
         prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
-        assert "does not carry the child's answer" in prompt
+        assert "completed answer is delivered with the background report" in prompt
 
     def test_spawn_agent_bullet_warns_against_reply_ping_pong(self) -> None:
         """An idle notification must not be treated as a cue to send_message back."""
@@ -182,6 +180,45 @@ class TestNotificationGuidance:
         model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
         prompt = build_system_prompt(_ROOT, model, [_tool("shell")])
         assert "announced to you automatically" not in prompt
+
+
+class TestForegroundAgentGuidance:
+    def test_agent_lifecycle_tools_cannot_be_detached(self) -> None:
+        lifecycle_tools = {tool.name: tool for tool in TOOLS if tool.name in {"run_agent", "spawn_agent"}}
+
+        assert lifecycle_tools.keys() == {"run_agent", "spawn_agent"}
+        assert all(not tool.detachable for tool in lifecycle_tools.values())
+        assert all("background" not in tool.input_schema["properties"] for tool in lifecycle_tools.values())
+
+    def test_foreground_child_has_no_orchestration_or_detachable_tools(self) -> None:
+        child_tools = _clone_tools_for_child(TOOLS, foreground=True)
+        orchestration = {
+            "run_agent",
+            "spawn_agent",
+            "send_message",
+            "list_peers",
+            "monitor",
+            "interrupt_agent",
+            "stop_agent",
+        }
+
+        assert not ({tool.name for tool in child_tools} & orchestration)
+        assert all(not tool.detachable for tool in child_tools)
+
+    def test_run_agent_is_waited_and_streamed(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("run_agent")])
+
+        assert "parent waits" in prompt
+        assert "streams live in the foreground" in prompt
+        assert "final answer returns as this tool result" in prompt
+
+    def test_run_agent_child_has_no_orchestration_tools(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("run_agent")])
+
+        assert "one-shot" in prompt
+        assert "has no peer messaging or orchestration tools" in prompt
 
 
 class TestAgentsText:
