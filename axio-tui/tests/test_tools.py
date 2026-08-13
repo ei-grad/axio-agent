@@ -16,6 +16,7 @@ from axio.testing import StubTransport, make_text_response, make_tool_use_respon
 from axio.tool import Tool
 
 import axio_tui.tools as _tools
+from axio_tui.app import AgentApp
 from axio_tui.tools import confirm, status_line, subagent, vision_analyze
 
 
@@ -98,6 +99,20 @@ class TestSubAgent:
             assert len(parent_history) == 1
         finally:
             _tools.subagent_factory = None
+
+    async def test_factory_clone_preserves_non_detachable_tools(self) -> None:
+        async def foreground_only() -> str:
+            return "ok"
+
+        parent_tool: Tool[Any] = Tool(name="foreground_only", handler=foreground_only, detachable=False)
+        app = AgentApp()
+        app._chat_context_ = MemoryContextStore()  # type: ignore[assignment]
+        app._agent = self._make_agent(StubTransport(), tools=[parent_tool])
+
+        sub_agent, _ = await app._make_subagent()
+
+        assert len(sub_agent.tools) == 1
+        assert not sub_agent.tools[0].detachable
 
     async def test_error_propagates(self) -> None:
         async def factory() -> tuple[Agent, MemoryContextStore]:

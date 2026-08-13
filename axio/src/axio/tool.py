@@ -20,7 +20,7 @@ from .exceptions import GuardError, HandlerError
 from .field import MISSING, FieldInfo, bare_type, get_field_info
 from .permission import PermissionGuard
 from .schema import build_tool_schema
-from .types import ToolName
+from .types import ToolCallID, ToolName
 
 type JSONSchema = dict[str, Any]
 
@@ -95,6 +95,20 @@ def hint_from_json_schema(prop_schema: dict[str, Any]) -> Any:
 CONTEXT: ContextVar[Any] = ContextVar("CONTEXT")
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCallContext:
+    """Identity of the agent tool call currently being executed."""
+
+    tool_use_id: ToolCallID
+    tool_name: ToolName
+    iteration: int
+
+
+# Set by Agent dispatch before invoking a handler. Direct Tool calls have no
+# protocol-level tool-use ID and therefore leave this variable unset.
+CURRENT_TOOL_CALL: ContextVar[ToolCallContext] = ContextVar("CURRENT_TOOL_CALL")
+
+
 def _default_format_stream_result(chunks: list[tuple[float, str, str]]) -> str:
     """Default streaming-aggregator: join all text, discard keys/timestamps."""
     return "".join(text for _, _, text in chunks)
@@ -110,6 +124,7 @@ class Tool[T]:
 
     context: T = field(default=MappingProxyType({}), compare=False)  # type: ignore[assignment]
     schema: MappingProxyType[str, Any] = field(default=MappingProxyType({}), repr=False, compare=False)
+    detachable: bool = True
     _semaphore: asyncio.Semaphore | None = field(init=False, default=None, repr=False, compare=False)
     _fields: Mapping[str, tuple[Any, FieldInfo]] = field(
         init=False, repr=False, compare=False, default_factory=lambda: MappingProxyType({})
@@ -174,11 +189,15 @@ class Tool[T]:
     @property
     def input_schema(self) -> JSONSchema:
         schema = copy.deepcopy(dict(self.schema))
-        # Offered on every tool rather than a chosen few: whether a call is
-        # worth detaching depends on its arguments, not on the tool.
         properties = schema.setdefault("properties", {})
-        if isinstance(properties, dict) and BACKGROUND_PARAM not in properties:
-            properties[BACKGROUND_PARAM] = copy.deepcopy(BACKGROUND_PROPERTY)
+        if isinstance(properties, dict):
+            if self.detachable and BACKGROUND_PARAM not in properties:
+                properties[BACKGROUND_PARAM] = copy.deepcopy(BACKGROUND_PROPERTY)
+            elif not self.detachable:
+                properties.pop(BACKGROUND_PARAM, None)
+                required = schema.get("required")
+                if isinstance(required, list):
+                    schema["required"] = [name for name in required if name != BACKGROUND_PARAM]
         return schema
 
     @property

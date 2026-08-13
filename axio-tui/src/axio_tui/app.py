@@ -711,6 +711,7 @@ class AgentApp(App[None]):
                 guards=t.guards,
                 context=t.context,
                 concurrency=t.concurrency,
+                detachable=t.detachable,
             )
             for t in self._agent.tools
             if t.name != "subagent"

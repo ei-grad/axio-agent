@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -8,7 +9,7 @@ from axio import background, notify
 from axio.agent import Agent
 from axio.blocks import ToolUseBlock
 from axio.testing import StubTransport
-from axio.tool import BACKGROUND_PARAM, Tool
+from axio.tool import BACKGROUND_PARAM, CURRENT_TOOL_CALL, Tool, ToolCallContext
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +35,30 @@ def test_every_tool_advertises_the_argument() -> None:
     assert BACKGROUND_PARAM in schema["properties"]
     # The tool's own arguments must survive alongside it.
     assert "text" in schema["properties"]
+
+
+def test_non_detachable_tool_omits_the_argument() -> None:
+    tool = Tool[Any](name="slow_echo", handler=slow_echo, detachable=False)
+    schema = tool.input_schema
+    assert BACKGROUND_PARAM not in schema["properties"]
+    assert "text" in schema["properties"]
+
+
+def test_non_detachable_tool_removes_argument_from_explicit_schema() -> None:
+    async def handler(**kwargs: object) -> str:
+        return str(kwargs)
+
+    schema = MappingProxyType(
+        {
+            "type": "object",
+            "properties": {BACKGROUND_PARAM: {"type": "boolean"}, "text": {"type": "string"}},
+            "required": [BACKGROUND_PARAM, "text"],
+        }
+    )
+    tool: Tool[Any] = Tool(name="explicit", handler=handler, schema=schema, detachable=False)
+    advertised = tool.input_schema
+    assert BACKGROUND_PARAM not in advertised["properties"]
+    assert advertised["required"] == ["text"]
 
 
 def test_the_argument_is_not_stored_on_the_tool_fields() -> None:
@@ -63,6 +88,50 @@ async def test_detached_call_returns_a_handle_and_finishes_later() -> None:
     assert await call.task == "echo: later"
     assert call.state == "done"
     assert call.output() == "echo: later"
+
+
+@pytest.mark.asyncio
+async def test_detached_handler_inherits_tool_call_correlation() -> None:
+    seen: list[ToolCallContext] = []
+
+    async def handler() -> str:
+        await asyncio.sleep(0)
+        seen.append(CURRENT_TOOL_CALL.get())
+        return "done"
+
+    agent = _agent(Tool[Any](name="detached", handler=handler))
+    outer = ToolCallContext(tool_use_id="outer", tool_name="outer", iteration=0)
+    token = CURRENT_TOOL_CALL.set(outer)
+    try:
+        block = ToolUseBlock(id="bg-call", name="detached", input={BACKGROUND_PARAM: True})
+        [result] = await agent.dispatch_tools([block], 5)
+        assert CURRENT_TOOL_CALL.get() is outer
+    finally:
+        CURRENT_TOOL_CALL.reset(token)
+
+    assert not result.is_error
+    [call] = background.snapshot()
+    assert await call.task == "done"
+    assert seen == [ToolCallContext(tool_use_id="bg-call", tool_name="detached", iteration=5)]
+
+
+@pytest.mark.asyncio
+async def test_non_detachable_call_rejects_forced_background() -> None:
+    called = False
+
+    async def handler() -> str:
+        nonlocal called
+        called = True
+        return "called"
+
+    agent = _agent(Tool[Any](name="foreground_only", handler=handler, detachable=False))
+    block = ToolUseBlock(id="1", name="foreground_only", input={BACKGROUND_PARAM: True})
+    [result] = await agent.dispatch_tools([block], 4)
+
+    assert result.is_error
+    assert "does not support background execution" in str(result.content)
+    assert not called
+    assert not background.snapshot()
 
 
 @pytest.mark.asyncio
@@ -102,6 +171,35 @@ async def test_streaming_tool_detaches_instead_of_streaming() -> None:
 
     [call] = background.snapshot()
     assert await call.task == "done: x"
+
+
+@pytest.mark.asyncio
+async def test_non_detachable_streaming_tool_rejects_forced_background() -> None:
+    called = False
+
+    async def streamer() -> str:
+        nonlocal called
+        called = True
+        return "done"
+
+    async def _stream() -> AsyncGenerator[tuple[str, str], None]:
+        nonlocal called
+        called = True
+        yield "stdout", "chunk"
+
+    streamer.stream = _stream  # type: ignore[attr-defined]
+    tool: Tool[Any] = Tool(name="foreground_stream", handler=streamer, detachable=False)
+    agent = _agent(tool)
+
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    block = ToolUseBlock(id="1", name="foreground_stream", input={BACKGROUND_PARAM: True})
+    [result] = await agent._dispatch_tools_streaming([block], 7, queue)  # type: ignore[arg-type]
+
+    assert result.is_error
+    assert "does not support background execution" in str(result.content)
+    assert not called
+    assert queue.empty()
+    assert not background.snapshot()
 
 
 @pytest.mark.asyncio

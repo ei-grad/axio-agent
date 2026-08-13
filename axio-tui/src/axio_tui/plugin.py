@@ -47,7 +47,8 @@ SELECTOR_GROUP = "axio.selector"
 def _make_tool(ep_name: str, handler: Callable[..., Any]) -> Tool[Any]:
     """Build a Tool from an entry-point handler (plain async function or callable)."""
     concurrency: int | None = getattr(handler, "_tool_concurrency", None)
-    return Tool(name=ep_name, handler=handler, concurrency=concurrency)
+    detachable: bool = getattr(handler, "_tool_detachable", True)
+    return Tool(name=ep_name, handler=handler, concurrency=concurrency, detachable=detachable)
 
 
 def discover_tools() -> list[Tool[Any]]:

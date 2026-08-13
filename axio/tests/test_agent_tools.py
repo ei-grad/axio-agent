@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from axio.agent import Agent
-from axio.blocks import ToolResultBlock
+from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     IterationEnd,
@@ -19,7 +20,7 @@ from axio.events import (
     ToolUseStart,
 )
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
-from axio.tool import Tool
+from axio.tool import CURRENT_TOOL_CALL, Tool, ToolCallContext
 from axio.types import StopReason, Usage
 
 calls_log: list[dict[str, Any]] = []
@@ -97,6 +98,103 @@ class TestTwoToolsOneResponse:
         agent = Agent(system="test", tools=[tool_a, tool_b], transport=transport)
         await agent.run("go", MemoryContextStore())
         assert set(calls) == {"a", "b"}
+
+
+class TestCurrentToolCall:
+    async def test_non_streaming_handler_sees_correlation_and_caller_is_restored(self) -> None:
+        seen: list[ToolCallContext] = []
+
+        async def handler() -> str:
+            seen.append(CURRENT_TOOL_CALL.get())
+            return "ok"
+
+        tool: Tool[Any] = Tool(name="inspect", handler=handler)
+        agent = Agent(system="test", tools=[tool], transport=StubTransport())
+        outer = ToolCallContext(tool_use_id="outer", tool_name="outer", iteration=0)
+        token = CURRENT_TOOL_CALL.set(outer)
+        try:
+            [result] = await agent.dispatch_tools([ToolUseBlock(id="call-7", name="inspect", input={})], 7)
+            assert CURRENT_TOOL_CALL.get() is outer
+        finally:
+            CURRENT_TOOL_CALL.reset(token)
+
+        assert not result.is_error
+        assert seen == [ToolCallContext(tool_use_id="call-7", tool_name="inspect", iteration=7)]
+
+    async def test_concurrent_handlers_have_isolated_correlation(self) -> None:
+        seen: dict[str, tuple[ToolCallContext, ToolCallContext]] = {}
+
+        async def handler() -> str:
+            before = CURRENT_TOOL_CALL.get()
+            await asyncio.sleep(0)
+            after = CURRENT_TOOL_CALL.get()
+            seen[before.tool_use_id] = (before, after)
+            return before.tool_use_id
+
+        tools: list[Tool[Any]] = [Tool(name="a", handler=handler), Tool(name="b", handler=handler)]
+        agent = Agent(system="test", tools=tools, transport=StubTransport())
+        blocks = [ToolUseBlock(id="call-a", name="a", input={}), ToolUseBlock(id="call-b", name="b", input={})]
+        results = await agent.dispatch_tools(blocks, 3)
+
+        assert [result.content for result in results] == ["call-a", "call-b"]
+        assert seen == {
+            "call-a": (
+                ToolCallContext(tool_use_id="call-a", tool_name="a", iteration=3),
+                ToolCallContext(tool_use_id="call-a", tool_name="a", iteration=3),
+            ),
+            "call-b": (
+                ToolCallContext(tool_use_id="call-b", tool_name="b", iteration=3),
+                ToolCallContext(tool_use_id="call-b", tool_name="b", iteration=3),
+            ),
+        }
+
+    async def test_failed_handler_restores_caller_context(self) -> None:
+        async def handler() -> str:
+            assert CURRENT_TOOL_CALL.get().tool_use_id == "failed-call"
+            raise RuntimeError("failed")
+
+        tool: Tool[Any] = Tool(name="fail", handler=handler)
+        agent = Agent(system="test", tools=[tool], transport=StubTransport())
+        outer = ToolCallContext(tool_use_id="outer", tool_name="outer", iteration=0)
+        token = CURRENT_TOOL_CALL.set(outer)
+        try:
+            [result] = await agent.dispatch_tools([ToolUseBlock(id="failed-call", name="fail", input={})], 2)
+            assert CURRENT_TOOL_CALL.get() is outer
+        finally:
+            CURRENT_TOOL_CALL.reset(token)
+
+        assert result.is_error
+
+    async def test_streaming_handler_sees_correlation_until_stream_finishes(self) -> None:
+        seen: list[ToolCallContext] = []
+
+        async def handler() -> str:
+            return "unused"
+
+        async def stream() -> AsyncGenerator[tuple[str, str], None]:
+            seen.append(CURRENT_TOOL_CALL.get())
+            yield "stdout", "one"
+            await asyncio.sleep(0)
+            seen.append(CURRENT_TOOL_CALL.get())
+            yield "stdout", "two"
+
+        handler.stream = stream  # type: ignore[attr-defined]
+        tool: Tool[Any] = Tool(name="stream", handler=handler)
+        agent = Agent(system="test", tools=[tool], transport=StubTransport())
+        queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
+        outer = ToolCallContext(tool_use_id="outer", tool_name="outer", iteration=0)
+        token = CURRENT_TOOL_CALL.set(outer)
+        try:
+            [result] = await agent._dispatch_tools_streaming(
+                [ToolUseBlock(id="stream-call", name="stream", input={})], 9, queue
+            )
+            assert CURRENT_TOOL_CALL.get() is outer
+        finally:
+            CURRENT_TOOL_CALL.reset(token)
+
+        expected = ToolCallContext(tool_use_id="stream-call", tool_name="stream", iteration=9)
+        assert seen == [expected, expected]
+        assert result.content == "onetwo"
 
 
 class TestUnknownTool:

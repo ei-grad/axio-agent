@@ -1169,6 +1169,7 @@ async def main() -> None:
                     guards=t.guards,
                     context=t.context,
                     concurrency=t.concurrency,
+                    detachable=t.detachable,
                 )
                 for t in agent.tools
                 if t.name != "spawn_agent"

@@ -23,7 +23,7 @@ from .permission import ConcurrentGuard, PermissionGuard
 from .realtime import RealtimeAgent
 from .selector import ToolSelector
 from .stream import AgentStream
-from .tool import CONTEXT, Tool
+from .tool import CONTEXT, CURRENT_TOOL_CALL, Tool, ToolCallContext
 from .transport import CompletionTransport, RealtimeSession, RealtimeTransport
 from .types import StopReason, Usage
 
@@ -32,6 +32,8 @@ __all__ = [
     "Agent",
     "Tool",
     "CONTEXT",
+    "CURRENT_TOOL_CALL",
+    "ToolCallContext",
     "ContextStore",
     "MemoryContextStore",
     "CompletionTransport",

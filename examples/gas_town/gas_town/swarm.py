@@ -557,7 +557,14 @@ async def run_gastown(
             guard_factory=guard_factory,
         )
         mayor_read_tools = [
-            Tool(name=t.name, description=t.description, handler=t.handler, context=t.context, guards=og(t.name))
+            Tool(
+                name=t.name,
+                description=t.description,
+                handler=t.handler,
+                context=t.context,
+                guards=og(t.name),
+                detachable=t.detachable,
+            )
             for t in toolbox.values()
             if t.name in {"list_files", "read_file"}
         ]

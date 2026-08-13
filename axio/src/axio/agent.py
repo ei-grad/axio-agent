@@ -7,7 +7,8 @@ import dataclasses
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Self
@@ -33,11 +34,20 @@ from .messages import Message
 from .models import Capability
 from .selector import ToolSelector
 from .stream import AgentStream
-from .tool import BACKGROUND_PARAM, Tool
+from .tool import BACKGROUND_PARAM, CURRENT_TOOL_CALL, Tool, ToolCallContext
 from .transport import CompletionTransport
 from .types import StopReason, Usage
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _tool_call_scope(block: ToolUseBlock, iteration: int) -> Iterator[None]:
+    token = CURRENT_TOOL_CALL.set(ToolCallContext(tool_use_id=block.id, tool_name=block.name, iteration=iteration))
+    try:
+        yield
+    finally:
+        CURRENT_TOOL_CALL.reset(token)
 
 
 class _RepetitionDetector:
@@ -155,19 +165,27 @@ class Agent:
             logger.debug("Tool %s (id=%s) args=%s", block.name, block.id, json.dumps(block.input)[:200])
             args = {k: v for k, v in block.input.items() if k != BACKGROUND_PARAM}
             if block.input.get(BACKGROUND_PARAM):
-                handle = background.start(block.name, _tool_result_text(tool, args))
+                if not tool.detachable:
+                    return ToolResultBlock(
+                        tool_use_id=block.id,
+                        content=f"Tool {block.name} does not support background execution.",
+                        is_error=True,
+                    )
+                with _tool_call_scope(block, iteration):
+                    handle = background.start(block.name, _tool_result_text(tool, args))
                 return ToolResultBlock(tool_use_id=block.id, content=background.started_message(block.name, handle))
-            try:
-                result = await tool(**args)
-                if isinstance(result, str):
-                    content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
-                elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
-                    content = result
-                else:
-                    content = str(result)
-            except Exception as exc:
-                logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
-                return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
+            with _tool_call_scope(block, iteration):
+                try:
+                    result = await tool(**args)
+                    if isinstance(result, str):
+                        content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
+                    elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
+                        content = result
+                    else:
+                        content = str(result)
+                except Exception as exc:
+                    logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                    return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
             return ToolResultBlock(tool_use_id=block.id, content=content)
 
         results = list(await asyncio.gather(*[_run_one(b) for b in blocks]))
@@ -192,34 +210,43 @@ class Agent:
             logger.debug("Tool %s (id=%s) args=%s", block.name, block.id, json.dumps(block.input)[:200])
             args = {k: v for k, v in block.input.items() if k != BACKGROUND_PARAM}
             if block.input.get(BACKGROUND_PARAM):
-                handle = background.start(block.name, _tool_result_text(tool, args))
+                if not tool.detachable:
+                    return ToolResultBlock(
+                        tool_use_id=block.id,
+                        content=f"Tool {block.name} does not support background execution.",
+                        is_error=True,
+                    )
+                with _tool_call_scope(block, iteration):
+                    handle = background.start(block.name, _tool_result_text(tool, args))
                 return ToolResultBlock(tool_use_id=block.id, content=background.started_message(block.name, handle))
 
             if tool.supports_streaming:
                 chunks: list[tuple[float, str, str]] = []
                 t0 = time.monotonic()
-                try:
-                    async for key, text in tool.call_streaming(**args):
-                        chunks.append((time.monotonic() - t0, key, text))
-                        await output_queue.put(
-                            ToolOutputDelta(tool_use_id=block.id, name=block.name, key=key, delta=text)
-                        )
-                except Exception as exc:
-                    logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
-                    return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
+                with _tool_call_scope(block, iteration):
+                    try:
+                        async for key, text in tool.call_streaming(**args):
+                            chunks.append((time.monotonic() - t0, key, text))
+                            await output_queue.put(
+                                ToolOutputDelta(tool_use_id=block.id, name=block.name, key=key, delta=text)
+                            )
+                    except Exception as exc:
+                        logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                        return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=tool.format_stream_result(chunks))
             else:
-                try:
-                    result = await tool(**args)
-                    if isinstance(result, str):
-                        content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
-                    elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
-                        content = result
-                    else:
-                        content = str(result)
-                except Exception as exc:
-                    logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
-                    return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
+                with _tool_call_scope(block, iteration):
+                    try:
+                        result = await tool(**args)
+                        if isinstance(result, str):
+                            content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
+                        elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
+                            content = result
+                        else:
+                            content = str(result)
+                    except Exception as exc:
+                        logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                        return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=content)
 
         results = list(await asyncio.gather(*[_run_one(b) for b in blocks]))

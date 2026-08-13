@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
@@ -92,6 +93,12 @@ class TestTool:
     def test_concurrency_default_none(self) -> None:
         t: Tool[Any] = Tool(name="c", description="concurrent", handler=_empty)
         assert t.concurrency is None
+
+    def test_detachable_defaults_true_and_survives_dataclass_copy(self) -> None:
+        t: Tool[Any] = Tool(name="foreground", handler=_empty, detachable=False)
+        copied = replace(t, description="copy")
+        assert not t.detachable
+        assert not copied.detachable
 
     async def test_concurrency_limits_parallel_calls(self) -> None:
         """concurrency=N must prevent more than N simultaneous handler executions."""

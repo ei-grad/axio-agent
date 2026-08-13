@@ -28,6 +28,13 @@ async def _concurrent_handler(text: str = "") -> str:
 _concurrent_handler._tool_concurrency = 2  # type: ignore[attr-defined]
 
 
+async def _foreground_handler(text: str = "") -> str:
+    return text
+
+
+_foreground_handler._tool_detachable = False  # type: ignore[attr-defined]
+
+
 class _FakeGuard(PermissionGuard):
     async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
         return kwargs
@@ -54,6 +61,7 @@ class TestDiscoverTools:
         assert tools[0].description == "Echo back input text."
         assert tools[0].handler is _echo_handler
         assert tools[0].concurrency is None
+        assert tools[0].detachable
 
     @patch("axio_tui.plugin.entry_points")
     def test_uses_empty_string_when_no_docstring(self, mock_eps: MagicMock) -> None:
@@ -66,6 +74,12 @@ class TestDiscoverTools:
         mock_eps.return_value = [_make_entry_point("concurrent", _concurrent_handler)]
         tools = discover_tools()
         assert tools[0].concurrency == 2
+
+    @patch("axio_tui.plugin.entry_points")
+    def test_respects_tool_detachable(self, mock_eps: MagicMock) -> None:
+        mock_eps.return_value = [_make_entry_point("foreground", _foreground_handler)]
+        tools = discover_tools()
+        assert not tools[0].detachable
 
     @patch("axio_tui.plugin.entry_points")
     def test_skips_non_callable(self, mock_eps: MagicMock) -> None:
