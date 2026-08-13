@@ -1,8 +1,15 @@
 """Block until something happens, instead of asking again and again.
 
-Polling from the model is the expensive way to wait: every check is a whole turn
-— the system prompt re-prefilled, tokens generated to say "still waiting" — and
-on a local model that costs more than the work being waited on. Worse, an agent
+Nothing here has to be called to *learn* an outcome: a detached call's result
+and a spawned agent's finished or failed turn are delivered on their own, into
+the running turn or as the next prompt. What is left is waiting — the case where
+the turn cannot go on without the outcome, so ending it and being woken up later
+is the wrong shape: joining a swarm before summarising it, watching a file a
+build writes, waiting out a process.
+
+Doing that from the model is the expensive way: every check is a whole turn —
+the system prompt re-prefilled, tokens generated to say "still waiting" — and on
+a local model that costs more than the work being waited on. Worse, an agent
 polling `list_peers` never learns that what it waits for has died, so it can
 loop forever.
 
@@ -159,20 +166,26 @@ async def monitor(
     wait_all: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> str:
-    """Wait for something to happen instead of polling for it.
+    """Wait, inside this turn, for something you cannot continue without.
 
-    Blocks until one of the watched conditions fires, then reports what happened
-    and the state of everything watched. Watch spawned agents by id (`agents`),
-    detached tool calls by handle (`tasks`), files or directories (`paths`),
-    processes (`pids`), or incoming messages from other agents (`messages`).
-    Finished tasks are reported with their full output — this is how a call made
-    with background=true delivers its result. With `wait_all=true` and `agents`
-    given, it returns only once every one of them has finished.
+    Results of detached calls and the fate of agents you spawned reach you by
+    themselves — call this only when the answer has to arrive before this turn
+    goes on. Blocks until one of the watched conditions fires, then reports what
+    happened and the state of everything watched. Watch spawned agents by id
+    (`agents`), detached tool calls by handle (`tasks`), files or directories
+    (`paths`), processes (`pids`), or incoming messages from other agents
+    (`messages`). A finished task is reported with its full output, so this is
+    also how you read one that was truncated on delivery. With `wait_all=true`
+    and `agents` given, it returns only once every one of them has finished —
+    the way to join a swarm before summarising it.
 
     Messages are watched only when nothing else is named, or when you ask for
-    them with `messages=true`. Naming what to wait for and then returning on an
-    unrelated message would make `wait_all` mean nothing: a child that reports
-    in early ends the wait for every other child.
+    them with `messages=true`. Unlike the deliveries above, a peer message is
+    still handed to you as your next prompt and never mid-turn: waiting for one
+    tells you it arrived, and you have to end the turn to read it. Naming what
+    to wait for and then returning on an unrelated message would make `wait_all`
+    mean nothing: a child that reports in early ends the wait for every other
+    child.
 
     Returns on timeout as well, reporting what is still outstanding, so a
     result is never an error — decide from the report whether to wait again.

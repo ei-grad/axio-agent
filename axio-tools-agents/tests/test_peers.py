@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
 import pytest
+from axio import notify
 from axio.agent import Agent
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
@@ -21,6 +22,7 @@ from axio_tools_agents.peers import (
     interrupt_agent,
     is_local_background_agent,
     list_peers,
+    mark_background_report_delivered,
     send_message,
     set_spawn_agent_factory,
     spawn_agent,
@@ -36,6 +38,15 @@ async def peer_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
     yield
     await stop_local_background_agents()
     set_spawn_agent_factory(None)
+
+
+@pytest.fixture(autouse=True)
+def clean_notification_bus() -> Iterator[None]:
+    # Owner buckets live for the process, so a queue or listener left by one
+    # test would be drained by the next one.
+    notify._buckets.clear()
+    yield
+    notify._buckets.clear()
 
 
 async def _noop_handler(message: PeerMessage) -> None:
@@ -380,3 +391,166 @@ async def test_an_explicit_name_is_kept() -> None:
     result = await spawn_agent(task="anything", name="docs-audit")
 
     assert "name='docs-audit'" in result
+
+
+class _AnsweringTransport:
+    """A model that answers every prompt in one iteration."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls.append(messages[-1].content[0].text)  # type: ignore[attr-defined]
+        yield TextDelta(index=0, delta="answered")
+        yield IterationEnd(iteration=len(self.calls), stop_reason=StopReason.end_turn, usage=Usage(0, 0))
+
+
+def _spawn_id(result: str) -> str:
+    return result.split("agent_id=", 1)[1].split(" ", 1)[0]
+
+
+async def _start_parent(tmp_path: Path, name: str = "parent") -> PeerServer:
+    return await PeerServer(name, kind="test", handler=_noop_handler, project=str(tmp_path)).start()
+
+
+async def test_a_finished_child_turn_is_announced_to_its_parent_once(tmp_path: Path) -> None:
+    transport = _AnsweringTransport()
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        agent_id = _spawn_id(await spawn_agent(task="do the thing"))
+        await _wait_for(lambda: len(received) == 1)
+
+        assert agent_id in received[0]
+        assert "finished its turn and is idle" in received[0]
+
+        # Stopping is the parent's own doing, so it is not news to report back.
+        assert (await stop_agent(agent_id=agent_id, reason="done")).startswith("Sent stop")
+        await _wait_for(lambda: not is_local_background_agent(agent_id))
+        assert len(received) == 1
+    finally:
+        await parent.close()
+
+
+async def test_a_failed_child_turn_carries_the_error_to_its_parent(tmp_path: Path) -> None:
+    async def noop() -> str:
+        return "ok"
+
+    transport = _LoopingTransport()
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        agent = Agent(
+            system="child",
+            tools=[Tool(name="noop", handler=noop)],
+            transport=transport,
+            max_iterations=2,
+        )
+        return agent, MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        _spawn_id(await spawn_agent(task="go"))
+        await _wait_for(lambda: len(received) == 1)
+
+        assert "turn failed" in received[0]
+        assert "2 iterations" in received[0]
+    finally:
+        await parent.close()
+
+
+async def test_a_turn_already_reported_to_the_parent_is_not_announced_again(tmp_path: Path) -> None:
+    transport = _DelayedTransport()
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        agent_id = _spawn_id(await spawn_agent(task="do the thing"))
+        await asyncio.wait_for(transport.started.wait(), timeout=1)
+
+        mark_background_report_delivered(agent_id, parent.id)
+        transport.release.set()
+        await asyncio.wait_for(wait_local_background_agents_idle([agent_id]), timeout=1)
+
+        assert received == []
+    finally:
+        await parent.close()
+
+
+async def test_a_report_delivered_elsewhere_still_announces_to_the_parent(tmp_path: Path) -> None:
+    transport = _DelayedTransport()
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        agent_id = _spawn_id(await spawn_agent(task="do the thing"))
+        await asyncio.wait_for(transport.started.wait(), timeout=1)
+
+        mark_background_report_delivered(agent_id, "some-other-peer")
+        transport.release.set()
+        await asyncio.wait_for(wait_local_background_agents_idle([agent_id]), timeout=1)
+
+        assert len(received) == 1
+        assert "finished its turn and is idle" in received[0]
+    finally:
+        await parent.close()
+
+
+async def test_an_idle_child_takes_a_notification_as_its_next_prompt() -> None:
+    transport = _AnsweringTransport()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    agent_id = _spawn_id(await spawn_agent(task="start something detached"))
+    await _wait_for(lambda: background_agent_state(agent_id)[0] == "idle")
+
+    notify.post("[background task t-1] shell: finished\nexit 0", owner=agent_id)
+
+    await _wait_for(lambda: len(transport.calls) == 2)
+    assert "[background task t-1] shell: finished" in transport.calls[1]
+
+
+async def test_a_stopped_agent_leaves_no_listener_or_queue_behind() -> None:
+    transport = _AnsweringTransport()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    agent_id = _spawn_id(await spawn_agent(task="do the thing"))
+    await _wait_for(lambda: background_agent_state(agent_id)[0] == "idle")
+
+    assert (await stop_agent(agent_id=agent_id, reason="done")).startswith("Sent stop")
+    await _wait_for(lambda: not is_local_background_agent(agent_id))
+
+    assert notify.drain(agent_id) == []
+    # A detached call finishing after the agent died must not wake anything: with
+    # the listener gone the text only waits, and monitor(tasks=[...]) still has it.
+    notify.post("[background task t-1] shell: finished", owner=agent_id)
+    assert notify.drain(agent_id) == ["[background task t-1] shell: finished"]
+    assert len(transport.calls) == 1

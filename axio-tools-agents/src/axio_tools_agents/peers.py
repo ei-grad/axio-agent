@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Self
 from uuid import uuid4
 
+from axio import notify
 from axio.agent import Agent
 from axio.context import ContextStore
 from axio.events import Error, StreamEvent
@@ -115,6 +116,10 @@ class _BackgroundAgent:
     # A failed turn leaves the agent alive and waiting, so without this the
     # parent cannot tell a crashed agent from one that finished its work.
     last_error: str | None = None
+    parent_id: str | None = None
+    # Who already received this turn's answer text, so the parent is not told
+    # "finished its turn" right after reading the answer itself.
+    reported_to: str | None = None
 
 
 _background_agents: dict[str, _BackgroundAgent] = {}
@@ -192,6 +197,37 @@ def _notify_idle(background: _BackgroundAgent) -> None:
     for waiter in waiters:
         if not waiter.done():
             waiter.set_result(None)
+
+
+def mark_background_report_delivered(agent_id: str, recipient_peer_id: str | None) -> None:
+    """Record that the agent's turn was already reported to *recipient_peer_id*.
+
+    The REPL hands a finished child's answer straight to its parent's prompt
+    queue; telling that parent a second time that the child is idle adds a turn
+    and no information. Unknown ids are ignored — the agent may be gone already.
+    """
+    background = _background_agents.get(agent_id)
+    if background is not None:
+        background.reported_to = recipient_peer_id
+
+
+def _notify_parent_of_turn_end(background: _BackgroundAgent) -> None:
+    """Tell the parent its child went idle, unless it already knows.
+
+    Every finished turn is news for the parent, including one it prompted
+    itself: it is the answer to that prompt. A stop is the exception — the
+    parent asked for it and gets the outcome from stop_agent.
+    """
+    if background.stopping or not _is_background_idle(background):
+        return
+    if background.reported_to is not None and background.reported_to == background.parent_id:
+        return
+    peer = background.peer
+    if background.last_error:
+        text = f"[agent {peer.name} ({peer.id})] turn failed: {background.last_error}"
+    else:
+        text = f"[agent {peer.name} ({peer.id})] finished its turn and is idle."
+    notify.post(text, owner=background.parent_id)
 
 
 def _finish_pending_prompts(background: _BackgroundAgent) -> None:
@@ -272,6 +308,18 @@ def set_current_peer(peer: PeerServer | None) -> contextvars.Token[PeerServer | 
 
 def current_peer() -> PeerServer | None:
     return _current_peer.get()
+
+
+def _current_owner_id() -> str | None:
+    peer = current_peer()
+    return peer.id if peer is not None else None
+
+
+# The peer identity already tracks who is running: the main agent sets it when
+# its server starts, and every child turn runs inside peer_context. Notifications
+# are addressed by the same id, so the bus reads it from here instead of keeping
+# a second contextvar that would have to be kept in step with this one.
+notify.set_owner_resolver(_current_owner_id)
 
 
 @contextlib.contextmanager
@@ -475,8 +523,9 @@ class PeerServer:
 async def list_peers(all_projects: bool = False) -> str:
     """List other running axio agents. By default only peers in the current
     project are returned. Pass all_projects=true to inspect peers from every
-    project on this host. This is a snapshot for discovery — to wait for an
-    agent, call monitor() rather than calling this in a loop."""
+    project on this host. This is a snapshot for discovery — agents you spawned
+    tell you themselves when they finish, and monitor() is how you wait for one
+    inside this turn, so never call this in a loop."""
     records = _visible_records(await list_peer_records(), all_projects=all_projects)
     if not records:
         if all_projects:
@@ -643,6 +692,7 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
             turn = asyncio.create_task(_run_agent_turn(background=background, prompt=queued.prompt))
             background.current_turn = turn
             background.last_error = None
+            background.reported_to = None
             try:
                 await turn
             except asyncio.CancelledError:
@@ -659,11 +709,16 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
                 _notify_idle(background)
+                _notify_parent_of_turn_end(background)
             if background.stopping:
                 break
     finally:
         _finish_pending_prompts(background)
         _background_agents.pop(background.peer.id, None)
+        # A detached call started by this agent can still complete after it is
+        # gone; without this its notification would sit in a queue nobody drains.
+        # The output stays collectable with monitor(tasks=[handle]).
+        notify.discard(background.peer.id)
         await background.peer.close()
 
 
@@ -675,6 +730,7 @@ async def _start_background_agent(
     name: str,
     project: str,
     cwd: str,
+    parent_id: str | None,
 ) -> _BackgroundAgent:
     accept_lock = asyncio.Lock()
     background: _BackgroundAgent
@@ -706,8 +762,12 @@ async def _start_background_agent(
         project=project,
         cwd=cwd,
     ).start(set_current=False)
-    background = _BackgroundAgent(agent=agent, context=context, peer=peer)
+    background = _BackgroundAgent(agent=agent, context=context, peer=peer, parent_id=parent_id)
     _background_agents[peer.id] = background
+    # Between turns the agent is not draining anything, so its own notifications
+    # — a detached call finishing, a child of its own going idle — arrive as the
+    # prompt that starts the next turn.
+    notify.add_listener(peer.id, lambda text: background.inbox.put_nowait(_QueuedPrompt(text)))
     background.inbox.put_nowait(_QueuedPrompt(initial_task))
     background.runner = asyncio.create_task(_run_background_agent(background))
     return background
@@ -774,11 +834,13 @@ async def spawn_agent(
     inherit_context=true only when the spawned agent must see the current
     conversation. The spawned agent remains available for IPC until it is
     explicitly stopped. This returns immediately and never carries the child's
-    answer — wait for it with monitor(agents=[id]), which also tells you if the
-    child died instead of finishing. Pass a short `name` describing the child's
-    job — "docs-audit", "transport-review" — since you will be reading it back
-    in list_peers and monitor; without one the child is named at random, which
-    identifies it but tells you nothing."""
+    answer: the child announces to you on its own, both when it finishes a turn
+    and when one fails, so you do not have to watch it. Call
+    monitor(agents=[id], wait_all=true) only when you cannot continue this turn
+    without the child — to join a swarm before summarising it, say. Pass a short
+    `name` describing the child's job — "docs-audit", "transport-review" — since
+    you will be reading it back in list_peers and monitor; without one the child
+    is named at random, which identifies it but tells you nothing."""
     if _spawn_agent_factory is None:
         return "spawn_agent is not configured"
 
@@ -794,6 +856,7 @@ async def spawn_agent(
         name=base_name,
         project=project,
         cwd=cwd,
+        parent_id=parent.id if parent is not None else None,
     )
     return (
         f"Spawned background agent_id={background.peer.id} name={background.peer.name!r}. "
