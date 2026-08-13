@@ -135,6 +135,42 @@ class TestToolRules:
         assert "send_message(agent_id='parent-123'" in prompt
 
 
+class TestNotificationGuidance:
+    """background=true and spawn_agent results now arrive via the notify bus.
+
+    See axio.notify: a detached call's or child's outcome is delivered
+    automatically (mid-turn injection or next-prompt), not just observable by
+    polling monitor(). These bullets must say so and must not claim monitor is
+    the only way to learn a result is ready.
+    """
+
+    def test_background_bullet_mentions_automatic_delivery(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("shell")])
+        assert "delivered automatically" in prompt
+        assert "you never need to poll for it" in prompt
+        assert "monitor(tasks=[handle])" in prompt
+
+    def test_spawn_agent_bullet_mentions_automatic_delivery(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
+        assert "announced to you automatically" in prompt
+        assert "never need to poll or monitor just to learn a child is done" in prompt
+
+    def test_spawn_agent_bullet_keeps_monitor_join_guidance(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("spawn_agent")])
+        assert "monitor(agents=[...], wait_all=true)" in prompt
+        assert "monitor(messages=true)" in prompt
+        assert "delivered only as your next prompt" in prompt
+        assert "paths=/pids=" in prompt
+
+    def test_no_spawn_agent_bullets_without_the_tool(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+        prompt = build_system_prompt(_ROOT, model, [_tool("shell")])
+        assert "announced to you automatically" not in prompt
+
+
 class TestAgentsText:
     def test_agents_text_appended(self) -> None:
         model = ModelSpec(id="test", capabilities=_CHAT_CAPS)

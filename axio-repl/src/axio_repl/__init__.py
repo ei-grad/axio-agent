@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import aiohttp
+from axio import notify
 from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
@@ -62,6 +63,7 @@ from axio_tools_agents.peers import (
     is_local_background_agent,
     list_peers,
     local_background_agent_records,
+    mark_background_report_delivered,
     send_message,
     set_agent_event_handler,
     set_pending_message_probe,
@@ -302,10 +304,13 @@ def build_system_prompt(
             "- Never use generate_image as a substitute for real UI testing.",
             "- Never run destructive shell commands (rm -rf, git reset --hard) without user confirmation.",
             "- For large files, read specific line ranges instead of the entire file.",
-            "- Any tool call accepts background=true: it returns a handle at once and keeps running, and you "
-            "collect the output later with monitor(tasks=[handle]). Use it for calls slow enough to be worth "
-            "doing while you carry on — a test suite, a build, a long download. Do not use it when you need the "
-            "result to decide your next step, and never for quick reads: the handle costs an extra round trip.",
+            "- Any tool call accepts background=true: it returns a handle at once and keeps running. The result is "
+            "delivered automatically — injected into your turn if you are still working, or as your next prompt "
+            "if you have already finished — so you never need to poll for it. Use monitor(tasks=[handle]) only "
+            "when you cannot proceed without the result right now. Use background=true for calls slow enough to "
+            "be worth doing while you carry on — a test suite, a build, a long download. Do not use it when you "
+            "need the result to decide your next step, and never for quick reads: the handle costs an extra "
+            "round trip.",
         ]
         if any(t.name == "spawn_agent" for t in tools):
             lines += [
@@ -322,11 +327,13 @@ def build_system_prompt(
                 "results will appear later unless you have arranged one of those delivery paths.",
                 "- Use list_peers() to discover running agents in this project, or list_peers(all_projects=true) "
                 "to inspect all local agent ids. Use send_message(agent_id=..., message=...) for IPC by global id.",
-                "- To wait, call monitor(...) — never poll. Calling list_peers repeatedly costs a full turn each "
-                "time and cannot tell you that a child has died, so it can loop forever. monitor blocks until "
-                "something actually happens: monitor(agents=[...], wait_all=true) to join spawned children, "
-                "monitor(messages=true) to wait for a child to report back, and paths=/pids= to wait on files or "
-                "processes. It reports a crashed child as finished, with its error, and a timeout returns what is "
+                "- A spawned child's completion or failure is announced to you automatically — injected into your "
+                "turn if you are still working, or as your next prompt if you have already finished — so you "
+                "never need to poll or monitor just to learn a child is done. Call monitor(agents=[...], "
+                "wait_all=true) only when you must join a swarm within this turn before proceeding; it reports a "
+                "crashed child as finished, with its error. monitor(messages=true) waits for a child's PEER "
+                "MESSAGE (sent via send_message) — those are still delivered only as your next prompt, never "
+                "injected mid-turn. Use paths=/pids= to wait on files or processes. A timeout returns what is "
                 "still outstanding rather than failing — so decide from that report whether to wait again.",
                 "- Use interrupt_agent(agent_id=...) to cancel a spawned agent's current response while keeping it "
                 "alive. Use stop_agent(agent_id=...) only when the child should exit. A parent may interrupt or "
@@ -1186,6 +1193,7 @@ async def main() -> None:
 
         def _queue_background_report(agent_id: str, text: str) -> None:
             peer_queue.put_nowait(f"Report from background agent {agent_id}:\n\n{text}")
+            mark_background_report_delivered(agent_id, parent_peer_id)
 
         stats = _panel.SessionStats()
         renderer = ReplRenderer(
@@ -1301,8 +1309,10 @@ async def main() -> None:
                     agents_text,
                     parent_peer_id=parent_peer_id,
                 )
+                notify.add_listener(peer_server.id, peer_queue.put_nowait)
             except OSError as exc:
                 print(f"{DIM}[peer messaging disabled: {exc}]{RESET}")
+                notify.add_listener(None, peer_queue.put_nowait)
 
             if args.prompt:
                 await _run_turn(args.prompt)
@@ -1432,6 +1442,7 @@ async def main() -> None:
                 if task is not None and not task.done():
                     task.cancel()
             await stop_local_background_agents()
+            notify.remove_listener(peer_server.id if peer_server is not None else None)
             if peer_server is not None:
                 await peer_server.close()
             set_agent_event_handler(None)
