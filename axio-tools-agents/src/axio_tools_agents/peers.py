@@ -18,6 +18,7 @@ from axio import notify
 from axio.agent import Agent
 from axio.context import ContextStore
 from axio.events import StreamEvent
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 from axio.tool import CURRENT_TOOL_CALL
 
@@ -661,16 +662,16 @@ async def send_message(agent_id: StrictStr, message: StrictStr) -> str:
     list_peers first to find the id. Incoming peer messages appear automatically
     in the recipient's dialog; there is no receive tool."""
     if len(message) > MAX_MESSAGE_CHARS:
-        return f"Message is too large; limit is {MAX_MESSAGE_CHARS} characters."
+        raise HandlerError(f"Message is too large; limit is {MAX_MESSAGE_CHARS} characters.")
 
     records = _visible_records(await list_peer_records(), all_projects=True)
     peer = _resolve_peer_by_id(records, agent_id)
     if peer is None:
-        return f"No peer found for agent_id={agent_id!r}. Call list_peers first."
+        raise HandlerError(f"No peer found for agent_id={agent_id!r}. Call list_peers first.")
 
     sender = current_peer()
     if sender is not None and peer.id == sender.id:
-        return "Cannot send a peer message to the current agent."
+        raise HandlerError("Cannot send a peer message to the current agent.")
 
     from_id = sender.id if sender is not None else f"unregistered-{os.getpid()}"
     from_name = sender.name if sender is not None else f"unregistered-{os.getpid()}"
@@ -689,14 +690,14 @@ async def send_message(agent_id: StrictStr, message: StrictStr) -> str:
     except (OSError, TimeoutError) as exc:
         _safe_unlink(_registry_path(peer.id))
         _safe_unlink(peer.socket_path)
-        return f"Failed to connect to peer {peer.id}: {exc}"
+        raise HandlerError(f"Failed to connect to peer {peer.id}: {exc}") from exc
 
     try:
         writer.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
         await asyncio.wait_for(writer.drain(), timeout=3)
         raw = await asyncio.wait_for(reader.readline(), timeout=3)
     except (ConnectionError, OSError, TimeoutError) as exc:
-        return f"Failed to send message to peer {peer.id}: {exc}"
+        raise HandlerError(f"Failed to send message to peer {peer.id}: {exc}") from exc
     finally:
         writer.close()
         with contextlib.suppress(ConnectionError, OSError):
@@ -705,7 +706,7 @@ async def send_message(agent_id: StrictStr, message: StrictStr) -> str:
     try:
         response = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return f"Peer {peer.id} returned an invalid response: {exc}"
+        raise HandlerError(f"Peer {peer.id} returned an invalid response: {exc}") from exc
     if response.get("ok") is not True:
         return f"Peer {peer.id} rejected the message: {response.get('error', 'unknown error')}"
     return f"Delivered message to {peer.name} ({peer.id})."
@@ -715,11 +716,11 @@ async def _send_control_request(agent_id: str, request_type: str, reason: str) -
     records = _visible_records(await list_peer_records(), all_projects=True)
     peer = _resolve_peer_by_id(records, agent_id)
     if peer is None:
-        return f"No peer found for agent_id={agent_id!r}. Call list_peers first."
+        raise HandlerError(f"No peer found for agent_id={agent_id!r}. Call list_peers first.")
 
     sender = current_peer()
     if sender is not None and peer.id == sender.id:
-        return f"Cannot {request_type} the current agent."
+        raise HandlerError(f"Cannot {request_type} the current agent.")
 
     payload = {
         "type": request_type,
@@ -736,14 +737,14 @@ async def _send_control_request(agent_id: str, request_type: str, reason: str) -
     except (OSError, TimeoutError) as exc:
         _safe_unlink(_registry_path(peer.id))
         _safe_unlink(peer.socket_path)
-        return f"Failed to connect to peer {peer.id}: {exc}"
+        raise HandlerError(f"Failed to connect to peer {peer.id}: {exc}") from exc
 
     try:
         writer.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
         await asyncio.wait_for(writer.drain(), timeout=3)
         raw = await asyncio.wait_for(reader.readline(), timeout=3)
     except (ConnectionError, OSError, TimeoutError) as exc:
-        return f"Failed to send {request_type} to peer {peer.id}: {exc}"
+        raise HandlerError(f"Failed to send {request_type} to peer {peer.id}: {exc}") from exc
     finally:
         writer.close()
         with contextlib.suppress(ConnectionError, OSError):
@@ -752,7 +753,7 @@ async def _send_control_request(agent_id: str, request_type: str, reason: str) -
     try:
         response = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return f"Peer {peer.id} returned an invalid response: {exc}"
+        raise HandlerError(f"Peer {peer.id} returned an invalid response: {exc}") from exc
     if response.get("ok") is not True:
         return f"Peer {peer.id} rejected {request_type}: {response.get('error', 'unknown error')}"
     return f"Sent {request_type} to {peer.name} ({peer.id})."
@@ -1010,7 +1011,7 @@ async def spawn_agent(
     you will be reading it back in list_peers and monitor; without one the child
     is named at random, which identifies it but tells you nothing."""
     if _spawn_agent_factory is None:
-        return "spawn_agent is not configured"
+        raise HandlerError("spawn_agent is not configured")
 
     try:
         parent_tool_use_id = CURRENT_TOOL_CALL.get().tool_use_id
@@ -1057,7 +1058,7 @@ async def run_agent(
     """
 
     if _run_agent_factory is None:
-        raise RuntimeError("run_agent is not configured")
+        raise HandlerError("run_agent is not configured")
 
     try:
         parent_tool_use_id = CURRENT_TOOL_CALL.get().tool_use_id
@@ -1116,9 +1117,9 @@ async def run_agent(
             await _session_event_hub.publish_for(identity, AgentStopped(status=status))
 
     if outcome is None:
-        raise RuntimeError("foreground agent stopped without an outcome")
+        raise HandlerError("foreground agent stopped without an outcome")
     if not outcome.succeeded:
-        raise RuntimeError(outcome.error or "foreground agent failed")
+        raise HandlerError(outcome.error or "foreground agent failed")
     return outcome.text
 
 

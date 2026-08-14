@@ -7,6 +7,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from axio.exceptions import HandlerError
 from axio.tool import Tool
 from mcp.types import CallToolResult, TextContent
 
@@ -36,7 +37,7 @@ async def test_call_forwarding() -> None:
 
 
 async def test_error_handling() -> None:
-    """Handler raises RuntimeError when isError=True."""
+    """Handler raises HandlerError when isError=True."""
     session = _make_mock_session()
     cast(AsyncMock, session.call_tool).return_value = CallToolResult(
         content=[TextContent(type="text", text="not found")],
@@ -44,7 +45,7 @@ async def test_error_handling() -> None:
     )
 
     handler = build_handler("fs__read", "read", "Read file", session)
-    with pytest.raises(RuntimeError, match="not found"):
+    with pytest.raises(HandlerError, match="not found"):
         await handler(path="/missing")
 
 
@@ -165,8 +166,6 @@ async def test_schema_type_validated_at_runtime() -> None:
         handler=handler,
         schema=MappingProxyType(mcp_schema),
     )
-
-    from axio.exceptions import HandlerError
 
     with pytest.raises(HandlerError, match="requires int"):
         await tool(count="not-an-int")
