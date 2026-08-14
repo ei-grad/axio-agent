@@ -140,8 +140,10 @@ recognized. Treat journals as sensitive local data.
 `native-effort` or `native-budget`; transports without verified granular control use `prompt-fallback`. The fallback
 adds one replaceable system-prompt overlay describing observable analysis and verification behavior. It does not add
 a conversation message and does not claim control over provider reasoning tokens, latency, or cost. `/effort default`
-removes the explicit native setting or prompt overlay and restores the provider/model default. A model switch reapplies
-the requested level and reports when the effective mechanism changes.
+removes the explicit native setting or prompt overlay and restores the provider/model default. For `native-effort`,
+the requested level must exactly match a level advertised for the selected model; unsupported levels are rejected
+instead of being mapped or routed through prompt fallback. A model switch reapplies the requested level, or resets it
+to `default` with an explicit message when the new model does not support that exact level.
 
 ## Foreground delegation and agent actions
 

@@ -59,6 +59,21 @@ def test_reasoning_effort_is_sent_only_when_supported() -> None:
     assert "reasoning" not in payload
 
 
+def test_native_reasoning_effort_requires_an_exact_supported_level() -> None:
+    model = ModelSpec(
+        id="gpt-5.5-pro",
+        capabilities=frozenset({Capability.text, Capability.reasoning}),
+    )
+    transport = OpenAIResponsesTransport(model=model)
+
+    state = transport.configure_effort("default")
+
+    assert state.allowed == ("medium", "high", "xhigh")
+    with pytest.raises(ValueError, match="low.*not supported"):
+        transport.configure_effort("low")
+    assert transport.reasoning_effort is None
+
+
 def test_tool_calls_and_results_become_top_level_items() -> None:
     messages = [
         Message(role="assistant", content=[ToolUseBlock(id="call-1", name="echo", input={"text": "x"})]),

@@ -15,7 +15,7 @@ from typing import Any, ClassVar, Self
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
-from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
+from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -34,7 +34,7 @@ _RT = frozenset({Capability.text, Capability.reasoning, Capability.tool_use})
 _TT = frozenset({Capability.text, Capability.tool_use})
 _VRT = frozenset({Capability.text, Capability.vision, Capability.reasoning, Capability.tool_use})
 
-_OPENAI_REASONING_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+_OPENAI_REASONING_EFFORTS: tuple[tuple[str, tuple[EffortLevel, ...]], ...] = (
     ("gpt-5.6", ("none", "low", "medium", "high", "xhigh", "max")),
     ("gpt-5.5-pro", ("medium", "high", "xhigh")),
     ("gpt-5.5", ("none", "low", "medium", "high", "xhigh")),
@@ -47,7 +47,7 @@ _OPENAI_REASONING_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def _openai_reasoning_efforts(model_id: str) -> tuple[str, ...]:
+def _openai_reasoning_efforts(model_id: str) -> tuple[EffortLevel, ...]:
     for prefix, efforts in _OPENAI_REASONING_EFFORTS:
         if model_id == prefix or model_id.startswith(f"{prefix}-"):
             return efforts
@@ -532,10 +532,15 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
             mechanism = (
                 EffortMechanism.native_effort if native_responses and supported else EffortMechanism.prompt_fallback
             )
-            return EffortState(None, mechanism)
-        if native_responses and level in supported:
+            allowed = supported if mechanism is EffortMechanism.native_effort else EFFORT_LEVELS
+            return EffortState(None, mechanism, allowed=allowed)
+        if native_responses and supported:
+            if level not in supported:
+                raise ValueError(
+                    f"Effort {level!r} is not supported by {self.model.id}. Valid values: {', '.join(supported)}"
+                )
             self.reasoning_effort = level
-            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level, allowed=supported)
         self.reasoning_effort = None
         return PromptEffortAdapter().configure_effort(level)
 

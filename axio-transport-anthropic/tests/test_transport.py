@@ -194,8 +194,14 @@ class TestKVCache:
         payload = transport.build_payload([], [], "")
 
         assert state.mechanism.value == "native-effort"
+        assert state.allowed == ("low", "medium", "high", "max")
         assert payload["thinking"] == {"type": "adaptive"}
         assert payload["output_config"] == {"effort": "medium"}
+
+        with pytest.raises(ValueError, match="xhigh.*not supported"):
+            transport.configure_effort("xhigh")
+
+        assert transport.build_payload([], [], "")["output_config"] == {"effort": "medium"}
 
     def test_system_message_in_history_appended_to_system(self) -> None:
         t = AnthropicTransport(model=ANTHROPIC_MODELS["claude-sonnet-4-6"])

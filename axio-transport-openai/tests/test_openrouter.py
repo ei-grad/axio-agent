@@ -432,12 +432,74 @@ async def test_reasoning_metadata_constrains_native_effort(
 
     await transport.fetch_models()
     transport.model = transport.models["thinks/mandatory"]
-    state = transport.configure_effort("none")
-    payload = transport.build_payload([], [], "")
+    state = transport.configure_effort("default")
 
-    assert state.provider_value == "low"
-    assert "requires reasoning" in state.note
-    assert payload["reasoning"] == {"effort": "low"}
+    assert state.allowed == ("low", "high")
+    with pytest.raises(ValueError, match="none.*not supported"):
+        transport.configure_effort("none")
+    assert "reasoning" not in transport.build_payload([], [], "")
+
+
+async def test_null_reasoning_efforts_means_all_gateway_levels(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+) -> None:
+    server, _ = fake_server
+    server.models_response = {
+        "data": [
+            {
+                "id": "thinks/all",
+                "reasoning": {"supported_efforts": None, "mandatory": False},
+            },
+            {
+                "id": "thinks/all-mandatory",
+                "reasoning": {"supported_efforts": None, "mandatory": True},
+            },
+        ]
+    }
+
+    await transport.fetch_models()
+
+    transport.model = transport.models["thinks/all"]
+    state = transport.configure_effort("high")
+    assert state.allowed == ("none", "low", "medium", "high", "xhigh", "max")
+    assert transport.build_payload([], [], "")["reasoning"] == {"effort": "high"}
+
+    transport.model = transport.models["thinks/all-mandatory"]
+    state = transport.configure_effort("default")
+    assert state.allowed == ("low", "medium", "high", "xhigh", "max")
+    with pytest.raises(ValueError, match="none.*not supported"):
+        transport.configure_effort("none")
+
+
+def test_non_axio_native_efforts_do_not_enable_prompt_fallback() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="thinks/minimal", capabilities=frozenset({Capability.reasoning})),
+        _reasoning_efforts={"thinks/minimal": ("minimal",)},
+    )
+
+    state = transport.configure_effort("default")
+
+    assert state.mechanism.value == "native-effort"
+    assert state.allowed == ()
+    with pytest.raises(ValueError, match="high.*not supported"):
+        transport.configure_effort("high")
+
+
+def test_rejected_native_effort_does_not_mutate_legacy_state() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="thinks/low", capabilities=frozenset({Capability.reasoning})),
+        thinking=True,
+        _reasoning_efforts={"thinks/low": ("low",)},
+    )
+    before = transport.build_payload([], [], "")
+
+    with pytest.raises(ValueError, match="high.*not supported"):
+        transport.configure_effort("high")
+
+    assert transport.thinking is True
+    assert transport.reasoning_effort is None
+    assert transport.build_payload([], [], "") == before
 
 
 # ---------------------------------------------------------------------------
@@ -517,12 +579,16 @@ async def test_thinking_is_requested_the_openrouter_way(
 
 
 def test_effort_is_requested_with_openrouter_native_reasoning() -> None:
-    transport = OpenRouterTransport(model=ModelSpec(id="thinks/a-lot", capabilities=frozenset({Capability.reasoning})))
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="thinks/a-lot", capabilities=frozenset({Capability.reasoning})),
+        _reasoning_efforts={"thinks/a-lot": ("low", "xhigh")},
+    )
 
     state = transport.configure_effort("xhigh")
     payload = transport.build_payload([], [], "")
 
     assert state.mechanism.value == "native-effort"
+    assert state.allowed == ("low", "xhigh")
     assert payload["reasoning"] == {"effort": "xhigh"}
 
 

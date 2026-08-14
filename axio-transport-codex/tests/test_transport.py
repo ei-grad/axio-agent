@@ -406,7 +406,13 @@ def test_effort_uses_codex_advertised_native_reasoning() -> None:
     payload = transport.build_payload([], [], "")
 
     assert state.mechanism.value == "native-effort"
+    assert state.allowed == ("low", "medium", "high")
     assert payload["reasoning"] == {"effort": "high"}
+
+    with pytest.raises(ValueError, match="xhigh.*not supported"):
+        transport.configure_effort("xhigh")
+
+    assert transport.build_payload([], [], "")["reasoning"] == {"effort": "high"}
 
 
 # ---------------------------------------------------------------------------

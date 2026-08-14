@@ -499,13 +499,16 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
 
     def configure_effort(self, requested: str | None) -> EffortState:
         level = parse_effort(requested)
-        self.thinking_level = None
-        self.thinking_budget = None
         if self.model.id.startswith("anthropic/"):
+            proxy = self._make_anthropic_proxy(apply_effort=False)
+            state = proxy.configure_effort(level)
+            self.thinking_level = None
+            self.thinking_budget = None
             self._anthropic_effort_configured = True
             self._anthropic_effort_requested = level
-            proxy = self._make_anthropic_proxy(apply_effort=False)
-            return proxy.configure_effort(level)
+            return state
+        self.thinking_level = None
+        self.thinking_budget = None
         self._anthropic_effort_configured = False
         self._anthropic_effort_requested = None
         levels = valid_thinking_levels(self.model.id)

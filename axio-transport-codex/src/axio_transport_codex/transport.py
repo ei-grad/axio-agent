@@ -14,7 +14,7 @@ from typing import Any
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
-from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
+from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -177,7 +177,7 @@ class CodexTransport(CompletionTransport):
     max_retries: int = 10
     retry_base_delay: float = 5.0
     reasoning_effort: str | None = field(default=None, repr=False)
-    _reasoning_efforts: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
+    _reasoning_efforts: dict[str, tuple[EffortLevel, ...]] = field(default_factory=dict, repr=False)
 
     def _get_retry_delay(self, resp: aiohttp.ClientResponse | None, attempt: int) -> float:
         """Return delay in seconds: prefer Retry-After header, fall back to exponential backoff."""
@@ -196,10 +196,15 @@ class CodexTransport(CompletionTransport):
         if level is None:
             self.reasoning_effort = None
             mechanism = EffortMechanism.native_effort if supported else EffortMechanism.prompt_fallback
-            return EffortState(None, mechanism)
-        if level in supported:
+            allowed = supported if mechanism is EffortMechanism.native_effort else EFFORT_LEVELS
+            return EffortState(None, mechanism, allowed=allowed)
+        if supported:
+            if level not in supported:
+                raise ValueError(
+                    f"Effort {level!r} is not supported by {self.model.id}. Valid values: {', '.join(supported)}"
+                )
             self.reasoning_effort = level
-            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level, allowed=supported)
         self.reasoning_effort = None
         return PromptEffortAdapter().configure_effort(level)
 
@@ -503,17 +508,18 @@ class CodexTransport(CompletionTransport):
             return
 
         specs: list[ModelSpec] = []
-        reasoning_efforts: dict[str, tuple[str, ...]] = {}
+        reasoning_efforts: dict[str, tuple[EffortLevel, ...]] = {}
         for item in model_list:
             model_id = item.get("id", item.get("slug", ""))
             if not model_id:
                 continue
             advertised = item.get("supported_reasoning_efforts", item.get("supported_reasoning_levels", []))
-            parsed_efforts = tuple(
+            advertised_efforts = {
                 str(option.get("effort", "")) if isinstance(option, dict) else str(option)
                 for option in advertised
                 if (isinstance(option, str) and option) or (isinstance(option, dict) and option.get("effort"))
-            )
+            }
+            parsed_efforts = tuple(level for level in EFFORT_LEVELS if level in advertised_efforts)
             if parsed_efforts:
                 reasoning_efforts[model_id] = parsed_efforts
             # Use known spec if available, otherwise build one from API data.

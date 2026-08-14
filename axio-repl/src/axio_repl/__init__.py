@@ -1786,13 +1786,24 @@ def _apply_model(
         sandbox_note=sandbox_note,
     )
     if effort is not None:
-        state = effort.reapply()
+        requested = effort.state.requested
+        try:
+            state = effort.reapply()
+            reset_reason = None
+        except ValueError as exc:
+            state = effort.configure("default")
+            reset_reason = str(exc)
         agent.system = effort.system_prompt(base_system)
     else:
+        requested = None
         state = None
+        reset_reason = None
         agent.system = base_system
     print(f"Switched to {BOLD}{transport.model.id}{RESET}")
-    if state is not None and state.requested is not None:
+    if reset_reason is not None:
+        print(f"Effort {BOLD}{requested}{RESET} is unavailable for this model; reset to {BOLD}default{RESET}.")
+        print(reset_reason)
+    elif state is not None and state.requested is not None:
         print(f"Effort reapplied: {BOLD}{state.requested}{RESET} via {state.mechanism.value}")
         if state.note:
             print(state.note)
@@ -1816,7 +1827,8 @@ def _show_effort(effort: EffortRuntime) -> None:
     print(f"Effective mechanism: {BOLD}{state.mechanism.value}{RESET}{detail}")
     if state.note:
         print(f"Limitation: {state.note}")
-    print(f"Valid values: default, {', '.join(state.allowed)}")
+    values = ", ".join(("default", *state.allowed))
+    print(f"Valid values: {values}")
 
 
 def _apply_effort(effort: EffortRuntime, arg: str) -> EffortState | None:

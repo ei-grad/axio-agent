@@ -13,7 +13,7 @@ from typing import Any, Protocol, Self, cast
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
-from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
+from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -39,7 +39,7 @@ _EFFORT_BUDGETS = {
 }
 
 
-def _adaptive_efforts(model_id: str) -> tuple[str, ...]:
+def _adaptive_efforts(model_id: str) -> tuple[EffortLevel, ...]:
     if any(name in model_id for name in ("claude-fable-5", "claude-opus-5", "claude-sonnet-5")):
         return ("low", "medium", "high", "xhigh", "max")
     if any(name in model_id for name in ("claude-opus-4-8", "claude-opus-4-7")):
@@ -338,28 +338,29 @@ class AnthropicTransport(CompletionTransport):
         level = parse_effort(requested)
         adaptive = _adaptive_efforts(self.model.id)
         budget_supported = _supports_thinking_budget(self.model.id)
-        self._effort_level = None
-        self.thinking_budget = None
         if level is None:
+            self._effort_level = None
+            self.thinking_budget = None
             mechanism = EffortMechanism.native_effort if adaptive else EffortMechanism.native_budget
             if not adaptive and not budget_supported:
                 mechanism = EffortMechanism.prompt_fallback
-            return EffortState(None, mechanism)
-        if level in adaptive:
+            allowed = adaptive if mechanism is EffortMechanism.native_effort else EFFORT_LEVELS
+            return EffortState(None, mechanism, allowed=allowed)
+        if adaptive:
+            if level not in adaptive:
+                raise ValueError(
+                    f"Effort {level!r} is not supported by {self.model.id}. Valid values: {', '.join(adaptive)}"
+                )
+            self.thinking_budget = None
             self._effort_level = level
-            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
-        if level == "xhigh" and "max" in adaptive:
-            self._effort_level = "max"
-            return EffortState(
-                level,
-                EffortMechanism.native_effort,
-                provider_value="max",
-                note="This model maps xhigh to its highest native effort, max.",
-            )
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level, allowed=adaptive)
         if budget_supported and level != "none":
             budget = min(_EFFORT_BUDGETS[level], max(1_024, self.model.max_output_tokens - 1_024))
+            self._effort_level = None
             self.thinking_budget = budget
             return EffortState(level, EffortMechanism.native_budget, provider_value=budget)
+        self._effort_level = None
+        self.thinking_budget = None
         return PromptEffortAdapter().configure_effort(level)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:

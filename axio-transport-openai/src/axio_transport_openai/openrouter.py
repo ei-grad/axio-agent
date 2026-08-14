@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
+from axio.effort import EFFORT_LEVELS, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
@@ -33,7 +33,7 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
     base_url: str = "https://openrouter.ai/api/v1"
     model: ModelSpec = ModelSpec(id="google/gemini-2.5-pro-preview")
     thinking: bool = False
-    _reasoning_efforts: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
+    _reasoning_efforts: dict[str, tuple[str, ...] | None] = field(default_factory=dict, repr=False)
     _reasoning_mandatory: set[str] = field(default_factory=set, repr=False)
 
     def _reasoning_metadata_id(self) -> str:
@@ -47,31 +47,35 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
 
     def configure_effort(self, requested: str | None) -> EffortState:
         level = parse_effort(requested)
-        self.thinking = False
         supports_reasoning = Capability.reasoning in self.model.capabilities
+        metadata_id = self._reasoning_metadata_id()
+        selector_present = metadata_id in self._reasoning_efforts
+        advertised = self._reasoning_efforts.get(metadata_id)
+        allowed = (
+            EFFORT_LEVELS
+            if selector_present and advertised is None
+            else tuple(item for item in EFFORT_LEVELS if advertised is not None and item in advertised)
+        )
+        if metadata_id in self._reasoning_mandatory:
+            allowed = tuple(item for item in allowed if item != "none")
         if level is None:
+            self.thinking = False
             self.reasoning_effort = None
-            mechanism = EffortMechanism.native_effort if supports_reasoning else EffortMechanism.prompt_fallback
-            return EffortState(None, mechanism)
-        if supports_reasoning:
-            metadata_id = self._reasoning_metadata_id()
-            supported = self._reasoning_efforts.get(metadata_id, ())
-            provider_level: str = level
-            note = ""
-            effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-            ranks = {name: index for index, name in enumerate(effort_order)}
-            if level == "none" and metadata_id in self._reasoning_mandatory:
-                choices = tuple(item for item in supported if item in ranks and item != "none")
-                provider_level = min(choices, key=ranks.__getitem__) if choices else "low"
-                note = f"This model requires reasoning; the lowest native effort, {provider_level}, is used."
-            elif supported and level not in supported:
-                choices = tuple(item for item in supported if item in ranks)
-                if choices:
-                    target = ranks[level]
-                    provider_level = min(choices, key=lambda item: (abs(ranks[item] - target), -ranks[item]))
-                    note = f"This model maps {level} to its nearest native effort, {provider_level}."
-            self.reasoning_effort = provider_level
-            return EffortState(level, EffortMechanism.native_effort, provider_value=provider_level, note=note)
+            mechanism = (
+                EffortMechanism.native_effort
+                if supports_reasoning and selector_present
+                else EffortMechanism.prompt_fallback
+            )
+            effective_allowed = allowed if mechanism is EffortMechanism.native_effort else EFFORT_LEVELS
+            return EffortState(None, mechanism, allowed=effective_allowed)
+        if supports_reasoning and selector_present:
+            if level not in allowed:
+                valid = ", ".join(allowed) or "none of the Axio effort levels"
+                raise ValueError(f"Effort {level!r} is not supported by {self.model.id}. Valid values: {valid}")
+            self.thinking = False
+            self.reasoning_effort = level
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level, allowed=allowed)
+        self.thinking = False
         self.reasoning_effort = None
         return PromptEffortAdapter().configure_effort(level)
 
@@ -132,9 +136,12 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
             self.models[m.id] = m
             reasoning = entry.get("reasoning")
             if isinstance(reasoning, dict):
-                efforts = reasoning.get("supported_efforts")
-                if isinstance(efforts, list):
-                    self._reasoning_efforts[m.id] = tuple(str(item) for item in efforts)
+                if "supported_efforts" in reasoning:
+                    efforts = reasoning["supported_efforts"]
+                    if efforts is None:
+                        self._reasoning_efforts[m.id] = None
+                    elif isinstance(efforts, list):
+                        self._reasoning_efforts[m.id] = tuple(str(item) for item in efforts)
                 if reasoning.get("mandatory") is True:
                     self._reasoning_mandatory.add(m.id)
         logger.info("Loaded %d models from %s", len(self.models), url)
@@ -148,7 +155,7 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
             caps.add(Capability.tool_use)
         # OpenRouter advertises reasoning support here; without reading it the
         # capability is never set, so thinking is never requested or announced.
-        if "reasoning" in params or "include_reasoning" in params:
+        if "reasoning" in params or "include_reasoning" in params or isinstance(entry.get("reasoning"), dict):
             caps.add(Capability.reasoning)
 
         arch: dict[str, Any] = entry.get("architecture", {})

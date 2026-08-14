@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from axio.effort import EffortMechanism, EffortRuntime, EffortState, PromptEffortAdapter, parse_effort
+from axio.effort import (
+    EFFORT_LEVELS,
+    EffortLevel,
+    EffortMechanism,
+    EffortRuntime,
+    EffortState,
+    PromptEffortAdapter,
+    parse_effort,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 
 from axio_repl import (
@@ -25,14 +33,18 @@ class _NativeTransport:
     model: ModelSpec
     models: ModelRegistry
     native_effort: str | None = None
+    supported: dict[str, tuple[EffortLevel, ...]] = field(default_factory=dict)
 
     def configure_effort(self, requested: str | None) -> EffortState:
         level = parse_effort(requested)
         if Capability.reasoning not in self.model.capabilities:
             self.native_effort = None
             return PromptEffortAdapter().configure_effort(level)
+        allowed = self.supported.get(self.model.id, EFFORT_LEVELS)
+        if level is not None and level not in allowed:
+            raise ValueError(f"Effort {level!r} is not supported by {self.model.id}")
         self.native_effort = level
-        return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+        return EffortState(level, EffortMechanism.native_effort, provider_value=level, allowed=allowed)
 
 
 _REASONING = ModelSpec(id="reasoning", capabilities=frozenset({Capability.text, Capability.reasoning}))
@@ -102,6 +114,44 @@ def test_model_switch_reapplies_effort_and_reports_fallback(capsys: pytest.Captu
     assert effort.state.mechanism is EffortMechanism.prompt_fallback
     assert "Effort guidance (high)" in agent.system
     assert "Effort reapplied" in capsys.readouterr().out
+
+
+def test_model_switch_resets_effort_when_native_level_is_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wide = ModelSpec(id="wide", capabilities=frozenset({Capability.text, Capability.reasoning}))
+    narrow = ModelSpec(id="narrow", capabilities=frozenset({Capability.text, Capability.reasoning}))
+    transport = _NativeTransport(
+        wide,
+        ModelRegistry([wide, narrow]),
+        supported={"wide": ("low", "high"), "narrow": ("low",)},
+    )
+    effort = EffortRuntime(transport)
+    effort.configure("high")
+    agent: Any = SimpleNamespace(system="old", transport=transport)
+
+    _apply_model(transport, agent, [], Path("/tmp/test-workspace"), "", "narrow", effort=effort)
+
+    assert effort.state.requested is None
+    assert effort.state.allowed == ("low",)
+    assert "Effort guidance" not in agent.system
+    output = capsys.readouterr().out
+    assert "reset to" in output
+    assert "not supported" in output
+
+
+def test_effort_show_uses_model_specific_native_levels(capsys: pytest.CaptureFixture[str]) -> None:
+    transport = _NativeTransport(
+        _REASONING,
+        ModelRegistry([_REASONING]),
+        supported={"reasoning": ("low", "high")},
+    )
+
+    _show_effort(EffortRuntime(transport))
+
+    output = capsys.readouterr().out
+    assert "Valid values: default, low, high" in output
+    assert "medium" not in output
 
 
 def test_child_transport_and_prompt_inherit_effective_effort() -> None:
