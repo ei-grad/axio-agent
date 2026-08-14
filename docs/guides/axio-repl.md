@@ -68,11 +68,13 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--temperature` | transport default | Sampling temperature |
 | `--thinking` | off | Thinking level: `LOW`, `MEDIUM`, `HIGH`, or a token budget |
 | `--max-tokens` | transport default | Max output tokens |
-| `--max-iterations` | 30 | Max agent iterations |
+| `--max-iterations` | 1000 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
+| `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
+| `--sandbox-image` | `python:3.12-slim` | Image for `--sandbox docker` |
 
 ## Session journals
 
@@ -178,6 +180,20 @@ once; the REPL does not temporarily focus an agent and replay its hidden prose.
 | `shell` | Run shell commands with streaming stdout/stderr |
 | `generate_image` | Generate images via Gemini (Google transport only) |
 | `generate_video` | Generate videos via Veo (Google transport only) |
+
+## Sandbox
+
+`--sandbox` decides where those tools act. The default is `auto`: a container is
+used whenever `aiodocker` is installed and `/var/run/docker.sock` exists, so a
+machine with Docker running gets a sandbox without asking for one. The startup
+banner states which it is — `Tools: docker — …` or `Tools: host — …`.
+
+In a container the working directory is bind-mounted at `/workspace`, and that
+is the path the system prompt gives the model. Host paths are meaningless to it.
+
+The default image is `python:3.12-slim` and networking is off, which together
+decide what the agent can and cannot do. Both are worth reading before wondering
+why a build failed: see [Docker Sandbox](docker-sandbox.md#from-axio-repl).
 
 ## AGENTS.md
 

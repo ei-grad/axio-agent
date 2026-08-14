@@ -60,6 +60,83 @@ requires changing only the tool list passed to `Agent`.
 The `tools` property is only valid inside the `async with` block. Accessing it
 outside raises `RuntimeError`.
 
+## From axio-repl
+
+`axio-repl --sandbox docker` builds the same sandbox for you. The default is
+`--sandbox auto`, which uses a container whenever `aiodocker` is importable and
+`/var/run/docker.sock` exists — on a machine with Docker running, the agent is
+sandboxed unless you pass `--sandbox none`.
+
+The REPL creates the container as:
+
+```text
+DockerSandbox(image=<--sandbox-image>, volumes={"/workspace": <cwd>}, workdir="/workspace", network=False)
+```
+
+Everything else is a `DockerSandbox` default, so the agent gets **256 MB of
+memory and one CPU** — enough for edits and small scripts, tight for a test
+suite or a compiler.
+
+Tools are swapped by name:
+
+| Tool | Where it runs |
+|---|---|
+| `read_file`, `write_file`, `patch_file`, `list_files`, `shell` | replaced by the container-backed versions |
+| `search_files` | reimplemented for the container: the search script is copied in and run with `python3` |
+| `ast_grep` | runs `ast-grep` **inside** the container |
+| `run_python` | offered only in the sandbox — running arbitrary Python on the host is what the sandbox exists to prevent |
+| `spawn_agent`, `send_message`, `list_peers`, `monitor`, `stop_agent`, `interrupt_agent` | left on the host; they touch no files |
+
+Spawned subagents inherit the parent's tools, so one substitution covers the
+whole tree.
+
+### What the default image contains
+
+`python:3.12-slim` is Debian with CPython and nothing else. Present:
+
+`sh`, `bash`, `grep`, `sed`, `awk`, `find`, `tar`, `diff`, `python3`, `pip`
+
+Absent — and each of these is something an agent will try:
+
+`git`, `make`, `uv`, `gcc`, `curl`, `wget`, `patch`, `ps`, `rg`, `ast-grep`
+
+Two consequences follow from that list plus `network=False`:
+
+- **Nothing can be installed at runtime.** `pip install`, `apt-get install` and
+  `git clone` all fail with a DNS or connection error, not a "not found". The
+  image is the environment; there is no repairing it from inside.
+- **`ast_grep` is offered but cannot work.** In sandbox mode the tool is
+  registered unconditionally, so the model sees it and its calls fail until the
+  binary is in the image. (On the host the tool appears only when `ast-grep` is
+  installed.)
+
+An agent asked to run the project's tests in the default image will discover
+this one command at a time. Give it an image that matches the work instead.
+
+### Building an image for your project
+
+```dockerfile
+FROM python:3.12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git make patch ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir ast-grep-cli
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+```
+
+```bash
+docker build -t my-project-sandbox .
+axio-repl --sandbox docker --sandbox-image my-project-sandbox
+```
+
+Keep `python3` in whatever you build: `search_files` and `run_python` both
+need it.
+
+Dependencies must be baked in for the same reason — with networking off, a
+`uv sync` inside the container cannot reach an index. Either pre-install them in
+the image, or start the sandbox yourself with `network=True` and accept that the
+agent's code can then reach the network.
+
 ## Container lifecycle
 
 `DockerSandbox` creates and starts the container in `__aenter__`. On
