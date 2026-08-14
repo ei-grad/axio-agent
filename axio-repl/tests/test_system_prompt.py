@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Annotated, Any
 
+import pytest
+from axio.exceptions import HandlerError
+from axio.field import Field
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 
@@ -219,6 +223,47 @@ class TestForegroundAgentGuidance:
 
         assert "one-shot" in prompt
         assert "has no peer messaging or orchestration tools" in prompt
+
+    async def test_child_clone_preserves_explicit_advertised_and_validation_schema(self) -> None:
+        received: list[object] = []
+
+        async def explicit_handler(**kwargs: object) -> str:
+            received.append(kwargs)
+            return "ok"
+
+        schema = MappingProxyType(
+            {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+                "additionalProperties": False,
+            }
+        )
+        original: Tool[object] = Tool(name="explicit", handler=explicit_handler, schema=schema, detachable=True)
+        [clone] = _clone_tools_for_child([original], foreground=True)
+
+        assert clone.schema is schema
+        assert clone.input_schema == dict(schema)
+        assert "background" not in clone.input_schema["properties"]
+        await clone(count=2, ignored="not advertised")
+        assert received == [{"count": 2}]
+        with pytest.raises(HandlerError, match="requires int"):
+            await clone(count="two")
+
+    async def test_child_clone_regenerates_implicit_annotated_validation_schema(self) -> None:
+        async def bounded(count: Annotated[int, Field(ge=1, le=3)]) -> str:
+            return str(count)
+
+        original: Tool[object] = Tool(name="bounded", handler=bounded, detachable=True)
+        [clone] = _clone_tools_for_child([original], foreground=True)
+        expected = original.input_schema
+        expected["properties"].pop("background")
+
+        assert clone.schema == original.schema
+        assert clone.input_schema == expected
+        assert await clone(count=2) == "2"
+        with pytest.raises(HandlerError, match="must be >= 1"):
+            await clone(count=0)
 
 
 class TestAgentsText:

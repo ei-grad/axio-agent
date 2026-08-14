@@ -159,6 +159,78 @@ async def _run_agent_tool_one_shot(
     await main()
 
 
+@pytest.mark.parametrize("agent_actions", ["off", "on"])
+async def test_one_shot_background_report_is_displayed_exactly_once_without_prose_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    agent_actions: str,
+) -> None:
+    import axio_repl
+
+    unique_report = "UNIQUE_BACKGROUND_ONE_SHOT_REPORT"
+
+    class BackgroundReportTransport(_OneShotTransport):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.parent_calls = 0
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, system
+            if not any(tool.name == "spawn_agent" for tool in tools):
+                yield TextDelta(index=0, delta=unique_report)
+                yield IterationEnd(
+                    iteration=1,
+                    stop_reason=StopReason.end_turn,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            self.parent_calls += 1
+            if self.parent_calls == 1:
+                for event in make_tool_use_response(
+                    "spawn_agent",
+                    tool_id="spawn-call",
+                    tool_input={"task": "report once", "name": "one-shot-child"},
+                ):
+                    yield event
+                return
+            yield TextDelta(index=0, delta="parent response")
+            yield IterationEnd(
+                iteration=self.parent_calls,
+                stop_reason=StopReason.end_turn,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (BackgroundReportTransport, ""))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "axio-repl",
+            "delegate once",
+            "--sandbox",
+            "none",
+            "--agent-actions",
+            agent_actions,
+            "--session-log-dir",
+            str(tmp_path / "journals"),
+        ],
+    )
+
+    await main()
+
+    output = capsys.readouterr().out
+    assert output.count(unique_report) == 1
+    assert output.index("incoming") < output.index(unique_report)
+    if agent_actions == "on":
+        assert "agent one-shot-child" in output
+
+
 def test_default_root_and_session_directory_follow_xdg() -> None:
     configured = default_journal_root(environ={"XDG_STATE_HOME": "/var/tmp/state"})
     fallback = default_journal_root(environ={"XDG_STATE_HOME": "relative"}, home=Path("/home/tester"))

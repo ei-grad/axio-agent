@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from axio.events import ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
-from axio_tools_agents.runtime import AgentStarted, TurnStarted
+from axio.events import SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
+from axio.types import StopReason, Usage
+from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
 
@@ -76,6 +77,89 @@ def test_overflow_is_bounded_and_reported_explicitly() -> None:
 
     assert "3 action frames suppressed" in frames[0]
     assert len(frames) == 3
+
+
+def test_high_cardinality_agents_bound_every_retained_index() -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_frames=32,
+        max_queued_bytes=100_000,
+        max_frames_per_agent=4,
+        max_agents=16,
+        max_tools=24,
+        max_tools_per_agent=4,
+    )
+
+    for index in range(10_000):
+        agent_id = f"agent-{index}"
+        mux.observe(agent_id, ToolUseStart(index=0, tool_use_id=f"call-{index}", name="shell"))
+        mux.observe(agent_id, AgentStarted(name=agent_id, kind="background-agent"))
+
+    assert mux.retained_agent_count <= 16
+    assert mux.retained_tool_count <= 24
+    assert mux.retained_queue_count <= 32
+    assert mux.round_robin_count <= 32
+    assert "incomplete action" in mux.drain(max_frames=1)[0]
+
+
+def test_incomplete_calls_are_globally_bounded_and_terminal_events_cleanup_state() -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_frames=64,
+        max_queued_bytes=100_000,
+        max_frames_per_agent=64,
+        max_agents=8,
+        max_tools=10,
+        max_tools_per_agent=6,
+    )
+    for index in range(100):
+        mux.observe("child", ToolUseStart(index=index, tool_use_id=f"call-{index}", name="shell"))
+
+    assert mux.retained_agent_count == 1
+    assert mux.retained_tool_count == 6
+
+    mux.observe("child", AgentStopped(status=TurnStatus.CANCELLED))
+
+    assert mux.retained_agent_count == 0
+    assert mux.retained_tool_count == 0
+    frames = mux.drain(max_frames=8)
+    assert "incomplete action" in frames[0]
+    assert any("stopped (cancelled)" in frame for frame in frames)
+
+
+def test_session_end_cleans_incomplete_collector_but_keeps_lifecycle_frame() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    mux.observe(
+        "child",
+        SessionEndEvent(stop_reason=StopReason.error, total_usage=Usage(input_tokens=1, output_tokens=0)),
+    )
+
+    assert mux.retained_agent_count == 0
+    assert mux.retained_tool_count == 0
+    frames = mux.drain(max_frames=2)
+    assert "incomplete action discarded" in frames[0]
+    assert "session ended (error)" in frames[1]
+
+
+def test_overflow_prefers_dropping_verbose_frames_before_a_critical_result() -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_frames=3,
+        max_queued_bytes=100_000,
+        max_frames_per_agent=3,
+    )
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="unknown", name="shell", is_error=True, content="critical failure"),
+    )
+    for _ in range(8):
+        mux.observe("child", TurnStarted(prompt="verbose"))
+
+    frames = mux.drain(max_frames=4)
+
+    assert any("critical failure" in frame for frame in frames)
+    assert "action frames suppressed" in frames[0]
 
 
 def test_toggling_has_no_replay_and_reports_discarded_backlog() -> None:

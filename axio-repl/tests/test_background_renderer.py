@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import re
+from collections.abc import AsyncIterator
 from contextlib import redirect_stdout
+from typing import Any
 
 import pytest
+from axio.agent import Agent
+from axio.context import MemoryContextStore
 from axio.events import (
     Error,
+    IterationEnd,
     ReasoningDelta,
     SessionEndEvent,
     StreamEvent,
@@ -16,7 +22,10 @@ from axio.events import (
     ToolResult,
     ToolUseStart,
 )
+from axio.messages import Message
+from axio.tool import Tool
 from axio.types import StopReason, Usage
+from axio_tools_agents.peers import run_agent, set_run_agent_factory, set_session_event_hub
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     AgentStarted,
@@ -24,10 +33,11 @@ from axio_tools_agents.runtime import (
     ForegroundEntered,
     ForegroundExited,
     RuntimeEvent,
+    SessionEventHub,
     TurnStatus,
 )
 
-from axio_repl import ReplRenderer, render_runtime_event
+from axio_repl import ReplRenderer, render_runtime_event, run_prompt
 from axio_repl._multiplexer import DisplayMode
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
@@ -41,44 +51,24 @@ async def _queue_background_tool_action(renderer: ReplRenderer, agent_id: str = 
     )
 
 
-async def test_one_shot_renderer_replays_buffered_background_output(
+async def test_focusing_an_agent_does_not_replay_hidden_prose(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(buffer_background_events=True)
+    renderer = ReplRenderer()
 
-    await renderer.render("child", TextDelta(index=0, delta="background report"))
+    await renderer.render("child", TextDelta(index=0, delta="unique hidden report"))
     await renderer.render(
         "child",
         SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(input_tokens=1, output_tokens=2)),
     )
 
-    assert capsys.readouterr().out == ""
+    assert "unique hidden report" not in capsys.readouterr().out
 
     renderer.set_focus("child")
+    assert "unique hidden report" not in capsys.readouterr().out
 
-    output = capsys.readouterr().out
-    assert "background report" in output
-    assert "[1in/2out tokens]" in output
-
-
-async def test_one_shot_renderer_replays_each_buffered_background_agent(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    renderer = ReplRenderer(buffer_background_events=True)
-
-    await renderer.render("child-a", TextDelta(index=0, delta="first report"))
-    await renderer.render("child-b", TextDelta(index=0, delta="second report"))
-
-    assert capsys.readouterr().out == ""
-
-    renderer.set_focus("child-a")
-    first_output = capsys.readouterr().out
-    assert "first report" in first_output
-    assert "second report" not in first_output
-
-    renderer.set_focus("child-b")
-    second_output = capsys.readouterr().out
-    assert "second report" in second_output
+    await renderer.incoming("Report from child:\n\nunique hidden report")
+    assert capsys.readouterr().out.count("unique hidden report") == 1
 
 
 async def test_foreground_child_streams_without_changing_input_focus(capsys: pytest.CaptureFixture[str]) -> None:
@@ -276,6 +266,131 @@ async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pyt
     assert "foreground agent returned its result to the parent" in output
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "main"
+
+
+async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exactly_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="agent-call", name="run_agent"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="agent-call", partial_json='{"task":"go"}'))
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell-call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=1, tool_use_id="shell-call", partial_json='{"command":"echo sibling"}'),
+    )
+    await renderer.enter_foreground("child", "agent-call")
+    capsys.readouterr()
+
+    await renderer.render("child", TextDelta(index=0, delta="child paragraph"))
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="unique sibling line\n"),
+    )
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="shell-call", name="shell", is_error=False, content="unique sibling line\n"),
+    )
+    assert "unique sibling line" not in capsys.readouterr().out
+
+    await renderer.render("child", TextDelta(index=0, delta="\n\nchild continues"))
+    output = capsys.readouterr().out
+
+    assert output.index("\n\n") < output.index("agent main · shell stdout")
+    assert output.index("shell completed") < output.index("child continues")
+    assert output.count("unique sibling line") == 1
+
+
+async def test_real_run_agent_and_streaming_sibling_preserve_nearest_safe_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    child_started = asyncio.Event()
+    parent_output_observed = asyncio.Event()
+
+    class ParentTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[Any]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            self.calls += 1
+            if self.calls == 1:
+                yield ToolUseStart(index=0, tool_use_id="agent-call", name="run_agent")
+                yield ToolInputDelta(index=0, tool_use_id="agent-call", partial_json='{"task":"inspect"}')
+                yield ToolUseStart(index=1, tool_use_id="shell-call", name="shell")
+                yield ToolInputDelta(index=1, tool_use_id="shell-call", partial_json='{"command":"echo sibling"}')
+                yield IterationEnd(iteration=1, stop_reason=StopReason.tool_use, usage=Usage(1, 1))
+                return
+            yield TextDelta(index=0, delta="parent done")
+            yield IterationEnd(iteration=2, stop_reason=StopReason.end_turn, usage=Usage(1, 1))
+
+    class ChildTransport:
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[Any]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            child_started.set()
+            yield TextDelta(index=0, delta="child paragraph")
+            await asyncio.wait_for(parent_output_observed.wait(), timeout=1)
+            yield TextDelta(index=0, delta="\n\nchild continues")
+            yield IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(1, 1))
+
+    async def shell_handler(command: str) -> str:
+        return command
+
+    async def shell_stream(command: str) -> AsyncIterator[tuple[str, str]]:
+        del command
+        await asyncio.wait_for(child_started.wait(), timeout=1)
+        yield "stdout", "unique concurrent sibling\n"
+
+    setattr(shell_handler, "stream", shell_stream)
+    hub = SessionEventHub(session_id="concurrent-render")
+    renderer = ReplRenderer()
+
+    async def coordinate(envelope: AgentEventEnvelope) -> None:
+        if isinstance(envelope.event, ToolOutputDelta) and envelope.event.tool_use_id == "shell-call":
+            parent_output_observed.set()
+
+    async def render(envelope: AgentEventEnvelope) -> None:
+        await render_runtime_event(renderer, envelope)
+
+    hub.subscribe(coordinate)
+    hub.subscribe(render)
+    set_session_event_hub(hub)
+
+    async def child_factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        assert not inherit_context
+        return Agent(system="child", transport=ChildTransport()), MemoryContextStore()
+
+    set_run_agent_factory(child_factory)
+    parent = Agent(
+        system="parent",
+        transport=ParentTransport(),
+        tools=[
+            Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False),
+            Tool(name="shell", handler=shell_handler),
+        ],
+    )
+    try:
+        outcome = await run_prompt(parent, MemoryContextStore(), "go", hub, "parent-run", source="test")
+    finally:
+        set_run_agent_factory(None)
+        set_session_event_hub(None)
+
+    output = capsys.readouterr().out
+    assert outcome.succeeded
+    assert output.count("unique concurrent sibling") == 1
+    assert output.index("child paragraph\n\n") < output.index("unique concurrent sibling")
+    assert output.index("unique concurrent sibling") < output.index("child continues")
+    assert "foreground agent returned its result to the parent" in output
 
 
 async def test_enabling_actions_does_not_replay_events_seen_while_off(

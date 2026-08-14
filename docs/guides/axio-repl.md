@@ -143,6 +143,11 @@ The user's input target remains unchanged. When the child finishes, its full
 answer is returned to the parent as a single tool result and is not printed a
 second time.
 
+When a sibling parent tool streams while `run_agent` owns the foreground, the
+REPL queues that sibling action separately and inserts it at the child's nearest
+safe boundary. These frames remain visible with `/agent-actions off` because
+they belong to the active parent turn, not a background agent.
+
 `spawn_agent` creates a persistent background agent. `/agent-actions on` makes
 its tool and lifecycle activity visible without mixing its free-form prose or
 reasoning into the active answer. Every background action is a labelled,
@@ -156,6 +161,10 @@ the active stream or monopolize a boundary. Overflow produces an explicit
 suppression marker. Switching the mode off discards queued presentation frames;
 switching it on does not replay old activity. Display mode is independent of
 input focus, scheduling, parent delivery, context, and the JSONL session log.
+
+For a single-prompt invocation, spawned background agents are joined before the
+process exits. Their final reports use the normal incoming-outcome path exactly
+once; the REPL does not temporarily focus an agent and replay its hidden prose.
 
 ## Tools
 

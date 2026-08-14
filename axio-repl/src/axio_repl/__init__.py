@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from importlib.metadata import entry_points
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 from uuid import uuid4
 
@@ -409,6 +410,7 @@ class _AgentRenderState:
         self.arg_streams: dict[str, ToolArgStream] = {}
         self.active_tool_ids: set[str] = set()
         self.streamed_tool_ids: set[str] = set()
+        self.tool_names: dict[str, str] = {}
         self.field_first_delta = True
         self.field_key: str | None = None
         self.background_text: list[str] = []
@@ -416,7 +418,6 @@ class _AgentRenderState:
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
-        self.background_events: list[StreamEvent] = []
         self.paragraph_newline_pending = False
 
 
@@ -424,7 +425,6 @@ class ReplRenderer:
     def __init__(
         self,
         *,
-        buffer_background_events: bool = False,
         stats: _panel.SessionStats | None = None,
         current_model: Callable[[], ModelSpec | None] | None = None,
         display_mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
@@ -433,7 +433,6 @@ class ReplRenderer:
         action_boundary_bytes: int = 16 * 1024,
     ) -> None:
         self._lock = asyncio.Lock()
-        self._buffer_background_events = buffer_background_events
         # Every agent's events pass through here, which makes this the one place
         # that sees the whole session's spend.
         self._stats = stats
@@ -449,6 +448,10 @@ class ReplRenderer:
         self._background_pending: set[str] = set()
         self._input_active = False
         self._actions = action_multiplexer or ActionMultiplexer(display_mode)
+        # A parent's sibling tool still belongs to the active turn while a child
+        # owns the terminal, so it has an always-on queue separate from background actions.
+        self._suspended_actions = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+        self._suspended_tool_calls: set[tuple[str, str]] = set()
         self._action_boundary_frames = action_boundary_frames
         self._action_boundary_bytes = action_boundary_bytes
 
@@ -466,7 +469,7 @@ class ReplRenderer:
 
     @property
     def queued_action_count(self) -> int:
-        return self._actions.queued_count
+        return self._actions.queued_count + self._suspended_actions.queued_count
 
     def action_status(self) -> str:
         status = f"actions: {self.display_mode.value}"
@@ -480,6 +483,14 @@ class ReplRenderer:
 
     async def enter_foreground(self, agent_id: str, parent_tool_use_id: str | None = None) -> None:
         async with self._lock:
+            owner = self.foreground_agent
+            owner_state = self._state(owner)
+            for tool_use_id in owner_state.active_tool_ids:
+                if tool_use_id == parent_tool_use_id:
+                    continue
+                name = owner_state.tool_names.get(tool_use_id, "tool")
+                self._suspended_tool_calls.add((owner, tool_use_id))
+                self._suspended_actions.adopt_tool(owner, tool_use_id, name)
             self._foreground_stack.append(agent_id)
             self._safe_boundary_open = False
             self._actions.discard_agent(agent_id)
@@ -496,30 +507,23 @@ class ReplRenderer:
             parent_tool_use_id = self._foreground_parent_calls.pop(agent_id, None)
             if parent_tool_use_id is not None:
                 self._streamed_foreground_calls[parent_tool_use_id] = status
-            self._safe_boundary_open = False
+            self._safe_boundary_open = True
             resumed = self._state(self.foreground_agent)
             self._foreground_streaming = bool(
                 resumed.in_text or resumed.in_reasoning or resumed.active_tool_ids or resumed.arg_streams
             )
+            self._drain_safe_boundary_locked()
 
     def set_focus(self, agent_id: str) -> None:
         self._focused_agent = agent_id
         self._safe_boundary_open = True
         self._actions.discard_agent(agent_id)
         state = self._state(agent_id)
-        buffered = state.background_events
-        state.background_events = []
         state.background_text.clear()
         state.background_reported_chars = 0
         state.background_tools.clear()
         state.background_errors.clear()
         self._background_pending.discard(agent_id)
-        for event in buffered:
-            self._render_locked(agent_id, event)
-            if isinstance(event, Error | SessionEndEvent):
-                self._foreground_streaming = False
-            elif not isinstance(event, IterationEnd):
-                self._foreground_streaming = True
 
     def set_input_active(self, active: bool) -> None:
         self._input_active = active
@@ -555,7 +559,11 @@ class ReplRenderer:
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
                 self._stats.record(agent_id, event.usage, model)
-            if agent_id == self.foreground_agent:
+            if self._is_suspended_tool_event(agent_id, event):
+                self._observe_suspended_tool_event_locked(agent_id, event)
+                if self._safe_boundary_open:
+                    self._drain_safe_boundary_locked()
+            elif agent_id == self.foreground_agent:
                 self._render_locked(agent_id, event)
                 if isinstance(event, Error | SessionEndEvent):
                     self._foreground_streaming = False
@@ -582,8 +590,9 @@ class ReplRenderer:
         async with self._lock:
             self._foreground_streaming = False
             self._safe_boundary_open = True
+            self._drain_all_actions_locked()
             if self.display_mode is DisplayMode.ALL_ACTIONS:
-                self._drain_all_actions_locked()
+                self._discard_background_summaries_locked()
             else:
                 self._flush_background_summaries_locked()
 
@@ -712,6 +721,7 @@ class ReplRenderer:
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tid)
+                state.tool_names[tid] = name
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
                 self._safe_boundary_open = False
@@ -755,6 +765,7 @@ class ReplRenderer:
                 self._flush()
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
+                state.tool_names.pop(tid, None)
                 if not state.active_tool_ids and not state.arg_streams:
                     self._safe_boundary_open = True
                     self._drain_safe_boundary_locked()
@@ -777,13 +788,12 @@ class ReplRenderer:
                     state.in_text = False
                 print(f"{DIM}[{usage.input_tokens}in/{usage.output_tokens}out tokens]{RESET}")
                 state.paragraph_newline_pending = False
+                self._discard_suspended_owner_locked(agent_id)
                 self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
         state = self._state(agent_id)
-        if self._buffer_background_events:
-            state.background_events.append(event)
         match event:
             case TextDelta(delta=delta):
                 state.background_text.append(delta)
@@ -792,12 +802,10 @@ class ReplRenderer:
                     state.background_tools.append(name)
             case Error(exception=exc):
                 state.background_errors.append(str(exc))
-                if not self._buffer_background_events:
-                    self._background_pending.add(agent_id)
+                self._background_pending.add(agent_id)
             case SessionEndEvent():
                 self._finish_background_report_locked(agent_id)
-                if not self._buffer_background_events:
-                    self._background_pending.add(agent_id)
+                self._background_pending.add(agent_id)
             case _:
                 pass
 
@@ -838,21 +846,66 @@ class ReplRenderer:
         self._background_pending.clear()
 
     def _drain_safe_boundary_locked(self, *, max_frames: int | None = None) -> None:
+        frame_budget = max_frames or self._action_boundary_frames
+        byte_budget = self._action_boundary_bytes
+        suspended = self._suspended_actions.drain(max_frames=frame_budget, max_bytes=byte_budget)
+        for frame in suspended:
+            sys.stdout.write(frame)
+            frame_budget -= 1
+            byte_budget -= len(frame.encode("utf-8"))
         if self.display_mode is DisplayMode.ALL_ACTIONS:
             self._discard_background_summaries_locked()
-            for frame in self._actions.drain(
-                max_frames=max_frames or self._action_boundary_frames,
-                max_bytes=self._action_boundary_bytes,
-            ):
-                sys.stdout.write(frame)
+            if frame_budget > 0 and byte_budget > 0:
+                for frame in self._actions.drain(max_frames=frame_budget, max_bytes=byte_budget):
+                    sys.stdout.write(frame)
+            self._flush()
+        elif suspended:
             self._flush()
 
     def _drain_all_actions_locked(self) -> None:
-        while self._actions.queued_count:
-            before = self._actions.queued_count
+        while self.queued_action_count:
+            before = self.queued_action_count
             self._drain_safe_boundary_locked()
-            if self._actions.queued_count >= before:
+            if self.queued_action_count >= before:
                 break
+
+    def _is_suspended_tool_event(self, agent_id: str, event: StreamEvent) -> bool:
+        match event:
+            case (
+                ToolInputDelta(tool_use_id=tool_use_id)
+                | ToolOutputDelta(tool_use_id=tool_use_id)
+                | ToolResult(tool_use_id=tool_use_id)
+            ):
+                return (agent_id, tool_use_id) in self._suspended_tool_calls
+            case _:
+                return False
+
+    def _observe_suspended_tool_event_locked(self, agent_id: str, event: StreamEvent) -> None:
+        self._suspended_actions.observe(agent_id, event)
+        state = self._state(agent_id)
+        match event:
+            case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
+                stream = state.arg_streams.get(tool_use_id)
+                if stream is not None:
+                    tuple(stream.feed(partial_json))
+                    if stream.done:
+                        state.arg_streams.pop(tool_use_id, None)
+                        state.field_key = None
+            case ToolOutputDelta(tool_use_id=tool_use_id):
+                state.streamed_tool_ids.add(tool_use_id)
+            case ToolResult(tool_use_id=tool_use_id):
+                state.active_tool_ids.discard(tool_use_id)
+                state.arg_streams.pop(tool_use_id, None)
+                state.tool_names.pop(tool_use_id, None)
+                self._suspended_tool_calls.discard((agent_id, tool_use_id))
+            case _:
+                pass
+
+    def _discard_suspended_owner_locked(self, agent_id: str) -> None:
+        self._suspended_actions.discard_agent(agent_id)
+        self._suspended_tool_calls = {
+            (owner, tool_use_id) for owner, tool_use_id in self._suspended_tool_calls if owner != agent_id
+        }
 
     def _render_text_delta_locked(self, state: _AgentRenderState, delta: str) -> None:
         if delta:
@@ -977,6 +1030,8 @@ def _clone_tools_for_child(tools: list[Tool[Any]], *, foreground: bool) -> list[
             context=tool.context,
             concurrency=tool.concurrency,
             detachable=tool.detachable and not foreground,
+            # Reusing a generated schema as explicit would discard Annotated validators.
+            schema=tool.schema if tool._schema_explicit else MappingProxyType({}),
         )
         for tool in tools
         if tool.name not in excluded
@@ -1682,7 +1737,6 @@ async def main() -> None:
 
         stats = _panel.SessionStats()
         renderer = ReplRenderer(
-            buffer_background_events=args.prompt is not None,
             stats=stats,
             current_model=lambda: transport.model,
             display_mode=DisplayMode.parse(args.agent_actions),
@@ -1737,20 +1791,8 @@ async def main() -> None:
             records = local_background_agent_records()
             if not records:
                 return
-            if renderer.display_mode is DisplayMode.ALL_ACTIONS:
-                await renderer.notice(f"[waiting for {len(records)} background agent(s)]")
-                await wait_local_background_agents_idle([record.id for record in records])
-                await renderer.mark_idle()
-                return
-            if len(records) == 1:
-                renderer.set_focus(records[0].id)
-                await renderer.notice(f"[following background agent {records[0].id}]")
-            else:
-                await renderer.notice(f"[waiting for {len(records)} background agents]")
-                renderer.set_focus(records[0].id)
+            await renderer.notice(f"[waiting for {len(records)} background agent(s)]")
             await wait_local_background_agents_idle([record.id for record in records])
-            for record in records[1:]:
-                renderer.set_focus(record.id)
             await renderer.mark_idle()
 
         def _collect_queued(first: str) -> list[str]:

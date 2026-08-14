@@ -160,6 +160,10 @@ appropriate retention policy.
 text, tool arguments, and streaming tool output use the same immediate terminal
 path as the parent. The input target does not change, and the child's final text
 is returned to the parent exactly once as the `run_agent` tool result.
+If another parent tool streams concurrently with the foreground child, its
+labelled output is inserted at the child's next safe boundary. This active
+parent work remains visible even when agent actions are off, without splitting
+the child's paragraph, reasoning, arguments, or tool output.
 
 `spawn_agent` starts a persistent background peer. By default, its prose and
 actions stay out of the active stream and the REPL prints a completion summary.
@@ -174,6 +178,11 @@ agent receives input nor affects execution, outcome delivery, context, or the
 session journal. Queues are bounded; overload is represented by a labelled
 suppression frame rather than delaying the active stream. Enabling the mode does
 not replay actions that occurred while it was off.
+
+In single-prompt mode, the REPL waits for spawned background agents and displays
+each final report through normal incoming-outcome delivery. It does not focus a
+background agent or replay that agent's hidden prose before displaying the
+report.
 
 ## Tools
 
