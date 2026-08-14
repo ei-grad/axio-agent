@@ -103,11 +103,20 @@ Terms used throughout Axio documentation.
 
 ## Other
 
+**GuardCrash**
+: Subclass of `GuardError` raised when a guard implementation itself fails, as opposed to
+  deliberately denying the call. The agent logs it with a traceback.
+
 **GuardError**
 : Exception raised by guards to deny tool execution. The error message is sent back to the model.
 
+**HandlerCrash**
+: Subclass of `HandlerError` that Axio raises when an unexpected exception escapes a tool
+  handler. The agent logs it with a traceback; the model still gets the message.
+
 **HandlerError**
-: Exception raised by tool handlers for expected failures. Distinguishes from unexpected crashes.
+: Exception raised by tool handlers for expected failures - a missing file, invalid input,
+  an unreachable service. The agent reports it to the model without a traceback.
 
 **to_thread()**
 : Python asyncio function for running blocking code in a thread pool. Used for CPU-bound tools.

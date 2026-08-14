@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncGenerator
 from dataclasses import replace
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
 import pytest
 
-from axio.exceptions import GuardError, HandlerError
+from axio.exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from axio.field import Field, StrictStr
 from axio.permission import PermissionGuard
 from axio.schema import build_tool_schema
@@ -288,8 +289,36 @@ class TestToolCall:
             raise ValueError("handler boom")
 
         t: Tool[Any] = Tool(name="t", description="t", handler=_fail)
-        with pytest.raises(HandlerError, match="handler boom"):
+        with pytest.raises(HandlerCrash, match="ValueError: handler boom"):
             await t()
+
+    async def test_deliberate_handler_error_is_not_a_crash(self) -> None:
+        async def _fail() -> str:
+            raise HandlerError("file not found: /tmp/nope")
+
+        t: Tool[Any] = Tool(name="t", description="t", handler=_fail)
+        with pytest.raises(HandlerError, match="file not found") as excinfo:
+            await t()
+        assert not isinstance(excinfo.value, HandlerCrash)
+
+    async def test_guard_denial_is_not_a_crash(self) -> None:
+        class _Deny(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                raise GuardError("denied by policy")
+
+        t: Tool[Any] = Tool(name="t", description="t", handler=_msg, guards=(_Deny(),))
+        with pytest.raises(GuardError, match="denied by policy") as excinfo:
+            await t(msg="hello")
+        assert not isinstance(excinfo.value, GuardCrash)
+
+    async def test_guard_exception_becomes_guard_crash(self) -> None:
+        class _Broken(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                raise RuntimeError("guard bug")
+
+        t: Tool[Any] = Tool(name="t", description="t", handler=_msg, guards=(_Broken(),))
+        with pytest.raises(GuardCrash, match="RuntimeError: guard bug"):
+            await t(msg="hello")
 
     async def test_context_var_set(self) -> None:
         captured: list[Any] = []
@@ -441,6 +470,90 @@ class TestToolValidation:
 
         t: Tool[Any] = Tool(name="f", description="f", handler=f)
         assert await t() == "5"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"n": 0, "name": "alice"}, {"n": 11, "name": "alice"}, {"n": 5, "name": 42}, {"n": 5}],
+        ids=["below-ge", "above-le", "wrong-type", "missing-required"],
+    )
+    async def test_invalid_input_is_expected_failure_not_crash(self, kwargs: dict[str, Any]) -> None:
+        """Model-correctable input errors stay plain HandlerError - the tool never ran."""
+
+        async def f(n: Annotated[int, Field(ge=1, le=10)], name: StrictStr) -> str:
+            return f"{name}:{n}"
+
+        t: Tool[Any] = Tool(name="f", description="f", handler=f)
+        with pytest.raises(HandlerError) as excinfo:
+            await t(**kwargs)
+        assert not isinstance(excinfo.value, HandlerCrash)
+
+
+def _streaming_handler(stream: Any) -> Any:
+    async def handler() -> str:
+        return "unused"
+
+    handler.stream = stream  # type: ignore[attr-defined]
+    return handler
+
+
+class TestToolCallStreaming:
+    async def _drain(self, tool: Tool[Any], **kwargs: Any) -> list[tuple[str, str]]:
+        return [chunk async for chunk in tool.call_streaming(**kwargs)]
+
+    async def test_stream_exception_becomes_handler_crash(self) -> None:
+        async def _stream() -> AsyncGenerator[tuple[str, str], None]:
+            raise ValueError("stream boom")
+            yield ("output", "unreachable")
+
+        t: Tool[Any] = Tool(name="t", handler=_streaming_handler(_stream))
+        with pytest.raises(HandlerCrash, match="ValueError: stream boom"):
+            await self._drain(t)
+
+    async def test_stream_handler_error_is_not_a_crash(self) -> None:
+        async def _stream() -> AsyncGenerator[tuple[str, str], None]:
+            yield ("output", "partial")
+            raise HandlerError("connection lost")
+
+        t: Tool[Any] = Tool(name="t", handler=_streaming_handler(_stream))
+        with pytest.raises(HandlerError, match="connection lost") as excinfo:
+            await self._drain(t)
+        assert not isinstance(excinfo.value, HandlerCrash)
+
+    async def test_non_streaming_handler_exception_becomes_handler_crash(self) -> None:
+        async def _fail() -> str:
+            raise ValueError("handler boom")
+
+        t: Tool[Any] = Tool(name="t", handler=_fail)
+        with pytest.raises(HandlerCrash, match="ValueError: handler boom"):
+            await self._drain(t)
+
+    async def test_invalid_input_is_expected_failure_not_crash(self) -> None:
+        async def f(n: Annotated[int, Field(ge=1)]) -> str:
+            return str(n)
+
+        t: Tool[Any] = Tool(name="f", handler=f)
+        with pytest.raises(HandlerError, match=">= 1") as excinfo:
+            await self._drain(t, n=0)
+        assert not isinstance(excinfo.value, HandlerCrash)
+
+    async def test_guard_denial_is_not_a_crash(self) -> None:
+        class _Deny(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                raise GuardError("denied by policy")
+
+        t: Tool[Any] = Tool(name="t", handler=_msg, guards=(_Deny(),))
+        with pytest.raises(GuardError, match="denied by policy") as excinfo:
+            await self._drain(t, msg="hello")
+        assert not isinstance(excinfo.value, GuardCrash)
+
+    async def test_guard_exception_becomes_guard_crash(self) -> None:
+        class _Broken(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                raise RuntimeError("guard bug")
+
+        t: Tool[Any] = Tool(name="t", handler=_msg, guards=(_Broken(),))
+        with pytest.raises(GuardCrash, match="RuntimeError: guard bug"):
+            await self._drain(t, msg="hello")
 
 
 class TestToolCustomSchema:

@@ -10,11 +10,19 @@ class ToolError(AxioError):
 
 
 class GuardError(ToolError):
-    """Guard denied or crashed during permission check."""
+    """Guard denied the tool call."""
+
+
+class GuardCrash(GuardError):
+    """A guard implementation crashed, as opposed to deliberately denying."""
 
 
 class HandlerError(ToolError):
-    """Handler raised during execution."""
+    """Expected tool failure, reported to the model."""
+
+
+class HandlerCrash(HandlerError):
+    """An unexpected exception escaped a tool handler."""
 
 
 class StreamError(AxioError):

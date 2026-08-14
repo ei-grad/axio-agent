@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any, get_args, get_type_hints
 
 from .background import BACKGROUND_PROPERTY
-from .exceptions import GuardError, HandlerError
+from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from .field import MISSING, FieldInfo, bare_type, get_field_info
 from .permission import PermissionGuard
 from .schema import build_tool_schema
@@ -253,7 +253,7 @@ class Tool[T]:
                 except GuardError:
                     raise
                 except Exception as exc:
-                    raise GuardError(str(exc)) from exc
+                    raise GuardCrash(f"{type(exc).__name__}: {exc}") from exc
 
             try:
                 if self._schema_explicit:
@@ -270,7 +270,7 @@ class Tool[T]:
             except HandlerError:
                 raise
             except Exception as exc:
-                raise HandlerError(str(exc)) from exc
+                raise HandlerCrash(f"{type(exc).__name__}: {exc}") from exc
 
     async def call_streaming(self, **kwargs: Any) -> AsyncGenerator[tuple[str, str], None]:
         """Execute handler, yielding ``(key, text)`` chunks for streaming output.
@@ -293,7 +293,7 @@ class Tool[T]:
                 except GuardError:
                     raise
                 except Exception as exc:
-                    raise GuardError(str(exc)) from exc
+                    raise GuardCrash(f"{type(exc).__name__}: {exc}") from exc
 
             if self._schema_explicit:
                 schema_props = self.schema.get("properties")
@@ -317,6 +317,6 @@ class Tool[T]:
             except HandlerError:
                 raise
             except Exception as exc:
-                raise HandlerError(str(exc)) from exc
+                raise HandlerCrash(f"{type(exc).__name__}: {exc}") from exc
             finally:
                 CONTEXT.reset(token)

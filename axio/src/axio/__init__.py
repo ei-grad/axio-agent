@@ -17,7 +17,7 @@ from .events import (
     TranscriptDelta,
     TurnComplete,
 )
-from .exceptions import GuardError, HandlerError
+from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from .field import Field, FieldInfo, StrictStr
 from .messages import Message
 from .permission import ConcurrentGuard, PermissionGuard
@@ -69,7 +69,9 @@ __all__ = [
     "StopReason",
     "Usage",
     "GuardError",
+    "GuardCrash",
     "HandlerError",
+    "HandlerCrash",
     # permissions
     "PermissionGuard",
     "ConcurrentGuard",

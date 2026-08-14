@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncGenerator
+import logging
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import pytest
@@ -22,6 +23,8 @@ from axio.events import (
     ToolResult,
     ToolUseStart,
 )
+from axio.exceptions import GuardError, HandlerError
+from axio.permission import PermissionGuard
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
 from axio.tool import CURRENT_TOOL_CALL, Tool, ToolCallContext
 from axio.types import StopReason, Usage
@@ -228,6 +231,132 @@ class TestHandlerException:
         assert len(tool_results) == 1
         assert tool_results[0].is_error
         assert isinstance(events[-1], SessionEndEvent)
+
+
+class _RaisingGuard(PermissionGuard):
+    def __init__(self, factory: Callable[[], Exception]) -> None:
+        self._factory = factory
+
+    async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+        raise self._factory()
+
+
+def _build_failing_tool(
+    *,
+    handler_error: Callable[[], Exception] | None = None,
+    guard_error: Callable[[], Exception] | None = None,
+    streaming: bool = False,
+) -> Tool[Any]:
+    async def handler() -> str:
+        if handler_error is not None:
+            raise handler_error()
+        return "ok"
+
+    if streaming:
+
+        async def stream() -> AsyncGenerator[tuple[str, str], None]:
+            if handler_error is not None:
+                raise handler_error()
+            yield ("output", "ok")
+
+        handler.stream = stream  # type: ignore[attr-defined]
+
+    guards = (_RaisingGuard(guard_error),) if guard_error is not None else ()
+    return Tool(name="failing", handler=handler, guards=guards)
+
+
+async def _dispatch_one(tool: Tool[Any], mode: str) -> ToolResultBlock:
+    agent = Agent(system="test", tools=[tool], transport=StubTransport())
+    block = ToolUseBlock(id="c1", name="failing", input={})
+    if mode == "dispatch_tools":
+        [result] = await agent.dispatch_tools([block], 1)
+        return result
+    queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
+    [result] = await agent._dispatch_tools_streaming([block], 1, queue)
+    return result
+
+
+def _failure_logs(caplog: pytest.LogCaptureFixture) -> list[tuple[int, bool, str]]:
+    return [
+        (r.levelno, r.exc_info is not None, r.getMessage())
+        for r in caplog.records
+        if r.name == "axio.agent" and r.getMessage().startswith("Tool failing")
+    ]
+
+
+_DISPATCH_MODES = [
+    pytest.param("dispatch_tools", False, id="dispatch_tools"),
+    pytest.param("streaming_dispatch", False, id="streaming_dispatch-plain_tool"),
+    pytest.param("streaming_dispatch", True, id="streaming_dispatch-streaming_tool"),
+]
+
+
+class TestToolFailureLogging:
+    """Expected tool failures are logged as such; only crashes get a traceback."""
+
+    @pytest.mark.parametrize("mode, streaming", _DISPATCH_MODES)
+    async def test_handler_error_logs_at_info(
+        self, mode: str, streaming: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tool = _build_failing_tool(handler_error=lambda: HandlerError("file not found"), streaming=streaming)
+        with caplog.at_level(logging.INFO, logger="axio.agent"):
+            result = await _dispatch_one(tool, mode)
+
+        assert result.is_error
+        assert result.content == "file not found"
+        assert _failure_logs(caplog) == [(logging.INFO, False, "Tool failing failed: file not found")]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize("mode, streaming", _DISPATCH_MODES)
+    async def test_handler_crash_logs_at_error_with_traceback(
+        self, mode: str, streaming: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tool = _build_failing_tool(handler_error=lambda: ValueError("boom"), streaming=streaming)
+        with caplog.at_level(logging.INFO, logger="axio.agent"):
+            result = await _dispatch_one(tool, mode)
+
+        assert result.is_error
+        assert result.content == "ValueError: boom"
+        assert _failure_logs(caplog) == [
+            (logging.ERROR, True, "Tool failing raised HandlerCrash: ValueError: boom"),
+        ]
+
+    @pytest.mark.parametrize("mode, streaming", _DISPATCH_MODES)
+    async def test_guard_denial_logs_at_info(
+        self, mode: str, streaming: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tool = _build_failing_tool(guard_error=lambda: GuardError("denied by policy"), streaming=streaming)
+        with caplog.at_level(logging.INFO, logger="axio.agent"):
+            result = await _dispatch_one(tool, mode)
+
+        assert result.is_error
+        assert result.content == "denied by policy"
+        assert _failure_logs(caplog) == [(logging.INFO, False, "Tool failing failed: denied by policy")]
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.parametrize("mode, streaming", _DISPATCH_MODES)
+    async def test_guard_crash_logs_at_error_with_traceback(
+        self, mode: str, streaming: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tool = _build_failing_tool(guard_error=lambda: RuntimeError("guard bug"), streaming=streaming)
+        with caplog.at_level(logging.INFO, logger="axio.agent"):
+            result = await _dispatch_one(tool, mode)
+
+        assert result.is_error
+        assert result.content == "RuntimeError: guard bug"
+        assert _failure_logs(caplog) == [
+            (logging.ERROR, True, "Tool failing raised GuardCrash: RuntimeError: guard bug"),
+        ]
+
+    async def test_cancelled_handler_propagates_out_of_dispatch(self) -> None:
+        """Cancellation is not a tool failure: it must not be reported to the model."""
+
+        async def handler() -> str:
+            raise asyncio.CancelledError
+
+        agent = Agent(system="test", tools=[Tool(name="cancelled", handler=handler)], transport=StubTransport())
+        with pytest.raises(asyncio.CancelledError):
+            await agent.dispatch_tools([ToolUseBlock(id="c1", name="cancelled", input={})], 1)
 
 
 class TestMalformedJson:

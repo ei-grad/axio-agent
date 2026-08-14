@@ -30,6 +30,7 @@ from .events import (
     ToolUseStart,
     VideoOutput,
 )
+from .exceptions import GuardCrash, HandlerCrash, ToolError
 from .messages import Message
 from .models import Capability
 from .selector import ToolSelector
@@ -130,6 +131,19 @@ class _RepetitionDetector:
         return False
 
 
+def _log_tool_failure(name: str, exc: Exception) -> None:
+    """Log a failed tool call, distinguishing expected failures from crashes.
+
+    An expected failure (a handler reporting a missing file, a guard denying the
+    call, invalid model-supplied input) is ordinary agent control flow and gets no
+    traceback. Anything else escaped the code that should have handled it.
+    """
+    if isinstance(exc, ToolError) and not isinstance(exc, HandlerCrash | GuardCrash):
+        logger.info("Tool %s failed: %s", name, exc)
+    else:
+        logger.error("Tool %s raised %s: %s", name, type(exc).__name__, exc, exc_info=exc)
+
+
 async def _tool_result_text(tool: Tool[Any], args: dict[str, Any]) -> str:
     result = await tool(**args)
     return result if isinstance(result, str) else str(result)
@@ -184,7 +198,7 @@ class Agent:
                     else:
                         content = str(result)
                 except Exception as exc:
-                    logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                    _log_tool_failure(block.name, exc)
                     return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
             return ToolResultBlock(tool_use_id=block.id, content=content)
 
@@ -241,7 +255,7 @@ class Agent:
                                 ToolOutputDelta(tool_use_id=block.id, name=block.name, key=key, delta=text)
                             )
                     except Exception as exc:
-                        logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                        _log_tool_failure(block.name, exc)
                         return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=tool.format_stream_result(chunks))
             else:
@@ -255,7 +269,7 @@ class Agent:
                         else:
                             content = str(result)
                     except Exception as exc:
-                        logger.error("Tool %s raised %s: %s", block.name, type(exc).__name__, exc, exc_info=True)
+                        _log_tool_failure(block.name, exc)
                         return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=content)
 
