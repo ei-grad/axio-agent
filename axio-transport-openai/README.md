@@ -315,11 +315,12 @@ proof that a model reasons; streamed `reasoning_content` is still emitted as
 
 ## Plugin registration
 
-When installed, this package registers all five transports via entry points so `axio-tui` discovers them automatically:
+When installed, this package registers all six transports via entry points so `axio-tui` discovers them automatically:
 
 ```toml
 [project.entry-points."axio.transport"]
 openai         = "axio_transport_openai:OpenAITransport"
+openai-responses = "axio_transport_openai.responses:OpenAIResponsesTransport"
 nebius         = "axio_transport_openai.nebius:NebiusTransport"
 openrouter     = "axio_transport_openai.openrouter:OpenRouterTransport"
 openai-custom  = "axio_transport_openai.custom:OpenAICompatibleTransport"
