@@ -117,6 +117,25 @@ output, and outcome-delivery correlation. Binary media is stored by hash under
 the session's `attachments/` directory. Directories are created with mode
 `0700` and files with `0600`.
 
+The initial `session_start` record is fsynced before the REPL starts normal
+session work. Streaming records are admitted to a bounded memory queue without
+an fsync per token. Successfully committed context mutations, completed turns,
+outcome deliveries, and stopped agents are durability boundaries: each drains
+and fsyncs every earlier accepted record. A clean shutdown also drains the queue,
+writes `session_end`, and fsyncs it.
+
+After abrupt process termination, all records through the last successful
+durability boundary are retained. Records accepted after that
+boundary are explicitly best-effort: all of them may be lost, or a prefix may
+be present. Any present data remains valid newline-delimited JSON except for at
+most one final unterminated line interrupted during `write(2)`. Journal readers
+may ignore that final tail; `recover_journal_tail()` validates the earlier
+prefix before truncating it. Corruption in a newline-terminated or non-final
+record is not treated as a crash tail.
+
+Storage-media corruption and filesystem failures outside this interrupted-tail
+model are reported as corruption; the reader does not silently skip them.
+
 Known secret-shaped fields and common token formats are redacted before writing,
 but arbitrary secrets embedded in prose or tool output cannot be identified
 reliably. Treat the journal as sensitive local session data and apply an

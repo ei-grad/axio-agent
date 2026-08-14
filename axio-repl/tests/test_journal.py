@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import stat
+import subprocess
+import sys
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -31,11 +34,14 @@ from axio_tools_agents.runtime import (
 )
 
 from axio_repl import _journal as journal_module
-from axio_repl import _session_journal, main
+from axio_repl import _session_journal, _write_runtime_event, main
 from axio_repl._journal import (
+    JournalCorruptionError,
     JournalQueueFullError,
     SessionJournal,
     default_journal_root,
+    read_journal,
+    recover_journal_tail,
     session_directory,
 )
 
@@ -181,6 +187,9 @@ async def test_open_creates_private_storage_and_lifecycle_records(tmp_path: Path
 
     assert stat.S_IMODE(journal.session_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(journal.events_path.stat().st_mode) == 0o600
+    opened = read_journal(journal.events_path)
+    assert [record["kind"] for record in opened.records] == ["session_start"]
+    assert opened.discarded_tail_bytes == 0
 
     await journal.close({"status": "complete"})
 
@@ -189,6 +198,48 @@ async def test_open_creates_private_storage_and_lifecycle_records(tmp_path: Path
     assert records[0]["payload"] == {"model": "test-model"}
     assert records[1]["payload"] == {"status": "complete"}
     assert journal.closed
+
+
+def test_crash_keeps_last_synced_prefix_after_more_publishes_are_accepted(tmp_path: Path) -> None:
+    script = """
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+from axio_repl._journal import SessionJournal
+
+
+async def run() -> None:
+    journal = await SessionJournal.open(session_id="crash", root=Path(sys.argv[1]))
+    for index in range(25):
+        assert await journal.publish("before_boundary", {"index": index})
+    assert await journal.sync()
+    for index in range(100):
+        assert await journal.publish("after_boundary", {"index": index})
+    os._exit(23)
+
+
+asyncio.run(run())
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 23, completed.stderr
+    result = read_journal(_only_events_path(tmp_path))
+    assert len(result.records) == 26
+    assert result.discarded_tail_bytes == 0
+    assert [record["seq"] for record in result.records] == list(range(1, len(result.records) + 1))
+    assert result.records[0]["kind"] == "session_start"
+    boundary_payloads = [record["payload"] for record in result.records[1:26]]
+    assert all(isinstance(payload, dict) for payload in boundary_payloads)
+    assert [payload["index"] for payload in boundary_payloads if isinstance(payload, dict)] == list(range(25))
+    assert all(record["kind"] != "session_end" for record in result.records)
 
 
 async def test_default_one_shot_writes_complete_main_session_journal(
@@ -303,6 +354,33 @@ async def test_journal_open_failure_warns_once_and_does_not_abort_session(
     assert "PermissionError: journal root is read-only" in captured.err
 
 
+async def test_start_sync_failure_warns_once_and_disables_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_sync(_file_descriptor: int) -> None:
+        raise OSError("fsync unavailable")
+
+    monkeypatch.setattr(journal_module, "_sync_file", fail_sync)
+    hub = SessionEventHub(session_id="start-sync-failure")
+
+    async with _session_journal(
+        hub,
+        disabled=False,
+        root=tmp_path,
+        one_shot=True,
+        cwd=tmp_path,
+    ) as journal:
+        assert journal is None
+    await asyncio.sleep(0)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("Session journal degraded") == 1
+    assert "OSError: fsync unavailable" in captured.err
+
+
 async def test_journal_records_hidden_agents_and_delivery_before_display_filtering(tmp_path: Path) -> None:
     hub = SessionEventHub(session_id="all-agents")
     displayed: list[str] = []
@@ -354,6 +432,64 @@ async def test_journal_records_hidden_agents_and_delivery_before_display_filteri
     assert delivered["parent_agent_id"] == "main"
     assert delivered["parent_tool_use_id"] == "run-call"
     assert delivered["payload"]["event"]["route"] == "parent_tool_result"
+
+
+async def test_completed_turn_is_a_durable_boundary_without_syncing_stream_deltas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_calls = 0
+    original_sync = journal_module._sync_file
+
+    def count_sync(file_descriptor: int) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        original_sync(file_descriptor)
+
+    monkeypatch.setattr(journal_module, "_sync_file", count_sync)
+    journal = await SessionJournal.open(session_id="boundaries", root=tmp_path)
+    assert sync_calls == 1
+
+    await _write_runtime_event(
+        journal,
+        AgentEventEnvelope(
+            seq=1,
+            session_id="boundaries",
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="turn-1",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=TextDelta(index=0, delta="live"),
+            context_id="context-1",
+        ),
+    )
+    assert sync_calls == 1
+
+    await _write_runtime_event(
+        journal,
+        AgentEventEnvelope(
+            seq=2,
+            session_id="boundaries",
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="turn-1",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn),
+            context_id="context-1",
+        ),
+    )
+    assert sync_calls == 2
+    durable = read_journal(journal.events_path)
+    assert [record["kind"] for record in durable.records] == [
+        "session_start",
+        "stream_event",
+        "turn_finished",
+    ]
+    await journal.close()
 
 
 @pytest.mark.parametrize(
@@ -592,6 +728,58 @@ async def test_close_drains_all_accepted_records_without_an_explicit_sync(tmp_pa
     assert records[-1]["kind"] == "session_end"
 
 
+async def test_partial_write_leaves_one_recoverable_unterminated_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = await SessionJournal.open(session_id="torn-write", root=tmp_path)
+
+    def write_partial_then_fail(file_descriptor: int, line: bytes) -> None:
+        os.write(file_descriptor, line[: max(1, len(line) // 2)])
+        raise OSError("simulated crash during write")
+
+    monkeypatch.setattr(journal_module, "_append_line", write_partial_then_fail)
+    assert await journal.publish("event", {"value": "not durable"})
+    assert not await journal.sync()
+    await journal.close()
+
+    before_recovery = read_journal(journal.events_path)
+    assert [record["kind"] for record in before_recovery.records] == ["session_start"]
+    assert before_recovery.discarded_tail_bytes > 0
+
+    recovered = recover_journal_tail(journal.events_path)
+    assert recovered == before_recovery
+    assert journal.events_path.read_bytes().endswith(b"\n")
+    after_recovery = read_journal(journal.events_path)
+    assert after_recovery.records == before_recovery.records
+    assert after_recovery.discarded_tail_bytes == 0
+
+
+async def test_reader_rejects_corruption_except_for_final_unterminated_line(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(session_id="corruption", root=tmp_path)
+    await journal.close()
+    valid = journal.events_path.read_bytes()
+
+    journal.events_path.write_bytes(valid + b'{"partial":')
+    result = read_journal(journal.events_path)
+    assert len(result.records) == 2
+    assert result.discarded_tail_bytes == len(b'{"partial":')
+
+    complete_without_delimiter = b'{"complete":true}'
+    journal.events_path.write_bytes(valid + complete_without_delimiter)
+    result = read_journal(journal.events_path)
+    assert len(result.records) == 2
+    assert result.discarded_tail_bytes == len(complete_without_delimiter)
+
+    journal.events_path.write_bytes(valid + b"{not-json}\n")
+    with pytest.raises(JournalCorruptionError, match="invalid JSON"):
+        read_journal(journal.events_path)
+
+    journal.events_path.write_bytes(valid + b"{not-json}\n{}\n")
+    with pytest.raises(JournalCorruptionError, match="invalid JSON"):
+        read_journal(journal.events_path)
+
+
 async def test_writer_failure_degrades_once_without_failing_the_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -640,13 +828,14 @@ async def test_full_queue_degrades_instead_of_blocking_publishers(
         assert release_writer.wait(timeout=2)
         original_append(file_descriptor, line)
 
-    monkeypatch.setattr(journal_module, "_append_line", blocked_append)
     journal = await SessionJournal.open(
         session_id="queue-full",
         root=tmp_path,
         queue_size=1,
         on_degraded=failures.append,
     )
+    monkeypatch.setattr(journal_module, "_append_line", blocked_append)
+    assert await journal.publish("event", {"value": 0})
     assert await asyncio.to_thread(writer_entered.wait, 1)
     try:
         assert await journal.publish("event", {"value": 1})

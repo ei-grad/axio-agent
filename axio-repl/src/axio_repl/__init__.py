@@ -1374,6 +1374,15 @@ _JOURNAL_EVENT_KINDS: dict[type[object], str] = {
     ContextCleared: "context_cleared",
 }
 
+_DURABLE_JOURNAL_EVENTS = (
+    MessageCommitted,
+    ContextForked,
+    ContextCleared,
+    TurnFinished,
+    OutcomeDelivered,
+    AgentStopped,
+)
+
 
 async def _write_runtime_event(journal: _journal.SessionJournal, envelope: AgentEventEnvelope) -> None:
     event = envelope.event
@@ -1391,7 +1400,7 @@ async def _write_runtime_event(journal: _journal.SessionJournal, envelope: Agent
             "run_id": envelope.run_id,
             "event": event,
         }
-    await journal.publish(
+    accepted = await journal.publish(
         kind,
         payload,
         agent_id=envelope.agent_id,
@@ -1401,6 +1410,8 @@ async def _write_runtime_event(journal: _journal.SessionJournal, envelope: Agent
         execution_mode=envelope.execution_mode.value,
         parent_tool_use_id=envelope.parent_tool_use_id,
     )
+    if accepted and isinstance(event, _DURABLE_JOURNAL_EVENTS):
+        await journal.sync()
 
 
 @asynccontextmanager
@@ -1416,7 +1427,13 @@ async def _session_journal(
         yield None
         return
 
+    warning_emitted = False
+
     def warn_degraded(error: BaseException) -> None:
+        nonlocal warning_emitted
+        if warning_emitted:
+            return
+        warning_emitted = True
         print(
             f"Session journal degraded; subsequent records may be missing: {type(error).__name__}: {error}",
             file=sys.stderr,

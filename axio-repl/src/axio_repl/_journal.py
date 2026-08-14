@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
+from typing import cast
 
 SCHEMA_VERSION = 1
 REDACTED = "[REDACTED]"
@@ -41,6 +42,23 @@ type DegradedCallback = Callable[[BaseException], None]
 
 class JournalQueueFullError(RuntimeError):
     """The bounded journal queue could not accept another record."""
+
+
+class JournalStartError(OSError):
+    """The journal could not make its initial record durable."""
+
+
+class JournalCorruptionError(ValueError):
+    """A newline-terminated journal record is not valid JSON."""
+
+
+@dataclass(frozen=True, slots=True)
+class JournalReadResult:
+    """The valid JSONL prefix and any ignored unterminated tail."""
+
+    records: tuple[dict[str, JsonValue], ...]
+    valid_prefix_bytes: int
+    discarded_tail_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +123,54 @@ def session_directory(
     return journal_root / timestamp.strftime("%Y") / timestamp.strftime("%m") / timestamp.strftime("%d") / session_id
 
 
+def read_journal(events_path: Path) -> JournalReadResult:
+    """Read the valid JSONL prefix, ignoring only a final unterminated line.
+
+    A writer crash can interrupt its current ``write(2)`` and leave that one
+    line incomplete. Any malformed newline-terminated record is corruption and
+    is rejected, including corruption before the final line.
+    """
+
+    raw = events_path.read_bytes()
+    valid_prefix_bytes = raw.rfind(b"\n") + 1
+    records: list[dict[str, JsonValue]] = []
+    for line_number, line in enumerate(raw[:valid_prefix_bytes].splitlines(), start=1):
+        if not line:
+            raise JournalCorruptionError(f"empty record at line {line_number}")
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise JournalCorruptionError(f"invalid JSON at line {line_number}: {error}") from error
+        if not isinstance(value, dict):
+            raise JournalCorruptionError(f"journal record at line {line_number} is not an object")
+        records.append(cast(dict[str, JsonValue], value))
+    return JournalReadResult(
+        records=tuple(records),
+        valid_prefix_bytes=valid_prefix_bytes,
+        discarded_tail_bytes=len(raw) - valid_prefix_bytes,
+    )
+
+
+def recover_journal_tail(events_path: Path) -> JournalReadResult:
+    """Validate a stopped journal and truncate only its unterminated tail."""
+
+    result = read_journal(events_path)
+    if result.discarded_tail_bytes == 0:
+        return result
+    file_descriptor = os.open(events_path, os.O_WRONLY)
+    try:
+        current_size = os.fstat(file_descriptor).st_size
+        expected_size = result.valid_prefix_bytes + result.discarded_tail_bytes
+        if current_size != expected_size:
+            raise RuntimeError("journal changed while its tail was being recovered")
+        os.ftruncate(file_descriptor, result.valid_prefix_bytes)
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+    _sync_directory(events_path.parent)
+    return result
+
+
 def _is_secret_key(key: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
     compact = normalized.replace("_", "")
@@ -158,6 +224,27 @@ def _sync_file(file_descriptor: int) -> None:
     os.fsync(file_descriptor)
 
 
+def _sync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    file_descriptor = os.open(directory, flags)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _sync_directory_chain(directory: Path, existing_ancestor: Path) -> None:
+    current = directory
+    while True:
+        _sync_directory(current)
+        if current == existing_ancestor:
+            return
+        parent = current.parent
+        if parent == current:
+            raise OSError(f"{existing_ancestor} is not an ancestor of {directory}")
+        current = parent
+
+
 def _sync_and_close(file_descriptor: int) -> None:
     try:
         os.fsync(file_descriptor)
@@ -165,7 +252,13 @@ def _sync_and_close(file_descriptor: int) -> None:
         os.close(file_descriptor)
 
 
-def _open_storage(directory: Path) -> tuple[int, Path]:
+def _open_storage(directory: Path) -> tuple[int, Path, Path]:
+    existing_ancestor = directory
+    while not existing_ancestor.exists():
+        parent = existing_ancestor.parent
+        if parent == existing_ancestor:
+            break
+        existing_ancestor = parent
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.chmod(0o700)
     events_path = directory / "events.jsonl"
@@ -175,7 +268,7 @@ def _open_storage(directory: Path) -> tuple[int, Path]:
     except OSError:
         os.close(file_descriptor)
         raise
-    return file_descriptor, events_path
+    return file_descriptor, events_path, existing_ancestor
 
 
 class _AttachmentStore:
@@ -186,10 +279,12 @@ class _AttachmentStore:
 
     def put(self, data: bytes, media_type: str | None) -> dict[str, JsonValue]:
         digest = hashlib.sha256(data).hexdigest()
+        directory_created = False
         if not self._ready:
             self._directory.mkdir(mode=0o700, exist_ok=True)
             self._directory.chmod(0o700)
             self._ready = True
+            directory_created = True
         target = self._directory / digest
         try:
             file_descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -203,6 +298,9 @@ class _AttachmentStore:
                 os.fsync(file_descriptor)
             finally:
                 os.close(file_descriptor)
+            _sync_directory(self._directory)
+            if directory_created:
+                _sync_directory(self._session_dir)
         return {
             "type": "attachment",
             "sha256": digest,
@@ -266,7 +364,11 @@ class _JournalSerializer:
 
 
 class SessionJournal:
-    """A bounded, non-blocking publisher backed by one JSONL writer task."""
+    """A bounded JSONL writer with explicit durability boundaries.
+
+    ``publish()`` only acknowledges admission to the in-memory queue. A
+    successful ``sync()`` makes every record accepted before it durable.
+    """
 
     def __init__(
         self,
@@ -275,6 +377,7 @@ class SessionJournal:
         session_dir: Path,
         events_path: Path,
         file_descriptor: int,
+        metadata_sync_root: Path,
         queue_size: int,
         on_degraded: DegradedCallback | None,
     ) -> None:
@@ -283,6 +386,7 @@ class SessionJournal:
         self.events_path = events_path
         self.attachments_dir = session_dir / "attachments"
         self._file_descriptor = file_descriptor
+        self._metadata_sync_root = metadata_sync_root
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue(maxsize=queue_size)
         self._serializer = _JournalSerializer(session_dir)
         self._on_degraded = on_degraded
@@ -290,6 +394,7 @@ class SessionJournal:
         self._next_seq = 1
         self._accepting = True
         self._closed = False
+        self._storage_metadata_synced = False
         self._close_lock = asyncio.Lock()
         self._writer_task = asyncio.create_task(self._writer_loop(), name=f"axio-journal-{session_id}")
 
@@ -304,23 +409,33 @@ class SessionJournal:
         queue_size: int = 4096,
         on_degraded: DegradedCallback | None = None,
     ) -> SessionJournal:
-        """Create a new session directory and enqueue ``session_start``."""
+        """Create a journal whose ``session_start`` is already durable."""
 
         if queue_size < 1:
             raise ValueError("queue_size must be at least 1")
         resolved_session_id = uuid.uuid4().hex if session_id is None else session_id
         resolved_started_at = datetime.now(UTC) if started_at is None else started_at
         directory = session_directory(resolved_session_id, root=root, started_at=resolved_started_at)
-        file_descriptor, events_path = await asyncio.to_thread(_open_storage, directory)
+        file_descriptor, events_path, metadata_sync_root = await asyncio.to_thread(_open_storage, directory)
         journal = cls(
             session_id=resolved_session_id,
             session_dir=directory,
             events_path=events_path,
             file_descriptor=file_descriptor,
+            metadata_sync_root=metadata_sync_root,
             queue_size=queue_size,
             on_degraded=on_degraded,
         )
-        journal._enqueue_nowait("session_start", start_payload)
+        if not journal._enqueue_nowait("session_start", start_payload):
+            await journal.close()
+            raise JournalStartError("session_start could not be queued")
+        if not await journal.sync():
+            reason = journal.degraded_reason
+            await journal.close()
+            message = "session_start could not be made durable"
+            if reason is not None:
+                raise JournalStartError(f"{message}: {type(reason).__name__}: {reason}") from reason
+            raise JournalStartError(message)
         return journal
 
     @property
@@ -347,7 +462,11 @@ class SessionJournal:
         execution_mode: str | None = None,
         parent_tool_use_id: str | None = None,
     ) -> bool:
-        """Queue one record without waiting for serialization or filesystem I/O."""
+        """Queue one record without waiting for serialization or persistence.
+
+        ``True`` means the bounded in-memory queue accepted the record. The
+        record is not durable until a later successful ``sync()`` or ``close()``.
+        """
 
         if not kind:
             raise ValueError("kind must not be empty")
@@ -363,7 +482,7 @@ class SessionJournal:
         )
 
     async def sync(self) -> bool:
-        """Wait until prior records are processed and synchronize valid data."""
+        """Drain prior accepted records and make their valid JSONL prefix durable."""
 
         async with self._close_lock:
             if self._closed or not self._accepting:
@@ -500,6 +619,13 @@ class SessionJournal:
                     elif isinstance(item, _SyncRequest):
                         try:
                             await asyncio.to_thread(_sync_file, self._file_descriptor)
+                            if not self._storage_metadata_synced:
+                                await asyncio.to_thread(
+                                    _sync_directory_chain,
+                                    self.session_dir,
+                                    self._metadata_sync_root,
+                                )
+                                self._storage_metadata_synced = True
                         except Exception as error:
                             # fsync failures are platform- and filesystem-specific.
                             self._mark_degraded(error)

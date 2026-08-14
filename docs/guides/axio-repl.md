@@ -93,6 +93,25 @@ events, successfully committed context messages, lifecycle events, configuration
 changes, and the correlation between child outcomes and their delivery routes.
 Media bytes are stored by content hash in an adjacent `attachments/` directory.
 
+`session_start` is written and fsynced before normal session work begins. The
+hot streaming path only admits records to a bounded in-memory queue; admission
+does not claim that an individual record is durable. The journal drains and
+fsyncs at successfully committed context mutations, completed turns, outcome
+delivery, agent shutdown, and clean session shutdown. This preserves live
+streaming while giving completed work explicit durability boundaries.
+
+If the process stops abruptly, every record through the last successful
+boundary is retained. Every record accepted after that boundary may
+be lost; alternatively, some prefix can reach disk. The on-disk result is valid
+newline-delimited JSON through all complete records, with at most one final
+unterminated line from an interrupted write. `read_journal()` ignores only that
+tail, and `recover_journal_tail()` validates the complete prefix before
+truncating it. Malformed newline-terminated or earlier records are reported as
+corruption rather than silently skipped.
+
+This recovery rule does not mask storage-media corruption or broader filesystem
+failures; those remain hard errors.
+
 Session directories use mode `0700` and journal or attachment files use `0600`.
 Known secret-shaped fields and common token formats are redacted recursively,
 but a secret embedded in arbitrary prose or tool output cannot always be
