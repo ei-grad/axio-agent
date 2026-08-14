@@ -1,17 +1,19 @@
 # Standard agent sandbox image
 
-This directory builds a local agent environment. It is not published by the
-project, so choose the local tag explicitly when starting `axio-repl`. The
-current build has been smoke-tested on `linux/amd64`; other platforms are not
-claimed as tested.
+This directory builds the local default environment for `axio-repl`. It is not
+published by the project. The current build has been smoke-tested on
+`linux/amd64`; other platforms are not claimed as tested.
 
 ```bash
 make sandbox-image
 axio-repl --sandbox docker \
-  --sandbox-image axio-agent-sandbox:standard \
   --sandbox-memory 4g \
   --sandbox-cpus 2
 ```
+
+The REPL does not try to pull the default `axio-agent-sandbox:standard` tag. If
+it has not been built locally, startup reports the `make sandbox-image` command.
+Explicit `--sandbox-image` alternatives retain pull-on-missing behavior.
 
 The image is based on `mcr.microsoft.com/devcontainers/base:3-noble` and adds:
 

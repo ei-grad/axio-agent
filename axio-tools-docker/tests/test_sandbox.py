@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiodocker
 import pytest
 
-from axio_tools_docker.sandbox import DockerSandbox, parse_cpus, parse_device, parse_memory
+from axio_tools_docker.sandbox import DockerSandbox, ImageNotAvailableError, parse_cpus, parse_device, parse_memory
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,6 +135,37 @@ async def test_context_manager_creates_and_starts() -> None:
         async with DockerSandbox(image="alpine:latest"):
             pass
     container.start.assert_awaited_once()
+
+
+async def test_missing_local_only_image_is_not_pulled() -> None:
+    cls, client, container = mock_docker_factory()
+    client.images.inspect = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(ImageNotAvailableError, match="not available locally"):
+            async with DockerSandbox(image="local-only:latest", pull_missing=False):
+                pass
+    client.images.pull.assert_not_awaited()
+    client.close.assert_awaited_once()
+
+
+async def test_image_inspection_error_is_not_reported_as_missing() -> None:
+    cls, client, container = mock_docker_factory()
+    client.images.inspect = AsyncMock(side_effect=aiodocker.exceptions.DockerError(500, "daemon error"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(aiodocker.exceptions.DockerError, match="daemon error"):
+            async with DockerSandbox(image="local-only:latest", pull_missing=False):
+                pass
+    client.images.pull.assert_not_awaited()
+    client.close.assert_awaited_once()
+
+
+async def test_missing_image_is_pulled_by_default() -> None:
+    cls, client, container = mock_docker_factory()
+    client.images.inspect = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(image="public:latest"):
+            pass
+    client.images.pull.assert_awaited_once_with("public:latest")
 
 
 async def test_context_manager_deletes_on_exit() -> None:
@@ -354,6 +385,21 @@ async def test_write_file_tar_contains_content() -> None:
         f = tar.extractfile(member)
         assert f is not None
         assert f.read() == b"print('hi')"
+
+
+async def test_write_file_tar_uses_numeric_runtime_owner() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(user="1234:5678") as sb:
+            await sb.write_file("/workspace/hello.py", "print('hi')")
+
+    call_kwargs = container.put_archive.call_args
+    tar_bytes: bytes = call_kwargs.kwargs.get("data") or call_kwargs.args[1]
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tar:
+        member = tar.next()
+        assert member is not None
+        assert member.uid == 1234
+        assert member.gid == 5678
 
 
 async def test_write_file_correct_parent_dir() -> None:
@@ -644,6 +690,15 @@ async def test_user_absent_by_default() -> None:
             pass
     config = client._captured_config[0]
     assert "User" not in config
+
+
+async def test_supplementary_groups_set() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(group_add=["20", "998"]):
+            pass
+    config = client._captured_config[0]
+    assert config["HostConfig"]["GroupAdd"] == ["20", "998"]
 
 
 async def test_container_name_passed() -> None:

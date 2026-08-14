@@ -74,7 +74,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
 | `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
-| `--sandbox-image` | `python:3.12-slim` | Image for `--sandbox docker` |
+| `--sandbox-image` | `axio-agent-sandbox:standard` | Locally built image for `--sandbox docker` |
 | `--sandbox-network` | none | User-defined internal Docker network for restricted service access |
 | `--sandbox-memory` | `256m` | Container memory limit |
 | `--sandbox-cpus` | `1.0` | Container CPU limit |
@@ -215,13 +215,18 @@ used whenever `aiodocker` is installed and `/var/run/docker.sock` exists, so a
 machine with Docker running gets a sandbox without asking for one. The startup
 banner states which it is — `Tools: docker — …` or `Tools: host — …`.
 
-In a container the working directory is bind-mounted at `/workspace`, and that
-is the path the system prompt gives the model. Host paths are meaningless to it.
+In a container the project is bind-mounted at the same absolute path used on
+the host, and that is the path the system prompt gives the model. The container
+runs with the invoking numeric UID/GID and supplementary groups. Read-only host
+`/etc/passwd` and `/etc/group` mounts provide file-based name resolution, while
+an automatically removed temporary bind mount provides a writable isolated
+`HOME`; the real host home is not exposed.
 
-The default image is `python:3.12-slim` and networking is off, which together
-decide what the agent can and cannot do. The repository also contains a locally
-buildable standard image and fail-closed support for an internal Docker network,
-policy proxy, registry caches, and read-only dataset snapshots. See
+The default image is the locally built `axio-agent-sandbox:standard`, and
+networking is off. Run `make sandbox-image` before its first use; the REPL does
+not try to pull that local-only tag. Explicit alternative image names retain
+pull-on-missing behavior. Fail-closed support for an internal Docker network,
+policy proxy, registry caches, and read-only dataset snapshots is described in
 [Docker Sandbox](docker-sandbox.md#from-axio-repl).
 
 ## AGENTS.md

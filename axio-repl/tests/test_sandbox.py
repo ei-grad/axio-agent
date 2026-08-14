@@ -1,3 +1,4 @@
+import os
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Self
@@ -202,6 +203,8 @@ async def test_docker_mode_passes_restricted_configuration(monkeypatch: pytest.M
             return None
 
         async def exec(self, command: str, timeout: float = 30) -> str:
+            if "AXIO_RUNTIME_OK" in command:
+                return "AXIO_RUNTIME_OK"
             return ""
 
     monkeypatch.setattr(docker_sandbox, "DockerSandbox", FakeDockerSandbox)
@@ -215,20 +218,108 @@ async def test_docker_mode_passes_restricted_configuration(monkeypatch: pytest.M
     )
 
     async with AsyncExitStack() as stack:
-        _, description, _, _ = await _sandbox.build_tools(stack, [], "docker", "img", tmp_path, options)
+        _, description, tool_root, _ = await _sandbox.build_tools(stack, [], "docker", "img", tmp_path, options)
 
         read_only_volumes = captured["read_only_volumes"]
         cargo_config_path = Path(read_only_volumes[_sandbox.CARGO_CONFIG_PATH])
         assert cargo_config_path.parent != tmp_path
         assert cargo_config_path.read_text(encoding="utf-8") == options.cargo_config()
+        home_dir = Path(captured["volumes"][_sandbox.SANDBOX_HOME])
+        assert home_dir.is_dir()
+        assert (home_dir / ".cargo").is_dir()
+        assert home_dir != Path.home()
 
     assert captured["network"] == "agent-egress"
     assert captured["require_internal_network"] is True
     assert captured["memory"] == "4g"
     assert captured["cpus"] == "2.0"
     assert captured["env"]["HTTPS_PROXY"] == "http://mitmania:8080"
+    assert captured["env"]["HOME"] == _sandbox.SANDBOX_HOME
+    assert captured["user"] == f"{os.getuid()}:{os.getgid()}"
+    expected_groups = dict.fromkeys(str(group_id) for group_id in os.getgroups() if group_id != os.getgid())
+    assert captured["group_add"] == list(expected_groups)
+    assert captured["volumes"][str(tmp_path)] == str(tmp_path)
+    assert captured["workdir"] == str(tmp_path)
+    assert captured["pull_missing"] is True
     assert read_only_volumes[_sandbox.DATASETS_DIR] == str(datasets)
+    assert read_only_volumes["/etc/passwd"] == "/etc/passwd"
+    assert read_only_volumes["/etc/group"] == "/etc/group"
+    assert tool_root == tmp_path
+    assert not home_dir.exists()
     assert "internal network agent-egress" in description
+    assert f"project at {tmp_path}" in description
+
+
+@pytest.mark.asyncio
+async def test_default_image_is_local_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    class MissingDockerSandbox:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self) -> Self:
+            raise docker_sandbox.ImageNotAvailableError("missing")
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(docker_sandbox, "DockerSandbox", MissingDockerSandbox)
+
+    async with AsyncExitStack() as stack:
+        with pytest.raises(RuntimeError, match="make sandbox-image"):
+            await _sandbox.build_tools(stack, [], "docker", _sandbox.DEFAULT_SANDBOX_IMAGE, tmp_path)
+
+    assert captured["pull_missing"] is False
+    assert not Path(captured["volumes"][_sandbox.SANDBOX_HOME]).exists()
+
+
+@pytest.mark.asyncio
+async def test_identity_verification_failure_is_not_silent(tmp_path: Path) -> None:
+    class BrokenIdentitySandbox:
+        async def exec(self, command: str, timeout: float = 30) -> str:
+            return "AXIO_RUNTIME_ERROR: container UID differs from the invoking user\n[exit code: 1]"
+
+    with pytest.raises(RuntimeError, match="--sandbox none"):
+        await _sandbox._verify_runtime_identity(
+            BrokenIdentitySandbox(), tmp_path, _sandbox.HostIdentity(uid=123, gid=456, supplementary_gids=())
+        )
+
+
+@pytest.mark.parametrize("mode", ["auto", "docker"])
+@pytest.mark.asyncio
+async def test_identity_failure_never_falls_back_to_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    class BrokenIdentityDockerSandbox:
+        def __init__(self, **kwargs: Any) -> None:
+            self.tools: list[Tool[Any]] = []
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def exec(self, command: str, timeout: float = 30) -> str:
+            return "AXIO_RUNTIME_ERROR: current UID is absent from mounted /etc/passwd\n[exit code: 1]"
+
+    monkeypatch.setattr(_sandbox, "docker_available", lambda: True)
+    monkeypatch.setattr(docker_sandbox, "DockerSandbox", BrokenIdentityDockerSandbox)
+
+    async with AsyncExitStack() as stack:
+        with pytest.raises(RuntimeError, match="--sandbox none"):
+            await _sandbox.build_tools(stack, [], mode, "explicit-image", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_project_path_with_colon_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "project:invalid"
+    workspace.mkdir()
+
+    async with AsyncExitStack() as stack:
+        with pytest.raises(RuntimeError, match="contains ':'"):
+            await _sandbox.build_tools(stack, [], "docker", "explicit-image", workspace)
 
 
 class _StubSandbox:

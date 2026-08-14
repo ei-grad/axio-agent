@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import shlex
 import shutil
 import tempfile
@@ -39,13 +40,15 @@ SANDBOXED_TOOL_NAMES = frozenset({"read_file", "write_file", "patch_file", "list
 # exactly what this is meant to avoid.
 SANDBOX_ONLY_TOOL_NAMES = frozenset({"run_python"})
 
-WORKDIR = "/workspace"
+DEFAULT_SANDBOX_IMAGE = "axio-agent-sandbox:standard"
+SANDBOX_HOME = "/tmp/axio-home"
 DATASETS_DIR = "/datasets"
 EGRESS_CA_PATH = "/etc/axio/egress-ca.pem"
-CARGO_HOME = "/tmp/axio-cargo"
+CARGO_HOME = f"{SANDBOX_HOME}/.cargo"
 CARGO_CONFIG_PATH = f"{CARGO_HOME}/config.toml"
 DEFAULT_SANDBOX_MEMORY = "256m"
 DEFAULT_SANDBOX_CPUS = "1.0"
+HOST_IDENTITY_ESCAPE_HATCH = "Pass `--sandbox none` to explicitly run tools on the host."
 
 _MEMORY_MULTIPLIERS = {"k": 1024, "m": 1024**2, "g": 1024**3}
 
@@ -202,6 +205,64 @@ class SandboxOptions:
         return volumes
 
 
+@dataclass(frozen=True, slots=True)
+class HostIdentity:
+    """POSIX identity projected into a REPL-created sandbox."""
+
+    uid: int
+    gid: int
+    supplementary_gids: tuple[int, ...]
+
+
+def _current_host_identity() -> HostIdentity:
+    if os.name != "posix" or not all(hasattr(os, name) for name in ("getuid", "getgid", "getgroups")):
+        raise RuntimeError(
+            f"Docker sandbox host-user projection requires a POSIX client. {HOST_IDENTITY_ESCAPE_HATCH}"
+        )
+    if not Path("/etc/passwd").is_file() or not Path("/etc/group").is_file():
+        raise RuntimeError(
+            f"Docker sandbox host-user projection requires /etc/passwd and /etc/group. {HOST_IDENTITY_ESCAPE_HATCH}"
+        )
+
+    uid = os.getuid()
+    gid = os.getgid()
+    supplementary_gids = tuple(dict.fromkeys(group_id for group_id in os.getgroups() if group_id != gid))
+    return HostIdentity(uid=uid, gid=gid, supplementary_gids=supplementary_gids)
+
+
+async def _verify_runtime_identity(sandbox: Any, workspace: Path, identity: HostIdentity) -> None:
+    supplementary_checks = "\n".join(
+        (
+            f'case " $(id -G) " in *" {group_id} "*) ;; '
+            f'*) fail "supplementary group {group_id} was not preserved" ;; esac'
+        )
+        for group_id in identity.supplementary_gids
+    )
+    script = f"""
+fail() {{ printf 'AXIO_RUNTIME_ERROR: %s\\n' "$1"; exit 1; }}
+[ "$(id -u)" = {identity.uid} ] || fail 'container UID differs from the invoking user'
+[ "$(id -g)" = {identity.gid} ] || fail 'container primary GID differs from the invoking user'
+id -un >/dev/null 2>&1 || fail 'current UID is not resolvable through the mounted /etc/passwd'
+id -gn >/dev/null 2>&1 || fail 'current GID is not resolvable through the mounted /etc/group'
+command -v getent >/dev/null 2>&1 || fail 'the sandbox image does not provide getent'
+getent passwd {identity.uid} >/dev/null || fail 'current UID is absent from the mounted /etc/passwd'
+getent group {identity.gid} >/dev/null || fail 'current GID is absent from the mounted /etc/group'
+[ "$(pwd -P)" = {shlex.quote(str(workspace))} ] || fail 'container workdir differs from the host project path'
+[ "$HOME" = {shlex.quote(SANDBOX_HOME)} ] || fail 'sandbox HOME is not isolated'
+[ -w "$HOME" ] || fail 'sandbox HOME is not writable by the invoking user'
+[ -w . ] || fail 'project directory is not writable by the invoking user'
+{supplementary_checks}
+awk '$5 == "/etc/passwd" && $6 ~ /(^|,)ro(,|$)/ {{ found=1 }} END {{ exit !found }}' /proc/self/mountinfo \
+    || fail '/etc/passwd is not a read-only mount'
+awk '$5 == "/etc/group" && $6 ~ /(^|,)ro(,|$)/ {{ found=1 }} END {{ exit !found }}' /proc/self/mountinfo \
+    || fail '/etc/group is not a read-only mount'
+printf 'AXIO_RUNTIME_OK\\n'
+"""
+    result = await sandbox.exec(script, timeout=15)
+    if result != "AXIO_RUNTIME_OK":
+        raise RuntimeError(f"Docker sandbox identity verification failed: {result}. {HOST_IDENTITY_ESCAPE_HATCH}")
+
+
 # ast-grep installs its binary as `ast-grep`. `sg` is shadow-utils' setgid
 # helper on Linux and must never be invoked in its place.
 AST_GREP = "ast-grep"
@@ -318,10 +379,9 @@ def _make_sandbox_overrides(sandbox: Any) -> list[Tool[Any]]:
 async def describe_environment(sandbox: Any, image: str, networking: bool) -> str:
     """What the image has and what it lacks, asked of the image itself.
 
-    A default `python:3.12-slim` has no git, make, uv or compiler, and with
-    networking off none of them can be installed — an agent told to build or
-    test the project otherwise finds this out one failed command at a time.
-    Probed rather than assumed, because the image is the caller's choice.
+    Explicit image overrides may contain a very different toolset from the
+    standard image. Probe rather than assume so the system prompt describes the
+    container the caller actually selected.
     """
     probe = "; ".join(f"command -v {name} >/dev/null 2>&1 && echo {name}" for name in PROBED_COMMANDS)
     try:
@@ -363,8 +423,8 @@ async def build_tools(
     """Return the toolset, a one-line description, the root the tools see, and
     what the sandbox environment offers.
 
-    In a container the workspace is mounted elsewhere than on the host, and the
-    system prompt has to state the path the model can actually act on.
+    REPL-created containers preserve the project's absolute host path so tool
+    output and system-prompt paths stay valid on both sides of the bind mount.
     """
     options = options or SandboxOptions()
     if mode == "none" or (mode == "auto" and not docker_available()):
@@ -375,29 +435,61 @@ async def build_tools(
             result.append(Tool(name="ast_grep", handler=_make_host_ast_grep()))
         return result, "host — tools run directly on this machine", workspace, ""
 
-    from axio_tools_docker.sandbox import DockerSandbox
+    from axio_tools_docker.sandbox import DockerSandbox, ImageNotAvailableError
 
+    try:
+        workspace = workspace.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Docker sandbox project directory is unavailable: {workspace}") from exc
+    if not workspace.is_dir():
+        raise RuntimeError(f"Docker sandbox project path is not a directory: {workspace}")
+    if workspace == Path("/"):
+        raise RuntimeError("Docker sandbox refuses to mount the host filesystem root as a project")
+    if ":" in str(workspace):
+        raise RuntimeError(
+            f"Docker sandbox project path contains ':' and cannot be encoded as a bind mount: {workspace}"
+        )
+    if str(workspace) == SANDBOX_HOME:
+        raise RuntimeError(f"Docker sandbox project path conflicts with its isolated HOME: {workspace}")
+
+    identity = _current_host_identity()
     network: bool | str = options.network if options.network is not None else False
     read_only_volumes = options.read_only_volumes()
+    read_only_volumes.update({"/etc/passwd": "/etc/passwd", "/etc/group": "/etc/group"})
+    home_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="axio-sandbox-home-")))
+    (home_dir / ".cargo").mkdir()
     cargo_config = options.cargo_config()
     if cargo_config:
         cargo_config_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="axio-cargo-config-")))
         cargo_config_file = cargo_config_dir / "config.toml"
         cargo_config_file.write_text(cargo_config, encoding="utf-8")
         read_only_volumes[CARGO_CONFIG_PATH] = str(cargo_config_file)
-    sandbox = await stack.enter_async_context(
-        DockerSandbox(
-            image=image,
-            memory=options.memory,
-            cpus=options.cpus,
-            volumes={WORKDIR: str(workspace)},
-            read_only_volumes=read_only_volumes,
-            workdir=WORKDIR,
-            network=network,
-            env=options.environment(),
-            require_internal_network=options.network is not None,
+    environment = options.environment()
+    environment["HOME"] = SANDBOX_HOME
+    try:
+        sandbox = await stack.enter_async_context(
+            DockerSandbox(
+                image=image,
+                memory=options.memory,
+                cpus=options.cpus,
+                volumes={str(workspace): str(workspace), SANDBOX_HOME: str(home_dir)},
+                read_only_volumes=read_only_volumes,
+                workdir=str(workspace),
+                network=network,
+                env=environment,
+                user=f"{identity.uid}:{identity.gid}",
+                group_add=[str(group_id) for group_id in identity.supplementary_gids],
+                require_internal_network=options.network is not None,
+                pull_missing=image != DEFAULT_SANDBOX_IMAGE,
+            )
         )
-    )
+    except ImageNotAvailableError as exc:
+        if image == DEFAULT_SANDBOX_IMAGE:
+            raise RuntimeError(
+                f"Default sandbox image {DEFAULT_SANDBOX_IMAGE!r} is not built; run `make sandbox-image`"
+            ) from exc
+        raise
+    await _verify_runtime_identity(sandbox, workspace, identity)
     available = {t.name: t for t in sandbox.tools}
     overrides = {t.name: t for t in _make_sandbox_overrides(sandbox)}
 
@@ -415,7 +507,7 @@ async def build_tools(
     network_description = f"internal network {options.network}" if options.network else "no network"
     return (
         merged,
-        f"docker — {image}, {network_description}, {workspace} mounted at {WORKDIR}",
-        Path(WORKDIR),
+        f"docker — {image}, {network_description}, project at {workspace}",
+        workspace,
         note,
     )

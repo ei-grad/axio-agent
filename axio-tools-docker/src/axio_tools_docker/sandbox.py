@@ -21,6 +21,10 @@ from axio.tool import CONTEXT, Tool
 logger = logging.getLogger(__name__)
 
 
+class ImageNotAvailableError(RuntimeError):
+    """Raised when a local-only sandbox image is absent from the daemon."""
+
+
 def parse_memory(s: str) -> int:
     """Parse human-readable memory string to bytes: "256m" → 268435456."""
     units = {"k": 1024, "m": 1024**2, "g": 1024**3}
@@ -217,6 +221,7 @@ class DockerSandbox:
         volumes_remove: bool = False,
         env: dict[str, str] | None = None,
         user: str = "",
+        group_add: list[str] | None = None,
         name: str = "",
         remove: bool = True,
         read_only: bool = False,
@@ -232,6 +237,7 @@ class DockerSandbox:
         devices: list[str] | None = None,
         dns: list[str] | None = None,
         require_internal_network: bool = False,
+        pull_missing: bool = True,
     ) -> None:
         """Create a DockerSandbox.
 
@@ -254,6 +260,7 @@ class DockerSandbox:
                 an existing container (``name=`` reuse) or when ``named_volumes`` is empty.
             env: Environment variables passed to all commands, e.g. {"PYTHONPATH": "/app"}.
             user: User to run as inside the container, e.g. "1000" or "nobody".
+            group_add: Supplementary group names or numeric IDs for the container process.
             name: Container name. If a container with this name already exists and
                 is running, the sandbox attaches to it instead of creating a new one
                 and will not remove it on exit. If no container exists, a new one is
@@ -288,6 +295,8 @@ class DockerSandbox:
             require_internal_network: When true, ``network`` must name a Docker network
                 configured with ``Internal=true``. Container creation fails closed if the
                 network is missing or externally routed.
+            pull_missing: Pull ``image`` when absent locally. When false, fail without
+                contacting a registry.
         """
         if require_internal_network and not isinstance(network, str):
             raise ValueError("require_internal_network needs a named Docker network")
@@ -305,6 +314,7 @@ class DockerSandbox:
         self.volumes_remove = volumes_remove
         self.env: dict[str, str] = env or {}
         self.user = user
+        self.group_add: list[str] = group_add or []
         self.name = name
         self.remove = remove
         self.read_only = read_only
@@ -320,6 +330,7 @@ class DockerSandbox:
         self.devices: list[str] = devices or []
         self.dns: list[str] = dns or []
         self.require_internal_network = require_internal_network
+        self.pull_missing = pull_missing
         self._verified_network_id: str | None = None
         self._client: aiodocker.Docker | None = None
         self._container: aiodocker.containers.DockerContainer | None = None
@@ -367,7 +378,13 @@ class DockerSandbox:
                 self._attached = False
 
         if not self._attached:
-            await self._ensure_image()
+            try:
+                await self._ensure_image()
+            except Exception:  # inspection and pull failures can originate in Docker, HTTP, or the socket
+                self._verified_network_id = None
+                await self._client.close()
+                self._client = None
+                raise
             binds = [f"{host}:{container}" for container, host in self.volumes.items()]
             binds += [f"{host}:{container}:ro" for container, host in self.read_only_volumes.items()]
             binds += [f"{vol}:{path}" for path, vol in self.named_volumes.items()]
@@ -412,6 +429,8 @@ class DockerSandbox:
                 host_config["Devices"] = [parse_device(d) for d in self.devices]
             if self.dns:
                 host_config["Dns"] = self.dns
+            if self.group_add:
+                host_config["GroupAdd"] = self.group_add
 
             config: dict[str, Any] = {
                 "Image": self.image,
@@ -496,7 +515,11 @@ class DockerSandbox:
         try:
             await self._client.images.inspect(self.image)
             logger.debug("Image already present: %s", self.image)
-        except aiodocker.exceptions.DockerError:
+        except aiodocker.exceptions.DockerError as exc:
+            if exc.status != 404:
+                raise
+            if not self.pull_missing:
+                raise ImageNotAvailableError(f"Docker image {self.image!r} is not available locally") from exc
             logger.info("Pulling image %s ...", self.image)
             await self._client.images.pull(self.image)
             logger.info("Image pulled: %s", self.image)
@@ -562,6 +585,10 @@ class DockerSandbox:
             info = tarfile.TarInfo(name=os.path.basename(path))
             info.size = len(data)
             info.mode = mode
+            user_parts = self.user.split(":", maxsplit=1)
+            if len(user_parts) == 2 and all(part.isdecimal() for part in user_parts):
+                info.uid = int(user_parts[0])
+                info.gid = int(user_parts[1])
             tar.addfile(info, io.BytesIO(data))
         parent = os.path.dirname(path) or "/"
         await self.exec(f"mkdir -p {shlex.quote(parent)}")

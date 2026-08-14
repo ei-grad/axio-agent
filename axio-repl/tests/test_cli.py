@@ -31,6 +31,7 @@ def test_agent_actions_rejects_unknown_modes() -> None:
 def test_sandbox_networking_defaults_to_fail_closed() -> None:
     args = _build_argument_parser().parse_args([])
 
+    assert args.sandbox_image == "axio-agent-sandbox:standard"
     assert args.sandbox_network is None
     assert args.sandbox_proxy is None
     assert args.sandbox_memory == "256m"

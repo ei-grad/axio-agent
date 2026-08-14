@@ -2111,7 +2111,11 @@ def _build_argument_parser() -> Any:
         default="auto",
         help="Run file and shell tools inside a Docker container (default: auto — used when a daemon is reachable)",
     )
-    parser.add_argument("--sandbox-image", default="python:3.12-slim", help="Image for --sandbox docker")
+    parser.add_argument(
+        "--sandbox-image",
+        default=_sandbox.DEFAULT_SANDBOX_IMAGE,
+        help="Image for --sandbox docker (default: locally built standard image)",
+    )
     parser.add_argument(
         "--sandbox-network",
         default=None,

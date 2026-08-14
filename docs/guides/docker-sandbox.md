@@ -67,11 +67,27 @@ outside raises `RuntimeError`.
 `/var/run/docker.sock` exists — on a machine with Docker running, the agent is
 sandboxed unless you pass `--sandbox none`.
 
-Without network options, the REPL creates the container as:
+The REPL preserves the invoking process identity and project path. Conceptually,
+without network options it creates the container as:
 
 ```text
-DockerSandbox(image=<--sandbox-image>, volumes={"/workspace": <cwd>}, workdir="/workspace", network=False)
+DockerSandbox(
+    image=<--sandbox-image>,
+    user="<host uid>:<host gid>",
+    group_add=[<host supplementary gids>],
+    volumes={<absolute cwd>: <absolute cwd>, "/tmp/axio-home": <temporary host directory>},
+    read_only_volumes={"/etc/passwd": "/etc/passwd", "/etc/group": "/etc/group"},
+    workdir=<absolute cwd>,
+    network=False,
+)
 ```
+
+The system prompt and tools therefore use the same absolute project path as the
+host. Files created through `write_file` are archived with the numeric runtime
+UID/GID instead of becoming root-owned on the host. `HOME=/tmp/axio-home` is a
+writable, per-session bind mount backed by a host temporary directory; it is
+removed with the sandbox. The real host home is never mounted, and CLI caches
+and configuration do not spill into the project.
 
 The defaults give the agent **256 MB of memory and one CPU** — enough for edits
 and small scripts, tight for a test suite or a compiler. Override them with
@@ -90,29 +106,6 @@ Tools are swapped by name:
 Spawned subagents inherit the parent's tools, so one substitution covers the
 whole tree.
 
-### What the default image contains
-
-`python:3.12-slim` is Debian with CPython and nothing else. Present:
-
-`sh`, `bash`, `grep`, `sed`, `awk`, `find`, `tar`, `diff`, `python3`, `pip`
-
-Absent — and each of these is something an agent will try:
-
-`git`, `make`, `uv`, `gcc`, `curl`, `wget`, `patch`, `ps`, `rg`, `ast-grep`
-
-Two consequences follow from that list plus `network=False`:
-
-- **Nothing can be installed at runtime.** `pip install`, `apt-get install` and
-  `git clone` all fail with a DNS or connection error, not a "not found". The
-  image is the environment; there is no repairing it from inside.
-- **`ast_grep` is offered but cannot work.** In sandbox mode the tool is
-  registered unconditionally, so the model sees it and its calls fail until the
-  binary is in the image. (On the host the tool appears only when `ast-grep` is
-  installed.)
-
-An agent asked to run the project's tests in the default image will discover
-this one command at a time. Give it an image that matches the work instead.
-
 ### Standard agent image
 
 The repository contains a moderately sized universal image based on
@@ -123,19 +116,57 @@ environment, and Kaggle/Hugging Face CLIs.
 ```bash
 make sandbox-image
 axio-repl --sandbox docker \
-  --sandbox-image axio-agent-sandbox:standard \
   --sandbox-memory 4g \
   --sandbox-cpus 2
 ```
 
-The project does not publish this image. The tag above is local and exists only
-after `make sandbox-image`. See `docker/agent-sandbox/README.md` for the exact
-inventory and build arguments. Keep `python3` in derivative images:
+`axio-agent-sandbox:standard` is the REPL default. It is deliberately local-only
+and is not pulled from a registry: when absent, startup stops with the command
+to run `make sandbox-image`. An explicit alternative such as
+`--sandbox-image python:3.12-slim` retains the generic Docker behavior and is
+pulled when missing. See `docker/agent-sandbox/README.md` for the exact inventory
+and build arguments. Keep `python3` in derivative images:
 `search_files` and `run_python` both need it.
 
 Dependencies must be baked in for the same reason — with networking off, a
 `uv sync` inside the container cannot reach an index. The next section describes
 restricted registry access without enabling Docker's routed default network.
+
+### Host identity limitations
+
+Host identity projection is intentionally limited to a local POSIX Docker
+client. REPL sandbox startup fails when numeric UID/GID APIs or `/etc/passwd`
+and `/etc/group` are unavailable. It also verifies the effective UID/GID,
+supplementary numeric group IDs, NSS resolution of the current user and primary
+group, exact workdir, writable project and temporary home, and read-only account
+database mounts before exposing tools to the agent. Root invocation therefore
+runs as root; the REPL does not invent a safer identity.
+
+Both `--sandbox auto` and `--sandbox docker` fail closed when this projection or
+its startup verification fails; neither falls back to host tools. Use
+`--sandbox none` to make host execution an explicit choice.
+
+Only `/etc/passwd` and `/etc/group` are exposed. `/etc/shadow`, `/etc/gshadow`,
+and the host home are not mounted. Supplementary GIDs supplied by an NSS source
+other than `/etc/group` remain usable numerically but may not resolve to names
+inside the container.
+
+The current user and primary group must exist in the mounted files. Accounts
+resolved only through LDAP, SSSD, systemd-homed, macOS Directory Services, or
+another non-file NSS backend are not reproduced by these two mounts, so startup
+fails instead of running under an unresolved identity. In particular, macOS
+Docker Desktop is POSIX on the client side but normally cannot project the
+interactive macOS account through its host `/etc/passwd`; use `--sandbox none`
+unless a file-based identity visible to the Linux container is configured.
+
+Bind source paths are interpreted by the Docker daemon. A remote daemon cannot
+see ordinary client paths, so its mount or the startup verification fails; the
+REPL does not silently fall back to another identity or path. Nested mounts are
+required when a project lies below `/tmp/axio-home` or includes `/etc`; Docker
+on Linux supports them, but unusual daemon/storage configurations can reject
+them. An exact collision with `/tmp/axio-home`, or mounting `/` as the project,
+is rejected before container creation. Project paths containing `:` are also
+rejected because Docker's bind-string representation cannot encode them safely.
 
 ### Restricted packages and datasets
 
@@ -431,6 +462,7 @@ sandbox = DockerSandbox(
     volumes_remove=False,
     env={"PYTHONPATH": "/app"},
     user="nobody",
+    group_add=["20", "998"],
     name="my-sandbox",
     remove=False,
     read_only=True,
@@ -446,6 +478,7 @@ sandbox = DockerSandbox(
     devices=["/dev/net/tun"],
     dns=["8.8.8.8", "1.1.1.1"],
     require_internal_network=False,
+    pull_missing=True,
 )
 ```
 
@@ -463,6 +496,7 @@ sandbox = DockerSandbox(
 | `volumes_remove` | `bool` | `False` | Remove named volumes on exit. No effect when attached to an existing container. |
 | `env` | `dict[str, str]` | `{}` | Environment variables passed to all commands. |
 | `user` | `str` | `""` | User to run as (e.g. `"nobody"`, `"1000"`). |
+| `group_add` | `list[str]` | `[]` | Supplementary group names or numeric IDs. |
 | `name` | `str` | `""` | Container name. Attaches to existing container if running; creates new one otherwise. |
 | `remove` | `bool` | `True` | Remove container on exit. No effect when attached to an existing container. |
 | `read_only` | `bool` | `False` | Read-only root filesystem. Combine with `tmpfs` for writable scratch space. |
@@ -478,6 +512,7 @@ sandbox = DockerSandbox(
 | `devices` | `list[str]` | `[]` | Host devices to expose. Format: `"/dev/sda"` (same container path, `rwm`), `"/dev/sda:/dev/xvda"` (custom path), `"/dev/sda:/dev/xvda:r"` (explicit permissions). |
 | `dns` | `list[str]` | `[]` | DNS servers (e.g. `["8.8.8.8", "1.1.1.1"]`). Only meaningful when `network != False`. |
 | `require_internal_network` | `bool` | `False` | Require a named network whose Docker metadata has `Internal=true`, then create against its verified ID; fail before container creation otherwise. Incompatible with `name` reuse. |
+| `pull_missing` | `bool` | `True` | Pull an absent image. Set false for a local-only image and receive `ImageNotAvailableError` instead. |
 
 ## Docker daemon not available
 
