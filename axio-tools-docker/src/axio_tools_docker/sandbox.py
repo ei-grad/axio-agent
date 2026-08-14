@@ -201,7 +201,10 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
         raw = await sandbox.read_file_bytes(resolved)
     except FileNotFoundError as exc:
         raise HandlerError(str(exc)) from exc
-    lines = raw.decode().splitlines(keepends=True)
+    try:
+        lines = raw.decode().splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n"):
         content_lines[-1] += "\n"

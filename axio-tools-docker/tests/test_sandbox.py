@@ -529,6 +529,19 @@ async def test_read_file_handler_non_utf8_without_hex_raises_handler_error() -> 
                 CONTEXT.reset(token)
 
 
+async def test_patch_file_handler_non_utf8_target_raises_handler_error() -> None:
+    tar_file = make_tar_file("bin.dat", b"\x80\x81\xff")
+    cls, client, container = mock_docker_factory(archive_content=tar_file)
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="not valid UTF-8"):
+                    await sandbox_module.patch_file(path="bin.dat", from_line=1, to_line=1, content="x")
+            finally:
+                CONTEXT.reset(token)
+
+
 # ---------------------------------------------------------------------------
 # Container config
 # ---------------------------------------------------------------------------
