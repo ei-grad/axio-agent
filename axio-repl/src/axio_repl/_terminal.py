@@ -7,11 +7,10 @@ import logging
 import sys
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import TextIOBase
 from typing import Any, Literal, TextIO, cast
-
-from prompt_toolkit.application import run_in_terminal
 
 RESET = "\033[0m"
 MAX_PENDING_CHARS = 256 * 1024
@@ -111,10 +110,10 @@ class _TerminalStream(TextIOBase):
 class TerminalUI:
     """The only interactive writer allowed to touch the prompt terminal.
 
-    Application output is written through ``run_in_terminal`` so prompt_toolkit
-    removes and redraws its inline layout on the primary screen. Producers see
-    ordinary TextIO objects, but completed lines are serialized by one asyncio
-    consumer instead of being written from background tasks or logging threads.
+    prompt_toolkit's inline layout is removed and redrawn around application
+    output without detaching input or leaving raw mode. Producers see ordinary
+    TextIO objects, but completed lines are serialized by one asyncio consumer
+    instead of being written from background tasks or logging threads.
     """
 
     def __init__(self, prompt_session: Any) -> None:
@@ -369,14 +368,39 @@ class TerminalUI:
 
         app = self._session.app
         if app.is_running:
-            context = app.context
-            if context is None:
-                await run_in_terminal(write_and_flush, in_executor=False)
-            else:
-                operation = context.copy().run(lambda: run_in_terminal(write_and_flush, in_executor=False))
-                await operation
+            await self._write_above_prompt(app, write_and_flush)
         else:
             write_and_flush()
+
+    @staticmethod
+    async def _write_above_prompt(app: Any, write: Callable[[], None]) -> None:
+        """Suspend rendering without prompt_toolkit's cooked input mode."""
+        previous = app._running_in_terminal_f
+        completed = asyncio.get_running_loop().create_future()
+        app._running_in_terminal_f = completed
+        rendering_suspended = False
+        try:
+            if previous is not None:
+                await asyncio.shield(previous)
+            if app.output.responds_to_cpr:
+                await app.renderer.wait_for_cpr_responses()
+            if not app.is_running:
+                write()
+                return
+            app.renderer.erase()
+            app._running_in_terminal = True
+            rendering_suspended = True
+            write()
+        finally:
+            try:
+                if rendering_suspended:
+                    app._running_in_terminal = False
+                    app.renderer.reset()
+                    app._request_absolute_cursor_position()
+                    app._redraw()
+            finally:
+                if not completed.done():
+                    completed.set_result(None)
 
     def _restore_terminal(self) -> None:
         self._output.reset_attributes()
