@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import os
 
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
 
@@ -15,10 +18,13 @@ async def write_file(
 
     def _blocking() -> str:
         resolved = os.path.join(os.getcwd(), path)
-        os.makedirs(os.path.dirname(resolved), exist_ok=True)
-        with open(resolved, "w") as f:
-            f.write(content)
-        os.chmod(resolved, mode=mode)
+        try:
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            with open(resolved, "w") as f:
+                f.write(content)
+            os.chmod(resolved, mode=mode)
+        except OSError as exc:
+            raise HandlerError(f"{exc.strerror or exc}: {path}") from exc
         return f"Wrote {len(content)} bytes to {path}"
 
     return await asyncio.to_thread(_blocking)

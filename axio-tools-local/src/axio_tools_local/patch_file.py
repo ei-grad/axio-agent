@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import asyncio
 import os
 from pathlib import Path
 
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
 
@@ -21,8 +24,10 @@ async def patch_file(
 
     def _blocking() -> str:
         resolved = Path(os.getcwd()) / path
+        if not resolved.exists():
+            raise HandlerError(f"No such file or directory: {path}")
         if not resolved.is_file():
-            raise FileNotFoundError(f"{path} is not a valid file")
+            raise HandlerError(f"Not a file: {path}")
 
         with resolved.open("r") as f:
             lines = f.readlines()

@@ -12,6 +12,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from axio.exceptions import HandlerError
 
 from axio_tools_local.patch_file import patch_file
 
@@ -153,8 +154,15 @@ class TestNewlineHandling:
 
 class TestEdgeCases:
     async def test_file_not_found(self, tmp_cwd: Path) -> None:
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(HandlerError, match="missing.txt"):
             await patch(tmp_cwd / "missing.txt", 1, 1, "x")
+
+    async def test_wrong_type_raises_with_distinct_message(self, tmp_cwd: Path) -> None:
+        """A path that exists but is a directory gets a different message than a missing path."""
+        d = tmp_cwd / "adir"
+        d.mkdir()
+        with pytest.raises(HandlerError, match="Not a file"):
+            await patch(d, 1, 1, "x")
 
     async def test_returns_bytes_written_message(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"

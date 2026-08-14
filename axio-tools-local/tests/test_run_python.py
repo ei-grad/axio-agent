@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from axio.exceptions import HandlerError
 
 from axio_tools_local.run_python import run_python
 
@@ -86,6 +87,10 @@ class TestRunPythonCwd:
     async def test_cwd_affects_execution(self, tmp_path: Path) -> None:
         result = await run("import os; print(os.getcwd())", cwd=str(tmp_path))
         assert str(tmp_path) in result
+
+    async def test_invalid_cwd_raises_handler_error(self) -> None:
+        with pytest.raises(HandlerError):
+            await run("print('x')", cwd="/definitely/does/not/exist")
 
 
 class TestRunPythonCleanup:

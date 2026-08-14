@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import subprocess
 import sys
 import tempfile
+
+from axio.exceptions import HandlerError
 
 
 async def run_python(
@@ -34,6 +38,8 @@ async def run_python(
             )
         except subprocess.TimeoutExpired:
             return f"[timeout: code exceeded {timeout}s]"
+        except OSError as exc:
+            raise HandlerError(f"Failed to run subprocess: {exc.strerror or exc}: cwd={cwd}") from exc
         finally:
             os.unlink(path)
         output = ""
