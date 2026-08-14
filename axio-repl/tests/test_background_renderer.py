@@ -311,6 +311,71 @@ async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pyt
     assert renderer.foreground_agent == "main"
 
 
+async def _prime_legacy_foreground_result(renderer: ReplRenderer, tool_use_id: str = "reused") -> None:
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id=tool_use_id, name="run_agent"))
+    await renderer.enter_foreground("child", tool_use_id, "main")
+    await renderer.exit_foreground("child", TurnStatus.SUCCEEDED)
+
+
+async def test_legacy_foreground_marker_is_consumed_before_a_parent_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await _prime_legacy_foreground_result(renderer)
+    capsys.readouterr()
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="reused", name="run_agent", is_error=False, content="child result"),
+    )
+
+    output = capsys.readouterr().out
+    assert "foreground agent child returned its result to the parent" in output
+    assert "child result" not in output
+
+
+async def test_iteration_end_purges_an_unconsumed_legacy_foreground_marker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await _prime_legacy_foreground_result(renderer)
+    await renderer.render(
+        "main",
+        IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(1, 1)),
+    )
+    capsys.readouterr()
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="reused", name="shell", is_error=False, content="unrelated result"),
+    )
+
+    output = capsys.readouterr().out
+    assert "unrelated result" in output
+    assert "foreground agent" not in output
+
+
+async def test_session_end_purges_an_unconsumed_legacy_foreground_marker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await _prime_legacy_foreground_result(renderer)
+    await renderer.render(
+        "main",
+        SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(1, 1)),
+    )
+    capsys.readouterr()
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="reused", name="shell", is_error=False, content="unrelated result"),
+    )
+
+    output = capsys.readouterr().out
+    assert "unrelated result" in output
+    assert "foreground agent" not in output
+
+
 async def test_foreground_result_suppression_does_not_cross_parent_turns_when_tool_ids_repeat(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

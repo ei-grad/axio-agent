@@ -1013,6 +1013,25 @@ class ReplRenderer:
             )
         }
 
+    def _purge_legacy_foreground_parent_locked(self, parent_agent_id: str) -> None:
+        def is_legacy_parent(parent_key: _ParentToolKey) -> bool:
+            return (
+                parent_key.parent_agent_id == parent_agent_id
+                and not parent_key.parent_run_id
+                and not parent_key.parent_turn_id
+            )
+
+        self._streamed_foreground_calls = {
+            parent_key: result
+            for parent_key, result in self._streamed_foreground_calls.items()
+            if not is_legacy_parent(parent_key)
+        }
+        self._foreground_parent_calls = {
+            child_id: call
+            for child_id, call in self._foreground_parent_calls.items()
+            if not is_legacy_parent(call.parent_key)
+        }
+
     def _cleanup_turn_state_locked(self, agent_id: str) -> None:
         if agent_id == "main":
             return
@@ -1202,6 +1221,7 @@ class ReplRenderer:
                 # The agent has written this iteration into the context itself;
                 # what is kept here is only ever the unfinished tail.
                 state.pending_text.clear()
+                self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
                 if presentation is not None:
@@ -1217,6 +1237,7 @@ class ReplRenderer:
                 self._drain_safe_boundary_locked()
 
             case SessionEndEvent(total_usage=usage):
+                self._purge_legacy_foreground_parent_locked(agent_id)
                 if presentation is not None and presentation.error_seen and not presentation.stdout_started:
                     self._discard_suspended_owner_locked(agent_id)
                     self._safe_boundary_open = True
