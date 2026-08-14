@@ -915,16 +915,27 @@ async def _start_background_agent(
     # — a detached call finishing, a child of its own going idle — arrive as the
     # prompt that starts the next turn.
     notify.add_listener(peer.id, lambda text: background.inbox.put_nowait(_QueuedPrompt(text)))
-    await _session_event_hub.publish(
-        AgentStarted(name=peer.name, kind=peer.kind),
-        run_id=background.run_id,
-        agent_id=peer.id,
-        parent_agent_id=parent_agent_id,
-        turn_id=None,
-        execution_mode=ExecutionMode.BACKGROUND,
-        parent_tool_use_id=parent_tool_use_id,
-        context_id=context.session_id,
-    )
+    # A subscriber failure or task cancellation happens after registration;
+    # both must unwind every resource allocated above.
+    try:
+        await _session_event_hub.publish(
+            AgentStarted(name=peer.name, kind=peer.kind),
+            run_id=background.run_id,
+            agent_id=peer.id,
+            parent_agent_id=parent_agent_id,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id=parent_tool_use_id,
+            context_id=context.session_id,
+        )
+    except BaseException:
+        _background_agents.pop(peer.id, None)
+        notify.discard(peer.id)
+        try:
+            await context.close()
+        finally:
+            await peer.close()
+        raise
     background.inbox.put_nowait(_QueuedPrompt(initial_task, parent_tool_use_id=parent_tool_use_id))
     background.runner = asyncio.create_task(_run_background_agent(background))
     return background
@@ -1079,12 +1090,11 @@ async def run_agent(
         parent_tool_use_id=parent_tool_use_id,
         context_id=context.session_id,
     )
-    await _session_event_hub.publish_for(identity, AgentStarted(name=base_name, kind="foreground-agent"))
-    await _session_event_hub.publish_for(identity, ForegroundEntered(parent_agent_id=parent_agent_id))
-
     outcome: TurnOutcome | None = None
     status = TurnStatus.FAILED
     try:
+        await _session_event_hub.publish_for(identity, AgentStarted(name=base_name, kind="foreground-agent"))
+        await _session_event_hub.publish_for(identity, ForegroundEntered(parent_agent_id=parent_agent_id))
         with peer_context(child_peer):
             outcome = await observe_agent_turn(
                 agent=agent,
@@ -1105,10 +1115,8 @@ async def run_agent(
             await _session_event_hub.publish_for(identity, ForegroundExited(status=status))
             await _session_event_hub.publish_for(identity, AgentStopped(status=status))
 
-    await _session_event_hub.publish_for(
-        identity,
-        OutcomeDelivered(recipient_agent_id=parent_agent_id, route="parent_tool_result"),
-    )
+    if outcome is None:
+        raise RuntimeError("foreground agent stopped without an outcome")
     if not outcome.succeeded:
         raise RuntimeError(outcome.error or "foreground agent failed")
     return outcome.text

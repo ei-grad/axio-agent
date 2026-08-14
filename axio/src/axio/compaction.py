@@ -122,6 +122,9 @@ class AutoCompactStore(ContextStore):
     async def append(self, message: Message) -> None:
         await self._store.append(message)
 
+    async def append_many(self, messages: list[Message]) -> None:
+        await self._store.append_many(messages)
+
     async def get_history(self) -> list[Message]:
         return await self._store.get_history()
 

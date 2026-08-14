@@ -36,6 +36,16 @@ class ContextStore(ABC):
     @abstractmethod
     async def append(self, message: Message) -> None: ...
 
+    async def append_many(self, messages: list[Message]) -> None:
+        """Append an ordered batch of messages.
+
+        Persistent stores should override this method with one atomic storage
+        transaction. The sequential default preserves compatibility for custom
+        stores that only implement :meth:`append`.
+        """
+        for message in messages:
+            await self.append(message)
+
     @abstractmethod
     async def get_history(self) -> list[Message]: ...
 
@@ -116,6 +126,9 @@ class MemoryContextStore(ContextStore):
 
     async def append(self, message: Message) -> None:
         self._history.append(message)
+
+    async def append_many(self, messages: list[Message]) -> None:
+        self._history.extend(messages)
 
     async def get_history(self) -> list[Message]:
         return list(self._history)

@@ -7,10 +7,11 @@ from pathlib import Path
 import pytest
 from axio import notify
 from axio.agent import Agent
-from axio.blocks import ToolUseBlock
+from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.messages import Message
+from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 
@@ -22,6 +23,7 @@ from axio_tools_agents.peers import (
     format_message_for_dialog,
     interrupt_agent,
     is_local_background_agent,
+    list_peer_records,
     list_peers,
     mark_background_report_delivered,
     peer_context,
@@ -44,10 +46,14 @@ from axio_tools_agents.runtime import (
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
+    MessageCommitted,
+    ObservedContextStore,
     OutcomeDelivered,
     SessionEventHub,
     TurnOutcome,
     TurnStatus,
+    new_turn_identity,
+    observe_agent_turn,
 )
 
 
@@ -687,9 +693,276 @@ async def test_run_agent_streams_one_shot_child_with_parent_tool_correlation(tmp
     assert isinstance(events[0], AgentStarted)
     assert isinstance(events[1], ForegroundEntered)
     assert any(isinstance(event, TextDelta) and event.delta == "answered" for event in events)
-    assert isinstance(events[-3], ForegroundExited)
-    assert isinstance(events[-2], AgentStopped)
-    assert events[-1] == OutcomeDelivered(recipient_agent_id=parent.id, route="parent_tool_result")
+    assert isinstance(events[-2], ForegroundExited)
+    assert isinstance(events[-1], AgentStopped)
+    assert not any(isinstance(event, OutcomeDelivered) for event in events)
+
+
+async def test_foreground_answer_is_delivered_by_one_correlated_parent_commit(tmp_path: Path) -> None:
+    parent = await _start_parent(tmp_path)
+    hub = SessionEventHub()
+    envelopes: list[AgentEventEnvelope] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        envelopes.append(envelope)
+
+    hub.subscribe(collect)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=_AnsweringTransport()), MemoryContextStore()
+
+    set_run_agent_factory(factory)
+    parent_agent = Agent(
+        system="parent",
+        transport=StubTransport(
+            [
+                make_tool_use_response("run_agent", "foreground-call", {"task": "answer"}),
+                make_text_response("parent done"),
+            ]
+        ),
+        tools=[Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False)],
+    )
+    inner = MemoryContextStore()
+    context = ObservedContextStore(inner, hub)
+    identity = new_turn_identity(
+        agent_id=parent.id,
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        context_id=context.session_id,
+    )
+
+    try:
+        with peer_context(parent):
+            outcome = await observe_agent_turn(
+                agent=parent_agent,
+                context=context,
+                prompt="delegate",
+                identity=identity,
+                hub=hub,
+            )
+    finally:
+        await parent.close()
+
+    assert outcome.succeeded
+    result_commits: list[tuple[int, MessageCommitted]] = []
+    for envelope in envelopes:
+        event = envelope.event
+        if isinstance(event, MessageCommitted) and any(
+            isinstance(block, ToolResultBlock) for block in event.message.content
+        ):
+            result_commits.append((envelope.seq, event))
+    assert len(result_commits) == 1
+    commit_seq, commit_event = result_commits[0]
+    [result] = [block for block in commit_event.message.content if isinstance(block, ToolResultBlock)]
+    assert result.tool_use_id == "foreground-call"
+    assert result.content == "answered"
+    assert not result.is_error
+    child_envelopes = [
+        envelope
+        for envelope in envelopes
+        if envelope.agent_id != parent.id and envelope.execution_mode is ExecutionMode.FOREGROUND
+    ]
+    assert child_envelopes
+    assert all(envelope.parent_tool_use_id == result.tool_use_id for envelope in child_envelopes)
+    assert commit_seq > max(envelope.seq for envelope in child_envelopes)
+    assert not any(
+        isinstance(envelope.event, OutcomeDelivered) and envelope.execution_mode is ExecutionMode.FOREGROUND
+        for envelope in envelopes
+    )
+
+
+@pytest.mark.parametrize("blocked_event_type", [AgentStarted, ForegroundEntered])
+async def test_foreground_startup_cancellation_cleans_resources(
+    tmp_path: Path,
+    blocked_event_type: type[object],
+) -> None:
+    parent = await _start_parent(tmp_path)
+    hub = SessionEventHub()
+    blocked = asyncio.Event()
+    envelopes: list[AgentEventEnvelope] = []
+    child_context = _ClosingMemoryContext()
+    transport = _AnsweringTransport()
+
+    async def block_lifecycle(envelope: AgentEventEnvelope) -> None:
+        envelopes.append(envelope)
+        if isinstance(envelope.event, blocked_event_type):
+            blocked.set()
+            await asyncio.Event().wait()
+
+    hub.subscribe(block_lifecycle)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), child_context
+
+    set_run_agent_factory(factory)
+    with peer_context(parent):
+        task = asyncio.create_task(run_agent(task="never starts", name="startup-cancel"))
+        await asyncio.wait_for(blocked.wait(), timeout=1)
+        [child_id] = {envelope.agent_id for envelope in envelopes}
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+    assert task.done()
+    assert child_context.closed
+    assert transport.calls == []
+    assert not is_local_background_agent(child_id)
+    marker = "owner was discarded"
+    notify.post(marker, owner=child_id)
+    assert notify.drain(child_id) == [marker]
+    await parent.close()
+
+
+async def test_background_startup_cancellation_cleans_peer_listener_and_context(tmp_path: Path) -> None:
+    hub = SessionEventHub()
+    blocked = asyncio.Event()
+    child_id: str | None = None
+    child_context = _ClosingMemoryContext()
+
+    async def block_started(envelope: AgentEventEnvelope) -> None:
+        nonlocal child_id
+        if isinstance(envelope.event, AgentStarted) and envelope.execution_mode is ExecutionMode.BACKGROUND:
+            child_id = envelope.agent_id
+            blocked.set()
+            await asyncio.Event().wait()
+
+    hub.subscribe(block_started)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=_AnsweringTransport()), child_context
+
+    set_spawn_agent_factory(factory)
+    task = asyncio.create_task(spawn_agent(task="never starts", name="startup-cancel"))
+    await asyncio.wait_for(blocked.wait(), timeout=1)
+    assert child_id is not None
+    [started_record] = [record for record in await list_peer_records() if record.id == child_id]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert task.done()
+    assert child_context.closed
+    assert not is_local_background_agent(child_id)
+    assert all(record.id != child_id for record in await list_peer_records())
+    assert not Path(started_record.socket_path).exists()
+    marker = "listener was discarded"
+    notify.post(marker, owner=child_id)
+    assert notify.drain(child_id) == [marker]
+
+
+async def test_cancelled_parent_never_records_foreground_outcome_as_delivered(tmp_path: Path) -> None:
+    slow_started = asyncio.Event()
+    slow_closed = asyncio.Event()
+
+    async def slow_sibling() -> str:
+        slow_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            slow_closed.set()
+        return "unreachable"
+
+    parent_transport = StubTransport(
+        [
+            [
+                ToolUseStart(index=0, tool_use_id="foreground-call", name="run_agent"),
+                ToolInputDelta(
+                    index=0,
+                    tool_use_id="foreground-call",
+                    partial_json='{"task":"answer"}',
+                ),
+                ToolUseStart(index=1, tool_use_id="slow-call", name="slow_sibling"),
+                ToolInputDelta(index=1, tool_use_id="slow-call", partial_json="{}"),
+                IterationEnd(iteration=1, stop_reason=StopReason.tool_use, usage=Usage(0, 0)),
+            ],
+            make_text_response("unreachable"),
+        ]
+    )
+    child_context = _ClosingMemoryContext()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=_AnsweringTransport()), child_context
+
+    set_run_agent_factory(factory)
+    hub = SessionEventHub()
+    envelopes: list[AgentEventEnvelope] = []
+    child_stopped = asyncio.Event()
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        envelopes.append(envelope)
+        if (
+            envelope.execution_mode is ExecutionMode.FOREGROUND
+            and isinstance(envelope.event, AgentStopped)
+            and envelope.event.status is TurnStatus.SUCCEEDED
+        ):
+            child_stopped.set()
+
+    hub.subscribe(collect)
+    set_session_event_hub(hub)
+    inner = MemoryContextStore()
+    context = ObservedContextStore(inner, hub)
+    parent = await _start_parent(tmp_path)
+    parent_agent = Agent(
+        system="parent",
+        transport=parent_transport,
+        tools=[
+            Tool(name="run_agent", handler=run_agent, concurrency=1, detachable=False),
+            Tool(name="slow_sibling", handler=slow_sibling),
+        ],
+    )
+    identity = new_turn_identity(
+        agent_id=parent.id,
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        context_id=context.session_id,
+    )
+
+    with peer_context(parent):
+        task = asyncio.create_task(
+            observe_agent_turn(
+                agent=parent_agent,
+                context=context,
+                prompt="delegate and wait",
+                identity=identity,
+                hub=hub,
+            )
+        )
+        await asyncio.wait_for(slow_started.wait(), timeout=1)
+        await asyncio.wait_for(child_stopped.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+    await parent.close()
+    assert child_context.closed
+    assert slow_closed.is_set()
+    assert not any(
+        isinstance(envelope.event, OutcomeDelivered) and envelope.execution_mode is ExecutionMode.FOREGROUND
+        for envelope in envelopes
+    )
+    committed_results = [
+        block
+        for envelope in envelopes
+        if isinstance(envelope.event, MessageCommitted)
+        for block in envelope.event.message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    foreground_results = [block for block in committed_results if block.tool_use_id == "foreground-call"]
+    assert len(foreground_results) == 1
+    assert foreground_results[0].is_error
+    assert foreground_results[0].content == "[interrupted by user]"
+    child_envelopes = [
+        envelope
+        for envelope in envelopes
+        if envelope.agent_id != parent.id and envelope.execution_mode is ExecutionMode.FOREGROUND
+    ]
+    assert child_envelopes
+    assert all(envelope.parent_tool_use_id == "foreground-call" for envelope in child_envelopes)
 
 
 async def test_run_agent_failure_becomes_one_parent_tool_error(tmp_path: Path) -> None:

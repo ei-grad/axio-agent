@@ -188,7 +188,17 @@ class Agent:
                     return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
             return ToolResultBlock(tool_use_id=block.id, content=content)
 
-        results = list(await asyncio.gather(*[_run_one(b) for b in blocks]))
+        tasks = [asyncio.create_task(_run_one(block)) for block in blocks]
+        try:
+            results = list(await asyncio.gather(*tasks))
+        except BaseException:
+            # Tool coroutines may terminate with cancellation or another
+            # BaseException; either way no sibling dispatch may outlive this call.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         error_count = sum(1 for r in results if r.is_error)
         logger.info("Tools complete: %d total, %d errors", len(results), error_count)
         return results
@@ -249,7 +259,17 @@ class Agent:
                         return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=content)
 
-        results = list(await asyncio.gather(*[_run_one(b) for b in blocks]))
+        tasks = [asyncio.create_task(_run_one(block)) for block in blocks]
+        try:
+            results = list(await asyncio.gather(*tasks))
+        except BaseException:
+            # Streaming tools have the same structured-lifetime requirement as
+            # regular tools, including failures outside Exception.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         error_count = sum(1 for r in results if r.is_error)
         logger.info("Tools complete: %d total, %d errors", len(results), error_count)
         return results
@@ -444,9 +464,10 @@ class Agent:
                                     output_queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
 
                                     async def _dispatch_and_signal() -> list[ToolResultBlock]:
-                                        result = await self._dispatch_tools_streaming(valid, iteration, output_queue)
-                                        await output_queue.put(None)
-                                        return result
+                                        try:
+                                            return await self._dispatch_tools_streaming(valid, iteration, output_queue)
+                                        finally:
+                                            output_queue.put_nowait(None)
 
                                     dispatch_task = asyncio.create_task(_dispatch_and_signal())
                                     while True:
@@ -466,12 +487,10 @@ class Agent:
                                 dispatched = []
                             results = dispatched + error_results
                         except asyncio.CancelledError:
-                            if dispatch_task is not None and not dispatch_task.done():
-                                dispatch_task.cancel()
-                                try:
-                                    await dispatch_task
-                                except (asyncio.CancelledError, Exception):
-                                    pass
+                            if dispatch_task is not None:
+                                if not dispatch_task.done():
+                                    dispatch_task.cancel()
+                                await asyncio.gather(dispatch_task, return_exceptions=True)
                             interrupted_results: list[ToolResultBlock] = []
                             for b in tool_blocks:
                                 chunks = partial_output.get(b.id, [])
@@ -485,13 +504,20 @@ class Agent:
                                 interrupted_results.append(
                                     ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
                                 )
-                            await self._append(context, Message(role="assistant", content=list(content)))
-                            await self._append(context, Message(role="user", content=list(interrupted_results)))
+                            await context.append_many(
+                                [
+                                    Message(role="assistant", content=list(content)),
+                                    Message(role="user", content=list(interrupted_results)),
+                                ]
+                            )
                             raise
 
-                        # Append both messages atomically (assistant + tool results)
-                        await self._append(context, Message(role="assistant", content=list(content)))
-                        await self._append(context, Message(role="user", content=list(results)))
+                        await context.append_many(
+                            [
+                                Message(role="assistant", content=list(content)),
+                                Message(role="user", content=list(results)),
+                            ]
+                        )
 
                         # Gemini stops generating (~20 tokens, end_turn) after receiving
                         # media as sibling inlineData parts alongside functionResponse.

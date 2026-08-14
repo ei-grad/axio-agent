@@ -42,6 +42,32 @@ async def test_append_and_get_history(store: SQLiteContextStore) -> None:
     assert history[1].role == "assistant"
 
 
+async def test_append_many_commits_ordered_batch(store: SQLiteContextStore) -> None:
+    await store.append_many([_msg("assistant", "tool use"), _msg("user", "tool result")])
+
+    history = await store.get_history()
+    assert [(message.role, message.content[0].text) for message in history] == [  # type: ignore[attr-defined]
+        ("assistant", "tool use"),
+        ("user", "tool result"),
+    ]
+
+
+async def test_append_many_rolls_back_whole_batch_on_insert_failure(
+    store: SQLiteContextStore,
+    conn: aiosqlite.Connection,
+) -> None:
+    await conn.execute(
+        "CREATE TRIGGER reject_user_message BEFORE INSERT ON axio_context_messages "
+        "WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'rejected test row'); END"
+    )
+    await conn.commit()
+
+    with pytest.raises(aiosqlite.DatabaseError, match="rejected test row"):
+        await store.append_many([_msg("assistant", "tool use"), _msg("user", "tool result")])
+
+    assert await store.get_history() == []
+
+
 async def test_clear(store: SQLiteContextStore) -> None:
     await store.append(_msg("user", "Hello"))
     await store.clear()

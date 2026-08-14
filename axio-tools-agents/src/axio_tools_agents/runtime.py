@@ -289,6 +289,12 @@ class ObservedContextStore(ContextStore):
         await self._store.append(message)
         await self._publish(MessageCommitted(message=copy.deepcopy(message)))
 
+    async def append_many(self, messages: list[Message]) -> None:
+        committed = copy.deepcopy(messages)
+        await self._store.append_many(messages)
+        for message in committed:
+            await self._publish(MessageCommitted(message=message))
+
     async def get_history(self) -> list[Message]:
         return await self._store.get_history()
 

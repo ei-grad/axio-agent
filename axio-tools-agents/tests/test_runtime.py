@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from axio.agent import Agent
-from axio.blocks import TextBlock
+from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     IterationEnd,
@@ -201,6 +201,56 @@ async def test_failed_context_append_is_not_reported_as_committed() -> None:
         await context.append(Message(role="user", content=[TextBlock(text="not stored")]))
 
     assert not any(isinstance(event, MessageCommitted) for event in events)
+
+
+async def test_cancellation_during_commit_observation_cannot_split_tool_exchange() -> None:
+    async def answer() -> str:
+        return "tool answer"
+
+    hub = SessionEventHub()
+    assistant_commit_started = asyncio.Event()
+
+    async def block_assistant_commit(envelope: AgentEventEnvelope) -> None:
+        event = envelope.event
+        if isinstance(event, MessageCommitted) and any(
+            isinstance(block, ToolUseBlock) for block in event.message.content
+        ):
+            assistant_commit_started.set()
+            await asyncio.Event().wait()
+
+    hub.subscribe(block_assistant_commit)
+    inner = MemoryContextStore()
+    context = ObservedContextStore(inner, hub)
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        context_id=context.session_id,
+    )
+    agent = Agent(
+        system="main",
+        transport=StubTransport(
+            [
+                make_tool_use_response("answer", tool_id="call-1", tool_input={}),
+                make_text_response("done"),
+            ]
+        ),
+        tools=[Tool(name="answer", handler=answer)],
+    )
+    task = asyncio.create_task(
+        observe_agent_turn(agent=agent, context=context, prompt="work", identity=identity, hub=hub)
+    )
+    await asyncio.wait_for(assistant_commit_started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    history = await inner.get_history()
+    tool_uses = [block for message in history for block in message.content if isinstance(block, ToolUseBlock)]
+    tool_results = [block for message in history for block in message.content if isinstance(block, ToolResultBlock)]
+    assert [block.id for block in tool_uses] == ["call-1"]
+    assert [block.tool_use_id for block in tool_results] == ["call-1"]
 
 
 async def test_observed_turn_forwards_child_tool_arguments_output_and_result_in_order() -> None:

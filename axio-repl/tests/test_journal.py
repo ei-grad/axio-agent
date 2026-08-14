@@ -386,8 +386,24 @@ async def test_one_shot_journal_captures_actual_local_subagent_session(
     committed = [record for record in child_records if record["kind"] == "message_committed"]
     assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
     assert len({record["context_id"] for record in child_records if record["context_id"]}) == 1
-    delivered = next(record for record in child_records if record["kind"] == "outcome_delivered")
-    assert delivered["payload"]["event"]["route"] == delivery_route
+    if tool_name == "run_agent":
+        assert not any(record["kind"] == "outcome_delivered" for record in child_records)
+        parent_result_records = [
+            record
+            for record in records
+            if record["agent_id"] == "main"
+            and record["kind"] == "message_committed"
+            and any(
+                block.get("record_type") == "ToolResultBlock" and block.get("tool_use_id") == f"{tool_name}-call"
+                for block in record["payload"]["message"]["content"]
+            )
+        ]
+        assert len(parent_result_records) == 1
+        child_stopped_seq = max(record["seq"] for record in child_records if record["kind"] == "agent_stopped")
+        assert parent_result_records[0]["seq"] > child_stopped_seq
+    else:
+        delivered = next(record for record in child_records if record["kind"] == "outcome_delivered")
+        assert delivered["payload"]["event"]["route"] == delivery_route
     stopped_index = max(index for index, record in enumerate(records) if record["kind"] == "agent_stopped")
     assert stopped_index < len(records) - 1
     assert records[-1]["kind"] == "session_end"

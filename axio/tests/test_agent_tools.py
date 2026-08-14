@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
+
+import pytest
 
 from axio.agent import Agent
 from axio.blocks import ToolResultBlock, ToolUseBlock
@@ -446,3 +449,91 @@ class TestStreamingToolDispatch:
 
         results = [e for e in events if isinstance(e, ToolResult)]
         assert len(results) == 2
+
+    @pytest.mark.parametrize("emit_chunk", [False, True])
+    async def test_self_cancelled_streaming_tool_closes_dispatch(self, emit_chunk: bool) -> None:
+        closed = asyncio.Event()
+
+        async def _stream() -> AsyncGenerator[tuple[str, str], None]:
+            try:
+                if emit_chunk:
+                    yield "stdout", "partial\n"
+                raise asyncio.CancelledError
+            finally:
+                closed.set()
+
+        async def streaming_handler() -> str:
+            return "unreachable"
+
+        streaming_handler.stream = _stream  # type: ignore[attr-defined]
+        context = MemoryContextStore()
+        agent = Agent(
+            system="test",
+            tools=[Tool(name="streamer", handler=streaming_handler)],
+            transport=StubTransport(
+                [make_tool_use_response("streamer", "cancelled-call", {}), make_text_response("unreachable")]
+            ),
+        )
+
+        async def consume() -> None:
+            async for _event in agent.run_stream("go", context):
+                pass
+
+        task = asyncio.create_task(consume())
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        assert closed.is_set()
+        history = await context.get_history()
+        tool_uses = [block for message in history for block in message.content if isinstance(block, ToolUseBlock)]
+        tool_results = [
+            block for message in history for block in message.content if isinstance(block, ToolResultBlock)
+        ]
+        assert [block.id for block in tool_uses] == ["cancelled-call"]
+        assert [block.tool_use_id for block in tool_results] == ["cancelled-call"]
+        assert tool_results[0].is_error
+        assert "[interrupted by user]" in str(tool_results[0].content)
+        assert ("partial" in str(tool_results[0].content)) is emit_chunk
+
+    async def test_streaming_tool_base_exception_closes_dispatch_without_committing_tool_use(self) -> None:
+        class FatalToolError(BaseException):
+            pass
+
+        closed = asyncio.Event()
+
+        async def _stream() -> AsyncGenerator[tuple[str, str], None]:
+            try:
+                raise FatalToolError("fatal stream")
+                yield "stdout", "unreachable"
+            finally:
+                closed.set()
+
+        async def streaming_handler() -> str:
+            return "unreachable"
+
+        streaming_handler.stream = _stream  # type: ignore[attr-defined]
+        context = MemoryContextStore()
+        agent = Agent(
+            system="test",
+            tools=[Tool(name="streamer", handler=streaming_handler)],
+            transport=StubTransport([make_tool_use_response("streamer", "fatal-call", {})]),
+        )
+
+        async def consume() -> None:
+            async for _event in agent.run_stream("go", context):
+                pass
+
+        with pytest.raises(FatalToolError, match="fatal stream"):
+            await asyncio.wait_for(consume(), timeout=1)
+
+        assert closed.is_set()
+        history = await context.get_history()
+        assert not any(
+            isinstance(block, ToolUseBlock | ToolResultBlock) for message in history for block in message.content
+        )

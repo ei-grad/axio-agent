@@ -122,6 +122,32 @@ class SQLiteContextStore(ContextStore):
         )
         await self._conn.commit()
 
+    async def append_many(self, messages: list[Message]) -> None:
+        if not messages:
+            return
+        rows = [
+            (
+                self._session_id,
+                self._project,
+                self._session_id,
+                message.role,
+                json.dumps(message.to_dict()["content"]),
+            )
+            for message in messages
+        ]
+        try:
+            await self._conn.executemany(
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
+                "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, "
+                "compress_payload(?))",
+                rows,
+            )
+            await self._conn.commit()
+        except BaseException:
+            # Cancellation and non-Exception failures must both leave no partial batch.
+            await self._conn.rollback()
+            raise
+
     async def get_history(self) -> list[Message]:
         async with self._conn.execute(
             "SELECT role, decompress_payload(content) FROM axio_context_messages"
