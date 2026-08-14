@@ -259,6 +259,7 @@ def build_system_prompt(
     tools: list[Tool[Any]],
     agents_text: str = "",
     parent_peer_id: str | None = None,
+    sandbox_note: str = "",
 ) -> str:
     caps = model.capabilities
     ctx_k = model.context_window // 1000
@@ -275,6 +276,8 @@ def build_system_prompt(
     if has_tools:
         lines.append(f"Tools: {tool_names}")
     lines.append("")
+    if sandbox_note:
+        lines += [sandbox_note, ""]
 
     # Capability-aware guidance
     cap_notes: list[str] = []
@@ -1764,12 +1767,20 @@ def _apply_model(
     agents_text: str,
     arg: str,
     parent_peer_id: str | None = None,
+    sandbox_note: str = "",
 ) -> None:
     chosen = _choose_model(transport, arg)
     if chosen is None:
         return
     transport.model = chosen
-    agent.system = build_system_prompt(root, transport.model, tools, agents_text, parent_peer_id=parent_peer_id)
+    agent.system = build_system_prompt(
+        root,
+        transport.model,
+        tools,
+        agents_text,
+        parent_peer_id=parent_peer_id,
+        sandbox_note=sandbox_note,
+    )
     print(f"Switched to {BOLD}{transport.model.id}{RESET}")
 
 
@@ -2112,11 +2123,11 @@ async def main() -> None:
         }
         _apply_cli_args(args, commands)
 
-        tools, sandbox_desc, tool_root = await _sandbox.build_tools(
+        tools, sandbox_desc, tool_root, sandbox_note = await _sandbox.build_tools(
             stack, list(TOOLS), args.sandbox, args.sandbox_image, root
         )
         print(f"Tools: {BOLD}{sandbox_desc}{RESET}")
-        system = build_system_prompt(tool_root, transport.model, tools, agents_text)
+        system = build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)
         agent = Agent(
             system=system,
             tools=tools,
@@ -2187,6 +2198,7 @@ async def main() -> None:
                 child_tools,
                 agents_text,
                 parent_peer_id=None if foreground else parent_peer_id,
+                sandbox_note=sandbox_note,
             )
             return agent.copy(
                 transport=child_transport,
@@ -2208,7 +2220,9 @@ async def main() -> None:
         # Agent-dependent commands.
         commands["/model"] = Command(
             lambda: _show_model(transport),
-            lambda a: _apply_model(transport, agent, tools, tool_root, agents_text, a, parent_peer_id),
+            lambda a: _apply_model(
+                transport, agent, tools, tool_root, agents_text, a, parent_peer_id, sandbox_note=sandbox_note
+            ),
         )
         commands["/iterations"] = Command(
             lambda: _show_iterations(agent),
@@ -2366,6 +2380,7 @@ async def main() -> None:
                     tools,
                     agents_text,
                     parent_peer_id=parent_peer_id,
+                    sandbox_note=sandbox_note,
                 )
                 notify.add_listener(
                     peer_server.id,

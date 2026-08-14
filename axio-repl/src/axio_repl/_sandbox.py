@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 import shutil
 from contextlib import AsyncExitStack
@@ -23,6 +24,8 @@ from typing import Any
 from axio import Tool
 
 from axio_repl import _search
+
+logger = logging.getLogger(__name__)
 
 # Replaced by the container-backed implementations of the same name.
 SANDBOXED_TOOL_NAMES = frozenset({"read_file", "write_file", "patch_file", "list_files", "shell"})
@@ -41,6 +44,27 @@ _AST_GREP_DOC = """Structural search: match a code *pattern* by syntax rather th
     Patterns are written as ordinary code with `$VAR` metavariables, e.g.
     `$A == $A` or `def $NAME($$$ARGS)`. Prefer this over search_files when
     looking for a shape of code rather than a literal string."""
+
+# What an agent reaches for first, and what a slim image is least likely to have.
+PROBED_COMMANDS = (
+    "python3",
+    "pip",
+    "git",
+    "make",
+    "uv",
+    "gcc",
+    "curl",
+    "wget",
+    "patch",
+    "rg",
+    AST_GREP,
+    "grep",
+    "sed",
+    "awk",
+    "find",
+    "tar",
+    "diff",
+)
 
 
 def docker_available() -> bool:
@@ -110,14 +134,51 @@ def _make_sandbox_overrides(sandbox: Any) -> list[Tool[Any]]:
     return [Tool(name="search_files", handler=search_files), Tool(name="ast_grep", handler=ast_grep)]
 
 
+async def describe_environment(sandbox: Any, image: str, networking: bool) -> str:
+    """What the image has and what it lacks, asked of the image itself.
+
+    A default `python:3.12-slim` has no git, make, uv or compiler, and with
+    networking off none of them can be installed — an agent told to build or
+    test the project otherwise finds this out one failed command at a time.
+    Probed rather than assumed, because the image is the caller's choice.
+    """
+    probe = "; ".join(f"command -v {name} >/dev/null 2>&1 && echo {name}" for name in PROBED_COMMANDS)
+    try:
+        output = await sandbox.exec(f"{probe}; exit 0", timeout=15)
+    except Exception:  # a sandbox that cannot answer must not stop the session
+        logger.warning("Could not probe the sandbox image", exc_info=True)
+        return ""
+
+    found = {line.strip() for line in output.splitlines()}
+    present = [name for name in PROBED_COMMANDS if name in found]
+    missing = [name for name in PROBED_COMMANDS if name not in found]
+    if not present:
+        return ""
+
+    lines = [f"Sandbox: docker — image {image}, networking {'on' if networking else 'off'}.", ""]
+    lines.append(f"Available: {', '.join(present)}")
+    if missing:
+        lines.append(f"Not installed: {', '.join(missing)}")
+        if not networking:
+            lines.append(
+                "Networking is off, so none of the missing ones can be added: pip install, apt-get and "
+                "git clone all fail to resolve a host. Solve the task with what is listed, and say so "
+                "plainly when it cannot be done rather than retrying installs."
+            )
+        if AST_GREP in missing:
+            lines.append("The ast_grep tool needs the ast-grep binary, which this image lacks — use search_files.")
+    return "\n".join(lines)
+
+
 async def build_tools(
     stack: AsyncExitStack,
     tools: list[Tool[Any]],
     mode: str,
     image: str,
     workspace: Path,
-) -> tuple[list[Tool[Any]], str, Path]:
-    """Return the toolset, a one-line description, and the root the tools see.
+) -> tuple[list[Tool[Any]], str, Path, str]:
+    """Return the toolset, a one-line description, the root the tools see, and
+    what the sandbox environment offers.
 
     In a container the workspace is mounted elsewhere than on the host, and the
     system prompt has to state the path the model can actually act on.
@@ -126,7 +187,7 @@ async def build_tools(
         result = [t for t in tools if t.name not in SANDBOX_ONLY_TOOL_NAMES]
         if ast_grep_available():
             result.append(Tool(name="ast_grep", handler=_make_host_ast_grep()))
-        return result, "host — tools run directly on this machine", workspace
+        return result, "host — tools run directly on this machine", workspace, ""
 
     from axio_tools_docker.sandbox import DockerSandbox
 
@@ -145,4 +206,5 @@ async def build_tools(
     merged.extend(overrides.values())
     for name in SANDBOX_ONLY_TOOL_NAMES & available.keys():
         merged.append(available[name])
-    return merged, f"docker — {image}, no network, {workspace} mounted at {WORKDIR}", Path(WORKDIR)
+    note = await describe_environment(sandbox, image, networking=False)
+    return merged, f"docker — {image}, no network, {workspace} mounted at {WORKDIR}", Path(WORKDIR), note
