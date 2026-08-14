@@ -4,6 +4,7 @@ import asyncio
 import os
 
 from axio.blocks import AudioBlock, AudioMediaType, ImageBlock, ImageMediaType, TextBlock, VideoBlock, VideoMediaType
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
 type ReadFileResult = str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock]
@@ -97,25 +98,25 @@ def _read_text(
     explicit_limit = max_chars is not None
     limit = _DEFAULT_TEXT_MAX_CHARS if max_chars is None else max_chars
     if limit < 0:
-        raise ValueError("max_chars must be >= 0")
+        raise HandlerError(f"max_chars must be >= 0: {resolved}")
 
     with open(resolved, "rb") as f:
         raw = f.read()
     try:
         text = raw.decode()
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
         if binary_as_hex:
             hex_chars = len(raw) * 2
             if hex_chars > limit:
                 if not explicit_limit:
-                    raise ValueError(
+                    raise HandlerError(
                         f"Binary file is too large to read without an explicit max_chars limit "
                         f"({hex_chars} hex chars > {limit} default): {resolved}. "
                         "Pass max_chars to read a bounded hex prefix."
-                    )
+                    ) from exc
                 return "Encoded binary data HEX: " + raw[: limit // 2].hex() + "\n...[truncated]"
             return "Encoded binary data HEX: " + raw.hex()
-        raise
+        raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     all_lines = text.splitlines(keepends=True)
     start = 0 if start_line is None else start_line - 1
     end = len(all_lines) if end_line is None else end_line
@@ -126,7 +127,7 @@ def _read_text(
         result = "".join(lines)
     if len(result) > limit:
         if not explicit_limit:
-            raise ValueError(
+            raise HandlerError(
                 f"File is too large to read without an explicit max_chars limit "
                 f"({len(result)} chars > {limit} default): {resolved}. "
                 "Pass max_chars to read a bounded prefix, or use start_line/end_line to read a smaller range."
@@ -157,12 +158,17 @@ async def read_file(
     def _blocking() -> ReadFileResult:
         resolved = os.path.join(os.getcwd(), path)
         ext = os.path.splitext(resolved)[1].lower()
-        if ext in _AUDIO_EXTENSIONS:
-            return _read_audio(resolved, path, ext)
-        if ext in _IMAGE_EXTENSIONS:
-            return _read_image(resolved, path, ext)
-        if ext in _VIDEO_EXTENSIONS:
-            return _read_video(resolved, path, ext)
-        return _read_text(resolved, max_chars, binary_as_hex, start_line, end_line, line_numbers)
+        try:
+            if ext in _AUDIO_EXTENSIONS:
+                return _read_audio(resolved, path, ext)
+            if ext in _IMAGE_EXTENSIONS:
+                return _read_image(resolved, path, ext)
+            if ext in _VIDEO_EXTENSIONS:
+                return _read_video(resolved, path, ext)
+            return _read_text(resolved, max_chars, binary_as_hex, start_line, end_line, line_numbers)
+        except OSError as exc:
+            # exc.strerror carries the plain OS message ("No such file or directory",
+            # "Permission denied", "Is a directory") without the "[Errno N]" noise.
+            raise HandlerError(f"{exc.strerror or exc}: {resolved}") from exc
 
     return await asyncio.to_thread(_blocking)

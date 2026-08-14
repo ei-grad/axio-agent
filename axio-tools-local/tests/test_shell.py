@@ -10,6 +10,9 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+from axio.exceptions import HandlerError
+
 from axio_tools_local.shell import shell
 
 
@@ -231,3 +234,26 @@ class TestShellStreaming:
         assert "line00-" in result
         assert "line19-" in result
         assert "[truncated]" in result
+
+
+class TestShellExpectedFailures:
+    """Genuine failures (bad input, spawn failure) must raise HandlerError, not return a string."""
+
+    async def test_negative_max_output_chars_raises(self) -> None:
+        with pytest.raises(HandlerError, match="max_output_chars"):
+            await sh("echo hi", max_output_chars=-1)
+
+    async def test_stream_negative_max_output_chars_raises(self) -> None:
+        with pytest.raises(HandlerError, match="max_output_chars"):
+            async for _ in shell_stream(command="echo hi", max_output_chars=-1):
+                pass
+
+    async def test_spawn_failure_raises(self) -> None:
+        """An invalid cwd makes the shell fail to spawn at all."""
+        with pytest.raises(HandlerError):
+            await sh("echo hi", cwd="/definitely/does/not/exist")
+
+    async def test_stream_spawn_failure_raises(self) -> None:
+        with pytest.raises(HandlerError):
+            async for _ in shell_stream(command="echo hi", cwd="/definitely/does/not/exist"):
+                pass

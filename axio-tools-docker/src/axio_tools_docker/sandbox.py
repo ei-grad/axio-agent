@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
+from axio.exceptions import HandlerError
 from axio.tool import CONTEXT, Tool
 
 logger = logging.getLogger(__name__)
@@ -102,13 +103,18 @@ async def read_file(
     write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    raw = await sandbox.read_file_bytes(resolved)
+    if max_chars < 0:
+        raise HandlerError(f"max_chars must be >= 0: {resolved}")
+    try:
+        raw = await sandbox.read_file_bytes(resolved)
+    except FileNotFoundError as exc:
+        raise HandlerError(str(exc)) from exc
     try:
         text = raw.decode()
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
         if binary_as_hex:
             return "Encoded binary data HEX: " + raw[:max_chars].hex()
-        raise
+        raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     all_lines = text.splitlines(keepends=True)
     start = 0 if start_line is None else start_line - 1
     end = len(all_lines) if end_line is None else end_line
@@ -129,7 +135,10 @@ async def list_files(path: str = ".") -> str:
     reading or editing files."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    tar = await sandbox.get_archive(resolved)
+    try:
+        tar = await sandbox.get_archive(resolved)
+    except FileNotFoundError as exc:
+        raise HandlerError(str(exc)) from exc
 
     members = tar.getmembers()
     if not members:
@@ -188,7 +197,10 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     write_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    raw = await sandbox.read_file_bytes(resolved)
+    try:
+        raw = await sandbox.read_file_bytes(resolved)
+    except FileNotFoundError as exc:
+        raise HandlerError(str(exc)) from exc
     lines = raw.decode().splitlines(keepends=True)
     content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n"):
