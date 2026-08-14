@@ -167,6 +167,36 @@ class TestKVCache:
         payload = t.build_payload([], [], "")
         assert "system" not in payload
 
+    def test_effort_maps_to_legacy_thinking_budget(self) -> None:
+        transport = AnthropicTransport(model=ANTHROPIC_MODELS["claude-haiku-4-5"])
+
+        state = transport.configure_effort("medium")
+        payload = transport.build_payload([], [], "")
+
+        assert state.mechanism.value == "native-budget"
+        assert state.provider_value == 4_096
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4_096}
+
+    def test_current_claude_uses_adaptive_native_effort(self) -> None:
+        transport = AnthropicTransport(model=ANTHROPIC_MODELS["claude-sonnet-5"])
+
+        state = transport.configure_effort("xhigh")
+        payload = transport.build_payload([], [], "")
+
+        assert state.mechanism.value == "native-effort"
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert payload["output_config"] == {"effort": "xhigh"}
+
+    def test_claude_4_6_uses_adaptive_native_effort(self) -> None:
+        transport = AnthropicTransport(model=ANTHROPIC_MODELS["claude-sonnet-4-6"])
+
+        state = transport.configure_effort("medium")
+        payload = transport.build_payload([], [], "")
+
+        assert state.mechanism.value == "native-effort"
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert payload["output_config"] == {"effort": "medium"}
+
     def test_system_message_in_history_appended_to_system(self) -> None:
         t = AnthropicTransport(model=ANTHROPIC_MODELS["claude-sonnet-4-6"])
         messages = [Message(role="system", content=[TextBlock(text="wrap up now")])]

@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
@@ -32,6 +33,47 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
     base_url: str = "https://openrouter.ai/api/v1"
     model: ModelSpec = ModelSpec(id="google/gemini-2.5-pro-preview")
     thinking: bool = False
+    _reasoning_efforts: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
+    _reasoning_mandatory: set[str] = field(default_factory=set, repr=False)
+
+    def _reasoning_metadata_id(self) -> str:
+        model_id, _provider = _split_provider(self.model.id)
+        if model_id in self._reasoning_efforts or model_id in self._reasoning_mandatory:
+            return model_id
+        base_id, separator, _tier = model_id.rpartition(":")
+        if separator and (base_id in self._reasoning_efforts or base_id in self._reasoning_mandatory):
+            return base_id
+        return model_id
+
+    def configure_effort(self, requested: str | None) -> EffortState:
+        level = parse_effort(requested)
+        self.thinking = False
+        supports_reasoning = Capability.reasoning in self.model.capabilities
+        if level is None:
+            self.reasoning_effort = None
+            mechanism = EffortMechanism.native_effort if supports_reasoning else EffortMechanism.prompt_fallback
+            return EffortState(None, mechanism)
+        if supports_reasoning:
+            metadata_id = self._reasoning_metadata_id()
+            supported = self._reasoning_efforts.get(metadata_id, ())
+            provider_level: str = level
+            note = ""
+            effort_order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+            ranks = {name: index for index, name in enumerate(effort_order)}
+            if level == "none" and metadata_id in self._reasoning_mandatory:
+                choices = tuple(item for item in supported if item in ranks and item != "none")
+                provider_level = min(choices, key=ranks.__getitem__) if choices else "low"
+                note = f"This model requires reasoning; the lowest native effort, {provider_level}, is used."
+            elif supported and level not in supported:
+                choices = tuple(item for item in supported if item in ranks)
+                if choices:
+                    target = ranks[level]
+                    provider_level = min(choices, key=lambda item: (abs(ranks[item] - target), -ranks[item]))
+                    note = f"This model maps {level} to its nearest native effort, {provider_level}."
+            self.reasoning_effort = provider_level
+            return EffortState(level, EffortMechanism.native_effort, provider_value=provider_level, note=note)
+        self.reasoning_effort = None
+        return PromptEffortAdapter().configure_effort(level)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         payload = super().build_payload(messages, tools, system)
@@ -40,6 +82,8 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
         # delta.reasoning.
         if payload.pop("enable_thinking", None):
             payload.setdefault("reasoning", {"enabled": True})
+        if self.reasoning_effort is not None and Capability.reasoning in self.model.capabilities:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
         model_id, provider = _split_provider(str(payload.get("model", "")))
         if provider:
             payload["model"] = model_id
@@ -81,9 +125,18 @@ class OpenRouterTransport(ThinkingMixin, OpenAITransport):
             payload: dict[str, Any] = await resp.json()
 
         self.models.clear()
+        self._reasoning_efforts.clear()
+        self._reasoning_mandatory.clear()
         for entry in payload.get("data", []):
             m = self._parse_model(entry)
             self.models[m.id] = m
+            reasoning = entry.get("reasoning")
+            if isinstance(reasoning, dict):
+                efforts = reasoning.get("supported_efforts")
+                if isinstance(efforts, list):
+                    self._reasoning_efforts[m.id] = tuple(str(item) for item in efforts)
+                if reasoning.get("mandatory") is True:
+                    self._reasoning_mandatory.add(m.id)
         logger.info("Loaded %d models from %s", len(self.models), url)
 
     @staticmethod

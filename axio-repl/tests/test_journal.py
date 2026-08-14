@@ -72,8 +72,6 @@ class _OneShotTransport:
         self.models = ModelRegistry([self.model])
         self.temperature: float | None = None
         self.max_output_tokens: int | None = None
-        self.thinking_level: str | None = None
-        self.thinking_budget: int | None = None
         self.debug = False
 
     async def fetch_models(self) -> None:
@@ -115,6 +113,8 @@ async def _run_agent_tool_one_shot(
     tmp_path: Path,
     *,
     tool_name: str,
+    extra_args: tuple[str, ...] = (),
+    observed_systems: list[str] | None = None,
 ) -> None:
     import axio_repl
 
@@ -129,7 +129,9 @@ async def _run_agent_tool_one_shot(
             tools: list[Tool[object]],
             system: str,
         ) -> AsyncIterator[StreamEvent]:
-            del messages, tools, system
+            del messages
+            if observed_systems is not None:
+                observed_systems.append(system)
             self.calls += 1
             events = (
                 make_tool_use_response(
@@ -154,9 +156,28 @@ async def _run_agent_tool_one_shot(
             "none",
             "--session-log-dir",
             str(tmp_path / "journals"),
+            *extra_args,
         ],
     )
     await main()
+
+
+async def test_spawned_child_inherits_prompt_fallback_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    systems: list[str] = []
+
+    await _run_agent_tool_one_shot(
+        monkeypatch,
+        tmp_path,
+        tool_name="spawn_agent",
+        extra_args=("--effort", "high"),
+        observed_systems=systems,
+    )
+
+    assert len(systems) >= 2
+    assert all("Effort guidance (high)" in system for system in systems)
 
 
 @pytest.mark.parametrize("agent_actions", ["off", "on"])
@@ -437,6 +458,8 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     assert configurations["transport"] == "stub"
     assert configurations["model"] == "stub/model"
     assert configurations["sandbox"] == "host — tools run directly on this machine"
+    assert configurations["effort"]["requested"] == "default"
+    assert configurations["effort"]["mechanism"] == "prompt-fallback"
 
     committed = [record for record in records if record["kind"] == "message_committed"]
     assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
@@ -448,6 +471,28 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     captured = capsys.readouterr()
     assert "Session log:" not in captured.out
     assert str(events_path) in captured.err
+
+
+async def test_cli_effort_is_recorded_as_configuration_without_extra_history_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    await _run_stub_one_shot(monkeypatch, tmp_path, "--effort", "high")
+
+    events_path = _only_events_path(state_home / "axio" / "sessions")
+    records = _read_records(events_path)
+    effort_change = next(
+        record
+        for record in records
+        if record["kind"] == "configuration_changed" and record["payload"]["event"]["name"] == "effort"
+    )
+    assert effort_change["payload"]["event"]["value"]["requested"] == "high"
+    assert effort_change["payload"]["event"]["value"]["mechanism"] == "prompt-fallback"
+    committed = [record for record in records if record["kind"] == "message_committed"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
 
 
 async def test_one_shot_session_log_can_be_disabled(

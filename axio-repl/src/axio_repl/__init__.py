@@ -32,6 +32,7 @@ from axio import notify
 from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import ContextStore, MemoryContextStore
+from axio.effort import EFFORT_LEVELS, EffortRuntime, EffortState
 from axio.events import (
     AudioOutput,
     Error,
@@ -1640,12 +1641,12 @@ class Command(NamedTuple):
     """A REPL command with separate show (no arg) and apply (with arg) modes."""
 
     show: Callable[[], None]
-    apply: Callable[[str], None]
+    apply: Callable[[str], object]
 
 
 # CLI arg attr → slash command name (for unified init).
 _CLI_TO_SLASH: dict[str, str] = {
-    "thinking": "/thinking",
+    "effort": "/effort",
     "temperature": "/temperature",
     "max_tokens": "/max-tokens",
     "debug": "/debug",
@@ -1659,7 +1660,9 @@ def _apply_cli_args(args: object, commands: dict[str, Command]) -> None:
         if val is None or val is False:
             continue
         arg = "on" if isinstance(val, bool) else val if isinstance(val, str) else str(val)
-        commands[cmd_name].apply(arg)
+        result = commands[cmd_name].apply(arg)
+        if cmd_name == "/effort" and result is None:
+            raise SystemExit(2)
 
 
 # ── model ──
@@ -1768,12 +1771,13 @@ def _apply_model(
     arg: str,
     parent_peer_id: str | None = None,
     sandbox_note: str = "",
+    effort: EffortRuntime | None = None,
 ) -> None:
     chosen = _choose_model(transport, arg)
     if chosen is None:
         return
     transport.model = chosen
-    agent.system = build_system_prompt(
+    base_system = build_system_prompt(
         root,
         transport.model,
         tools,
@@ -1781,49 +1785,73 @@ def _apply_model(
         parent_peer_id=parent_peer_id,
         sandbox_note=sandbox_note,
     )
+    if effort is not None:
+        state = effort.reapply()
+        agent.system = effort.system_prompt(base_system)
+    else:
+        state = None
+        agent.system = base_system
     print(f"Switched to {BOLD}{transport.model.id}{RESET}")
+    if state is not None and state.requested is not None:
+        print(f"Effort reapplied: {BOLD}{state.requested}{RESET} via {state.mechanism.value}")
+        if state.note:
+            print(state.note)
 
 
-# ── thinking ──
+# ── effort ──
 
 
-def _show_thinking(transport: Any) -> None:
-    level = getattr(transport, "thinking_level", None)
-    budget = getattr(transport, "thinking_budget", None)
-    get_opts = getattr(transport, "get_thinking_options", None)
-    valid_levels = get_opts() if get_opts else None
-    if level:
-        print(f"Thinking level: {BOLD}{level}{RESET}")
-    elif budget is not None:
-        print(f"Thinking budget: {BOLD}{budget}{RESET} tokens")
+def _show_effort(effort: EffortRuntime) -> None:
+    state = effort.state
+    requested = state.requested or "default"
+    print(f"Requested effort: {BOLD}{requested}{RESET}")
+    if state.provider_value is None:
+        detail = ""
+    elif state.mechanism.value == "native-budget" and isinstance(state.provider_value, int):
+        detail = f" (budget: {state.provider_value} tokens)"
+    elif state.mechanism.value == "native-budget":
+        detail = f" (thinking level: {state.provider_value})"
     else:
-        print("Thinking: default")
-    if valid_levels is not None:
-        print(f"Valid levels: {', '.join(valid_levels)}")
-    elif get_opts is not None:
-        print("Usage: /thinking <budget_tokens>")
+        detail = f" (provider effort: {state.provider_value})"
+    print(f"Effective mechanism: {BOLD}{state.mechanism.value}{RESET}{detail}")
+    if state.note:
+        print(f"Limitation: {state.note}")
+    print(f"Valid values: default, {', '.join(state.allowed)}")
 
 
-def _apply_thinking(transport: Any, arg: str) -> None:
-    get_opts = getattr(transport, "get_thinking_options", None)
-    valid_levels = get_opts() if get_opts else None
-    if arg.isdigit():
-        if valid_levels is not None:
-            model_id = getattr(getattr(transport, "model", None), "id", "?")
-            print(f"{model_id} uses thinking levels, not token budgets.")
-            print(f"Valid levels: {', '.join(valid_levels)}")
-            return
-        transport.thinking_budget = int(arg)
-        transport.thinking_level = None
-        print(f"Thinking budget: {BOLD}{arg}{RESET} tokens")
-    else:
-        name = arg.upper()
-        if valid_levels is not None and name not in valid_levels:
-            print(f"{name} is not valid. Valid levels: {', '.join(valid_levels)}")
-            return
-        transport.thinking_level = name
-        transport.thinking_budget = None
-        print(f"Thinking level: {BOLD}{name}{RESET}")
+def _apply_effort(effort: EffortRuntime, arg: str) -> EffortState | None:
+    try:
+        state = effort.configure(arg)
+    except ValueError as exc:
+        print(str(exc))
+        return None
+    _show_effort(effort)
+    return state
+
+
+def _apply_agent_effort(
+    effort: EffortRuntime,
+    agent: Agent,
+    root: Path,
+    tools: list[Tool[Any]],
+    agents_text: str,
+    parent_peer_id: str | None,
+    sandbox_note: str,
+    arg: str,
+) -> EffortState | None:
+    state = _apply_effort(effort, arg)
+    if state is None:
+        return None
+    base_system = build_system_prompt(
+        root,
+        cast(Any, agent.transport).model,
+        tools,
+        agents_text,
+        parent_peer_id=parent_peer_id,
+        sandbox_note=sandbox_note,
+    )
+    agent.system = effort.system_prompt(base_system)
+    return state
 
 
 # ── temperature ──
@@ -2048,7 +2076,7 @@ def _build_argument_parser() -> Any:
     parser.add_argument("--transport", default=None, help="Transport name (auto-detected if omitted)")
     parser.add_argument("--model", default=None, help="Model name")
     parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--thinking", default=None, help="Thinking level or token budget (integer)")
+    parser.add_argument("--effort", default=None, help=f"Effort level: default, {', '.join(EFFORT_LEVELS)}")
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
     parser.add_argument("--debug", action="store_true", help="Log request/response bodies to stderr")
@@ -2114,9 +2142,11 @@ async def main() -> None:
                 sys.exit(1)
             transport.model = chosen
 
+        effort = EffortRuntime(transport)
+
         # Transport-level commands (available before agent creation).
         commands: dict[str, Command] = {
-            "/thinking": Command(lambda: _show_thinking(transport), lambda a: _apply_thinking(transport, a)),
+            "/effort": Command(lambda: _show_effort(effort), lambda a: _apply_effort(effort, a)),
             "/temperature": Command(lambda: _show_temperature(transport), lambda a: _apply_temperature(transport, a)),
             "/max-tokens": Command(lambda: _show_max_tokens(transport), lambda a: _apply_max_tokens(transport, a)),
             "/debug": Command(lambda: _show_debug(transport), lambda a: _apply_debug(transport, a)),
@@ -2127,7 +2157,9 @@ async def main() -> None:
             stack, list(TOOLS), args.sandbox, args.sandbox_image, root
         )
         print(f"Tools: {BOLD}{sandbox_desc}{RESET}")
-        system = build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)
+        system = effort.system_prompt(
+            build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)
+        )
         agent = Agent(
             system=system,
             tools=tools,
@@ -2158,8 +2190,7 @@ async def main() -> None:
             ("max_iterations", agent.max_iterations),
             ("max_output_tokens", getattr(transport, "max_output_tokens", None)),
             ("temperature", getattr(transport, "temperature", None)),
-            ("thinking_level", getattr(transport, "thinking_level", None)),
-            ("thinking_budget", getattr(transport, "thinking_budget", None)),
+            ("effort", effort.state.to_dict()),
             ("agent_actions", args.agent_actions),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
@@ -2170,11 +2201,8 @@ async def main() -> None:
                     return transport.model.id
                 case "/iterations":
                     return agent.max_iterations
-                case "/thinking":
-                    return {
-                        "level": getattr(transport, "thinking_level", None),
-                        "budget": getattr(transport, "thinking_budget", None),
-                    }
+                case "/effort":
+                    return effort.state.to_dict()
                 case "/temperature":
                     return getattr(transport, "temperature", None)
                 case "/max-tokens":
@@ -2192,13 +2220,15 @@ async def main() -> None:
             child_ctx = await ctx.fork() if inherit_context else ObservedContextStore(MemoryContextStore(), event_hub)
             child_transport = _clone_transport_for_spawn(agent.transport)
             child_tools = _clone_tools_for_child(agent.tools, foreground=foreground)
-            child_system = build_system_prompt(
-                tool_root,
-                child_transport.model,
-                child_tools,
-                agents_text,
-                parent_peer_id=None if foreground else parent_peer_id,
-                sandbox_note=sandbox_note,
+            child_system = effort.system_prompt(
+                build_system_prompt(
+                    tool_root,
+                    child_transport.model,
+                    child_tools,
+                    agents_text,
+                    parent_peer_id=None if foreground else parent_peer_id,
+                    sandbox_note=sandbox_note,
+                )
             )
             return agent.copy(
                 transport=child_transport,
@@ -2221,7 +2251,21 @@ async def main() -> None:
         commands["/model"] = Command(
             lambda: _show_model(transport),
             lambda a: _apply_model(
-                transport, agent, tools, tool_root, agents_text, a, parent_peer_id, sandbox_note=sandbox_note
+                transport,
+                agent,
+                tools,
+                tool_root,
+                agents_text,
+                a,
+                parent_peer_id,
+                sandbox_note=sandbox_note,
+                effort=effort,
+            ),
+        )
+        commands["/effort"] = Command(
+            lambda: _show_effort(effort),
+            lambda a: _apply_agent_effort(
+                effort, agent, tool_root, tools, agents_text, parent_peer_id, sandbox_note, a
             ),
         )
         commands["/iterations"] = Command(
@@ -2374,13 +2418,15 @@ async def main() -> None:
                     cwd=str(root),
                 ).start()
                 parent_peer_id = peer_server.id
-                agent.system = build_system_prompt(
-                    tool_root,
-                    transport.model,
-                    tools,
-                    agents_text,
-                    parent_peer_id=parent_peer_id,
-                    sandbox_note=sandbox_note,
+                agent.system = effort.system_prompt(
+                    build_system_prompt(
+                        tool_root,
+                        transport.model,
+                        tools,
+                        agents_text,
+                        parent_peer_id=parent_peer_id,
+                        sandbox_note=sandbox_note,
+                    )
                 )
                 notify.add_listener(
                     peer_server.id,
@@ -2506,6 +2552,7 @@ async def main() -> None:
                             cmd.show()
                         else:
                             previous_value = _command_configuration(prefix)
+                            previous_effort = effort.state.to_dict() if prefix == "/model" else None
                             cmd.apply(cmd_arg)
                             current_value = _command_configuration(prefix)
                             if current_value != previous_value:
@@ -2513,6 +2560,14 @@ async def main() -> None:
                                     ConfigurationChanged(
                                         name=prefix.removeprefix("/"),
                                         value=current_value,
+                                        source="interactive",
+                                    )
+                                )
+                            if previous_effort is not None and effort.state.to_dict() != previous_effort:
+                                await _publish_main_event(
+                                    ConfigurationChanged(
+                                        name="effort",
+                                        value=effort.state.to_dict(),
                                         source="interactive",
                                     )
                                 )

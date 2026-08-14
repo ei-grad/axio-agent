@@ -34,9 +34,6 @@ from axio_transport_openai import OpenAITransport, _strip_title
 
 logger = logging.getLogger(__name__)
 
-# Values accepted by the reasoning.effort field.
-REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
-
 _ORPHAN_OUTPUT = "[Tool was not executed - context was interrupted or compacted]"
 
 
@@ -106,9 +103,6 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
 @dataclass
 class OpenAIResponsesTransport(OpenAITransport):
     name: str = "OpenAI Responses"
-    # none|low|medium|high|xhigh|max. Left unset the API picks its own default;
-    # set it to "none" to turn reasoning off entirely.
-    reasoning_effort: str | None = None
 
     stream_path: ClassVar[str] = "responses"
 

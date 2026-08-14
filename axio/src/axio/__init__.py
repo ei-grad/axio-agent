@@ -3,6 +3,7 @@
 from .agent import Agent
 from .blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from .context import ContextStore, MemoryContextStore
+from .effort import EFFORT_LEVELS, EffortControl, EffortLevel, EffortMechanism, EffortRuntime, EffortState
 from .events import (
     AudioOutputDelta,
     IterationEnd,
@@ -37,6 +38,12 @@ __all__ = [
     "ContextStore",
     "MemoryContextStore",
     "CompletionTransport",
+    "EffortControl",
+    "EffortLevel",
+    "EffortMechanism",
+    "EffortRuntime",
+    "EffortState",
+    "EFFORT_LEVELS",
     # events
     "StreamEvent",
     "TextDelta",

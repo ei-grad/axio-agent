@@ -9,10 +9,11 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import aiohttp
 from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
+from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import (
     AudioOutput,
     ImageOutput,
@@ -46,6 +47,9 @@ from axio_transport_google._generated_types import (
     Tool as ToolDict,
 )
 
+if TYPE_CHECKING:
+    from axio_transport_anthropic import AnthropicTransport
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,16 +66,44 @@ class _RefreshableCredentials(Protocol):
 
 def valid_thinking_levels(model_id: str) -> tuple[str, ...] | None:
     """Return valid thinkingLevel values for a Gemini 3+ model, or None for budget-based (2.5) models."""
-    if "gemini-3" not in model_id:
+    normalized = model_id.lower()
+    if "gemini-3" not in normalized:
         return None
-    if "-pro-image" in model_id:
+    if "-flash-lite-image" in normalized:
+        return None
+    if "-pro-image" in normalized:
         return ("HIGH",)
-    if "-pro" in model_id:
-        return ("LOW", "MEDIUM", "HIGH")
-    if "-flash-image" in model_id:
+    if "-flash-image" in normalized:
         return ("MINIMAL", "HIGH")
-    # Flash, Flash-Lite
-    return ("MINIMAL", "LOW", "MEDIUM", "HIGH")
+    if "gemini-3.1-pro" in normalized:
+        return ("LOW", "MEDIUM", "HIGH")
+    if "gemini-3-pro" in normalized:
+        return ("LOW", "HIGH")
+    if "-flash-lite" in normalized or "-flash" in normalized:
+        return ("MINIMAL", "LOW", "MEDIUM", "HIGH")
+    return None
+
+
+_THINKING_BUDGETS = {
+    "none": 0,
+    "low": 1_024,
+    "medium": 8_192,
+    "high": 24_576,
+    "xhigh": 24_576,
+    "max": 24_576,
+}
+
+
+def _thinking_level_for_effort(level: str, allowed: tuple[str, ...]) -> str:
+    preferences = {
+        "none": ("MINIMAL", "LOW", "MEDIUM", "HIGH"),
+        "low": ("LOW", "MINIMAL", "MEDIUM", "HIGH"),
+        "medium": ("MEDIUM", "HIGH", "LOW", "MINIMAL"),
+        "high": ("HIGH", "MEDIUM", "LOW", "MINIMAL"),
+        "xhigh": ("HIGH", "MEDIUM", "LOW", "MINIMAL"),
+        "max": ("HIGH", "MEDIUM", "LOW", "MINIMAL"),
+    }
+    return next(candidate for candidate in preferences[level] if candidate in allowed)
 
 
 def _redact_body(obj: Any) -> Any:
@@ -381,6 +413,8 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
     last_usage: Usage | None = field(default=None, repr=False, compare=False)
     # Vertex AI credentials (lazily initialised)
     _credentials: Any = field(default=None, repr=False, compare=False)
+    _anthropic_effort_configured: bool = field(default=False, repr=False, compare=False)
+    _anthropic_effort_requested: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if isinstance(self.vertexai, str):
@@ -463,9 +497,46 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
                 headers["x-goog-user-project"] = project
         return headers
 
-    def get_thinking_options(self) -> tuple[str, ...] | None:
-        """Valid thinkingLevel values for the current model, or None if budget-based (2.5)."""
-        return valid_thinking_levels(self.model.id)
+    def configure_effort(self, requested: str | None) -> EffortState:
+        level = parse_effort(requested)
+        self.thinking_level = None
+        self.thinking_budget = None
+        if self.model.id.startswith("anthropic/"):
+            self._anthropic_effort_configured = True
+            self._anthropic_effort_requested = level
+            proxy = self._make_anthropic_proxy(apply_effort=False)
+            return proxy.configure_effort(level)
+        self._anthropic_effort_configured = False
+        self._anthropic_effort_requested = None
+        levels = valid_thinking_levels(self.model.id)
+        budget_supported = "gemini-2.5" in self.model.id and Capability.reasoning in self.model.capabilities
+        if level is None:
+            if Capability.reasoning in self.model.capabilities and (levels is not None or budget_supported):
+                return EffortState(None, EffortMechanism.native_budget)
+            return PromptEffortAdapter().configure_effort(None)
+        if levels is not None and Capability.reasoning in self.model.capabilities:
+            native_level = _thinking_level_for_effort(level, levels)
+            self.thinking_level = native_level
+            note = ""
+            if level == "none" and native_level != "MINIMAL":
+                note = "This model cannot disable thinking; the lowest native level is used."
+            elif level == "none":
+                note = "Minimal thinking does not guarantee that reasoning is disabled."
+            elif native_level != level.upper():
+                note = f"This model maps {level} to its nearest native thinking level, {native_level}."
+            return EffortState(level, EffortMechanism.native_budget, provider_value=native_level, note=note)
+        if budget_supported:
+            budget = _THINKING_BUDGETS[level]
+            note = ""
+            if "pro" in self.model.id:
+                if level == "none":
+                    budget = 128
+                    note = "This model cannot disable thinking; the minimum native budget is used."
+                elif level in {"xhigh", "max"}:
+                    budget = 32_768
+            self.thinking_budget = budget
+            return EffortState(level, EffortMechanism.native_budget, provider_value=budget, note=note)
+        return PromptEffortAdapter().configure_effort(level)
 
     # ── Generation config ──
 
@@ -487,9 +558,9 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
         if self.thinking_level or self.thinking_budget is not None or Capability.reasoning in self.model.capabilities:
             thinking: ThinkingConfig = {"includeThoughts": True}
             levels = valid_thinking_levels(self.model.id)
-            if levels is not None:
+            if levels is not None and self.thinking_level is not None:
                 # Gemini 3+: use thinkingLevel (thinkingBudget is not supported)
-                level = (self.thinking_level or "HIGH").upper()
+                level = self.thinking_level.upper()
                 if level not in levels:
                     level = levels[-1]  # fall back to highest supported
                 thinking["thinkingLevel"] = level  # type: ignore[typeddict-item]
@@ -513,6 +584,11 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
     async def _stream_anthropic(
         self, messages: list[Message], tools: list[Tool[Any]], system: str
     ) -> AsyncIterator[StreamEvent]:
+        proxy = self._make_anthropic_proxy()
+        async for event in proxy.stream(messages, tools, system):
+            yield event
+
+    def _make_anthropic_proxy(self, *, apply_effort: bool = True) -> AnthropicTransport:
         from axio_transport_anthropic import ANTHROPIC_MODELS, AnthropicTransport
 
         bare_id = self.model.id.removeprefix("anthropic/")
@@ -529,8 +605,9 @@ class GoogleTransport(CompletionTransport, ImageGenTransport, VideoGenTransport)
             thinking_budget=self.thinking_budget,
             session=self.session,
         )
-        async for event in proxy.stream(messages, tools, system):
-            yield event
+        if apply_effort and self._anthropic_effort_configured:
+            proxy.configure_effort(self._anthropic_effort_requested)
+        return proxy
 
     async def _do_stream(
         self, messages: list[Message], tools: list[Tool[Any]], system: str

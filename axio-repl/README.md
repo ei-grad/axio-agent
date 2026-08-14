@@ -90,6 +90,9 @@ axio-repl --transport google --model gemini-3.1-pro-preview
 # Custom temperature and iteration limit
 axio-repl --temperature 0.5 --max-iterations 100
 
+# Set reasoning effort when the transport supports it, otherwise use prompt guidance
+axio-repl --effort high
+
 # Choose another journal root, or explicitly opt out
 axio-repl --session-log-dir ./axio-session-logs
 axio-repl --no-session-log
@@ -152,6 +155,7 @@ appropriate retention policy.
 | `/agent-focus <id>`  | Change the input target                         |
 | `/model`             | Show current model and list available models    |
 | `/model <query>`     | Switch to a model matching the query            |
+| `/effort [level]`    | Show or set effort; `default` resets it          |
 | `/quit` `/exit` `/q` | Exit the REPL                                   |
 
 ## Foreground and background agents

@@ -14,6 +14,7 @@ from typing import Any
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -175,6 +176,8 @@ class CodexTransport(CompletionTransport):
     )
     max_retries: int = 10
     retry_base_delay: float = 5.0
+    reasoning_effort: str | None = field(default=None, repr=False)
+    _reasoning_efforts: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
 
     def _get_retry_delay(self, resp: aiohttp.ClientResponse | None, attempt: int) -> float:
         """Return delay in seconds: prefer Retry-After header, fall back to exponential backoff."""
@@ -186,6 +189,19 @@ class CodexTransport(CompletionTransport):
                 except (ValueError, TypeError):
                     pass
         return float(self.retry_base_delay * (2 ** (attempt - 1)))
+
+    def configure_effort(self, requested: str | None) -> EffortState:
+        level = parse_effort(requested)
+        supported = self._reasoning_efforts.get(self.model.id, ())
+        if level is None:
+            self.reasoning_effort = None
+            mechanism = EffortMechanism.native_effort if supported else EffortMechanism.prompt_fallback
+            return EffortState(None, mechanism)
+        if level in supported:
+            self.reasoning_effort = level
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+        self.reasoning_effort = None
+        return PromptEffortAdapter().configure_effort(level)
 
     async def _ensure_token(self) -> None:
         """Refresh access token if expired or about to expire."""
@@ -255,6 +271,8 @@ class CodexTransport(CompletionTransport):
             payload["tools"] = _convert_tools(tools)
             payload["tool_choice"] = "auto"
             payload["parallel_tool_calls"] = True
+        if self.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
 
         # Log input items summary for debugging
         fc = [i for i in input_items if i.get("type") == "function_call"]
@@ -485,10 +503,19 @@ class CodexTransport(CompletionTransport):
             return
 
         specs: list[ModelSpec] = []
+        reasoning_efforts: dict[str, tuple[str, ...]] = {}
         for item in model_list:
             model_id = item.get("id", item.get("slug", ""))
             if not model_id:
                 continue
+            advertised = item.get("supported_reasoning_efforts", item.get("supported_reasoning_levels", []))
+            parsed_efforts = tuple(
+                str(option.get("effort", "")) if isinstance(option, dict) else str(option)
+                for option in advertised
+                if (isinstance(option, str) and option) or (isinstance(option, dict) and option.get("effort"))
+            )
+            if parsed_efforts:
+                reasoning_efforts[model_id] = parsed_efforts
             # Use known spec if available, otherwise build one from API data.
             if model_id in CODEX_MODELS:
                 specs.append(CODEX_MODELS[model_id])
@@ -496,13 +523,14 @@ class CodexTransport(CompletionTransport):
                 specs.append(
                     ModelSpec(
                         id=model_id,
-                        capabilities=_TT,
+                        capabilities=_RT if parsed_efforts else _TT,
                         context_window=item.get("context_window", 128_000),
                         max_output_tokens=item.get("max_output_tokens", 8_192),
                     )
                 )
 
         self.models = ModelRegistry(specs) if specs else ModelRegistry(CODEX_MODELS.values())
+        self._reasoning_efforts = reasoning_efforts
 
         # If the currently selected model was dropped from the API list, switch to
         # the first available one so the transport stays usable out of the box.

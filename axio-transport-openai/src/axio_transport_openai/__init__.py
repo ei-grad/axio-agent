@@ -15,6 +15,7 @@ from typing import Any, ClassVar, Self
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -32,6 +33,26 @@ _VT = frozenset({Capability.text, Capability.vision, Capability.tool_use})
 _RT = frozenset({Capability.text, Capability.reasoning, Capability.tool_use})
 _TT = frozenset({Capability.text, Capability.tool_use})
 _VRT = frozenset({Capability.text, Capability.vision, Capability.reasoning, Capability.tool_use})
+
+_OPENAI_REASONING_EFFORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("gpt-5.6", ("none", "low", "medium", "high", "xhigh", "max")),
+    ("gpt-5.5-pro", ("medium", "high", "xhigh")),
+    ("gpt-5.5", ("none", "low", "medium", "high", "xhigh")),
+    ("gpt-5.4-pro", ("medium", "high", "xhigh")),
+    ("gpt-5.4", ("none", "low", "medium", "high", "xhigh")),
+    ("gpt-5.2-pro", ("medium", "high", "xhigh")),
+    ("gpt-5.2", ("none", "low", "medium", "high", "xhigh")),
+    ("gpt-5.1", ("none", "low", "medium", "high")),
+    ("gpt-5", ("low", "medium", "high")),
+)
+
+
+def _openai_reasoning_efforts(model_id: str) -> tuple[str, ...]:
+    for prefix, efforts in _OPENAI_REASONING_EFFORTS:
+        if model_id == prefix or model_id.startswith(f"{prefix}-"):
+            return efforts
+    return ()
+
 
 OPENAI_MODELS: ModelRegistry = ModelRegistry(
     {
@@ -482,10 +503,14 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
     max_retries: int = 10
     retry_base_delay: float = 5.0
     extra_params: Mapping[str, Any] = field(default=MappingProxyType({}), repr=False)
+    reasoning_effort: str | None = field(default=None, repr=False)
+    supports_responses: bool | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.extra_params, MappingProxyType):
             self.extra_params = MappingProxyType(self.extra_params)
+        if self.supports_responses is None:
+            self.supports_responses = self.base_url.rstrip("/") == "https://api.openai.com/v1"
 
     def _get_retry_delay(self, resp: aiohttp.ClientResponse | None, attempt: int) -> float:
         """Return delay in seconds: prefer Retry-After header, fall back to exponential backoff."""
@@ -497,6 +522,22 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
                 except (ValueError, TypeError):
                     pass
         return float(self.retry_base_delay * (2 ** (attempt - 1)))
+
+    def configure_effort(self, requested: str | None) -> EffortState:
+        level = parse_effort(requested)
+        supported = _openai_reasoning_efforts(self.model.id) if Capability.reasoning in self.model.capabilities else ()
+        native_responses = self.stream_path == "responses" or self.supports_responses is True
+        if level is None:
+            self.reasoning_effort = None
+            mechanism = (
+                EffortMechanism.native_effort if native_responses and supported else EffortMechanism.prompt_fallback
+            )
+            return EffortState(None, mechanism)
+        if native_responses and level in supported:
+            self.reasoning_effort = level
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+        self.reasoning_effort = None
+        return PromptEffortAdapter().configure_effort(level)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -656,6 +697,31 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
     stream_path: ClassVar[str] = "chat/completions"
 
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[StreamEvent]:
+        supported = _openai_reasoning_efforts(self.model.id)
+        use_responses = (
+            self.stream_path == "chat/completions"
+            and self.supports_responses is True
+            and Capability.reasoning in self.model.capabilities
+            and bool(supported)
+            and (self.reasoning_effort is not None or (self.model.id.startswith("gpt-5.6") and bool(tools)))
+        )
+        if use_responses:
+            from .responses import OpenAIResponsesTransport
+
+            routed = OpenAIResponsesTransport(
+                name=self.name,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model=self.model,
+                models=self.models,
+                session=self.session,
+                max_retries=self.max_retries,
+                retry_base_delay=self.retry_base_delay,
+                extra_params=self.extra_params,
+                reasoning_effort=self.reasoning_effort,
+                supports_responses=True,
+            )
+            return routed.stream(messages, tools, system)
         return self._do_stream(messages, tools, system)
 
     async def _do_stream(
@@ -779,6 +845,9 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
         }
         if self.extra_params:
             result["extra_params"] = dict(self.extra_params)
+        if self.reasoning_effort is not None:
+            result["reasoning_effort"] = self.reasoning_effort
+        result["supports_responses"] = self.supports_responses
         return result
 
     @classmethod
@@ -805,6 +874,10 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
             api_key=str(data.get("api_key", "")) or os.environ.get("OPENAI_API_KEY", ""),
             models=models,
             extra_params=dict(data.get("extra_params") or {}),
+            reasoning_effort=str(data["reasoning_effort"]) if data.get("reasoning_effort") is not None else None,
+            supports_responses=(
+                bool(data["supports_responses"]) if data.get("supports_responses") is not None else None
+            ),
             session=session,
         )
 

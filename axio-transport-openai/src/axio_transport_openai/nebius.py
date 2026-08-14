@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from axio.effort import EffortState
 from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
@@ -55,6 +56,10 @@ class NebiusTransport(ThinkingMixin, OpenAITransport):
     base_url: str = "https://api.tokenfactory.nebius.com/v1"
     model: ModelSpec = field(default_factory=lambda: _UNSET)
     thinking: bool = False
+
+    def configure_effort(self, requested: str | None) -> EffortState:
+        self.thinking = False
+        return super().configure_effort(requested)
 
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[Any]:
         if self.model is _UNSET:

@@ -415,6 +415,31 @@ async def test_reasoning_capability_from_supported_parameters(
     assert Capability.reasoning not in transport.models["thinks/not"].capabilities
 
 
+async def test_reasoning_metadata_constrains_native_effort(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+) -> None:
+    server, _ = fake_server
+    server.models_response = {
+        "data": [
+            {
+                "id": "thinks/mandatory",
+                "supported_parameters": ["reasoning"],
+                "reasoning": {"supported_efforts": ["high", "low"], "mandatory": True},
+            }
+        ]
+    }
+
+    await transport.fetch_models()
+    transport.model = transport.models["thinks/mandatory"]
+    state = transport.configure_effort("none")
+    payload = transport.build_payload([], [], "")
+
+    assert state.provider_value == "low"
+    assert "requires reasoning" in state.note
+    assert payload["reasoning"] == {"effort": "low"}
+
+
 # ---------------------------------------------------------------------------
 # Request payload
 # ---------------------------------------------------------------------------
@@ -489,6 +514,29 @@ async def test_thinking_is_requested_the_openrouter_way(
     payload = server.received_payloads[0]
     assert payload["reasoning"] == {"enabled": True}
     assert "enable_thinking" not in payload
+
+
+def test_effort_is_requested_with_openrouter_native_reasoning() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="thinks/a-lot", capabilities=frozenset({Capability.reasoning})))
+
+    state = transport.configure_effort("xhigh")
+    payload = transport.build_payload([], [], "")
+
+    assert state.mechanism.value == "native-effort"
+    assert payload["reasoning"] == {"effort": "xhigh"}
+
+
+def test_effort_default_clears_legacy_thinking() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="thinks/a-lot", capabilities=frozenset({Capability.reasoning})),
+        thinking=True,
+    )
+
+    state = transport.configure_effort("default")
+    payload = transport.build_payload([], [], "")
+
+    assert state.requested is None
+    assert "reasoning" not in payload
 
 
 # ---------------------------------------------------------------------------

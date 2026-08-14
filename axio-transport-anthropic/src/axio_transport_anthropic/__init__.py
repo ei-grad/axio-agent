@@ -13,6 +13,7 @@ from typing import Any, Protocol, Self, cast
 
 import aiohttp
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
+from axio.effort import EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import Message
@@ -28,6 +29,35 @@ VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
 
 _VT = frozenset({Capability.text, Capability.vision, Capability.tool_use})
 _RT = frozenset({Capability.text, Capability.vision, Capability.reasoning, Capability.tool_use})
+
+_EFFORT_BUDGETS = {
+    "low": 1_024,
+    "medium": 4_096,
+    "high": 8_192,
+    "xhigh": 16_384,
+    "max": 32_768,
+}
+
+
+def _adaptive_efforts(model_id: str) -> tuple[str, ...]:
+    if any(name in model_id for name in ("claude-fable-5", "claude-opus-5", "claude-sonnet-5")):
+        return ("low", "medium", "high", "xhigh", "max")
+    if any(name in model_id for name in ("claude-opus-4-8", "claude-opus-4-7")):
+        return ("low", "medium", "high", "xhigh", "max")
+    if any(name in model_id for name in ("claude-opus-4-6", "claude-sonnet-4-6")):
+        return ("low", "medium", "high", "max")
+    return ()
+
+
+def _supports_thinking_budget(model_id: str) -> bool:
+    return any(
+        name in model_id
+        for name in (
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        )
+    )
 
 
 class _RefreshableCredentials(Protocol):
@@ -255,6 +285,7 @@ class AnthropicTransport(CompletionTransport):
     top_p: float | None = None
     top_k: int | None = None
     thinking_budget: int | None = None
+    _effort_level: str | None = field(default=None, repr=False)
     max_retries: int = 10
     retry_base_delay: float = 5.0
 
@@ -303,6 +334,34 @@ class AnthropicTransport(CompletionTransport):
                     pass
         return float(self.retry_base_delay * (2 ** (attempt - 1)))
 
+    def configure_effort(self, requested: str | None) -> EffortState:
+        level = parse_effort(requested)
+        adaptive = _adaptive_efforts(self.model.id)
+        budget_supported = _supports_thinking_budget(self.model.id)
+        self._effort_level = None
+        self.thinking_budget = None
+        if level is None:
+            mechanism = EffortMechanism.native_effort if adaptive else EffortMechanism.native_budget
+            if not adaptive and not budget_supported:
+                mechanism = EffortMechanism.prompt_fallback
+            return EffortState(None, mechanism)
+        if level in adaptive:
+            self._effort_level = level
+            return EffortState(level, EffortMechanism.native_effort, provider_value=level)
+        if level == "xhigh" and "max" in adaptive:
+            self._effort_level = "max"
+            return EffortState(
+                level,
+                EffortMechanism.native_effort,
+                provider_value="max",
+                note="This model maps xhigh to its highest native effort, max.",
+            )
+        if budget_supported and level != "none":
+            budget = min(_EFFORT_BUDGETS[level], max(1_024, self.model.max_output_tokens - 1_024))
+            self.thinking_budget = budget
+            return EffortState(level, EffortMechanism.native_budget, provider_value=budget)
+        return PromptEffortAdapter().configure_effort(level)
+
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         converted_messages = _convert_messages(messages)
 
@@ -339,7 +398,10 @@ class AnthropicTransport(CompletionTransport):
             payload["top_p"] = self.top_p
         if self.top_k is not None:
             payload["top_k"] = self.top_k
-        if self.thinking_budget is not None:
+        if self._effort_level is not None:
+            payload["thinking"] = {"type": "adaptive"}
+            payload["output_config"] = {"effort": self._effort_level}
+        elif self.thinking_budget is not None:
             payload["thinking"] = {"type": "enabled", "budget_tokens": self.thinking_budget}
 
         return payload
@@ -503,6 +565,10 @@ class AnthropicTransport(CompletionTransport):
                 d["project"] = self.project
             if self.location:
                 d["location"] = self.location
+        if self.thinking_budget is not None:
+            d["thinking_budget"] = self.thinking_budget
+        if self._effort_level is not None:
+            d["effort"] = self._effort_level
         return d
 
     @classmethod
@@ -534,6 +600,7 @@ class AnthropicTransport(CompletionTransport):
             top_p=float(data["top_p"]) if data.get("top_p") is not None else None,
             top_k=int(data["top_k"]) if data.get("top_k") is not None else None,
             thinking_budget=int(data["thinking_budget"]) if data.get("thinking_budget") is not None else None,
+            _effort_level=str(data["effort"]) if data.get("effort") is not None else None,
             models=models,
             session=session,
         )

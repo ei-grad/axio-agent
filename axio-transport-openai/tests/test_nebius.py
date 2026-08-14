@@ -639,6 +639,16 @@ def test_thinking_extra_params_can_override() -> None:
     assert payload["enable_thinking"] is False
 
 
+def test_effort_default_clears_legacy_thinking() -> None:
+    transport = NebiusTransport(model=_REASONING_MODEL, thinking=True)
+
+    state = transport.configure_effort("default")
+    payload = transport.build_payload([], [], "")
+
+    assert state.requested is None
+    assert "enable_thinking" not in payload
+
+
 async def test_the_unset_context_length_is_not_taken_literally(
     fake_server: tuple[FakeNebiusServer, str],
     transport: NebiusTransport,

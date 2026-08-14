@@ -48,8 +48,11 @@ def test_tools_are_flat_not_nested() -> None:
 
 def test_reasoning_effort_is_sent_only_when_supported() -> None:
     assert "reasoning" not in _transport().build_payload([], [], "")
-    payload = _transport(reasoning_effort="high").build_payload([], [], "")
+    transport = _transport()
+    state = transport.configure_effort("high")
+    payload = transport.build_payload([], [], "")
     assert payload["reasoning"] == {"effort": "high"}
+    assert state.mechanism.value == "native-effort"
 
     plain = ModelSpec(id="gpt-4o", capabilities=frozenset({Capability.text, Capability.tool_use}))
     payload = OpenAIResponsesTransport(model=plain, reasoning_effort="high").build_payload([], [], "")

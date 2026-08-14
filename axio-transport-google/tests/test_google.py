@@ -5,9 +5,10 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+import pytest
 from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from axio.messages import Message
-from axio.models import Capability, ModelRegistry
+from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 
 from axio_transport_google import (
@@ -478,3 +479,85 @@ def test_generation_config_thinking() -> None:
     config = t._build_generation_config_json()
     assert config["thinkingConfig"]["includeThoughts"] is True
     assert config["thinkingConfig"]["thinkingLevel"] == "HIGH"
+
+
+def test_effort_maps_to_native_thinking_budget() -> None:
+    model = ModelSpec(
+        id="gemini-2.5-flash",
+        capabilities=frozenset({Capability.text, Capability.reasoning}),
+    )
+    transport = GoogleTransport(model=model)
+
+    state = transport.configure_effort("medium")
+    config = transport._build_generation_config_json()
+
+    assert state.mechanism.value == "native-budget"
+    assert state.provider_value == 8_192
+    assert config["thinkingConfig"]["thinkingBudget"] == 8_192
+
+
+def test_effort_maps_xhigh_to_high_native_thinking_level() -> None:
+    transport = GoogleTransport(model=GENAI_MODELS["gemini-3.1-pro-preview"])
+
+    state = transport.configure_effort("xhigh")
+
+    assert state.provider_value == "HIGH"
+    assert transport._build_generation_config_json()["thinkingConfig"]["thinkingLevel"] == "HIGH"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "requested", "expected"),
+    [
+        ("gemini-3.1-pro-preview", "medium", "MEDIUM"),
+        ("gemini-3-pro-preview", "medium", "HIGH"),
+        ("gemini-3-flash-preview", "none", "MINIMAL"),
+        ("gemini-3.1-flash-lite-preview", "max", "HIGH"),
+    ],
+)
+def test_effort_uses_catalog_specific_thinking_levels(model_id: str, requested: str, expected: str) -> None:
+    model = ModelSpec(id=model_id, capabilities=frozenset({Capability.text, Capability.reasoning}))
+    transport = GoogleTransport(model=model)
+
+    state = transport.configure_effort(requested)
+
+    assert state.provider_value == expected
+    assert transport._build_generation_config_json()["thinkingConfig"]["thinkingLevel"] == expected
+
+
+def test_unknown_gemini_3_image_variant_uses_prompt_fallback() -> None:
+    model = ModelSpec(
+        id="gemini-3.1-flash-lite-image-preview",
+        capabilities=frozenset({Capability.text, Capability.reasoning}),
+    )
+    transport = GoogleTransport(model=model)
+
+    state = transport.configure_effort("medium")
+
+    assert state.mechanism.value == "prompt-fallback"
+    assert transport.thinking_level is None
+
+
+def test_vertex_claude_4_6_uses_anthropic_native_effort() -> None:
+    transport = GoogleTransport(
+        vertexai=True,
+        model=_get_anthropic_models()["anthropic/claude-sonnet-4-6"],
+    )
+
+    state = transport.configure_effort("medium")
+    payload = transport._make_anthropic_proxy().build_payload([], [], "")
+
+    assert state.mechanism.value == "native-effort"
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {"effort": "medium"}
+
+
+def test_effort_default_removes_native_override() -> None:
+    transport = GoogleTransport(model=GENAI_MODELS["gemini-3.1-pro-preview"])
+    transport.configure_effort("low")
+
+    state = transport.configure_effort("default")
+    thinking = transport._build_generation_config_json()["thinkingConfig"]
+
+    assert state.requested is None
+    assert "thinkingLevel" not in thinking
+    assert "thinkingBudget" not in thinking

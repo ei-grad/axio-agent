@@ -134,6 +134,7 @@ class FakeOpenAIServer:
     def __init__(self) -> None:
         self.responses: list[str] = []
         self.received_payloads: list[dict[str, Any]] = []
+        self.received_paths: list[str] = []
         self.status_code: int = 200
         self.error_body: str = ""
         self.error_headers: dict[str, str] = {}
@@ -152,6 +153,7 @@ class FakeOpenAIServer:
     def make_app(self) -> web.Application:
         app = web.Application()
         app.router.add_post("/v1/chat/completions", self._handle)
+        app.router.add_post("/v1/responses", self._handle)
         app.router.add_post("/v1/embeddings", self._handle_embeddings)
         return app
 
@@ -178,6 +180,7 @@ class FakeOpenAIServer:
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         payload = await request.json()
         self.received_payloads.append(payload)
+        self.received_paths.append(request.path)
 
         status, hdrs = self._get_status()
         if status != 200:
@@ -246,6 +249,7 @@ async def transport(fake_server: tuple[FakeOpenAIServer, str]) -> AsyncIterator[
             model=OPENAI_MODELS["gpt-4.1-mini"],
             session=session,
             retry_base_delay=0.0,
+            supports_responses=True,
         )
 
 
@@ -305,6 +309,42 @@ async def test_tool_call_streaming(fake_server: tuple[FakeOpenAIServer, str], tr
 
     ends = [e for e in events if isinstance(e, IterationEnd)]
     assert ends[0].stop_reason == StopReason.tool_use
+
+
+async def test_gpt_5_6_with_tools_routes_to_responses(
+    fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport
+) -> None:
+    server, _ = fake_server
+    transport.model = OPENAI_MODELS["gpt-5.6-terra"]
+    tool: Tool[Any] = Tool(name="get_weather", handler=get_weather)
+    server.responses.append(_sse_done())
+
+    await _collect(transport.stream([], [tool], "system"))
+
+    assert server.received_paths == ["/v1/responses"]
+    assert "reasoning_effort" not in server.received_payloads[0]
+
+
+async def test_custom_base_does_not_assume_responses_support(
+    fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport
+) -> None:
+    server, base_url = fake_server
+    custom = OpenAITransport(
+        base_url=base_url,
+        api_key="test-key",
+        model=OPENAI_MODELS["gpt-5.6-terra"],
+        session=transport.session,
+        retry_base_delay=0.0,
+    )
+    tool: Tool[Any] = Tool(name="get_weather", handler=get_weather)
+    server.responses.append(_text_chunks("ok"))
+    state = custom.configure_effort("high")
+
+    await _collect(custom.stream([], [tool], "system"))
+
+    assert custom.supports_responses is False
+    assert state.mechanism.value == "prompt-fallback"
+    assert server.received_paths == ["/v1/chat/completions"]
 
 
 # ---------------------------------------------------------------------------

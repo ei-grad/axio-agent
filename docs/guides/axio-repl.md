@@ -66,7 +66,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--transport` | auto | Transport name (see table above) |
 | `--model` | transport default | Model name |
 | `--temperature` | transport default | Sampling temperature |
-| `--thinking` | off | Thinking level: `LOW`, `MEDIUM`, `HIGH`, or a token budget |
+| `--effort` | `default` | Effort: `none`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `--max-tokens` | transport default | Max output tokens |
 | `--max-iterations` | 1000 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
@@ -125,7 +125,7 @@ recognized. Treat journals as sensitive local data.
 |---|---|
 | `/model` | Show current model and list available models |
 | `/model <query>` | Switch to a model matching the query |
-| `/thinking [level]` | Show or set thinking level/budget |
+| `/effort [level]` | Show or set effort; `default` restores the provider/model default |
 | `/temperature [val]` | Show or set sampling temperature |
 | `/max-tokens [val]` | Show or set max output tokens |
 | `/iterations [val]` | Show or set max agent iterations |
@@ -135,6 +135,13 @@ recognized. Treat journals as sensitive local data.
 | `/agent-focus <id>` | Change the input target without changing execution mode |
 | `/help` | List all tools and commands |
 | `/quit`, `/exit`, `/q` | Exit the REPL |
+
+`/effort` reports the requested level, the effective mechanism, and valid values. Native controls are shown as
+`native-effort` or `native-budget`; transports without verified granular control use `prompt-fallback`. The fallback
+adds one replaceable system-prompt overlay describing observable analysis and verification behavior. It does not add
+a conversation message and does not claim control over provider reasoning tokens, latency, or cost. `/effort default`
+removes the explicit native setting or prompt overlay and restores the provider/model default. A model switch reapplies
+the requested level and reports when the effective mechanism changes.
 
 ## Foreground delegation and agent actions
 

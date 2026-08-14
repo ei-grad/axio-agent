@@ -396,6 +396,19 @@ def test_build_payload_no_tools_field_when_empty() -> None:
     assert "tool_choice" not in payload
 
 
+def test_effort_uses_codex_advertised_native_reasoning() -> None:
+    transport = CodexTransport(
+        model=CODEX_MODELS["o4-mini"],
+        _reasoning_efforts={"o4-mini": ("low", "medium", "high")},
+    )
+
+    state = transport.configure_effort("high")
+    payload = transport.build_payload([], [], "")
+
+    assert state.mechanism.value == "native-effort"
+    assert payload["reasoning"] == {"effort": "high"}
+
+
 # ---------------------------------------------------------------------------
 # Message conversion
 # ---------------------------------------------------------------------------
