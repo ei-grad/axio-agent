@@ -10,13 +10,16 @@ from axio.agent import Agent
 from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
+from axio.exceptions import HandlerError
 from axio.messages import Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 
 from axio_tools_agents.peers import (
+    MAX_MESSAGE_CHARS,
     PeerMessage,
+    PeerRecord,
     PeerServer,
     background_agent_state,
     enqueue_local_agent_prompt,
@@ -160,6 +163,64 @@ async def test_send_message_delivers_by_global_agent_id(tmp_path: Path) -> None:
         assert len(received) == 1
         assert received[0].from_id == sender.id
         assert received[0].body == "hello"
+    finally:
+        await sender.close()
+        await recipient.close()
+
+
+async def test_send_message_too_large_raises_handler_error() -> None:
+    with pytest.raises(HandlerError, match="too large"):
+        await send_message(agent_id="whatever", message="x" * (MAX_MESSAGE_CHARS + 1))
+
+
+async def test_send_message_unknown_agent_raises_handler_error() -> None:
+    with pytest.raises(HandlerError, match="No peer found"):
+        await send_message(agent_id="does-not-exist", message="hi")
+
+
+async def test_send_message_connect_failure_raises_handler_error(tmp_path: Path) -> None:
+    import json
+    import os
+    import time
+
+    peer_dir = tmp_path / "peers"
+    peer_dir.mkdir(parents=True, exist_ok=True)
+    # A regular file at the socket path stands in for a peer whose process is
+    # gone but whose registry entry was never cleaned up: nothing is listening,
+    # so connecting to it fails the same way a crashed peer would.
+    socket_path = peer_dir / "dead.sock"
+    socket_path.write_text("")
+    record = PeerRecord(
+        id="dead-peer",
+        name="dead",
+        kind="test",
+        project=str(tmp_path),
+        pid=os.getpid(),
+        cwd=str(tmp_path),
+        socket_path=str(socket_path),
+        started_at=time.time(),
+    )
+    (peer_dir / f"{record.id}.json").write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    with pytest.raises(HandlerError, match="Failed to connect"):
+        await send_message(agent_id=record.id, message="hi")
+
+
+async def test_send_message_peer_rejection_returns_plain_string(tmp_path: Path) -> None:
+    async def failing_handler(message: PeerMessage) -> None:
+        raise ValueError("nope")
+
+    sender = await PeerServer("sender", kind="test", handler=_noop_handler, project=str(tmp_path)).start()
+    recipient = await PeerServer(
+        "recipient",
+        kind="test",
+        handler=failing_handler,
+        project=str(tmp_path),
+    ).start(set_current=False)
+
+    try:
+        result = await send_message(agent_id=recipient.id, message="hello")
+        assert result.startswith(f"Peer {recipient.id} rejected the message:")
     finally:
         await sender.close()
         await recipient.close()
@@ -1104,3 +1165,13 @@ async def test_background_outcome_delivery_does_not_depend_on_renderer(tmp_path:
         assert notifications == []
     finally:
         await parent.close()
+
+
+async def test_spawn_agent_not_configured_raises_handler_error() -> None:
+    with pytest.raises(HandlerError, match="spawn_agent is not configured"):
+        await spawn_agent(task="anything")
+
+
+async def test_run_agent_not_configured_raises_handler_error() -> None:
+    with pytest.raises(HandlerError, match="run_agent is not configured"):
+        await run_agent(task="anything")
