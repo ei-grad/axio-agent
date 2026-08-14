@@ -160,6 +160,11 @@ appropriate retention policy.
 text, tool arguments, and streaming tool output use the same immediate terminal
 path as the parent. The input target does not change, and the child's final text
 is returned to the parent exactly once as the `run_agent` tool result.
+
+Every visible turn starts with a source header. When an agent has a human name,
+headers, action frames, summaries, errors, and incoming reports identify it as
+`name (agent_id)`; otherwise they show the authoritative agent id.
+
 If another parent tool streams concurrently with the foreground child, its
 labelled output is inserted at the child's next safe boundary. This active
 parent work remains visible even when agent actions are off, without splitting

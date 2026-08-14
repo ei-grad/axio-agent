@@ -34,6 +34,8 @@ from axio_tools_agents.runtime import (
     ForegroundExited,
     RuntimeEvent,
     SessionEventHub,
+    TurnFinished,
+    TurnStarted,
     TurnStatus,
 )
 
@@ -87,17 +89,55 @@ async def test_foreground_child_streams_without_changing_input_focus(capsys: pyt
             event=event,
         )
 
-    await render_runtime_event(renderer, envelope(AgentStarted(name="child", kind="foreground-agent")))
+    await render_runtime_event(renderer, envelope(AgentStarted(name="researcher", kind="foreground-agent")))
     await render_runtime_event(renderer, envelope(ForegroundEntered(parent_agent_id="main")))
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
     await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="live child output")))
 
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "child"
-    assert "live child output" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert output.count("── agent researcher (child) ──") == 1
+    assert output.index("── agent researcher (child) ──") < output.index("live child output")
 
     await render_runtime_event(renderer, envelope(ForegroundExited(status=TurnStatus.SUCCEEDED)))
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "main"
+
+
+async def test_main_turn_labels_text_tool_and_error_with_one_source_header(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(main_agent_name="axio-repl")
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="main-turn",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="main answer")))
+    await render_runtime_event(
+        renderer,
+        envelope(ToolUseStart(index=0, tool_use_id="main-tool", name="shell")),
+    )
+    await render_runtime_event(renderer, envelope(Error(exception=RuntimeError("main failed"))))
+
+    captured = capsys.readouterr()
+    header = "── agent axio-repl (main) ──"
+    assert captured.out.count(header) == 1
+    assert captured.out.index(header) < captured.out.index("main answer")
+    assert captured.out.index(header) < captured.out.index("▶ shell")
+    assert "Error from agent axio-repl (main): main failed" in captured.err
+    assert "── main ──" not in captured.out
 
 
 async def test_foreground_child_reasoning_and_tool_actions_keep_the_active_streaming_path(
@@ -246,11 +286,12 @@ async def test_active_stream_is_identical_when_there_are_no_background_actions()
 
 async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pytest.CaptureFixture[str]) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    await renderer.remember_agent("child-id", "researcher")
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="parent-call", name="run_agent"))
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="parent-call", partial_json='{"task":"go"}'))
-    await renderer.enter_foreground("child", "parent-call")
-    await renderer.render("child", TextDelta(index=0, delta="unique child answer"))
-    await renderer.exit_foreground("child", TurnStatus.SUCCEEDED)
+    await renderer.enter_foreground("child-id", "parent-call")
+    await renderer.render("child-id", TextDelta(index=0, delta="unique child answer"))
+    await renderer.exit_foreground("child-id", TurnStatus.SUCCEEDED)
     await renderer.render(
         "main",
         ToolResult(
@@ -263,7 +304,7 @@ async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pyt
 
     output = capsys.readouterr().out
     assert output.count("unique child answer") == 1
-    assert "foreground agent returned its result to the parent" in output
+    assert "foreground agent researcher (child-id) returned its result to the parent" in output
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "main"
 
@@ -428,13 +469,28 @@ async def test_real_run_agent_and_streaming_sibling_preserve_nearest_safe_bounda
     assert output.count("unique concurrent sibling") == 1
     assert output.index("child paragraph\n\n") < output.index("unique concurrent sibling")
     assert output.index("unique concurrent sibling") < output.index("child continues")
-    assert "foreground agent returned its result to the parent" in output
+    assert re.search(r"foreground agent [^\n]+ \([^)]+\) returned its result to the parent", output)
 
 
 async def test_enabling_actions_does_not_replay_events_seen_while_off(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer()
+
+    await render_runtime_event(
+        renderer,
+        AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child",
+            parent_agent_id="main",
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=AgentStarted(name="analyst", kind="spawned-agent"),
+        ),
+    )
     await _queue_background_tool_action(renderer)
 
     change = await renderer.set_display_mode(DisplayMode.ALL_ACTIONS)
@@ -442,6 +498,9 @@ async def test_enabling_actions_does_not_replay_events_seen_while_off(
 
     assert change.discarded_frames == 0
     assert capsys.readouterr().out == ""
+
+    await _queue_background_tool_action(renderer)
+    assert "agent analyst (child) · tool call" in capsys.readouterr().out
 
 
 async def test_background_action_is_drained_immediately_while_foreground_is_at_a_safe_boundary(
@@ -454,6 +513,161 @@ async def test_background_action_is_drained_immediately_while_foreground_is_at_a
     await _queue_background_tool_action(renderer)
 
     assert "agent child · tool call" in capsys.readouterr().out
+
+
+async def test_two_focused_turns_each_get_one_canonical_source_header(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(turn_id: str | None, event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child-id",
+            parent_agent_id="main",
+            turn_id=turn_id,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(None, AgentStarted(name="analyst", kind="spawned-agent")))
+    renderer.set_focus("child-id")
+    for index in (1, 2):
+        turn_id = f"child-turn-{index}"
+        await render_runtime_event(renderer, envelope(turn_id, TurnStarted(prompt=f"prompt {index}")))
+        await render_runtime_event(renderer, envelope(turn_id, TextDelta(index=0, delta=f"answer {index}")))
+        await render_runtime_event(
+            renderer,
+            envelope(
+                turn_id,
+                SessionEndEvent(
+                    stop_reason=StopReason.end_turn,
+                    total_usage=Usage(input_tokens=1, output_tokens=1),
+                ),
+            ),
+        )
+        await render_runtime_event(
+            renderer,
+            envelope(
+                turn_id,
+                TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn),
+            ),
+        )
+
+    output = capsys.readouterr().out
+    header = "── agent analyst (child-id) ──"
+    assert output.count(header) == 2
+    assert output.index(header) < output.index("answer 1")
+    assert output.rindex(header) < output.index("answer 2")
+
+
+async def test_focused_final_reply_is_not_replayed_by_incoming_delivery(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child-id",
+            parent_agent_id="main",
+            turn_id="focused-turn",
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(AgentStarted(name="analyst", kind="spawned-agent")))
+    renderer.set_focus("child-id")
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="unique focused final")))
+    await render_runtime_event(
+        renderer,
+        envelope(
+            SessionEndEvent(
+                stop_reason=StopReason.end_turn,
+                total_usage=Usage(input_tokens=1, output_tokens=1),
+            )
+        ),
+    )
+    await renderer.incoming(
+        "Report from background agent analyst (child-id):\n\nunique focused final",
+        agent_id="child-id",
+        turn_id="focused-turn",
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("unique focused final") == 1
+    assert "incoming from agent analyst (child-id)" not in output
+
+
+async def test_actions_on_labels_same_named_agents_with_their_distinct_ids(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+
+    def envelope(agent_id: str) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id=f"{agent_id}-run",
+            agent_id=agent_id,
+            parent_agent_id="main",
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=AgentStarted(name="worker", kind="spawned-agent"),
+        )
+
+    await render_runtime_event(renderer, envelope("child-a"))
+    await render_runtime_event(renderer, envelope("child-b"))
+    await renderer.mark_idle()
+
+    output = capsys.readouterr().out
+    assert "agent worker (child-a) · lifecycle" in output
+    assert "agent worker (child-b) · lifecycle" in output
+    assert "── agent worker ·" not in output
+
+
+async def test_actions_off_failure_uses_one_canonical_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child-id",
+            parent_agent_id="main",
+            turn_id="failed-turn",
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(AgentStarted(name="analyst", kind="spawned-agent")))
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
+    await render_runtime_event(renderer, envelope(Error(exception=RuntimeError("child failed"))))
+    await render_runtime_event(
+        renderer,
+        envelope(SessionEndEvent(stop_reason=StopReason.error, total_usage=Usage(input_tokens=1, output_tokens=0))),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope(TurnFinished(status=TurnStatus.FAILED, stop_reason=StopReason.error, error="child failed")),
+    )
+    await renderer.mark_idle()
+
+    output = capsys.readouterr().out
+    assert output.count("[background agent analyst (child-id) completed") == 1
+    assert output.count("child failed") == 1
 
 
 async def test_a_background_failure_is_reported_with_its_reason(
@@ -533,13 +747,17 @@ async def test_an_arriving_message_is_shown_not_only_forwarded(
     # It used to reach the model's prompt and nothing else, so the only account
     # of a spawned agent's report was the model's summary of it.
     renderer = ReplRenderer()
+    await renderer.remember_agent("child-id", "analyst")
 
-    await renderer.incoming("Report from background agent child:\n\n## Findings\nAll good.")
+    await renderer.incoming(
+        "Report from background agent analyst (child-id):\n\n## Findings\nAll good.",
+        agent_id="child-id",
+    )
 
     output = capsys.readouterr().out
     assert "## Findings" in output
     assert "All good." in output
-    assert "incoming" in output
+    assert "incoming from agent analyst (child-id)" in output
 
 
 async def test_an_interrupted_answer_is_kept(capsys: pytest.CaptureFixture[str]) -> None:

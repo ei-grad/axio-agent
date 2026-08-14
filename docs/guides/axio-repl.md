@@ -150,6 +150,10 @@ REPL queues that sibling action separately and inserts it at the child's nearest
 safe boundary. These frames remain visible with `/agent-actions off` because
 they belong to the active parent turn, not a background agent.
 
+Every visible turn starts with a source header. When an agent has a human name,
+headers, action frames, summaries, errors, and incoming reports identify it as
+`name (agent_id)`; otherwise they show the authoritative agent id.
+
 `spawn_agent` creates a persistent background agent. `/agent-actions on` makes
 its tool and lifecycle activity visible without mixing its free-form prose or
 reasoning into the active answer. Every background action is a labelled,

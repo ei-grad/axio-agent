@@ -55,17 +55,19 @@ class ActionFrame:
     body: str
     sequence: int
     critical: bool = False
+    agent_name: str | None = None
 
     def render(self) -> str:
-        agent_id = sanitize_terminal_text(self.agent_id).replace("\n", " ")[:80]
+        identity = format_agent_identity(self.agent_id, self.agent_name)
         kind = sanitize_terminal_text(self.kind).replace("\n", " ")[:40]
         body = sanitize_terminal_text(self.body).rstrip("\n")
-        return f"{RESET}\n── agent {agent_id} · {kind} ──\n{body}\n── /agent {agent_id} ──\n{RESET}\n"
+        return f"{RESET}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{RESET}\n"
 
 
 @dataclass(slots=True)
 class _ToolAction:
     name: str
+    agent_name: str | None = None
     arguments: list[str] = field(default_factory=list)
     arguments_bytes: int = 0
     call_emitted: bool = False
@@ -75,7 +77,8 @@ class _ToolAction:
 
     @property
     def retained_bytes(self) -> int:
-        return len(self.name.encode("utf-8")) + self.arguments_bytes + self.output_bytes
+        agent_name_bytes = len(self.agent_name.encode("utf-8")) if self.agent_name is not None else 0
+        return len(self.name.encode("utf-8")) + agent_name_bytes + self.arguments_bytes + self.output_bytes
 
 
 @dataclass(slots=True)
@@ -90,6 +93,21 @@ def sanitize_terminal_text(value: object) -> str:
     text = _OSC.sub("", text)
     text = _CSI.sub("", text)
     return _CONTROL.sub("", text)
+
+
+def normalize_agent_name(agent_name: str | None) -> str | None:
+    if agent_name is None:
+        return None
+    return _fit_utf8(sanitize_terminal_text(agent_name).replace("\n", " "), 80, suffix="…").strip() or None
+
+
+def format_agent_identity(agent_id: str, agent_name: str | None = None) -> str:
+    """Return a terminal-safe identity whose authoritative id is always visible."""
+    clean_id = _fit_utf8(sanitize_terminal_text(agent_id).replace("\n", " "), 80, suffix="…") or "unknown"
+    clean_name = normalize_agent_name(agent_name)
+    if clean_name is None:
+        return clean_id
+    return f"{clean_name} ({clean_id})"
 
 
 def _fit_utf8(text: str, limit: int, *, suffix: str = "\n[… truncated]") -> str:
@@ -239,26 +257,39 @@ class ActionMultiplexer:
         self._unschedule(queue_agent_id)
         return frames, byte_count
 
-    def observe(self, agent_id: str, event: RuntimeEvent) -> None:  # noqa: C901
+    def observe(
+        self,
+        agent_id: str,
+        event: RuntimeEvent,
+        *,
+        agent_name: str | None = None,
+    ) -> None:  # noqa: C901
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
+        agent_name = normalize_agent_name(agent_name)
         try:
             match event:
                 case AgentStarted(name=name, kind=kind):
-                    self._enqueue(agent_id, "lifecycle", f"started {name} ({kind})")
+                    self._enqueue(agent_id, "lifecycle", f"started ({kind})", agent_name=agent_name or name)
                 case TurnStarted():
-                    self._enqueue(agent_id, "lifecycle", "turn started")
+                    self._enqueue(agent_id, "lifecycle", "turn started", agent_name=agent_name)
                 case TurnFinished(status=status, error=error):
                     detail = f"turn {status.value}"
                     if error:
                         detail += f": {error}"
-                    self._enqueue(agent_id, "lifecycle", detail, critical=True)
+                    self._enqueue(agent_id, "lifecycle", detail, critical=True, agent_name=agent_name)
                     self._remove_collector(agent_id, suppress_incomplete=True)
                 case AgentStopped(status=status):
-                    self._enqueue(agent_id, "lifecycle", f"stopped ({status.value})", critical=True)
+                    self._enqueue(
+                        agent_id,
+                        "lifecycle",
+                        f"stopped ({status.value})",
+                        critical=True,
+                        agent_name=agent_name,
+                    )
                     self._remove_collector(agent_id, suppress_incomplete=True)
                 case ToolUseStart(tool_use_id=tool_use_id, name=name):
-                    self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name))
+                    self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name, agent_name=agent_name))
                 case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
                     action = self._touch_tool(agent_id, tool_use_id)
                     if action is None or action.call_emitted or not partial_json:
@@ -284,33 +315,76 @@ class ActionMultiplexer:
                             "tool error" if is_error else "tool result",
                             f"{'✗' if is_error else '✓'} {name}\n{content}" if content else name,
                             critical=True,
+                            agent_name=agent_name,
                         )
                         return
                     self._emit_call(agent_id, action, retained=False)
                     for key in tuple(action.output):
                         self._flush_output(agent_id, action, key)
                     if is_error:
-                        self._enqueue(agent_id, "tool error", f"✗ {action.name}\n{content}", critical=True)
+                        self._enqueue(
+                            agent_id,
+                            "tool error",
+                            f"✗ {action.name}\n{content}",
+                            critical=True,
+                            agent_name=action.agent_name,
+                        )
                     elif action.saw_output:
-                        self._enqueue(agent_id, "tool result", f"✓ {action.name} completed", critical=True)
+                        self._enqueue(
+                            agent_id,
+                            "tool result",
+                            f"✓ {action.name} completed",
+                            critical=True,
+                            agent_name=action.agent_name,
+                        )
                     else:
                         suffix = f"\n{content}" if content else ""
-                        self._enqueue(agent_id, "tool result", f"✓ {action.name}{suffix}", critical=True)
+                        self._enqueue(
+                            agent_id,
+                            "tool result",
+                            f"✓ {action.name}{suffix}",
+                            critical=True,
+                            agent_name=action.agent_name,
+                        )
                 case Error(exception=exception):
-                    self._enqueue(agent_id, "error", f"{type(exception).__name__}: {exception}", critical=True)
+                    self._enqueue(
+                        agent_id,
+                        "error",
+                        f"{type(exception).__name__}: {exception}",
+                        critical=True,
+                        agent_name=agent_name,
+                    )
                 case SessionEndEvent(stop_reason=stop_reason):
-                    self._enqueue(agent_id, "lifecycle", f"session ended ({stop_reason.value})", critical=True)
+                    self._enqueue(
+                        agent_id,
+                        "lifecycle",
+                        f"session ended ({stop_reason.value})",
+                        critical=True,
+                        agent_name=agent_name,
+                    )
                     self._remove_collector(agent_id, suppress_incomplete=True)
                 case _:
                     return
         finally:
             self._enforce_retained_limit()
 
-    def adopt_tool(self, agent_id: str, tool_use_id: str, name: str) -> None:
+    def adopt_tool(
+        self,
+        agent_id: str,
+        tool_use_id: str,
+        name: str,
+        *,
+        agent_name: str | None = None,
+    ) -> None:
         """Collect continuation events for a tool call already shown live."""
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
-        self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name, call_emitted=True))
+        agent_name = normalize_agent_name(agent_name)
+        self._remember_tool(
+            agent_id,
+            tool_use_id,
+            _ToolAction(name=name, agent_name=agent_name, call_emitted=True),
+        )
         self._enforce_retained_limit()
 
     def drain(self, *, max_frames: int = 4, max_bytes: int = 16 * 1024) -> list[str]:
@@ -380,7 +454,7 @@ class ActionMultiplexer:
             body = f"▶ {action.name}\narguments: {arguments}"
         else:
             body = f"▶ {action.name}\narguments: {json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
-        self._enqueue(agent_id, "tool call", body)
+        self._enqueue(agent_id, "tool call", body, agent_name=action.agent_name)
         if retained:
             self._collector_bytes -= action.arguments_bytes
         action.arguments.clear()
@@ -395,13 +469,13 @@ class ActionMultiplexer:
                 end = self._output_chunk_chars
             else:
                 break
-            self._enqueue(agent_id, f"{action.name} {key}", buffer[:end])
+            self._enqueue(agent_id, f"{action.name} {key}", buffer[:end], agent_name=action.agent_name)
             self._set_output_buffer(action, key, buffer[end:])
 
     def _flush_output(self, agent_id: str, action: _ToolAction, key: str) -> None:
         buffer = action.output.pop(key, "")
         if buffer:
-            self._enqueue(agent_id, f"{action.name} {key}", buffer)
+            self._enqueue(agent_id, f"{action.name} {key}", buffer, agent_name=action.agent_name)
 
     def _set_output_buffer(self, action: _ToolAction, key: str, value: str) -> None:
         old = action.output.get(key)
@@ -416,21 +490,42 @@ class ActionMultiplexer:
         action.output_bytes += delta
         self._collector_bytes += delta
 
-    def _enqueue(self, agent_id: str, kind: str, body: object, *, critical: bool = False) -> None:
+    def _enqueue(
+        self,
+        agent_id: str,
+        kind: str,
+        body: object,
+        *,
+        critical: bool = False,
+        agent_name: str | None = None,
+    ) -> None:
         agent_id = self._queue_agent_id(agent_id)
+        agent_name = normalize_agent_name(agent_name)
         kind = _fit_utf8(sanitize_terminal_text(kind).replace("\n", " "), 40, suffix="…") or "action"
         clean_body = sanitize_terminal_text(body)
-        overhead = len(f"{RESET}\n── agent {agent_id} · {kind} ──\n\n── /agent {agent_id} ──\n{RESET}\n".encode())
+        identity = format_agent_identity(agent_id, agent_name)
+        overhead = len(f"{RESET}\n── agent {identity} · {kind} ──\n\n── /agent {identity} ──\n{RESET}\n".encode())
         if overhead >= self._max_frame_bytes:
-            while overhead >= self._max_frame_bytes and len(agent_id.encode()) > 1:
+            while overhead >= self._max_frame_bytes and (agent_name or len(agent_id.encode()) > 1):
                 excess = overhead - self._max_frame_bytes + 1
-                agent_id = _fit_utf8(
-                    agent_id,
-                    max(1, len(agent_id.encode()) - (excess + 1) // 2),
-                    suffix="…",
-                )
+                if agent_name:
+                    agent_name = (
+                        _fit_utf8(
+                            agent_name,
+                            max(0, len(agent_name.encode()) - (excess + 1) // 2),
+                            suffix="…",
+                        ).strip()
+                        or None
+                    )
+                else:
+                    agent_id = _fit_utf8(
+                        agent_id,
+                        max(1, len(agent_id.encode()) - (excess + 1) // 2),
+                        suffix="…",
+                    )
+                identity = format_agent_identity(agent_id, agent_name)
                 overhead = len(
-                    f"{RESET}\n── agent {agent_id} · {kind} ──\n\n── /agent {agent_id} ──\n{RESET}\n".encode()
+                    f"{RESET}\n── agent {identity} · {kind} ──\n\n── /agent {identity} ──\n{RESET}\n".encode()
                 )
         clean_body = _fit_utf8(clean_body, max(0, self._max_frame_bytes - overhead))
         self._sequence += 1
@@ -440,6 +535,7 @@ class ActionMultiplexer:
             body=clean_body,
             sequence=self._sequence,
             critical=critical,
+            agent_name=agent_name,
         )
         queue = self._queues.setdefault(agent_id, deque())
         queue.append(frame)
