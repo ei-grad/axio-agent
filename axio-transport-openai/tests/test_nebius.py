@@ -417,7 +417,7 @@ async def test_text_to_image_no_vision(
 
 
 # ---------------------------------------------------------------------------
-# Streaming (inherited from OpenAITransport)
+# Streaming (inherited from ChatCompletionsTransport)
 # ---------------------------------------------------------------------------
 
 

@@ -13,7 +13,7 @@ from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 
-from axio_transport_openai import OpenAITransport, ThinkingMixin
+from axio_transport_openai import ChatCompletionsTransport, ThinkingMixin
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def _split_provider(model_id: str) -> tuple[str, str | None]:
 
 
 @dataclass(slots=True)
-class OpenRouterTransport(ThinkingMixin, OpenAITransport):
+class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
     name: str = "OpenRouter"
     api_key: str = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", ""))
     base_url: str = "https://openrouter.ai/api/v1"

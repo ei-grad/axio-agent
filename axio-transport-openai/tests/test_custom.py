@@ -1,4 +1,4 @@
-"""Tests for OpenAICompatibleTransport (custom OpenAI-compatible providers)."""
+"""Tests for CustomChatCompletionsTransport (custom OpenAI-compatible providers)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from axio.events import IterationEnd, StreamEvent, TextDelta
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.types import StopReason, Usage
 
-from axio_transport_openai.custom import OpenAICompatibleTransport
+from axio_transport_openai.custom import CustomChatCompletionsTransport
 from axio_transport_openai.tui.custom import CustomHubScreen
 
 # ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ def _make_provider(
     base_url: str = "http://localhost:9000/v1",
     api_key: str = "sk-test",
     models: list[ModelSpec] | None = None,
-) -> OpenAICompatibleTransport:
-    return OpenAICompatibleTransport(
+) -> CustomChatCompletionsTransport:
+    return CustomChatCompletionsTransport(
         name=name,
         base_url=base_url,
         api_key=api_key,
@@ -110,7 +110,7 @@ def test_save_config_creates_parent_dirs(tmp_path: Path) -> None:
 
 
 def test_roundtrip_to_dict_from_dict() -> None:
-    t = OpenAICompatibleTransport(
+    t = CustomChatCompletionsTransport(
         name="local",
         base_url="http://x/v1",
         api_key="k",
@@ -129,7 +129,7 @@ def test_roundtrip_to_dict_from_dict() -> None:
     )
     d = t.to_dict()
     sentinel = MagicMock(spec=aiohttp.ClientSession)
-    t2 = OpenAICompatibleTransport.from_dict(d, session=sentinel)
+    t2 = CustomChatCompletionsTransport.from_dict(d, session=sentinel)
     assert t2.name == "local"
     assert t2.base_url == "http://x/v1"
     assert t2.api_key == "k"
@@ -142,7 +142,7 @@ def test_roundtrip_to_dict_from_dict() -> None:
     assert m.input_cost == pytest.approx(1.5)
     assert m.output_cost == pytest.approx(3.0)
 
-    t3 = OpenAICompatibleTransport.from_dict(d)
+    t3 = CustomChatCompletionsTransport.from_dict(d)
     assert t3.session is None
 
 
@@ -169,14 +169,14 @@ def test_roundtrip_unknown_capability_dropped(tmp_path: Path) -> None:
 
 async def test_fetch_models_noop_preserves_models() -> None:
     reg = ModelRegistry([_make_spec()])
-    t = OpenAICompatibleTransport(base_url="http://x/v1", api_key="k", models=reg)
+    t = CustomChatCompletionsTransport(base_url="http://x/v1", api_key="k", models=reg)
     assert "mymodel" in t.models
     await t.fetch_models()
     assert "mymodel" in t.models  # unchanged
 
 
 async def test_fetch_models_noop_on_empty() -> None:
-    t = OpenAICompatibleTransport()
+    t = CustomChatCompletionsTransport()
     await t.fetch_models()
     assert len(t.models) == 0  # stays empty, NOT populated with OPENAI_MODELS
 
@@ -232,7 +232,7 @@ async def test_stream_direct(fake_server: tuple[FakeServer, str]) -> None:
 
     reg = ModelRegistry([_make_spec()])
     async with aiohttp.ClientSession() as session:
-        t = OpenAICompatibleTransport(base_url=base_url, api_key="k", models=reg, session=session)
+        t = CustomChatCompletionsTransport(base_url=base_url, api_key="k", models=reg, session=session)
         t.model = t.models["mymodel"]
         events = await _collect(t.stream([], [], ""))
 
@@ -249,7 +249,7 @@ async def test_stream_sends_bare_model_id(fake_server: tuple[FakeServer, str]) -
 
     reg = ModelRegistry([_make_spec()])
     async with aiohttp.ClientSession() as session:
-        t = OpenAICompatibleTransport(base_url=base_url, api_key="k", models=reg, session=session)
+        t = CustomChatCompletionsTransport(base_url=base_url, api_key="k", models=reg, session=session)
         t.model = t.models["mymodel"]
         await _collect(t.stream([], [], ""))
 

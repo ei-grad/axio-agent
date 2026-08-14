@@ -497,7 +497,7 @@ class AgentApp(App[None]):
             for role in ModelRole:
                 config_value = await self._config.get(f"model.{role}")
                 if config_value:
-                    binding = self._transports.resolve(config_value)
+                    binding = await self._transports.resolve_config(f"model.{role}", config_value)
                     if binding is not None:
                         self._role_bindings[role] = binding
 

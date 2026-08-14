@@ -58,6 +58,13 @@ class _NoOpCustomTransport(_FakeTransport):
 
 
 @dataclass(slots=True)
+class _StatefulTransport(_FakeTransport):
+    extra_params: dict[str, Any] = field(default_factory=dict)
+    reasoning_effort: str | None = None
+    _request_state: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class _FailFetchTransport:
     """Transport whose fetch_models always fails (simulates missing credentials)."""
 
@@ -177,6 +184,33 @@ class TestResolve:
         assert binding.transport == "fake"
         assert binding.model.id == "test-chat"
 
+    async def test_resolve_openai_responses_entry_point_migration(self) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        reg = TransportRegistry()
+        with _patch_discover({"openai": _FakeTransport}):
+            await reg.init(session)
+
+        binding = reg.resolve("openai-responses:test-chat")
+
+        assert binding is not None
+        assert binding.transport == "openai"
+        assert reg.encode(binding.transport, binding.model.id) == "openai:test-chat"
+
+    async def test_resolve_config_persists_canonical_openai_name(self, tmp_path: Path) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        config = ProjectConfig(tmp_path / "test.db", project="test")
+        await config.set("model.chat", "openai-responses:test-chat")
+        reg = TransportRegistry()
+        with _patch_discover({"openai": _FakeTransport}):
+            await reg.init(session, global_config=config)
+
+        binding = await reg.resolve_config("model.chat", "openai-responses:test-chat")
+
+        assert binding is not None
+        assert binding.transport == "openai"
+        assert await config.get("model.chat") == "openai:test-chat"
+        await config.close()
+
     async def test_resolve_unknown_transport(self) -> None:
         session = AsyncMock(spec=aiohttp.ClientSession)
         reg = TransportRegistry()
@@ -226,6 +260,26 @@ class TestMakeTransport:
         transport = reg.make_transport("fake", _SPEC_VISION)
         assert transport.base_url == "https://custom.api/v1"
         await config.close()
+
+    async def test_dataclass_clone_preserves_protocol_state(self) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        reg = TransportRegistry()
+        with _patch_discover({"stateful": _StatefulTransport}):
+            await reg.init(session)
+        source = reg.get_transport("stateful")
+        source.extra_params = {"metadata": {"source": "tui"}}
+        source.reasoning_effort = "high"
+        source._request_state = {"call": "source"}
+
+        transport = reg.make_transport("stateful", _SPEC_VISION)
+
+        assert transport.model == _SPEC_VISION
+        assert transport.extra_params == source.extra_params
+        assert transport.reasoning_effort == "high"
+        assert transport._request_state == source._request_state
+        assert transport._request_state is not source._request_state
+        assert transport.extra_params is not source.extra_params
+        assert transport.extra_params["metadata"] is not source.extra_params["metadata"]
 
 
 class TestSavedSettings:

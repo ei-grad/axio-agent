@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import dataclasses
 import logging
 from dataclasses import dataclass, field
 from functools import partial
@@ -15,6 +17,8 @@ from .plugin import discover_transport_settings, discover_transports
 from .sqlite_config import ProjectConfig
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_TRANSPORT_NAMES = {"openai-responses": "openai"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +164,20 @@ class TransportRegistry:
     def make_transport(self, name: str, model: ModelSpec) -> Any:
         """Create a new transport instance for the given name and model."""
         src = self._transports[name]
+        if dataclasses.is_dataclass(src) and not isinstance(src, type):
+            transport = dataclasses.replace(src, model=model)
+            for descriptor in dataclasses.fields(transport):
+                value = getattr(transport, descriptor.name)
+                if isinstance(value, dict):
+                    setattr(transport, descriptor.name, copy.deepcopy(value))
+                elif isinstance(value, list):
+                    setattr(transport, descriptor.name, copy.deepcopy(value))
+                elif isinstance(value, set):
+                    setattr(transport, descriptor.name, copy.deepcopy(value))
+            if hasattr(transport, "on_auth_refresh"):
+                transport.on_auth_refresh = partial(self._persist_auth, name)
+            return transport
+
         cls = self._classes[name]
         kwargs: dict[str, Any] = {
             "api_key": src.api_key,
@@ -207,6 +225,7 @@ class TransportRegistry:
         """
         if ":" in config_value:
             transport_name, model_id = config_value.split(":", 1)
+            transport_name = _LEGACY_TRANSPORT_NAMES.get(transport_name, transport_name)
             if transport_name in self._transports:
                 transport = self._transports[transport_name]
                 if model_id in transport.models:
@@ -222,6 +241,16 @@ class TransportRegistry:
     def encode(self, name: str, model_id: str) -> str:
         """Encode a transport name and model ID for config persistence."""
         return f"{name}:{model_id}"
+
+    async def resolve_config(self, key: str, config_value: str) -> RoleBinding | None:
+        """Resolve a persisted role and rewrite legacy encodings canonically."""
+        binding = self.resolve(config_value)
+        if binding is None:
+            return None
+        canonical = self.encode(binding.transport, binding.model.id)
+        if self._config is not None and canonical != config_value:
+            await self._config.set(key, canonical)
+        return binding
 
     def model_counts(self) -> dict[str, int]:
         """Return number of models per available transport."""

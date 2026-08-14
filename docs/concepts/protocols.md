@@ -62,7 +62,8 @@ Available transports (each in its own installable package):
 | Transport | Package | Notes |
 |---|---|---|
 | `AnthropicTransport` | `axio-transport-anthropic` | Anthropic Claude models |
-| `OpenAITransport` | `axio-transport-openai` | OpenAI and OpenAI-compatible APIs |
+| `OpenAITransport` | `axio-transport-openai` | Official OpenAI Responses API |
+| `ChatCompletionsTransport` | `axio-transport-openai` | OpenAI-compatible Chat Completions APIs |
 | `CodexTransport` | `axio-transport-codex` | ChatGPT via OAuth |
 
 The core `axio` package does not bundle any transport implementation - install

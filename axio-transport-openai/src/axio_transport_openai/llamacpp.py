@@ -16,7 +16,7 @@ from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 
-from axio_transport_openai import OpenAITransport
+from axio_transport_openai import ChatCompletionsTransport
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ def _parse_model(entry: Mapping[str, Any], props: Mapping[str, Any]) -> ModelSpe
 
 
 @dataclass(slots=True)
-class LlamaCppTransport(OpenAITransport):
+class LlamaCppTransport(ChatCompletionsTransport):
     """OpenAI chat streaming backed by side-effect-free llama.cpp discovery.
 
     Router entries that are not already loaded (or sleeping) are deliberately
@@ -164,7 +164,7 @@ class LlamaCppTransport(OpenAITransport):
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[StreamEvent]:
         if not self._sync_active_model():
             raise RuntimeError("LlamaCppTransport: call fetch_models() before streaming")
-        return OpenAITransport.stream(self, messages, tools, system)
+        return ChatCompletionsTransport.stream(self, messages, tools, system)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         if not self._sync_active_model():

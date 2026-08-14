@@ -14,7 +14,7 @@ from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 
-from axio_transport_openai import OpenAITransport, ThinkingMixin
+from axio_transport_openai import ChatCompletionsTransport, ThinkingMixin
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ def _context_window(model_id: str, published: Any) -> int:
 
 
 @dataclass(slots=True)
-class NebiusTransport(ThinkingMixin, OpenAITransport):
+class NebiusTransport(ThinkingMixin, ChatCompletionsTransport):
     name: str = "Nebius AI Studio"
     api_key: str = field(default_factory=lambda: os.environ.get("NEBIUS_API_KEY", ""))
     base_url: str = "https://api.tokenfactory.nebius.com/v1"
@@ -64,7 +64,7 @@ class NebiusTransport(ThinkingMixin, OpenAITransport):
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[Any]:
         if self.model is _UNSET:
             raise RuntimeError("NebiusTransport: call fetch_models() before streaming")
-        return OpenAITransport.stream(self, messages, tools, system)
+        return ChatCompletionsTransport.stream(self, messages, tools, system)
 
     async def fetch_models(self) -> None:
         """Fetch available models from Nebius ``/v1/models?verbose=true``."""

@@ -222,7 +222,7 @@ my_guard = "my_package:MyGuard"
 | Package | Purpose |
 |---|---|
 | [axio-transport-anthropic](https://github.com/mosquito/axio-agent) | Anthropic Claude transport |
-| [axio-transport-openai](https://github.com/mosquito/axio-agent) | OpenAI-compatible transport (OpenAI, Nebius, OpenRouter, custom) |
+| [axio-transport-openai](https://github.com/mosquito/axio-agent) | OpenAI Responses plus Chat Completions transports (Nebius, OpenRouter, llama.cpp, custom) |
 | [axio-transport-codex](https://github.com/mosquito/axio-agent) | ChatGPT OAuth transport |
 | [axio-context-sqlite](https://github.com/mosquito/axio-agent) | SQLite-backed persistent context store |
 | [axio-tools-local](https://github.com/mosquito/axio-agent) | Shell, file, Python tools |

@@ -31,7 +31,7 @@ transport of its own; install the one that matches your model provider:
 | Package | Provider |
 |---|---|
 | `axio-transport-anthropic` | Anthropic Claude |
-| `axio-transport-openai` | OpenAI and any OpenAI-compatible API |
+| `axio-transport-openai` | OpenAI Responses and OpenAI-compatible Chat Completions APIs |
 | `axio-transport-codex` | ChatGPT via OAuth |
 | `axio-transport-google` | Google Gemini (Developer API and Vertex AI) |
 

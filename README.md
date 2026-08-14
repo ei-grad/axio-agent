@@ -16,7 +16,7 @@ streaming-first, protocol-driven foundation for LLM-powered agents.
 | [`axio`](axio/) | [![PyPI](https://img.shields.io/pypi/v/axio)](https://pypi.org/project/axio/) | Core library: Agent, Tool, Transport protocol, ContextStore, PermissionGuard |
 | [`axio-tui`](axio-tui/) | [![PyPI](https://img.shields.io/pypi/v/axio-tui)](https://pypi.org/project/axio-tui/) | Textual TUI application + SQLite context store + plugin discovery |
 | [`axio-transport-anthropic`](axio-transport-anthropic/) | [![PyPI](https://img.shields.io/pypi/v/axio-transport-anthropic)](https://pypi.org/project/axio-transport-anthropic/) | Anthropic Claude transport with prompt caching |
-| [`axio-transport-openai`](axio-transport-openai/) | [![PyPI](https://img.shields.io/pypi/v/axio-transport-openai)](https://pypi.org/project/axio-transport-openai/) | OpenAI-compatible transport (OpenAI, Nebius, OpenRouter, custom) |
+| [`axio-transport-openai`](axio-transport-openai/) | [![PyPI](https://img.shields.io/pypi/v/axio-transport-openai)](https://pypi.org/project/axio-transport-openai/) | OpenAI Responses plus Chat Completions transports (Nebius, OpenRouter, llama.cpp, custom) |
 | [`axio-transport-codex`](axio-transport-codex/) | [![PyPI](https://img.shields.io/pypi/v/axio-transport-codex)](https://pypi.org/project/axio-transport-codex/) | ChatGPT OAuth transport via Responses API |
 | [`axio-tools-local`](axio-tools-local/) | [![PyPI](https://img.shields.io/pypi/v/axio-tools-local)](https://pypi.org/project/axio-tools-local/) | File, shell, and Python execution tools |
 | [`axio-tools-mcp`](axio-tools-mcp/) | [![PyPI](https://img.shields.io/pypi/v/axio-tools-mcp)](https://pypi.org/project/axio-tools-mcp/) | MCP server bridge |

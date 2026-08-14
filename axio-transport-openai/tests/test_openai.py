@@ -19,7 +19,7 @@ from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 
-from axio_transport_openai import OPENAI_MODELS, OpenAITransport, ThinkTagParser
+from axio_transport_openai import OPENAI_MODELS, ChatCompletionsTransport, ThinkTagParser
 
 # ---------------------------------------------------------------------------
 # Test tool handler
@@ -240,16 +240,15 @@ async def fake_server() -> AsyncIterator[tuple[FakeOpenAIServer, str]]:
 
 
 @pytest.fixture
-async def transport(fake_server: tuple[FakeOpenAIServer, str]) -> AsyncIterator[OpenAITransport]:
+async def transport(fake_server: tuple[FakeOpenAIServer, str]) -> AsyncIterator[ChatCompletionsTransport]:
     _, base_url = fake_server
     async with aiohttp.ClientSession() as session:
-        yield OpenAITransport(
+        yield ChatCompletionsTransport(
             base_url=base_url,
             api_key="test-key",
             model=OPENAI_MODELS["gpt-4.1-mini"],
             session=session,
             retry_base_delay=0.0,
-            supports_responses=True,
         )
 
 
@@ -264,7 +263,7 @@ async def _collect(stream: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
 
 async def test_text_streaming(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     server, _ = fake_server
@@ -290,7 +289,9 @@ async def test_text_streaming(
 # ---------------------------------------------------------------------------
 
 
-async def test_tool_call_streaming(fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport) -> None:
+async def test_tool_call_streaming(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
     server, _ = fake_server
     args = json.dumps({"location": "Paris"})
     server.responses.append(_tool_call_chunks("call_abc", "get_weather", args))
@@ -311,38 +312,17 @@ async def test_tool_call_streaming(fake_server: tuple[FakeOpenAIServer, str], tr
     assert ends[0].stop_reason == StopReason.tool_use
 
 
-async def test_gpt_5_6_with_tools_routes_to_responses(
-    fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport
+async def test_chat_completions_never_routes_to_responses(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
 ) -> None:
     server, _ = fake_server
     transport.model = OPENAI_MODELS["gpt-5.6-terra"]
     tool: Tool[Any] = Tool(name="get_weather", handler=get_weather)
-    server.responses.append(_sse_done())
+    server.responses.append(_text_chunks("ok"))
+    state = transport.configure_effort("high")
 
     await _collect(transport.stream([], [tool], "system"))
 
-    assert server.received_paths == ["/v1/responses"]
-    assert "reasoning_effort" not in server.received_payloads[0]
-
-
-async def test_custom_base_does_not_assume_responses_support(
-    fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport
-) -> None:
-    server, base_url = fake_server
-    custom = OpenAITransport(
-        base_url=base_url,
-        api_key="test-key",
-        model=OPENAI_MODELS["gpt-5.6-terra"],
-        session=transport.session,
-        retry_base_delay=0.0,
-    )
-    tool: Tool[Any] = Tool(name="get_weather", handler=get_weather)
-    server.responses.append(_text_chunks("ok"))
-    state = custom.configure_effort("high")
-
-    await _collect(custom.stream([], [tool], "system"))
-
-    assert custom.supports_responses is False
     assert state.mechanism.value == "prompt-fallback"
     assert server.received_paths == ["/v1/chat/completions"]
 
@@ -352,7 +332,9 @@ async def test_custom_base_does_not_assume_responses_support(
 # ---------------------------------------------------------------------------
 
 
-async def test_multiple_tool_calls(fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport) -> None:
+async def test_multiple_tool_calls(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
     server, _ = fake_server
     args_a = json.dumps({"location": "Paris"})
     args_b = json.dumps({"location": "London"})
@@ -443,7 +425,7 @@ async def test_multiple_tool_calls(fake_server: tuple[FakeOpenAIServer, str], tr
 
 async def test_tool_calls_null_in_delta(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """delta.tool_calls=null must be ignored, not iterated."""
     sse = _sse_chunk({"choices": [{"index": 0, "delta": {"tool_calls": None}, "finish_reason": None}]})
@@ -461,7 +443,7 @@ async def test_tool_calls_null_in_delta(
 
 async def test_delta_null_in_choice(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """choice.delta=null must be treated as empty delta, not raise TypeError."""
     sse = _sse_chunk({"choices": [{"index": 0, "delta": None, "finish_reason": None}]})
@@ -478,7 +460,7 @@ async def test_delta_null_in_choice(
 
 async def test_tool_call_function_null(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """tc.function=null in a tool_calls delta must be skipped without raising."""
     sse = _sse_chunk(
@@ -518,7 +500,7 @@ async def test_tool_call_function_null(
 )
 async def test_stop_reason_mapping(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
     openai_reason: str,
     expected: StopReason,
 ) -> None:
@@ -533,7 +515,7 @@ async def test_stop_reason_mapping(
 
 async def test_content_filter_raises_stream_error(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """Provider-side errors (content_filter, etc.) surface as StreamError."""
     from axio.exceptions import StreamError
@@ -551,7 +533,7 @@ async def test_content_filter_raises_stream_error(
 
 
 def test_build_payload_system_prompt() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     payload = t.build_payload([], [], "You are helpful.")
     msgs = payload["messages"]
     assert msgs[0] == {"role": "system", "content": "You are helpful."}
@@ -561,7 +543,7 @@ def test_build_payload_system_prompt() -> None:
 
 
 def test_build_payload_user_text() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [Message(role="user", content=[TextBlock(text="Hello")])]
     payload = t.build_payload(messages, [], "")
     # No system message when empty
@@ -569,7 +551,7 @@ def test_build_payload_user_text() -> None:
 
 
 def test_build_payload_assistant_with_tool_calls() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(
             role="assistant",
@@ -592,7 +574,7 @@ def test_build_payload_assistant_with_tool_calls() -> None:
 
 
 def test_build_payload_tool_results() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(
             role="user",
@@ -610,7 +592,7 @@ def test_build_payload_tool_results() -> None:
 
 def test_build_payload_tool_result_with_image() -> None:
     """Tool results containing ImageBlocks should inject a follow-up user message with image_url parts."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     img_data = b"\x89PNG\r\n\x1a\nfake"
     messages = [
         Message(
@@ -644,7 +626,7 @@ def test_build_payload_tool_result_with_image() -> None:
 
 def test_build_payload_tool_result_no_image_no_injection() -> None:
     """Text-only tool results should NOT inject a user message."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(
             role="user",
@@ -660,7 +642,7 @@ def test_build_payload_tool_result_no_image_no_injection() -> None:
 def test_build_payload_tool_result_mixed_with_text() -> None:
     """A user message mixing a ToolResultBlock with a TextBlock must emit both the
     tool message and a follow-up user message with the trailing text, in that order."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(
             role="user",
@@ -684,7 +666,7 @@ def test_build_payload_tool_result_message_then_separate_user_text_message() -> 
     """The agent loop can inject a follow-up user message (e.g. a notification) as its
     own Message right after a tool-results message, rather than mixed into the same
     one. Both must still come through in order: tool output(s), then the user text."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(
             role="assistant",
@@ -705,7 +687,7 @@ def test_build_payload_tool_result_message_then_separate_user_text_message() -> 
 
 
 def test_build_payload_tool_schema() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     tool: Tool[Any] = Tool(name="get_weather", description="Get weather", handler=get_weather)
     payload = t.build_payload([], [tool], "")
     assert len(payload["tools"]) == 1
@@ -719,13 +701,13 @@ def test_build_payload_tool_schema() -> None:
 
 
 def test_build_payload_uses_model_spec_max_tokens() -> None:
-    t = OpenAITransport(model=ModelSpec(id="custom-model", max_output_tokens=4096))
+    t = ChatCompletionsTransport(model=ModelSpec(id="custom-model", max_output_tokens=4096))
     payload = t.build_payload([], [], "")
     assert payload["max_completion_tokens"] == 4096
 
 
 def test_build_payload_image_block() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     img_data = b"\x89PNG\r\n\x1a\nfake"
     messages = [
         Message(
@@ -748,7 +730,7 @@ def test_build_payload_image_block() -> None:
 
 
 def test_build_payload_image_only() -> None:
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     img_data = b"\xff\xd8\xff\xe0fake-jpeg"
     messages = [
         Message(role="user", content=[ImageBlock(media_type="image/jpeg", data=img_data)]),
@@ -763,7 +745,7 @@ def test_build_payload_image_only() -> None:
 
 def test_build_payload_text_only_stays_string() -> None:
     """Text-only user messages should remain plain strings, not arrays."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [Message(role="user", content=[TextBlock(text="Hello")])]
     payload = t.build_payload(messages, [], "")
     assert payload["messages"][0]["content"] == "Hello"
@@ -771,7 +753,7 @@ def test_build_payload_text_only_stays_string() -> None:
 
 def test_build_payload_system_message_in_history() -> None:
     """System messages in history are passed through as role=system."""
-    t = OpenAITransport(model=OPENAI_MODELS["gpt-4.1-mini"])
+    t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [
         Message(role="system", content=[TextBlock(text="You are concise.")]),
         Message(role="user", content=[TextBlock(text="Hello")]),
@@ -790,7 +772,7 @@ def test_build_payload_system_message_in_history() -> None:
 
 async def test_http_401(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     server, _ = fake_server
@@ -806,7 +788,7 @@ async def test_http_401(
     assert any(r.levelno == logging.ERROR and "401" in r.message for r in caplog.records)
 
 
-async def test_http_500(fake_server: tuple[FakeOpenAIServer, str], transport: OpenAITransport) -> None:
+async def test_http_500(fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport) -> None:
     server, _ = fake_server
     server.status_code = 500
     server.error_body = "Internal Server Error"
@@ -824,7 +806,7 @@ async def test_auth_header_sent(fake_server: tuple[FakeOpenAIServer, str]) -> No
     server, base_url = fake_server
     server.responses.append(_text_chunks("ok"))
     async with aiohttp.ClientSession() as session:
-        t = OpenAITransport(
+        t = ChatCompletionsTransport(
             base_url=base_url, api_key="sk-secret", model=OPENAI_MODELS["gpt-4.1-mini"], session=session
         )
         await _collect(t.stream([], [], ""))
@@ -1056,7 +1038,7 @@ def test_openai_models_is_registry() -> None:
 
 
 def test_default_model_is_terra() -> None:
-    assert OpenAITransport().model is OPENAI_MODELS["gpt-5.6-terra"]
+    assert ChatCompletionsTransport().model is OPENAI_MODELS["gpt-5.6-terra"]
 
 
 def test_openai_models_have_costs() -> None:
@@ -1194,7 +1176,7 @@ def _think_text_chunks(think: str, answer: str) -> str:
 
 async def test_sse_reasoning_then_text(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     server, _ = fake_server
     server.responses.append(_think_text_chunks("let me think", "42"))
@@ -1217,7 +1199,7 @@ async def test_sse_reasoning_then_text(
 
 async def test_embed_returns_vectors(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     server, _ = fake_server
     server.embedding_responses.append(
@@ -1241,7 +1223,7 @@ async def test_embed_returns_vectors(
 
 async def test_embed_sends_correct_payload(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     server, _ = fake_server
     await transport.embed(["test input"])
@@ -1253,7 +1235,7 @@ async def test_embed_sends_correct_payload(
 
 async def test_embed_error_raises(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     server, _ = fake_server
     server.embedding_status = 400
@@ -1270,7 +1252,7 @@ async def test_embed_error_raises(
 
 async def test_stream_429_uses_retry_after_header(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """429 with Retry-After header → retries and succeeds."""
     server, _ = fake_server
@@ -1287,7 +1269,7 @@ async def test_stream_429_uses_retry_after_header(
 
 async def test_stream_429_exhausts_retries(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """429 on all attempts → raises StreamError."""
     server, _ = fake_server
@@ -1302,7 +1284,7 @@ async def test_stream_429_exhausts_retries(
 
 async def test_stream_500_retries_without_retry_after(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """500 without Retry-After header → falls back to exponential backoff and succeeds."""
     server, _ = fake_server
@@ -1317,7 +1299,7 @@ async def test_stream_500_retries_without_retry_after(
 
 async def test_embed_429_retries_with_retry_after(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """embed() retries on 429 using Retry-After header."""
     server, _ = fake_server
@@ -1332,7 +1314,7 @@ async def test_embed_429_retries_with_retry_after(
 
 async def test_embed_429_exhausts_retries(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """embed() 429 on all attempts → raises StreamError."""
     server, _ = fake_server
@@ -1347,7 +1329,7 @@ async def test_embed_429_exhausts_retries(
 
 async def test_embed_500_retries_and_recovers(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """embed() retries on 500 and succeeds on second attempt."""
     server, _ = fake_server
@@ -1361,7 +1343,7 @@ async def test_embed_500_retries_and_recovers(
 
 def test_get_retry_delay_uses_header() -> None:
     """_get_retry_delay prefers Retry-After header value."""
-    t = OpenAITransport(retry_base_delay=1.0)
+    t = ChatCompletionsTransport(retry_base_delay=1.0)
     # Create a mock response with Retry-After header
     from unittest.mock import MagicMock
 
@@ -1372,7 +1354,7 @@ def test_get_retry_delay_uses_header() -> None:
 
 def test_get_retry_delay_falls_back_to_exponential() -> None:
     """_get_retry_delay uses exponential backoff when no header."""
-    t = OpenAITransport(retry_base_delay=2.0)
+    t = ChatCompletionsTransport(retry_base_delay=2.0)
     assert t._get_retry_delay(None, 1) == 2.0  # 2 * 2^0
     assert t._get_retry_delay(None, 2) == 4.0  # 2 * 2^1
     assert t._get_retry_delay(None, 3) == 8.0  # 2 * 2^2
@@ -1380,7 +1362,7 @@ def test_get_retry_delay_falls_back_to_exponential() -> None:
 
 def test_get_retry_delay_ignores_invalid_header() -> None:
     """_get_retry_delay falls back when Retry-After is not a number."""
-    t = OpenAITransport(retry_base_delay=1.0)
+    t = ChatCompletionsTransport(retry_base_delay=1.0)
     from unittest.mock import MagicMock
 
     resp = MagicMock()
@@ -1395,7 +1377,7 @@ def test_get_retry_delay_ignores_invalid_header() -> None:
 
 async def test_tool_call_args_in_first_chunk(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """When id, name, AND arguments arrive in the same SSE delta, arguments must not be dropped."""
     server, _ = fake_server
@@ -1447,7 +1429,7 @@ async def test_tool_call_args_in_first_chunk(
 
 async def test_sse_buffer_flush(
     fake_server: tuple[FakeOpenAIServer, str],
-    transport: OpenAITransport,
+    transport: ChatCompletionsTransport,
 ) -> None:
     """When the last SSE data line has no trailing newline, data must not be lost."""
     server, _ = fake_server
@@ -1483,7 +1465,7 @@ async def test_extra_params_sent_in_payload(
     server.responses.append(_text_chunks("ok"))
 
     async with aiohttp.ClientSession() as session:
-        t = OpenAITransport(
+        t = ChatCompletionsTransport(
             base_url=base_url,
             api_key="test-key",
             model=OPENAI_MODELS["gpt-4.1-mini"],
@@ -1504,7 +1486,7 @@ async def test_extra_params_override_payload_field(
     server.responses.append(_text_chunks("ok"))
 
     async with aiohttp.ClientSession() as session:
-        t = OpenAITransport(
+        t = ChatCompletionsTransport(
             base_url=base_url,
             api_key="test-key",
             model=OPENAI_MODELS["gpt-4.1-mini"],
@@ -1517,40 +1499,40 @@ async def test_extra_params_override_payload_field(
 
 
 def test_extra_params_default_is_proxy() -> None:
-    t = OpenAITransport(api_key="k")
+    t = ChatCompletionsTransport(api_key="k")
     assert isinstance(t.extra_params, MappingProxyType)
     assert len(t.extra_params) == 0
 
 
 def test_extra_params_dict_converted_to_proxy() -> None:
-    t = OpenAITransport(api_key="k", extra_params={"x": 1})
+    t = ChatCompletionsTransport(api_key="k", extra_params={"x": 1})
     assert isinstance(t.extra_params, MappingProxyType)
     assert t.extra_params["x"] == 1
 
 
 def test_extra_params_proxy_is_immutable() -> None:
-    t = OpenAITransport(api_key="k", extra_params={"x": 1})
+    t = ChatCompletionsTransport(api_key="k", extra_params={"x": 1})
     with pytest.raises(TypeError):
         t.extra_params["x"] = 2  # type: ignore[index]
 
 
 def test_extra_params_to_dict_round_trip() -> None:
-    t = OpenAITransport(api_key="k", extra_params={"enable_thinking": True})
+    t = ChatCompletionsTransport(api_key="k", extra_params={"enable_thinking": True})
     d = t.to_dict()
     assert d["extra_params"] == {"enable_thinking": True}
 
-    t2 = OpenAITransport.from_dict(d)
+    t2 = ChatCompletionsTransport.from_dict(d)
     assert isinstance(t2.extra_params, MappingProxyType)
     assert t2.extra_params["enable_thinking"] is True
 
 
 def test_extra_params_empty_omitted_from_dict() -> None:
-    t = OpenAITransport(api_key="k")
+    t = ChatCompletionsTransport(api_key="k")
     assert "extra_params" not in t.to_dict()
 
 
 def test_output_limit_leaves_room_for_the_prompt() -> None:
-    from axio_transport_openai import _fit_output_limit
+    from axio_transport_openai.chat import _fit_output_limit
 
     model = ModelSpec(id="m", context_window=100_000, max_output_tokens=100_000)
     payload = {"messages": [{"role": "user", "content": "x" * 60_000}]}
@@ -1561,7 +1543,7 @@ def test_output_limit_leaves_room_for_the_prompt() -> None:
 
 
 def test_output_limit_is_untouched_when_it_already_fits() -> None:
-    from axio_transport_openai import _fit_output_limit
+    from axio_transport_openai.chat import _fit_output_limit
 
     model = ModelSpec(id="m", context_window=128_000, max_output_tokens=8_000)
     payload = {"messages": [{"role": "user", "content": "hi"}]}
@@ -1570,7 +1552,7 @@ def test_output_limit_is_untouched_when_it_already_fits() -> None:
 
 
 def test_a_window_the_prompt_cannot_fit_is_not_believed() -> None:
-    from axio_transport_openai import _fit_output_limit
+    from axio_transport_openai.chat import _fit_output_limit
 
     # Nebius publishes 8000 for MiniMax-M3 and then serves a 20000-token prompt.
     # Clamping to the arithmetic starves the answer over a number that is wrong.
@@ -1581,7 +1563,7 @@ def test_a_window_the_prompt_cannot_fit_is_not_believed() -> None:
 
 
 def test_tools_count_against_the_window() -> None:
-    from axio_transport_openai import _fit_output_limit
+    from axio_transport_openai.chat import _fit_output_limit
 
     model = ModelSpec(id="m", context_window=4_000, max_output_tokens=4_000)
     bare = {"messages": [{"role": "user", "content": "hi"}]}

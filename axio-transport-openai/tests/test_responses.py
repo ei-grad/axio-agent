@@ -2,13 +2,18 @@ import json
 from typing import Any
 
 import pytest
-from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
+from axio.agent import Agent
+from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from axio.context import MemoryContextStore
+from axio.events import IterationEnd
+from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason
 
-from axio_transport_openai.responses import OpenAIResponsesTransport, _convert_messages
+from axio_transport_openai import OpenAITransport
+from axio_transport_openai.responses import _convert_messages
 
 _REASONING = ModelSpec(
     id="gpt-5.6",
@@ -22,12 +27,12 @@ async def _echo(text: str) -> str:
     return text
 
 
-def _transport(**kwargs: Any) -> OpenAIResponsesTransport:
-    return OpenAIResponsesTransport(model=_REASONING, **kwargs)
+def _transport(**kwargs: Any) -> OpenAITransport:
+    return OpenAITransport(model=_REASONING, **kwargs)
 
 
 def test_streams_from_the_responses_endpoint() -> None:
-    assert OpenAIResponsesTransport.stream_path == "responses"
+    assert OpenAITransport.stream_path == "responses"
 
 
 def test_system_prompt_moves_to_instructions() -> None:
@@ -35,6 +40,12 @@ def test_system_prompt_moves_to_instructions() -> None:
     assert payload["instructions"] == "be terse"
     assert payload["store"] is False
     assert payload["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_system_messages_in_history_are_preserved() -> None:
+    items = _convert_messages([Message(role="system", content=[TextBlock(text="historical policy")])])
+
+    assert items == [{"role": "system", "content": [{"type": "input_text", "text": "historical policy"}]}]
 
 
 def test_tools_are_flat_not_nested() -> None:
@@ -55,7 +66,7 @@ def test_reasoning_effort_is_sent_only_when_supported() -> None:
     assert state.mechanism.value == "native-effort"
 
     plain = ModelSpec(id="gpt-4o", capabilities=frozenset({Capability.text, Capability.tool_use}))
-    payload = OpenAIResponsesTransport(model=plain, reasoning_effort="high").build_payload([], [], "")
+    payload = OpenAITransport(model=plain, reasoning_effort="high").build_payload([], [], "")
     assert "reasoning" not in payload
 
 
@@ -64,7 +75,7 @@ def test_native_reasoning_effort_requires_an_exact_supported_level() -> None:
         id="gpt-5.5-pro",
         capabilities=frozenset({Capability.text, Capability.reasoning}),
     )
-    transport = OpenAIResponsesTransport(model=model)
+    transport = OpenAITransport(model=model)
 
     state = transport.configure_effort("default")
 
@@ -104,6 +115,41 @@ def test_tool_result_mixed_with_text_emits_both_in_order() -> None:
     assert items[2]["content"] == [{"type": "input_text", "text": "and then?"}]
 
 
+def test_tool_result_images_are_forwarded_as_user_input() -> None:
+    messages = [
+        Message(role="assistant", content=[ToolUseBlock(id="call-1", name="image", input={})]),
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(
+                    tool_use_id="call-1",
+                    content=[TextBlock(text="diagram"), ImageBlock(media_type="image/png", data=b"png")],
+                )
+            ],
+        ),
+    ]
+
+    items = _convert_messages(messages)
+
+    assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "diagram"}
+    assert items[2]["role"] == "user"
+    assert items[2]["content"][1]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_unsupported_media_is_rejected_explicitly() -> None:
+    message = Message(role="user", content=[AudioBlock(media_type="audio/wav", data=b"audio")])
+
+    with pytest.raises(ValueError, match="does not support input media: audio/wav"):
+        _convert_messages([message])
+
+
+def test_unsupported_assistant_media_is_not_dropped() -> None:
+    message = Message(role="assistant", content=[AudioBlock(media_type="audio/wav", data=b"audio")])
+
+    with pytest.raises(ValueError, match="does not support media in assistant history: audio/wav"):
+        _convert_messages([message])
+
+
 def test_tool_result_message_then_separate_user_text_message() -> None:
     """A follow-up user message (e.g. an injected notification) arriving as its own
     Message right after the tool-results message must still emit tool output first,
@@ -129,16 +175,45 @@ def test_unanswered_call_gets_a_placeholder_output() -> None:
 
 
 class _FakeContent:
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        self._body = b"".join(f"data: {json.dumps(e)}\n".encode() for e in events)
+    def __init__(self, events: list[dict[str, Any]], *, trailing_newline: bool = True) -> None:
+        separator = "\n"
+        body = separator.join(f"data: {json.dumps(e)}" for e in events)
+        if trailing_newline:
+            body += separator
+        self._body = body.encode()
 
     async def iter_any(self):  # type: ignore[no-untyped-def]
         yield self._body
 
 
 class _FakeResponse:
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        self.content = _FakeContent(events)
+    def __init__(self, events: list[dict[str, Any]], *, trailing_newline: bool = True) -> None:
+        self.status = 200
+        self.content = _FakeContent(events, trailing_newline=trailing_newline)
+
+
+class _ResponseContext:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _FakeResponse:
+        return self.response
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
+
+
+class _FakeSession:
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self.responses = responses
+        self.payloads: list[dict[str, Any]] = []
+        self.paths: list[str] = []
+
+    def post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> _ResponseContext:
+        del headers
+        self.paths.append(url)
+        self.payloads.append(json)
+        return _ResponseContext(self.responses.pop(0))
 
 
 async def _collect(events: list[dict[str, Any]]) -> list[Any]:
@@ -178,3 +253,156 @@ async def test_argument_deltas_are_joined_to_the_call_id() -> None:
     # Deltas arrive keyed by item id and must be reported under the call id.
     assert delta.tool_use_id == "call-1"
     assert end.stop_reason is StopReason.tool_use
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_without_trailing_newline_is_parsed() -> None:
+    response = _FakeResponse(
+        [{"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 2}}}],
+        trailing_newline=False,
+    )
+
+    events = [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+    assert isinstance(events[-1], IterationEnd)
+    assert events[-1].usage.input_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_response_with_null_usage_is_max_tokens() -> None:
+    response = _FakeResponse(
+        [
+            {
+                "type": "response.incomplete",
+                "response": {"usage": None, "output": [{"type": "function_call"}]},
+            }
+        ]
+    )
+
+    events = [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+    assert len(events) == 1
+    assert isinstance(events[0], IterationEnd)
+    assert events[0].stop_reason is StopReason.max_tokens
+    assert events[0].usage.input_tokens == 0
+    assert events[0].usage.output_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_requires_a_terminal_event() -> None:
+    response = _FakeResponse([{"type": "response.output_text.delta", "delta": "partial"}])
+
+    with pytest.raises(StreamError, match="without a terminal response event"):
+        [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_malformed_sse_is_an_error() -> None:
+    response = _FakeResponse([])
+    response.content._body = b"data: {not json}\n"
+
+    with pytest.raises(StreamError, match="Invalid OpenAI Responses SSE payload"):
+        [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_failed_response_event_is_an_error() -> None:
+    response = _FakeResponse([{"type": "response.failed", "response": {"error": {"message": "request failed"}}}])
+
+    with pytest.raises(StreamError, match="request failed"):
+        [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_top_level_error_preserves_code_and_message() -> None:
+    response = _FakeResponse([{"type": "error", "code": "rate_limit_exceeded", "message": "Please retry later"}])
+
+    with pytest.raises(StreamError, match="rate_limit_exceeded: Please retry later"):
+        [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
+
+
+def test_output_limit_leaves_room_for_responses_input() -> None:
+    model = ModelSpec(id="m", context_window=100_000, max_output_tokens=100_000)
+    transport = OpenAITransport(model=model)
+    messages = [Message(role="user", content=[TextBlock(text="x" * 60_000)])]
+
+    assert transport.build_payload(messages, [], "")["max_output_tokens"] <= 80_000
+
+
+def test_output_limit_leaves_room_for_responses_instructions() -> None:
+    model = ModelSpec(id="m", context_window=100_000, max_output_tokens=100_000)
+    transport = OpenAITransport(model=model)
+
+    assert transport.build_payload([], [], "x" * 60_000)["max_output_tokens"] <= 80_000
+
+
+def test_reserved_extra_params_cannot_replace_responses_contract() -> None:
+    transport = _transport(extra_params={"input": []})
+
+    with pytest.raises(ValueError, match="cannot override.*input"):
+        transport.build_payload([], [], "")
+
+
+def test_active_model_round_trips() -> None:
+    transport = _transport()
+
+    restored = OpenAITransport.from_dict(transport.to_dict())
+
+    assert restored.model == _REASONING
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_round_trip_uses_responses_items() -> None:
+    first = _FakeResponse(
+        [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "id": "item-1", "call_id": "call-1", "name": "echo"},
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "item-1",
+                "delta": '{"text":"hello"}',
+            },
+            {"type": "response.completed", "response": {"output": [{"type": "function_call"}]}},
+        ]
+    )
+    second = _FakeResponse(
+        [
+            {"type": "response.output_text.delta", "delta": "done"},
+            {"type": "response.completed", "response": {"output": [{"type": "message"}]}},
+        ]
+    )
+    session = _FakeSession([first, second])
+    transport = _transport(session=session)
+    agent = Agent(system="system", transport=transport, tools=[Tool[Any](name="echo", handler=_echo)])
+
+    result = await agent.run("go", MemoryContextStore())
+
+    assert result == "done"
+    assert session.paths == [
+        "https://api.openai.com/v1/responses",
+        "https://api.openai.com/v1/responses",
+    ]
+    second_input = session.payloads[1]["input"]
+    assert any(item.get("type") == "function_call" for item in second_input)
+    assert any(item.get("type") == "function_call_output" and item["output"] == "hello" for item in second_input)
+
+
+@pytest.mark.asyncio
+async def test_agent_returns_refusal_text() -> None:
+    response = _FakeResponse(
+        [
+            {"type": "response.refusal.delta", "delta": "I cannot help with that."},
+            {"type": "response.completed", "response": {"output": [{"type": "message"}]}},
+        ]
+    )
+    session = _FakeSession([response])
+    transport = _transport(session=session)
+    agent = Agent(system="system", transport=transport, tools=[])
+
+    result = await agent.run("go", MemoryContextStore())
+
+    assert result == "I cannot help with that."

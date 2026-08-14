@@ -13,7 +13,7 @@ pip install axio
 **Transport (pick one or more):**
 
 ```bash
-pip install axio-transport-openai      # OpenAI, Nebius, OpenRouter, any OpenAI-compatible
+pip install axio-transport-openai      # OpenAI Responses; Chat Completions providers
 pip install axio-transport-anthropic   # Anthropic Claude
 pip install axio-transport-google      # Google Gemini + Vertex AI
 pip install axio-transport-codex       # ChatGPT via OAuth

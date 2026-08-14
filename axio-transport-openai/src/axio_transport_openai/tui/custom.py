@@ -15,7 +15,7 @@ from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, OptionList, Static
 
-from axio_transport_openai.custom import OpenAICompatibleTransport
+from axio_transport_openai.custom import CustomChatCompletionsTransport
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ class ModelEditScreen(ModalScreen["ModelSpec | _DeleteSentinel | None"]):
         self.dismiss(None)
 
 
-class ProviderEditScreen(ModalScreen["OpenAICompatibleTransport | _DeleteSentinel | None"]):
+class ProviderEditScreen(ModalScreen["CustomChatCompletionsTransport | _DeleteSentinel | None"]):
     """Add / edit a custom provider and manage its model list."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -140,9 +140,9 @@ class ProviderEditScreen(ModalScreen["OpenAICompatibleTransport | _DeleteSentine
     .pe-buttons Button { margin: 0 1; }
     """
 
-    def __init__(self, provider: OpenAICompatibleTransport | None) -> None:
+    def __init__(self, provider: CustomChatCompletionsTransport | None) -> None:
         super().__init__()
-        self._editing: OpenAICompatibleTransport | None = provider
+        self._editing: CustomChatCompletionsTransport | None = provider
         self._models: list[ModelSpec] = list(provider.models.values()) if provider else []
 
     def _model_entries(self) -> list[str]:
@@ -233,7 +233,7 @@ class ProviderEditScreen(ModalScreen["OpenAICompatibleTransport | _DeleteSentine
             return
         api_key = self.query_one("#pe-apikey", Input).value.strip()
         self.dismiss(
-            OpenAICompatibleTransport(
+            CustomChatCompletionsTransport(
                 name=name,
                 base_url=url,
                 api_key=api_key,
@@ -267,23 +267,23 @@ class CustomHubScreen(ModalScreen["dict[str, str] | None"]):
 
     def __init__(self, settings: dict[str, str]) -> None:  # settings unused
         super().__init__()
-        self._providers: list[OpenAICompatibleTransport] = []
+        self._providers: list[CustomChatCompletionsTransport] = []
         self._changed = False
 
     @classmethod
-    def load_config(cls, session: aiohttp.ClientSession | None = None) -> list[OpenAICompatibleTransport]:
+    def load_config(cls, session: aiohttp.ClientSession | None = None) -> list[CustomChatCompletionsTransport]:
         """Read provider list from CONFIG_PATH; returns [] on any error."""
         if not cls.CONFIG_PATH.exists():
             return []
         try:
             raw = json.loads(cls.CONFIG_PATH.read_text("utf-8"))
-            return [OpenAICompatibleTransport.from_dict(p, session=session) for p in raw]
+            return [CustomChatCompletionsTransport.from_dict(p, session=session) for p in raw]
         except Exception:
             logger.warning("Failed to load %s", cls.CONFIG_PATH, exc_info=True)
             return []
 
     @classmethod
-    def save_config(cls, providers: list[OpenAICompatibleTransport]) -> None:
+    def save_config(cls, providers: list[CustomChatCompletionsTransport]) -> None:
         """Write provider list to CONFIG_PATH (creates parent dirs as needed)."""
         cls.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         cls.CONFIG_PATH.write_text(
@@ -328,12 +328,12 @@ class CustomHubScreen(ModalScreen["dict[str, str] | None"]):
     def _on_add(self, result: object) -> None:
         if result is None or _is_delete(result):
             return
-        assert isinstance(result, OpenAICompatibleTransport)
+        assert isinstance(result, CustomChatCompletionsTransport)
         self._providers.append(result)
         self._changed = True
         self._refresh_list()
 
-    def _on_edit(self, old: OpenAICompatibleTransport, result: object) -> None:
+    def _on_edit(self, old: CustomChatCompletionsTransport, result: object) -> None:
         if result is None:
             return
         idx = next((i for i, p in enumerate(self._providers) if p.name == old.name), None)
@@ -342,7 +342,7 @@ class CustomHubScreen(ModalScreen["dict[str, str] | None"]):
         if _is_delete(result):
             self._providers.pop(idx)
         else:
-            assert isinstance(result, OpenAICompatibleTransport)
+            assert isinstance(result, CustomChatCompletionsTransport)
             self._providers[idx] = result
         self._changed = True
         self._refresh_list()

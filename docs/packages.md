@@ -11,7 +11,7 @@ and all are managed as a uv workspace.
 | `axio` | Core framework | - |
 | `axio-context-sqlite` | SQLite-backed persistent context store | - |
 | `axio-transport-anthropic` | Anthropic Claude transport | `axio.transport`, `axio.transport.settings` |
-| `axio-transport-openai` | OpenAI-compatible transport (OpenAI, Nebius, OpenRouter, llama.cpp, custom) | `axio.transport`, `axio.transport.settings` |
+| `axio-transport-openai` | OpenAI Responses plus Chat Completions transports | `axio.transport`, `axio.transport.settings` |
 | `axio-transport-codex` | ChatGPT (Codex) OAuth transport | `axio.transport`, `axio.transport.settings` |
 | `axio-transport-google` | Google Gemini transport + Gemini Live realtime | `axio.transport`, `axio.transport.realtime`, `axio.transport.settings`, `axio.tools` |
 | `axio-audio` | Microphone and speaker helpers for realtime agents | - |
@@ -65,20 +65,23 @@ Dependencies: `axio`, `aiohttp>=3.11`
 
 ### axio-transport-openai
 
-OpenAI-compatible HTTP streaming transport using `aiohttp` and SSE parsing.
-Includes five transports registered as entry points:
+OpenAI Responses and OpenAI-compatible Chat Completions transports using
+`aiohttp` and SSE parsing. Includes five transports registered as entry points:
 
 | Entry point name | Class | Provider |
 |---|---|---|
-| `openai` | `OpenAITransport` | OpenAI API |
+| `openai` | `OpenAITransport` | OpenAI Responses API |
 | `nebius` | `NebiusTransport` | Nebius AI Studio |
 | `openrouter` | `OpenRouterTransport` | OpenRouter |
 | `llama-cpp` | `LlamaCppTransport` | Local llama.cpp server |
-| `openai-custom` | `OpenAICompatibleTransport` | Any OpenAI-compatible endpoint |
+| `openai-custom` | `CustomChatCompletionsTransport` | Any Chat Completions endpoint |
 
 Settings screens are registered under `axio.transport.settings` for each.
 
-`LlamaCppTransport` streams through `/v1/chat/completions` and performs
+`OpenAITransport` always streams through `/v1/responses`. The other four
+transports always use `/v1/chat/completions`; endpoint selection is explicit.
+
+`LlamaCppTransport` performs
 side-effect-free discovery through llama.cpp's native `/props` plus `/models`
 (router mode) or `/v1/models` (single-model mode). Router entries must already
 be loaded or sleeping; refresh never autoloads, unloads, downloads, or reloads

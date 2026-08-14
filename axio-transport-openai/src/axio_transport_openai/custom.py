@@ -1,6 +1,6 @@
 """Custom OpenAI-compatible provider transport.
 
-Each custom provider is a separate :class:`OpenAICompatibleTransport` instance with its
+Each custom provider is a separate :class:`CustomChatCompletionsTransport` instance with its
 own ``base_url``, ``api_key``, and ``models``.  Instances are created by the TUI hub
 screen and registered dynamically in the transport registry.
 
@@ -36,11 +36,11 @@ from typing import Any, Self
 import aiohttp
 from axio.models import ModelRegistry
 
-from axio_transport_openai import OpenAITransport
+from axio_transport_openai import ChatCompletionsTransport
 
 
 @dataclass
-class OpenAICompatibleTransport(OpenAITransport):
+class CustomChatCompletionsTransport(ChatCompletionsTransport):
     """OpenAI-compatible transport for a single user-defined provider.
 
     Instances are created by :class:`~axio_transport_openai.tui.custom.CustomHubScreen`
@@ -48,15 +48,20 @@ class OpenAICompatibleTransport(OpenAITransport):
     config.  Supports JSON round-trip via :meth:`to_dict` / :meth:`from_dict`.
     """
 
-    base_url: str = ""  # override OpenAITransport default
+    base_url: str = ""  # override the generic OpenAI-compatible default
     models: ModelRegistry = field(default_factory=ModelRegistry)  # empty default
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.models and self.model.id not in self.models:
+            self.model = self.models.first()
 
     async def fetch_models(self) -> None:
         pass  # models passed in at construction
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, session: aiohttp.ClientSession | None = None) -> Self:
-        """As :meth:`OpenAITransport.from_dict`, but ``base_url``/``api_key`` come verbatim from ``data``.
+        """Decode a custom Chat Completions provider without environment fallbacks.
 
         The base implementation falls back to the ``OPENAI_BASE_URL``/``OPENAI_API_KEY``
         env vars whenever the JSON value is falsy, which is the right behavior for the

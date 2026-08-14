@@ -10,7 +10,7 @@ from textual.widgets import Button, Input, Static
 
 
 class OpenAISettingsScreen(ModalScreen[dict[str, str] | None]):
-    """Editable settings form for OpenAI transport: base_url and api_key."""
+    """Editable settings form for the OpenAI Responses transport."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
@@ -30,7 +30,7 @@ class OpenAISettingsScreen(ModalScreen[dict[str, str] | None]):
 
     def compose(self) -> ComposeResult:
         with Container(id="openai-settings"):
-            yield Static("[bold]OpenAI Settings[/]")
+            yield Static("[bold]OpenAI Responses Settings[/]")
             yield Static("Base URL (leave blank to use OPENAI_BASE_URL or default):", classes="field-label")
             yield Input(
                 value=self._settings.get("base_url", ""),

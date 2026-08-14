@@ -606,7 +606,7 @@ def test_effort_default_clears_legacy_thinking() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Streaming (inherited from OpenAITransport)
+# Streaming (inherited from ChatCompletionsTransport)
 # ---------------------------------------------------------------------------
 
 

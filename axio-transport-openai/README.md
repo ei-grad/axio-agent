@@ -4,9 +4,13 @@
 [![Python](https://img.shields.io/pypi/pyversions/axio-transport-openai)](https://pypi.org/project/axio-transport-openai/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-OpenAI-compatible streaming transport for [axio](https://github.com/mosquito/axio-agent).
+OpenAI Responses and OpenAI-compatible Chat Completions transports for
+[axio](https://github.com/mosquito/axio-agent).
 
-Works with any API that speaks the OpenAI chat completions format - OpenAI itself, local models via Ollama/vLLM/LM Studio, Nebius AI Studio, OpenRouter, and any other compatible provider.
+`OpenAITransport` always uses OpenAI's `/v1/responses` endpoint.
+`ChatCompletionsTransport` and the Nebius, OpenRouter, llama.cpp, and custom
+provider transports always use `/v1/chat/completions`. There is no endpoint
+auto-detection or model-based routing.
 
 ## Features
 
@@ -73,9 +77,9 @@ The `session` parameter is **required** for streaming. Create an `aiohttp.Client
 
 ```python
 from axio.models import ModelSpec, Capability
-from axio_transport_openai import OpenAITransport
+from axio_transport_openai import ChatCompletionsTransport
 
-transport = OpenAITransport(
+transport = ChatCompletionsTransport(
     api_key="ollama",                        # any non-empty string
     model=ModelSpec(id="llama3.2", capabilities=frozenset({Capability.text})),
     base_url="http://localhost:11434/v1",
@@ -111,7 +115,7 @@ asyncio.run(main())
 
 ## Configuration reference
 
-`OpenAITransport` is a dataclass with the following fields:
+`OpenAITransport` and `ChatCompletionsTransport` share the following configuration fields:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -156,7 +160,7 @@ The default model is `gpt-5.6-terra`.
 
 ```python
 # Serialise
-data = transport.to_dict()   # -> {"name": ..., "base_url": ..., "api_key": ..., "models": [...]}
+data = transport.to_dict()   # -> {"name": ..., "base_url": ..., "model": ..., "models": [...]}
 
 # Restore
 transport = OpenAITransport.from_dict(data, session=session)
@@ -168,7 +172,7 @@ transport = OpenAITransport.from_dict(data, session=session)
 
 ### NebiusTransport
 
-`NebiusTransport` connects to [Nebius AI Studio](https://studio.nebius.com/) (`https://api.tokenfactory.nebius.com/v1`). It inherits all retry and streaming behaviour from `OpenAITransport`.
+`NebiusTransport` connects to [Nebius AI Studio](https://studio.nebius.com/) (`https://api.tokenfactory.nebius.com/v1`). It uses the Chat Completions protocol and shares retry and streaming behaviour with `ChatCompletionsTransport`.
 
 ```python
 from axio_transport_openai.nebius import NebiusTransport
@@ -221,15 +225,18 @@ Model ids follow `[<lab>/]<model>[:tier][@<provider>]`:
 
 The `@<provider>` part is not an OpenRouter model name: it is stripped off when the request is built and sent as `provider: {"only": [...]}`. Tier and provider suffixes stay in `model.id`, and the metadata of the base model applies to them.
 
-### OpenAICompatibleTransport
+### CustomChatCompletionsTransport
 
-`OpenAICompatibleTransport` is a thin subclass of `OpenAITransport` for user-defined custom providers. Instances are created by the TUI hub screen and persisted to `~/.local/share/axio/openai-custom.json`. You can also instantiate them directly:
+`CustomChatCompletionsTransport` is the explicit Chat Completions transport for
+user-defined providers. Instances are created by the TUI hub screen and
+persisted to `~/.local/share/axio/openai-custom.json`. You can also instantiate
+them directly:
 
 ```python
 from axio.models import ModelSpec, ModelRegistry, Capability
-from axio_transport_openai.custom import OpenAICompatibleTransport
+from axio_transport_openai.custom import CustomChatCompletionsTransport
 
-transport = OpenAICompatibleTransport(
+transport = CustomChatCompletionsTransport(
     name="localai",
     base_url="http://localhost:8080/v1",
     api_key="",
@@ -255,6 +262,7 @@ The JSON configuration format used by the TUI is:
     "name": "localai",
     "base_url": "http://localhost:8080/v1",
     "api_key": "",
+    "model": "llama3.2",
     "models": [
       {
         "id": "llama3.2",
@@ -315,17 +323,25 @@ proof that a model reasons; streamed `reasoning_content` is still emitted as
 
 ## Plugin registration
 
-When installed, this package registers all six transports via entry points so `axio-tui` discovers them automatically:
+When installed, this package registers five completion transports via entry points so `axio-tui` discovers them automatically:
 
 ```toml
 [project.entry-points."axio.transport"]
 openai         = "axio_transport_openai:OpenAITransport"
-openai-responses = "axio_transport_openai.responses:OpenAIResponsesTransport"
 nebius         = "axio_transport_openai.nebius:NebiusTransport"
 openrouter     = "axio_transport_openai.openrouter:OpenRouterTransport"
-openai-custom  = "axio_transport_openai.custom:OpenAICompatibleTransport"
+openai-custom  = "axio_transport_openai.custom:CustomChatCompletionsTransport"
 llama-cpp      = "axio_transport_openai.llamacpp:LlamaCppTransport"
 ```
+
+## Migration from 0.2.3
+
+`OpenAITransport` now means the official OpenAI Responses API exclusively.
+Use `ChatCompletionsTransport` for generic compatible endpoints. The former
+`OpenAIResponsesTransport`, `OpenAICompatibleTransport`, and
+`openai-responses` entry point were removed without aliases. Persisted TUI role
+bindings named `openai-responses:<model>` are migrated once to
+`openai:<model>`; command-line selections must use `openai`.
 
 ## Part of the axio ecosystem
 

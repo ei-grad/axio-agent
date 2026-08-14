@@ -257,7 +257,7 @@ Here's how Axio compares to other popular Python agent frameworks:
 | **Architecture** | Minimal core + protocols | Pydantic-native, validation-centric | Heavy abstraction layer | Multi-agent orchestration |
 | **Streaming** | All events typed, full tool visibility | Text streaming works; tool calls and final answer can't stream simultaneously | Added later, inconsistent | Limited |
 | **Tool definition** | Plain async function | Decorator + function signature → auto JSON schema | Functions + decorators | Class-based agents |
-| **Transport** | Pluggable protocol; OpenAI (+ any OpenAI-compatible endpoint), Anthropic, Google Gemini, Codex, or custom | Built-in 20+ providers, trivial to swap | Built-in, harder to swap | Azure OpenAI focused |
+| **Transport** | Pluggable protocol; OpenAI Responses, compatible Chat Completions, Anthropic, Google Gemini, Codex, or custom | Built-in 20+ providers, trivial to swap | Built-in, harder to swap | Azure OpenAI focused |
 | **Realtime / voice** | First-class via `RealtimeTransport` + `axio-audio` (Gemini Live, Vertex Live) | None | None | None |
 | **Multimodal** | text, vision, audio, video input; image + video generation | text + vision | text + vision | text + vision |
 | **Multi-agent** | Built-in (`subagent` tool, shared context stores) | Agent-as-tool pattern; not the primary focus | Via LangGraph | Native |

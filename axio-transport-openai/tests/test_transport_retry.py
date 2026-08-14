@@ -1,4 +1,4 @@
-"""Tests for OpenAITransport retry logic."""
+"""Tests for ChatCompletionsTransport retry logic."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import pytest
 from axio.events import StreamEvent, TextDelta
 from axio.exceptions import StreamError
 
-from axio_transport_openai import OpenAITransport
+from axio_transport_openai import ChatCompletionsTransport
 
 
 def _make_sse_bytes(text: str = "hello") -> bytes:
@@ -36,6 +36,7 @@ def _mock_response(status: int, body: str = "error") -> AsyncMock:
     """Create a mock aiohttp response with given status."""
     resp = AsyncMock()
     resp.status = status
+    resp.headers = {}
     resp.text = AsyncMock(return_value=body)
     return resp
 
@@ -44,6 +45,7 @@ def _mock_sse_response(text: str = "hello") -> AsyncMock:
     """Create a mock aiohttp response that streams SSE data."""
     resp = AsyncMock()
     resp.status = 200
+    resp.headers = {}
     data = _make_sse_bytes(text)
 
     content = AsyncMock()
@@ -69,10 +71,10 @@ class _FakeContextManager:
         pass
 
 
-def _make_transport(**kwargs: Any) -> OpenAITransport:
-    """Create an OpenAITransport with a mock session and fast retries."""
+def _make_transport(**kwargs: Any) -> ChatCompletionsTransport:
+    """Create an ChatCompletionsTransport with a mock session and fast retries."""
     kwargs.setdefault("retry_base_delay", 0.0)
-    transport = OpenAITransport(
+    transport = ChatCompletionsTransport(
         api_key="test-key",
         **kwargs,
     )
@@ -198,7 +200,7 @@ async def test_exponential_backoff_delays() -> None:
     error_resps = [_FakeContextManager(_mock_response(503, "unavailable")) for _ in range(3)]
     transport.session.post = MagicMock(side_effect=error_resps)  # type: ignore[union-attr,method-assign]
 
-    with patch("axio_transport_openai.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+    with patch("axio_transport_openai.chat.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         with pytest.raises(StreamError):
             await _collect_events(transport.stream([], [], ""))
 
