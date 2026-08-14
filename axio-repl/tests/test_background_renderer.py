@@ -41,7 +41,7 @@ from axio_tools_agents.runtime import (
     TurnStatus,
 )
 
-from axio_repl import ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
+from axio_repl import DIM, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
@@ -239,6 +239,52 @@ async def test_background_actions_wait_until_reasoning_closes(capsys: pytest.Cap
     output = capsys.readouterr().out
 
     assert output.index("agent child") < output.index("answer")
+
+
+async def test_multiline_reasoning_reapplies_dim_after_every_terminal_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+
+    await renderer.render("main", ReasoningDelta(index=0, delta="first\nsecond"))
+    await renderer.render("main", ReasoningDelta(index=0, delta=" continues\nthird"))
+    await renderer.render("main", TextDelta(index=0, delta="answer"))
+
+    output = capsys.readouterr().out
+    assert f"{DIM}> first{RESET}\n{DIM}> second{RESET}" in output
+    assert f"{DIM} continues{RESET}\n{DIM}> third{RESET}" in output
+    assert output.endswith("\nanswer")
+
+
+async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"value 1'))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="\\nvalue 2"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='\\nvalue 3"}'))
+
+    output = capsys.readouterr().out
+    assert f": {DIM}value 1{RESET}" in output
+    assert f"\n{DIM}value 2{RESET}" in output
+    assert f"\n{DIM}value 3{RESET}" in output
+
+
+async def test_multiline_tool_output_reapplies_its_style_after_newlines(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="one\ntwo\nthree"),
+    )
+
+    output = capsys.readouterr().out
+    assert f"{DIM}one{RESET}\n{DIM}two{RESET}\n{DIM}three{RESET}" in output
 
 
 async def test_background_actions_wait_for_all_parallel_active_tools(

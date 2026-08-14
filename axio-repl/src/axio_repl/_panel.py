@@ -1,10 +1,9 @@
 """A status line pinned to the bottom of an otherwise ordinary terminal.
 
-Deliberately not a full-screen UI. Output keeps going to real stdout, so it
-scrolls into the terminal's own history exactly as before and nothing here owns
-the screen buffer. prompt_toolkit reserves only the lines it draws, and
-patch_stdout redraws the input when a background agent prints underneath it —
-which is what made typing unusable while a swarm was reporting back.
+Deliberately not a full-screen UI. Output stays on the primary buffer, so it
+scrolls into the terminal's own history. prompt_toolkit owns only the lines it
+draws; the REPL terminal sink temporarily removes and redraws them around
+serialized background output.
 
 Everything the line reports is a pure function of state passed in, so what it
 says can be tested without a terminal.

@@ -116,6 +116,7 @@ from axio_repl._multiplexer import (
     format_agent_identity,
     normalize_agent_name,
 )
+from axio_repl._terminal import TerminalUI
 
 LAST_ITERATION_HINT = Message(
     role="system",
@@ -148,6 +149,14 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 RESET = "\033[0m"
+
+
+def _styled(style: str, text: str) -> str:
+    """Apply a style without relying on terminal state across line redraws."""
+    if not text:
+        return ""
+    line_break = f"{RESET}\n{style}"
+    return style + text.replace("\n", line_break) + RESET
 
 
 # ── Custom search tool ───────────────────────────────────────────────
@@ -891,7 +900,7 @@ class ReplRenderer:
             if self._active_agent is not None and self._state(self._active_agent).in_text:
                 print()
                 self._state(self._active_agent).in_text = False
-            print(f"{DIM}{text}{RESET}")
+            print(_styled(DIM, text))
             self._safe_boundary_open = True
             self._drain_safe_boundary_locked()
 
@@ -1060,7 +1069,7 @@ class ReplRenderer:
             if self._active_agent is not None:
                 active_state = self._state(self._active_agent)
                 if active_state.in_reasoning:
-                    sys.stdout.write(f"{RESET}\n")
+                    sys.stdout.write("\n")
                     active_state.in_reasoning = False
                 elif active_state.in_text:
                     print()
@@ -1079,16 +1088,13 @@ class ReplRenderer:
         if self._event_starts_stdout(event, presentation):
             self._ensure_stdout_header_locked(agent_id, presentation)
         if switched and state.field_key is not None:
-            sys.stdout.write(f"\n  {YELLOW}{state.field_key} (continued){RESET}: {DIM}")
+            sys.stdout.write(f"\n  {YELLOW}{state.field_key} (continued){RESET}: ")
             self._flush()
             state.field_first_delta = True
         if not isinstance(event, TextDelta):
             state.paragraph_newline_pending = False
-        # Reasoning streams in as one delta per token, so the quote marker and
-        # the colour reset belong to the run as a whole, not to every delta.
-        # Closing it here covers every kind of event that can follow.
         if state.in_reasoning and not isinstance(event, ReasoningDelta):
-            sys.stdout.write(f"{RESET}\n")
+            sys.stdout.write("\n")
             self._flush()
             state.in_reasoning = False
             self._safe_boundary_open = True
@@ -1105,9 +1111,9 @@ class ReplRenderer:
                     delta = delta.lstrip("\n")
                     if not delta:
                         return
-                    sys.stdout.write(f"{DIM}> ")
+                    delta = f"> {delta}"
                     state.in_reasoning = True
-                sys.stdout.write(delta.replace("\n", "\n> "))
+                sys.stdout.write(_styled(DIM, delta.replace("\n", "\n> ")))
                 self._flush()
 
             case TextDelta(delta=delta):
@@ -1115,7 +1121,7 @@ class ReplRenderer:
                     state.in_text = True
                 state.pending_text.append(delta)
                 if "[Output truncated:" in delta:
-                    sys.stdout.write(f"\n{RED}{delta.strip()}{RESET}\n")
+                    sys.stdout.write(f"\n{_styled(RED, delta.strip())}\n")
                     state.in_text = False
                     state.paragraph_newline_pending = False
                     self._safe_boundary_open = True
@@ -1181,7 +1187,7 @@ class ReplRenderer:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
                 color = RED if key == "stderr" else DIM
-                sys.stdout.write(f"{color}{delta}{RESET}")
+                sys.stdout.write(_styled(color, delta))
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
@@ -1202,15 +1208,15 @@ class ReplRenderer:
                     else:
                         content = f"[foreground agent {identity} failed; the outcome was returned to the parent]"
                     color = GREEN if foreground_status is TurnStatus.SUCCEEDED else RED
-                    sys.stdout.write(f"{RESET}\n{color}{content}{RESET}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(color, content)}\n")
                 elif is_error:
-                    sys.stdout.write(f"{RESET}\n{RED}{content}{RESET}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(RED, content)}\n")
                 elif name in {"run_agent", "spawn_agent"}:
-                    sys.stdout.write(f"{RESET}\n{GREEN}{content}{RESET}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(GREEN, content)}\n")
                 elif tid in state.streamed_tool_ids:
                     sys.stdout.write(f"{RESET}\n")
                 else:
-                    sys.stdout.write(f"{RESET}\n{GREEN}{content}{RESET}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(GREEN, content)}\n")
                 self._flush()
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
@@ -1236,7 +1242,7 @@ class ReplRenderer:
                     agent_id,
                     presentation.agent_name if presentation is not None else self._agent_name(agent_id),
                 )
-                print(f"\n{RED}Error from agent {identity}: {exc}{RESET}", file=sys.stderr, flush=True)
+                print(f"\n{_styled(RED, f'Error from agent {identity}: {exc}')}", file=sys.stderr, flush=True)
                 self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
@@ -1403,7 +1409,7 @@ class ReplRenderer:
     ) -> None:
         match event:
             case ToolFieldStart(key=key):
-                sys.stdout.write(f"\n  {YELLOW}{key}{RESET}: {DIM}")
+                sys.stdout.write(f"\n  {YELLOW}{key}{RESET}: ")
                 self._flush()
                 state.field_key = key
                 state.field_first_delta = True
@@ -1411,7 +1417,7 @@ class ReplRenderer:
                 if state.field_first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.field_first_delta = False
-                sys.stdout.write(text)
+                sys.stdout.write(_styled(DIM, text))
                 self._flush()
             case ToolFieldEnd():
                 sys.stdout.write(RESET)
@@ -1557,21 +1563,17 @@ def _save_media(data: bytes, media_type: str) -> str:
 
 
 async def _read_input_async(session: Any, renderer: ReplRenderer, on_interrupt: Callable[[], None]) -> str:
-    from prompt_toolkit.patch_stdout import patch_stdout
-
     renderer.set_input_active(True)
     try:
-        # raw=True keeps our own ANSI colouring intact while the prompt is up.
-        with patch_stdout(raw=True):
-            while True:
-                try:
-                    return str(await session.prompt_async("repl> ")).strip()
-                except KeyboardInterrupt:
-                    # The prompt is up for the whole session now, and it puts the
-                    # terminal in raw mode - so Ctrl+C arrives here as a keypress
-                    # and never reaches the signal handler that used to stop a
-                    # running turn. Do its job, and go back to waiting.
-                    on_interrupt()
+        while True:
+            try:
+                return str(await session.prompt_async("repl> ")).strip()
+            except KeyboardInterrupt:
+                # The prompt is up for the whole session now, and it puts the
+                # terminal in raw mode - so Ctrl+C arrives here as a keypress
+                # and never reaches the signal handler that used to stop a
+                # running turn. Do its job, and go back to waiting.
+                on_interrupt()
     finally:
         renderer.set_input_active(False)
 
@@ -2403,9 +2405,11 @@ async def main() -> None:
             lambda: _panel.status_line(transport.model, stats, renderer.action_status()),
             on_interrupt=lambda: _on_sigint(),
         )
+        terminal = TerminalUI(prompt_session)
         prompt_task: asyncio.Task[TurnOutcome] | None = None
         input_task: asyncio.Task[str] | None = None
         inbox_task: asyncio.Task[_IncomingPrompt] | None = None
+        terminal_failure_task: asyncio.Task[None] | None = None
         main_status = TurnStatus.SUCCEEDED
         # Lets monitor() see messages that arrived but have not been read:
         # they cannot be delivered until the current turn finishes.
@@ -2419,7 +2423,20 @@ async def main() -> None:
             nonlocal main_status, prompt_task
             prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, event_hub, main_run_id, source=source))
             try:
-                outcome = await prompt_task
+                if terminal_failure_task is None:
+                    outcome = await prompt_task
+                else:
+                    done, _ = await asyncio.wait(
+                        {prompt_task, terminal_failure_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if terminal_failure_task in done:
+                        if not prompt_task.done():
+                            prompt_task.cancel()
+                            await asyncio.gather(prompt_task, return_exceptions=True)
+                        await terminal_failure_task
+                        raise RuntimeError("terminal failure monitor stopped unexpectedly")
+                    outcome = prompt_task.result()
                 main_status = outcome.status
             except asyncio.CancelledError:
                 main_status = TurnStatus.CANCELLED
@@ -2523,6 +2540,11 @@ async def main() -> None:
                 await _drain_peer_messages()
                 return
 
+            await terminal.start()
+            terminal_failure_task = asyncio.create_task(
+                terminal.wait_failed(),
+                name="axio-repl-terminal-failure",
+            )
             agent_commands = ["/agents", "/agent-actions", "/agent-focus", "/agent-interrupt", "/agent-stop"]
             commands_list = ", ".join(["/help", *commands, *agent_commands, "/quit"])
             label = getattr(transport, "name", "unknown")
@@ -2535,10 +2557,17 @@ async def main() -> None:
                 if inbox_task is None:
                     inbox_task = asyncio.create_task(peer_queue.get())
 
+                wait_tasks: set[asyncio.Task[Any]] = {input_task, inbox_task}
+                if terminal_failure_task is not None:
+                    wait_tasks.add(terminal_failure_task)
                 done, _ = await asyncio.wait(
-                    {input_task, inbox_task},
+                    wait_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                if terminal_failure_task is not None and terminal_failure_task in done:
+                    await terminal_failure_task
+                    raise RuntimeError("terminal failure monitor stopped unexpectedly")
 
                 if inbox_task in done:
                     peer_prompt = inbox_task.result()
@@ -2674,22 +2703,34 @@ async def main() -> None:
             main_status = TurnStatus.FAILED
             raise
         finally:
-            for task in (input_task, inbox_task):
-                if task is not None and not task.done():
-                    task.cancel()
-            await stop_local_background_agents()
-            await ctx.close()
-            await _publish_main_event(AgentStopped(status=main_status))
-            notify.remove_listener(peer_server.id if peer_server is not None else None)
-            if peer_server is not None:
-                await peer_server.close()
-            unsubscribe_renderer()
-            set_background_outcome_handler(None)
-            set_run_agent_factory(None)
-            set_spawn_agent_factory(None)
-            set_session_event_hub(None)
-            set_pending_message_probe(None)
-            loop.remove_signal_handler(signal.SIGINT)
+            pending_tasks = [
+                task
+                for task in (input_task, inbox_task, terminal_failure_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            if terminal_failure_task is not None and terminal_failure_task.done():
+                with suppress(asyncio.CancelledError):
+                    terminal_failure_task.exception()
+            try:
+                await stop_local_background_agents()
+                await ctx.close()
+                await _publish_main_event(AgentStopped(status=main_status))
+                notify.remove_listener(peer_server.id if peer_server is not None else None)
+                if peer_server is not None:
+                    await peer_server.close()
+            finally:
+                unsubscribe_renderer()
+                set_background_outcome_handler(None)
+                set_run_agent_factory(None)
+                set_spawn_agent_factory(None)
+                set_session_event_hub(None)
+                set_pending_message_probe(None)
+                loop.remove_signal_handler(signal.SIGINT)
+                await terminal.close()
 
 
 def main_sync() -> None:
