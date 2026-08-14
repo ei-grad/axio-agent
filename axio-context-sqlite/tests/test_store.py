@@ -1,5 +1,7 @@
 """Tests for SQLiteContextStore."""
 
+import asyncio
+import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -68,6 +70,65 @@ async def test_append_many_rolls_back_whole_batch_on_insert_failure(
     assert await store.get_history() == []
 
 
+async def test_cancelled_batch_rollback_preserves_concurrent_fork_append(
+    store: SQLiteContextStore,
+    conn: aiosqlite.Connection,
+) -> None:
+    forked = await store.fork()
+    compress_count = 0
+    second_compress_started = threading.Event()
+    release_compress = threading.Event()
+
+    def blocking_compress(data: str) -> str:
+        nonlocal compress_count
+        compress_count += 1
+        if compress_count == 2:
+            second_compress_started.set()
+            if not release_compress.wait(timeout=2):
+                raise TimeoutError("test did not release the blocked compression")
+        return compress_payload(data)
+
+    await conn.create_function("compress_payload", 1, blocking_compress, deterministic=True)
+    batch_task = asyncio.create_task(
+        store.append_many([_msg("assistant", "batch tool use"), _msg("user", "batch tool result")])
+    )
+    independent_append_started = asyncio.Event()
+
+    async def append_to_fork() -> None:
+        independent_append_started.set()
+        await forked.append(_msg("user", "independent append"))
+
+    independent_task: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(second_compress_started.wait, 1), timeout=2)
+        independent_task = asyncio.create_task(append_to_fork())
+        await asyncio.wait_for(independent_append_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        batch_task.cancel()
+        release_compress.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(batch_task, timeout=1)
+        await asyncio.wait_for(independent_task, timeout=1)
+    finally:
+        release_compress.set()
+        if not batch_task.done():
+            batch_task.cancel()
+        if independent_task is not None and not independent_task.done():
+            independent_task.cancel()
+        await asyncio.gather(
+            batch_task,
+            *(task for task in [independent_task] if task is not None),
+            return_exceptions=True,
+        )
+
+    assert await store.get_history() == []
+    history = await forked.get_history()
+    assert [(message.role, message.content[0].text) for message in history] == [  # type: ignore[attr-defined]
+        ("user", "independent append"),
+    ]
+
+
 async def test_clear(store: SQLiteContextStore) -> None:
     await store.append(_msg("user", "Hello"))
     await store.clear()
@@ -80,6 +141,31 @@ async def test_fork(store: SQLiteContextStore) -> None:
     await forked.append(_msg("assistant", "Hi!"))
     assert len(await store.get_history()) == 1
     assert len(await forked.get_history()) == 2
+
+
+async def test_concurrent_parent_and_fork_mutations(store: SQLiteContextStore) -> None:
+    await store.append(_msg("user", "shared history"))
+    forked = await store.fork()
+
+    await asyncio.gather(
+        store.append(_msg("assistant", "parent only")),
+        forked.append(_msg("assistant", "fork only")),
+        store.add_context_tokens(10, 1),
+        forked.add_context_tokens(20, 2),
+    )
+
+    parent_history = await store.get_history()
+    fork_history = await forked.get_history()
+    assert [message.content[0].text for message in parent_history] == [  # type: ignore[attr-defined]
+        "shared history",
+        "parent only",
+    ]
+    assert [message.content[0].text for message in fork_history] == [  # type: ignore[attr-defined]
+        "shared history",
+        "fork only",
+    ]
+    assert await store.get_context_tokens() == (10, 1)
+    assert await forked.get_context_tokens() == (20, 2)
 
 
 async def test_set_get_context_tokens(store: SQLiteContextStore) -> None:

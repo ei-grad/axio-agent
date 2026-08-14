@@ -6,6 +6,11 @@ import asyncio
 import base64
 import gzip
 import json
+import threading
+from collections import deque
+from collections.abc import AsyncIterator
+from concurrent.futures import Future, InvalidStateError
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +20,66 @@ from axio.messages import Message
 
 # Compress content payloads above this size (bytes of UTF-8 JSON).
 COMPRESS_THRESHOLD = 512
+_TRANSACTION_LOCK_ATTRIBUTE = "_axio_context_sqlite_transaction_lock"
+_TRANSACTION_LOCK_CREATION_GUARD = threading.Lock()
+
+
+class _ConnectionTransactionLock:
+    """An event-loop-neutral lock shared by stores using one connection."""
+
+    def __init__(self) -> None:
+        self._state_guard = threading.Lock()
+        self._locked = False
+        self._waiters: deque[Future[None]] = deque()
+
+    async def acquire(self) -> None:
+        waiter: Future[None]
+        with self._state_guard:
+            if not self._locked:
+                self._locked = True
+                return
+            waiter = Future()
+            self._waiters.append(waiter)
+
+        try:
+            await asyncio.wrap_future(waiter)
+        except BaseException:
+            # If ownership was granted concurrently with cancellation, pass it on.
+            if not waiter.cancel():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        with self._state_guard:
+            if not self._locked:
+                raise RuntimeError("transaction lock is not acquired")
+            while self._waiters:
+                waiter = self._waiters.popleft()
+                try:
+                    waiter.set_result(None)
+                except InvalidStateError:
+                    continue
+                return
+            self._locked = False
+
+    @asynccontextmanager
+    async def hold(self) -> AsyncIterator[None]:
+        await self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
+
+
+def _transaction_lock_for(conn: aiosqlite.Connection) -> _ConnectionTransactionLock:
+    with _TRANSACTION_LOCK_CREATION_GUARD:
+        lock = getattr(conn, _TRANSACTION_LOCK_ATTRIBUTE, None)
+        if lock is None:
+            lock = _ConnectionTransactionLock()
+            setattr(conn, _TRANSACTION_LOCK_ATTRIBUTE, lock)
+        if not isinstance(lock, _ConnectionTransactionLock):
+            raise TypeError(f"unexpected {_TRANSACTION_LOCK_ATTRIBUTE} on connection")
+        return lock
 
 
 def compress_payload(data: str) -> str:
@@ -108,19 +173,32 @@ class SQLiteContextStore(ContextStore):
         self._db_name = db_name
         self._session_id = session_id
         self._project = project or str(Path.cwd().resolve())
+        self._transaction_lock = _transaction_lock_for(conn)
 
     @property
     def session_id(self) -> str:
         return self._session_id
 
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        async with self._transaction_lock.hold():
+            try:
+                yield
+            except BaseException:
+                # Cancellation and non-Exception failures must release no partial transaction.
+                await self._conn.rollback()
+                raise
+
     async def append(self, message: Message) -> None:
         content_json = json.dumps(message.to_dict()["content"])
-        await self._conn.execute(
-            "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
-            "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, compress_payload(?))",
-            (self._session_id, self._project, self._session_id, message.role, content_json),
-        )
-        await self._conn.commit()
+        async with self._transaction():
+            await self._conn.execute(
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
+                "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, "
+                "compress_payload(?))",
+                (self._session_id, self._project, self._session_id, message.role, content_json),
+            )
+            await self._conn.commit()
 
     async def append_many(self, messages: list[Message]) -> None:
         if not messages:
@@ -135,7 +213,7 @@ class SQLiteContextStore(ContextStore):
             )
             for message in messages
         ]
-        try:
+        async with self._transaction():
             await self._conn.executemany(
                 "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
                 "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, "
@@ -143,10 +221,6 @@ class SQLiteContextStore(ContextStore):
                 rows,
             )
             await self._conn.commit()
-        except BaseException:
-            # Cancellation and non-Exception failures must both leave no partial batch.
-            await self._conn.rollback()
-            raise
 
     async def get_history(self) -> list[Message]:
         async with self._conn.execute(
@@ -158,48 +232,52 @@ class SQLiteContextStore(ContextStore):
         return [Message.from_dict({"role": role, "content": json.loads(content)}) for role, content in rows]
 
     async def clear(self) -> None:
-        await self._conn.execute("DELETE FROM axio_context_messages WHERE session_id = ?", (self._session_id,))
-        await self._conn.execute(
-            "DELETE FROM axio_context_tokens WHERE session_id = ? AND project = ?",
-            (self._session_id, self._project),
-        )
-        await self._conn.commit()
+        async with self._transaction():
+            await self._conn.execute("DELETE FROM axio_context_messages WHERE session_id = ?", (self._session_id,))
+            await self._conn.execute(
+                "DELETE FROM axio_context_tokens WHERE session_id = ? AND project = ?",
+                (self._session_id, self._project),
+            )
+            await self._conn.commit()
 
     async def fork(self) -> SQLiteContextStore:
         new_id = uuid4().hex
-        await self._conn.execute(
-            "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
-            "SELECT ?, project, position, role, content FROM axio_context_messages WHERE session_id = ?",
-            (new_id, self._session_id),
-        )
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO axio_context_tokens (session_id, project, input_tokens, output_tokens) "
-            "SELECT ?, project, input_tokens, output_tokens FROM axio_context_tokens "
-            "WHERE session_id = ? AND project = ?",
-            (new_id, self._session_id, self._project),
-        )
-        await self._conn.commit()
+        async with self._transaction():
+            await self._conn.execute(
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
+                "SELECT ?, project, position, role, content FROM axio_context_messages WHERE session_id = ?",
+                (new_id, self._session_id),
+            )
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO axio_context_tokens (session_id, project, input_tokens, output_tokens) "
+                "SELECT ?, project, input_tokens, output_tokens FROM axio_context_tokens "
+                "WHERE session_id = ? AND project = ?",
+                (new_id, self._session_id, self._project),
+            )
+            await self._conn.commit()
         return SQLiteContextStore(self._conn, new_id, self._project)
 
     async def set_context_tokens(self, input_tokens: int, output_tokens: int) -> None:
-        await self._conn.execute(
-            "INSERT INTO axio_context_tokens (session_id, project, input_tokens, output_tokens)"
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id, project) DO UPDATE SET input_tokens=?, output_tokens=?",
-            (self._session_id, self._project, input_tokens, output_tokens, input_tokens, output_tokens),
-        )
-        await self._conn.commit()
+        async with self._transaction():
+            await self._conn.execute(
+                "INSERT INTO axio_context_tokens (session_id, project, input_tokens, output_tokens)"
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, project) DO UPDATE SET input_tokens=?, output_tokens=?",
+                (self._session_id, self._project, input_tokens, output_tokens, input_tokens, output_tokens),
+            )
+            await self._conn.commit()
 
     async def add_context_tokens(self, input_tokens: int, output_tokens: int) -> None:
-        await self._conn.execute(
-            "INSERT INTO axio_context_tokens (session_id, project, input_tokens, output_tokens)"
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id, project) DO UPDATE "
-            "SET input_tokens = input_tokens + excluded.input_tokens, "
-            "    output_tokens = output_tokens + excluded.output_tokens",
-            (self._session_id, self._project, input_tokens, output_tokens),
-        )
-        await self._conn.commit()
+        async with self._transaction():
+            await self._conn.execute(
+                "INSERT INTO axio_context_tokens (session_id, project, input_tokens, output_tokens)"
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, project) DO UPDATE "
+                "SET input_tokens = input_tokens + excluded.input_tokens, "
+                "    output_tokens = output_tokens + excluded.output_tokens",
+                (self._session_id, self._project, input_tokens, output_tokens),
+            )
+            await self._conn.commit()
 
     async def get_context_tokens(self) -> tuple[int, int]:
         async with self._conn.execute(
