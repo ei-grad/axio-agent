@@ -116,7 +116,7 @@ asyncio.run(main())
 | `name` | `str` | `"OpenAI"` | Display name (used by TUI) |
 | `api_key` | `str` | `$OPENAI_API_KEY` | API key |
 | `base_url` | `str` | `$OPENAI_BASE_URL` or `https://api.openai.com/v1` | API base URL |
-| `model` | `ModelSpec` | `OPENAI_MODELS["gpt-4.1-mini"]` | Active model |
+| `model` | `ModelSpec` | `OPENAI_MODELS["gpt-5.6-terra"]` | Active model |
 | `models` | `ModelRegistry` | all `OPENAI_MODELS` | Available models |
 | `session` | `aiohttp.ClientSession \| None` | `None` | HTTP session (required for streaming) |
 | `max_retries` | `int` | `10` | Maximum retry attempts on 429 / 5xx |
@@ -142,7 +142,7 @@ asyncio.run(main())
 | `gpt-4o` | 128,000 | 16,384 | text, vision, tool use | $2.50 / $10 |
 | `gpt-4o-mini` | 128,000 | 16,384 | text, vision, tool use | $0.15 / $0.60 |
 
-The default model is `gpt-4.1-mini`.
+The default model is `gpt-5.6-terra`.
 
 ## `fetch_models()`
 
