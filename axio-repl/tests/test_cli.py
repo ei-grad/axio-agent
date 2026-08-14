@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 from axio.events import ToolInputDelta, ToolUseStart
 from axio_tools_agents.runtime import ConfigurationChanged, RuntimeEvent
 
-from axio_repl import ReplRenderer, _build_argument_parser, _handle_agent_actions
+from axio_repl import ReplRenderer, _build_argument_parser, _handle_agent_actions, main
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 
 
@@ -24,6 +26,46 @@ def test_agent_actions_can_be_enabled() -> None:
 def test_agent_actions_rejects_unknown_modes() -> None:
     with pytest.raises(SystemExit):
         _build_argument_parser().parse_args(["--agent-actions", "verbose"])
+
+
+def test_sandbox_networking_defaults_to_fail_closed() -> None:
+    args = _build_argument_parser().parse_args([])
+
+    assert args.sandbox_network is None
+    assert args.sandbox_proxy is None
+    assert args.sandbox_memory == "256m"
+    assert args.sandbox_cpus == "1.0"
+
+
+def test_sandbox_restricted_network_flags_are_parsed() -> None:
+    args = _build_argument_parser().parse_args(
+        [
+            "--sandbox-network",
+            "agent-egress",
+            "--sandbox-proxy",
+            "http://mitmania:8080",
+            "--sandbox-pypi-index",
+            "http://nexus:8081/repository/pypi/simple",
+            "--sandbox-datasets",
+            "/srv/datasets",
+        ]
+    )
+
+    assert args.sandbox_network == "agent-egress"
+    assert args.sandbox_proxy == "http://mitmania:8080"
+    assert args.sandbox_pypi_index.endswith("/simple")
+    assert args.sandbox_datasets.as_posix() == "/srv/datasets"
+
+
+async def test_sandbox_none_reports_restricted_options_as_cli_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["axio-repl", "--sandbox", "none", "--sandbox-memory", "1g"])
+
+    with pytest.raises(SystemExit, match="2"):
+        await main()
+
+    assert "restricted sandbox settings require Docker" in capsys.readouterr().err
 
 
 async def test_agent_actions_command_toggles_and_publishes_configuration(capsys: pytest.CaptureFixture[str]) -> None:

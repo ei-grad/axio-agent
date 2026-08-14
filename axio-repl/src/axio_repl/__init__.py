@@ -2112,11 +2112,72 @@ def _build_argument_parser() -> Any:
         help="Run file and shell tools inside a Docker container (default: auto — used when a daemon is reachable)",
     )
     parser.add_argument("--sandbox-image", default="python:3.12-slim", help="Image for --sandbox docker")
+    parser.add_argument(
+        "--sandbox-network",
+        default=None,
+        help="User-defined internal Docker network for restricted service access (default: no network)",
+    )
+    parser.add_argument(
+        "--sandbox-memory",
+        default=_sandbox.DEFAULT_SANDBOX_MEMORY,
+        help=f"Sandbox memory limit (default: {_sandbox.DEFAULT_SANDBOX_MEMORY})",
+    )
+    parser.add_argument(
+        "--sandbox-cpus",
+        default=_sandbox.DEFAULT_SANDBOX_CPUS,
+        help=f"Sandbox CPU limit (default: {_sandbox.DEFAULT_SANDBOX_CPUS})",
+    )
+    parser.add_argument("--sandbox-proxy", default=None, help="HTTP(S) policy proxy URL inside the sandbox network")
+    parser.add_argument("--sandbox-no-proxy", default=None, help="Comma-separated proxy bypass hostnames")
+    parser.add_argument("--sandbox-pypi-index", default=None, help="Internal PyPI/simple index URL")
+    parser.add_argument("--sandbox-npm-registry", default=None, help="Internal npm registry URL")
+    parser.add_argument("--sandbox-cargo-index", default=None, help="Internal Cargo registry index URL")
+    parser.add_argument("--sandbox-go-proxy", default=None, help="Internal GOPROXY URL")
+    parser.add_argument(
+        "--sandbox-go-sumdb",
+        default=None,
+        help="Explicit GOSUMDB setting (default: preserve Go's checksum database behavior)",
+    )
+    parser.add_argument(
+        "--sandbox-datasets",
+        type=Path,
+        default=None,
+        help="Host dataset directory mounted read-only at /datasets",
+    )
+    parser.add_argument(
+        "--sandbox-ca-cert",
+        type=Path,
+        default=None,
+        help="Full CA bundle (system roots plus interception CA) mounted read-only for common clients",
+    )
     return parser
 
 
 async def main() -> None:
-    args = _build_argument_parser().parse_args()
+    parser = _build_argument_parser()
+    args = parser.parse_args()
+
+    try:
+        sandbox_options = _sandbox.SandboxOptions(
+            network=args.sandbox_network,
+            memory=args.sandbox_memory,
+            cpus=args.sandbox_cpus,
+            proxy=args.sandbox_proxy,
+            no_proxy=args.sandbox_no_proxy,
+            pypi_index=args.sandbox_pypi_index,
+            npm_registry=args.sandbox_npm_registry,
+            cargo_index=args.sandbox_cargo_index,
+            go_proxy=args.sandbox_go_proxy,
+            go_sumdb=args.sandbox_go_sumdb,
+            datasets=args.sandbox_datasets.expanduser().resolve() if args.sandbox_datasets else None,
+            ca_certificate=args.sandbox_ca_cert.expanduser().resolve() if args.sandbox_ca_cert else None,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if sandbox_options.requires_docker and (
+        args.sandbox == "none" or (args.sandbox == "auto" and not _sandbox.docker_available())
+    ):
+        parser.error("restricted sandbox settings require Docker, but sandbox execution is unavailable")
 
     setup_logging(args.debug)
     root = Path.cwd().resolve()
@@ -2165,9 +2226,12 @@ async def main() -> None:
         }
         _apply_cli_args(args, commands)
 
-        tools, sandbox_desc, tool_root, sandbox_note = await _sandbox.build_tools(
-            stack, list(TOOLS), args.sandbox, args.sandbox_image, root
-        )
+        try:
+            tools, sandbox_desc, tool_root, sandbox_note = await _sandbox.build_tools(
+                stack, list(TOOLS), args.sandbox, args.sandbox_image, root, sandbox_options
+            )
+        except RuntimeError as exc:
+            parser.error(str(exc))
         print(f"Tools: {BOLD}{sandbox_desc}{RESET}")
         system = effort.system_prompt(
             build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)

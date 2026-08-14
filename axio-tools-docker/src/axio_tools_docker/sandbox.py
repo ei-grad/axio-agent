@@ -212,6 +212,7 @@ class DockerSandbox:
         network: bool | str = False,
         workdir: str = "/workspace",
         volumes: dict[str, str] | None = None,
+        read_only_volumes: dict[str, str] | None = None,
         named_volumes: dict[str, str] | None = None,
         volumes_remove: bool = False,
         env: dict[str, str] | None = None,
@@ -230,6 +231,7 @@ class DockerSandbox:
         extra_hosts: dict[str, str] | None = None,
         devices: list[str] | None = None,
         dns: list[str] | None = None,
+        require_internal_network: bool = False,
     ) -> None:
         """Create a DockerSandbox.
 
@@ -244,6 +246,7 @@ class DockerSandbox:
                 ``"bridge"``, or a named network like ``"my-project_default"``.
             workdir: Working directory inside the container.
             volumes: Mapping of {container_path: host_path} bind mounts.
+            read_only_volumes: Mapping of {container_path: host_path} read-only bind mounts.
             named_volumes: Mapping of {container_path: volume_name} named Docker volumes.
                 Docker creates the volume automatically if it does not exist. Named volumes
                 persist across container restarts and can be shared between sandbox sessions.
@@ -282,7 +285,14 @@ class DockerSandbox:
                 ``"/dev/sda:/dev/xvda:r"`` (read-only).
             dns: DNS servers to use inside the container, e.g.
                 ``["8.8.8.8", "1.1.1.1"]``.
+            require_internal_network: When true, ``network`` must name a Docker network
+                configured with ``Internal=true``. Container creation fails closed if the
+                network is missing or externally routed.
         """
+        if require_internal_network and not isinstance(network, str):
+            raise ValueError("require_internal_network needs a named Docker network")
+        if require_internal_network and name:
+            raise ValueError("require_internal_network cannot be combined with named-container reuse")
         self.url = url
         self.image = image
         self.memory = memory
@@ -290,6 +300,7 @@ class DockerSandbox:
         self.network: bool | str = network
         self.workdir = workdir
         self.volumes: dict[str, str] = volumes or {}
+        self.read_only_volumes: dict[str, str] = read_only_volumes or {}
         self.named_volumes: dict[str, str] = named_volumes or {}
         self.volumes_remove = volumes_remove
         self.env: dict[str, str] = env or {}
@@ -308,6 +319,8 @@ class DockerSandbox:
         self.extra_hosts: dict[str, str] = extra_hosts or {}
         self.devices: list[str] = devices or []
         self.dns: list[str] = dns or []
+        self.require_internal_network = require_internal_network
+        self._verified_network_id: str | None = None
         self._client: aiodocker.Docker | None = None
         self._container: aiodocker.containers.DockerContainer | None = None
         self._attached: bool = False  # True when we reused an existing container
@@ -321,6 +334,26 @@ class DockerSandbox:
             await self._client.close()
             self._client = None
             raise RuntimeError(f"Docker daemon not available at {self.url!r}: {exc}") from exc
+
+        if self.require_internal_network:
+            assert isinstance(self.network, str)
+            try:
+                docker_network = await self._client.networks.get(self.network)
+                network_info = await docker_network.show()
+            except Exception as exc:  # network lookup may fail through Docker, HTTP, or socket layers
+                await self._client.close()
+                self._client = None
+                raise RuntimeError(f"Required internal Docker network {self.network!r} is unavailable: {exc}") from exc
+            if not isinstance(network_info, dict) or network_info.get("Internal") is not True:
+                await self._client.close()
+                self._client = None
+                raise RuntimeError(f"Docker network {self.network!r} is not internal; refusing sandbox egress")
+            network_id = network_info.get("Id")
+            if not isinstance(network_id, str) or not network_id.strip() or network_id != network_id.strip():
+                await self._client.close()
+                self._client = None
+                raise RuntimeError(f"Docker network {self.network!r} returned no stable ID; refusing sandbox egress")
+            self._verified_network_id = network_id
 
         if self.name:
             try:
@@ -336,6 +369,7 @@ class DockerSandbox:
         if not self._attached:
             await self._ensure_image()
             binds = [f"{host}:{container}" for container, host in self.volumes.items()]
+            binds += [f"{host}:{container}:ro" for container, host in self.read_only_volumes.items()]
             binds += [f"{vol}:{path}" for path, vol in self.named_volumes.items()]
             host_config: dict[str, Any] = {
                 "Init": True,
@@ -346,7 +380,7 @@ class DockerSandbox:
             if self.network is False:
                 host_config["NetworkMode"] = "none"
             elif isinstance(self.network, str):
-                host_config["NetworkMode"] = self.network
+                host_config["NetworkMode"] = self._verified_network_id or self.network
             if self.read_only:
                 host_config["ReadonlyRootfs"] = True
             if self.shm_size:
@@ -395,8 +429,18 @@ class DockerSandbox:
             create_kwargs: dict[str, Any] = {"config": config}
             if self.name:
                 create_kwargs["name"] = self.name
-            self._container = await self._client.containers.create(**create_kwargs)
-            await self._container.start()
+            try:
+                self._container = await self._client.containers.create(**create_kwargs)
+                await self._container.start()
+            except Exception:  # create/start failures may originate in Docker, HTTP, or socket layers
+                if self._container is not None:
+                    with contextlib.suppress(Exception):
+                        await self._container.delete(force=True)
+                self._container = None
+                self._verified_network_id = None
+                await self._client.close()
+                self._client = None
+                raise
             logger.info("Started sandbox container (image=%s)", self.image)
 
         self._tools = [
@@ -420,6 +464,7 @@ class DockerSandbox:
                 logger.info("Kept sandbox container (attached=%r, remove=%r)", was_attached, self.remove)
             self._container = None
             self._attached = False
+            self._verified_network_id = None
         if self._client is not None:
             if self.named_volumes and self.volumes_remove and not was_attached:
                 for vol_name in self.named_volumes.values():

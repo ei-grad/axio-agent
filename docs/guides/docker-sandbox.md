@@ -67,15 +67,15 @@ outside raises `RuntimeError`.
 `/var/run/docker.sock` exists — on a machine with Docker running, the agent is
 sandboxed unless you pass `--sandbox none`.
 
-The REPL creates the container as:
+Without network options, the REPL creates the container as:
 
 ```text
 DockerSandbox(image=<--sandbox-image>, volumes={"/workspace": <cwd>}, workdir="/workspace", network=False)
 ```
 
-Everything else is a `DockerSandbox` default, so the agent gets **256 MB of
-memory and one CPU** — enough for edits and small scripts, tight for a test
-suite or a compiler.
+The defaults give the agent **256 MB of memory and one CPU** — enough for edits
+and small scripts, tight for a test suite or a compiler. Override them with
+`--sandbox-memory` and `--sandbox-cpus`.
 
 Tools are swapped by name:
 
@@ -113,29 +113,139 @@ Two consequences follow from that list plus `network=False`:
 An agent asked to run the project's tests in the default image will discover
 this one command at a time. Give it an image that matches the work instead.
 
-### Building an image for your project
+### Standard agent image
 
-```dockerfile
-FROM python:3.12-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends git make patch ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir ast-grep-cli
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
-```
+The repository contains a moderately sized universal image based on
+`mcr.microsoft.com/devcontainers/base:3-noble`. It includes Python/uv, Node.js,
+Go, Rust, OpenJDK, Git, `gh`, `glab`, PDF/OCR utilities, a Python data-analysis
+environment, and Kaggle/Hugging Face CLIs.
 
 ```bash
-docker build -t my-project-sandbox .
-axio-repl --sandbox docker --sandbox-image my-project-sandbox
+make sandbox-image
+axio-repl --sandbox docker \
+  --sandbox-image axio-agent-sandbox:standard \
+  --sandbox-memory 4g \
+  --sandbox-cpus 2
 ```
 
-Keep `python3` in whatever you build: `search_files` and `run_python` both
-need it.
+The project does not publish this image. The tag above is local and exists only
+after `make sandbox-image`. See `docker/agent-sandbox/README.md` for the exact
+inventory and build arguments. Keep `python3` in derivative images:
+`search_files` and `run_python` both need it.
 
 Dependencies must be baked in for the same reason — with networking off, a
-`uv sync` inside the container cannot reach an index. Either pre-install them in
-the image, or start the sandbox yourself with `network=True` and accept that the
-agent's code can then reach the network.
+`uv sync` inside the container cannot reach an index. The next section describes
+restricted registry access without enabling Docker's routed default network.
+
+### Restricted packages and datasets
+
+Create a user-defined internal network and attach only the sandbox and trusted
+service endpoints to it:
+
+```bash
+docker network create --internal axio-agent-egress
+```
+
+A typical deployment connects these components:
+
+```mermaid
+flowchart LR
+    A[agent sandbox] -->|HTTP_PROXY| M[mitmania policy proxy]
+    A -->|registry endpoints| C[Nexus or Artifactory cache]
+    A -->|read-only mount| D[dataset snapshots]
+    B[dataset broker] --> D
+    M --> I[allowlisted Internet]
+    C --> I
+    B --> I
+```
+
+The sandbox is attached only to `axio-agent-egress`, which has Docker
+`Internal=true`. mitmania, the package cache, and the dataset broker need a
+separately controlled upstream path. Do not attach the sandbox itself to that
+upstream network.
+
+mitmania is an HTTP/HTTPS policy data plane, not a package cache and not a
+containment boundary. Its own documentation requires a firewall or equivalent
+network boundary to prevent direct egress. An internal Docker network supplies
+that boundary for this topology; mitmania supplies per-host/path/method policy,
+auditing, and optional TLS interception. Nexus or Artifactory supplies caching
+and repository grouping.
+
+Point the REPL at those internal services explicitly:
+
+```bash
+axio-repl --sandbox docker \
+  --sandbox-image axio-agent-sandbox:standard \
+  --sandbox-memory 4g \
+  --sandbox-cpus 2 \
+  --sandbox-network axio-agent-egress \
+  --sandbox-proxy http://mitmania:3128 \
+  --sandbox-no-proxy nexus \
+  --sandbox-pypi-index http://nexus:8081/repository/pypi/simple \
+  --sandbox-npm-registry http://nexus:8081/repository/npm/ \
+  --sandbox-cargo-index sparse+http://nexus:8081/repository/cargo/ \
+  --sandbox-go-proxy http://nexus:8081/repository/go/ \
+  --sandbox-go-sumdb 'sum.golang.org https://nexus:8081/repository/sumdb/sum.golang.org' \
+  --sandbox-datasets /srv/axio-datasets
+```
+
+`axio-repl` verifies that the named Docker network has `Internal=true` before
+creating the container, then creates it against that verified network ID rather
+than looking it up again by name. Missing, malformed, replaced, and routed
+networks fail closed. Proxy and registry flags, read-only data mounts, CA
+configuration, and non-default resource limits are rejected instead of silently
+falling back to the host when `--sandbox none` is selected or `--sandbox auto`
+cannot use Docker.
+
+For an HTTP PyPI mirror, the REPL validates the URL and derives
+`PIP_TRUSTED_HOST` and `UV_INSECURE_HOST` from its host and optional port. This
+is intentionally weaker transport security and should be limited to the
+isolated internal network; prefer an HTTPS mirror. Credentials, query strings,
+and fragments are rejected in the configured URL.
+
+Cargo source replacement cannot be implemented by changing the registry-index
+environment variable alone. The REPL generates a temporary Cargo config with
+`[source.crates-io] replace-with = "axio-mirror"`, mounts it read-only at
+`/tmp/axio-cargo/config.toml`, and points `CARGO_HOME` there. It does not modify
+the project's `.cargo/config.toml`. A project-local Cargo config has higher
+precedence, so the internal Docker network and proxy policy remain the actual
+fail-closed egress boundary.
+
+`GOPROXY` controls Go module downloads but does not by itself proxy the public
+checksum database. By default the REPL leaves Go's `GOSUMDB` behavior unchanged;
+the policy proxy must allow that traffic or the operator must explicitly set an
+internal checksum database/proxy with `--sandbox-go-sumdb`. Do not silently set
+`GOSUMDB=off`: that removes an integrity check.
+
+Do not embed credentials in endpoint URLs: command lines, shell history, and
+Docker container metadata are not secret stores. Prefer an unauthenticated
+cache reachable only on the internal network, or let mitmania/broker policy
+inject narrowly scoped credentials without exposing them to the sandbox.
+
+The dataset path is mounted read-only at `/datasets`. A broker outside the
+sandbox should validate provider, dataset ID, immutable revision, license, file
+types, and size; download to content-addressed storage; then publish an approved
+snapshot under that host directory. The `kaggle` and `hf` binaries in the image
+do not bypass this policy. Avoid passing upload/delete credentials to the
+sandbox if its job is dataset consumption.
+
+For TLS interception, add `--sandbox-ca-cert /path/to/egress-ca-bundle.pem`.
+This must be a complete CA bundle containing the normal system roots plus the
+interception CA: several of the Python, uv, Git, curl, and Cargo variables set
+by this flag replace those clients' default bundle rather than extending it
+(`NODE_EXTRA_CA_CERTS` extends Node's trust instead).
+Java tools need a corresponding JVM truststore baked into the image or
+configured through Maven/Gradle; the PEM flag does not mutate the system or JVM
+trust stores. `wget` does not honor these per-client CA variables; use `curl` or
+configure its trust separately. With mitmania `mitm:false`, no interception CA
+is needed and TLS remains end-to-end. `--sandbox-no-proxy` is only for trusted
+internal service names: it bypasses the HTTP proxy, not the internal-network
+containment boundary.
+
+Ubuntu's system Python in the standard image is externally managed under PEP
+668. Use `uv add`, `uv sync`, or `uvx` for project dependencies and one-off
+tools; do not rely on global `pip install`. The `python-data` command selects
+the baked data-analysis environment.
 
 ## Container lifecycle
 
@@ -316,6 +426,7 @@ sandbox = DockerSandbox(
     network=False,
     workdir="/workspace",
     volumes={"/workspace": "/tmp/host-dir"},
+    read_only_volumes={"/datasets": "/srv/datasets"},
     named_volumes={"/data": "my-project-data"},
     volumes_remove=False,
     env={"PYTHONPATH": "/app"},
@@ -334,6 +445,7 @@ sandbox = DockerSandbox(
     extra_hosts={"host.docker.internal": "host-gateway"},
     devices=["/dev/net/tun"],
     dns=["8.8.8.8", "1.1.1.1"],
+    require_internal_network=False,
 )
 ```
 
@@ -346,6 +458,7 @@ sandbox = DockerSandbox(
 | `network` | `bool \| str` | `False` | Network mode. `False` → `none`. `True` → Docker default. String → explicit `NetworkMode` (e.g. `"host"`, `"bridge"`, `"my-project_default"`). |
 | `workdir` | `str` | `"/workspace"` | Working directory inside the container. Relative paths in tool calls resolve against this. |
 | `volumes` | `dict[str, str]` | `{}` | Bind mounts as `{container_path: host_path}`. |
+| `read_only_volumes` | `dict[str, str]` | `{}` | Read-only bind mounts as `{container_path: host_path}`. |
 | `named_volumes` | `dict[str, str]` | `{}` | Named Docker volumes as `{container_path: volume_name}`. Created automatically if absent. |
 | `volumes_remove` | `bool` | `False` | Remove named volumes on exit. No effect when attached to an existing container. |
 | `env` | `dict[str, str]` | `{}` | Environment variables passed to all commands. |
@@ -364,6 +477,7 @@ sandbox = DockerSandbox(
 | `extra_hosts` | `dict[str, str]` | `{}` | Extra `/etc/hosts` entries as `{hostname: ip}` (e.g. `{"host.docker.internal": "host-gateway"}`). |
 | `devices` | `list[str]` | `[]` | Host devices to expose. Format: `"/dev/sda"` (same container path, `rwm`), `"/dev/sda:/dev/xvda"` (custom path), `"/dev/sda:/dev/xvda:r"` (explicit permissions). |
 | `dns` | `list[str]` | `[]` | DNS servers (e.g. `["8.8.8.8", "1.1.1.1"]`). Only meaningful when `network != False`. |
+| `require_internal_network` | `bool` | `False` | Require a named network whose Docker metadata has `Internal=true`, then create against its verified ID; fail before container creation otherwise. Incompatible with `name` reuse. |
 
 ## Docker daemon not available
 

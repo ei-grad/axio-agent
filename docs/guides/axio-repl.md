@@ -75,6 +75,18 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--no-session-log` | off | Disable the default session journal |
 | `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
 | `--sandbox-image` | `python:3.12-slim` | Image for `--sandbox docker` |
+| `--sandbox-network` | none | User-defined internal Docker network for restricted service access |
+| `--sandbox-memory` | `256m` | Container memory limit |
+| `--sandbox-cpus` | `1.0` | Container CPU limit |
+| `--sandbox-proxy` | none | HTTP(S) policy proxy URL |
+| `--sandbox-no-proxy` | none | Comma-separated internal proxy bypass hostnames |
+| `--sandbox-pypi-index` | none | Internal PyPI/simple index URL |
+| `--sandbox-npm-registry` | none | Internal npm registry URL |
+| `--sandbox-cargo-index` | none | Internal Cargo registry index URL |
+| `--sandbox-go-proxy` | none | Internal Go module proxy URL |
+| `--sandbox-go-sumdb` | Go default | Explicit `GOSUMDB` setting for an internal checksum database/proxy |
+| `--sandbox-datasets` | none | Host directory mounted read-only at `/datasets` |
+| `--sandbox-ca-cert` | none | Full CA bundle (system roots plus interception CA) mounted read-only for common clients |
 
 ## Session journals
 
@@ -207,8 +219,10 @@ In a container the working directory is bind-mounted at `/workspace`, and that
 is the path the system prompt gives the model. Host paths are meaningless to it.
 
 The default image is `python:3.12-slim` and networking is off, which together
-decide what the agent can and cannot do. Both are worth reading before wondering
-why a build failed: see [Docker Sandbox](docker-sandbox.md#from-axio-repl).
+decide what the agent can and cannot do. The repository also contains a locally
+buildable standard image and fail-closed support for an internal Docker network,
+policy proxy, registry caches, and read-only dataset snapshots. See
+[Docker Sandbox](docker-sandbox.md#from-axio-repl).
 
 ## AGENTS.md
 

@@ -168,6 +168,7 @@ sandbox = DockerSandbox(
     network=False,  # False=none, True=default, str=explicit mode
     workdir="/workspace",
     volumes={"/workspace": "/tmp/host-dir"},  # {container_path: host_path}
+    read_only_volumes={"/datasets": "/srv/datasets"},  # read-only bind mounts
     named_volumes={"/data": "my-project-data"},  # named Docker volumes
     volumes_remove=False,  # remove named volumes on exit
     env={"PYTHONPATH": "/app"},
@@ -186,6 +187,7 @@ sandbox = DockerSandbox(
     extra_hosts={"host.docker.internal": "host-gateway"},
     devices=["/dev/net/tun", "/dev/sda:/dev/xvda:r"],
     dns=["8.8.8.8", "1.1.1.1"],
+    require_internal_network=False,
 )
 
 assert sandbox.image == "python:3.12-slim"
@@ -203,6 +205,7 @@ assert sandbox.network == False
 | `network` | `bool \| str` | `False` | Network mode. `False` → `none`. `True` → Docker default. String → explicit `NetworkMode` (e.g. `"host"`, `"bridge"`, `"my-net"`). |
 | `workdir` | `str` | `"/workspace"` | Working directory inside the container. |
 | `volumes` | `dict[str, str]` | `{}` | Bind mounts as `{container_path: host_path}`. |
+| `read_only_volumes` | `dict[str, str]` | `{}` | Read-only bind mounts as `{container_path: host_path}`. |
 | `named_volumes` | `dict[str, str]` | `{}` | Named Docker volumes as `{container_path: volume_name}`. Created automatically if absent. |
 | `volumes_remove` | `bool` | `False` | Remove named volumes on exit. No effect when attached to an existing container. |
 | `env` | `dict[str, str]` | `{}` | Environment variables passed to all commands. |
@@ -221,6 +224,7 @@ assert sandbox.network == False
 | `extra_hosts` | `dict[str, str]` | `{}` | Extra `/etc/hosts` entries as `{hostname: ip}`. |
 | `devices` | `list[str]` | `[]` | Host devices to expose. Format: `"/dev/sda"`, `"/dev/sda:/dev/xvda"`, `"/dev/sda:/dev/xvda:r"`. |
 | `dns` | `list[str]` | `[]` | DNS servers (e.g. `["8.8.8.8"]`). Only meaningful when `network != False`. |
+| `require_internal_network` | `bool` | `False` | Require a named network with Docker `Internal=true`, then create against its verified ID; fail before container creation otherwise. Incompatible with `name` reuse. |
 
 ## Part of the axio ecosystem
 

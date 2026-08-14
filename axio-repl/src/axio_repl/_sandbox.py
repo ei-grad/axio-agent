@@ -6,8 +6,9 @@ by name. Coordination tools (spawn/stop/interrupt/peers) are left alone — they
 touch no files. Spawned subagents inherit the parent's tools, so substituting
 once covers the whole tree.
 
-The container runs with networking disabled, which costs nothing here: the model
-is contacted by axio-repl on the host, never from inside the sandbox.
+The container runs with networking disabled unless an operator selects a named,
+internal Docker network. The model is contacted by axio-repl on the host, never
+from inside the sandbox.
 """
 
 from __future__ import annotations
@@ -15,11 +16,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shlex
 import shutil
+import tempfile
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import SplitResult, urlsplit
 
 from axio import Tool
 
@@ -35,6 +40,167 @@ SANDBOXED_TOOL_NAMES = frozenset({"read_file", "write_file", "patch_file", "list
 SANDBOX_ONLY_TOOL_NAMES = frozenset({"run_python"})
 
 WORKDIR = "/workspace"
+DATASETS_DIR = "/datasets"
+EGRESS_CA_PATH = "/etc/axio/egress-ca.pem"
+CARGO_HOME = "/tmp/axio-cargo"
+CARGO_CONFIG_PATH = f"{CARGO_HOME}/config.toml"
+DEFAULT_SANDBOX_MEMORY = "256m"
+DEFAULT_SANDBOX_CPUS = "1.0"
+
+_MEMORY_MULTIPLIERS = {"k": 1024, "m": 1024**2, "g": 1024**3}
+
+_ROUTED_DOCKER_NETWORKS = frozenset({"bridge", "default", "host", "none"})
+
+
+def _parse_memory(value: str) -> int:
+    normalized = value.lower().strip()
+    suffix = normalized[-1:] if normalized[-1:] in _MEMORY_MULTIPLIERS else ""
+    amount = normalized[: -len(suffix)] if suffix else normalized
+    try:
+        parsed = int(amount)
+    except ValueError as exc:
+        raise ValueError("--sandbox-memory must be a positive integer with an optional k, m, or g suffix") from exc
+    if parsed <= 0:
+        raise ValueError("--sandbox-memory must be greater than zero")
+    return parsed * _MEMORY_MULTIPLIERS.get(suffix, 1)
+
+
+def _parse_http_endpoint(option: str, value: str) -> SplitResult:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{option} must be a valid HTTP or HTTPS URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(f"{option} must be an HTTP or HTTPS URL without credentials, query, or fragment")
+    return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxOptions:
+    """Operator-controlled Docker resources and restricted network endpoints."""
+
+    network: str | None = None
+    memory: str = DEFAULT_SANDBOX_MEMORY
+    cpus: str = DEFAULT_SANDBOX_CPUS
+    proxy: str | None = None
+    no_proxy: str | None = None
+    pypi_index: str | None = None
+    npm_registry: str | None = None
+    cargo_index: str | None = None
+    go_proxy: str | None = None
+    go_sumdb: str | None = None
+    datasets: Path | None = None
+    ca_certificate: Path | None = None
+
+    def __post_init__(self) -> None:
+        _parse_memory(self.memory)
+        try:
+            cpus = float(self.cpus)
+        except ValueError as exc:
+            raise ValueError("--sandbox-cpus must be a positive number") from exc
+        if not math.isfinite(cpus) or cpus <= 0:
+            raise ValueError("--sandbox-cpus must be greater than zero")
+        if self.network is not None and (not self.network or self.network != self.network.strip()):
+            raise ValueError("--sandbox-network must be a non-empty Docker network name without surrounding spaces")
+        if self.network in _ROUTED_DOCKER_NETWORKS or (self.network or "").startswith("container:"):
+            raise ValueError("--sandbox-network must name a user-defined internal Docker network")
+        endpoints = (
+            self.proxy,
+            self.no_proxy,
+            self.pypi_index,
+            self.npm_registry,
+            self.cargo_index,
+            self.go_proxy,
+            self.go_sumdb,
+            self.ca_certificate,
+        )
+        if any(endpoints) and self.network is None:
+            raise ValueError("sandbox proxy, registry, and CA settings require --sandbox-network")
+        if self.datasets is not None and not self.datasets.is_dir():
+            raise ValueError(f"sandbox dataset directory does not exist or is not a directory: {self.datasets}")
+        if self.ca_certificate is not None and not self.ca_certificate.is_file():
+            raise ValueError(f"sandbox CA certificate does not exist or is not a file: {self.ca_certificate}")
+        if self.pypi_index:
+            _parse_http_endpoint("--sandbox-pypi-index", self.pypi_index)
+        if self.cargo_index:
+            cargo_endpoint = self.cargo_index.removeprefix("sparse+")
+            _parse_http_endpoint("--sandbox-cargo-index", cargo_endpoint)
+            if self.cargo_index.startswith("sparse+") and not self.cargo_index.endswith("/"):
+                raise ValueError("--sandbox-cargo-index sparse registry URLs must end with a slash")
+
+    @property
+    def requires_docker(self) -> bool:
+        return (
+            self.network is not None
+            or self.datasets is not None
+            or self.ca_certificate is not None
+            or _parse_memory(self.memory) != _parse_memory(DEFAULT_SANDBOX_MEMORY)
+            or float(self.cpus) != float(DEFAULT_SANDBOX_CPUS)
+        )
+
+    def environment(self) -> dict[str, str]:
+        env: dict[str, str] = {}
+        if self.proxy:
+            env.update(
+                {
+                    "HTTP_PROXY": self.proxy,
+                    "HTTPS_PROXY": self.proxy,
+                    "http_proxy": self.proxy,
+                    "https_proxy": self.proxy,
+                }
+            )
+        if self.no_proxy:
+            env.update({"NO_PROXY": self.no_proxy, "no_proxy": self.no_proxy})
+        if self.pypi_index:
+            env.update({"UV_DEFAULT_INDEX": self.pypi_index, "PIP_INDEX_URL": self.pypi_index})
+            parsed_index = _parse_http_endpoint("--sandbox-pypi-index", self.pypi_index)
+            if parsed_index.scheme == "http":
+                env.update({"UV_INSECURE_HOST": parsed_index.netloc, "PIP_TRUSTED_HOST": parsed_index.netloc})
+        if self.npm_registry:
+            env["NPM_CONFIG_REGISTRY"] = self.npm_registry
+        if self.cargo_index:
+            env["CARGO_HOME"] = CARGO_HOME
+        if self.go_proxy:
+            env["GOPROXY"] = self.go_proxy
+        if self.go_sumdb:
+            env["GOSUMDB"] = self.go_sumdb
+        if self.ca_certificate:
+            env.update(
+                {
+                    "SSL_CERT_FILE": EGRESS_CA_PATH,
+                    "REQUESTS_CA_BUNDLE": EGRESS_CA_PATH,
+                    "CURL_CA_BUNDLE": EGRESS_CA_PATH,
+                    "GIT_SSL_CAINFO": EGRESS_CA_PATH,
+                    "NODE_EXTRA_CA_CERTS": EGRESS_CA_PATH,
+                    "CARGO_HTTP_CAINFO": EGRESS_CA_PATH,
+                }
+            )
+        return env
+
+    def cargo_config(self) -> str | None:
+        if not self.cargo_index:
+            return None
+        registry = json.dumps(self.cargo_index)
+        return f'[source.crates-io]\nreplace-with = "axio-mirror"\n\n[source.axio-mirror]\nregistry = {registry}\n'
+
+    def read_only_volumes(self) -> dict[str, str]:
+        volumes: dict[str, str] = {}
+        if self.datasets:
+            volumes[DATASETS_DIR] = str(self.datasets)
+        if self.ca_certificate:
+            volumes[EGRESS_CA_PATH] = str(self.ca_certificate)
+        return volumes
+
 
 # ast-grep installs its binary as `ast-grep`. `sg` is shadow-utils' setgid
 # helper on Linux and must never be invoked in its place.
@@ -48,16 +214,31 @@ _AST_GREP_DOC = """Structural search: match a code *pattern* by syntax rather th
 # What an agent reaches for first, and what a slim image is least likely to have.
 PROBED_COMMANDS = (
     "python3",
+    "python-data",
     "pip",
-    "git",
-    "make",
     "uv",
+    "node",
+    "npm",
+    "go",
+    "rustc",
+    "cargo",
+    "java",
+    "git",
+    "gh",
+    "glab",
+    "kaggle",
+    "hf",
+    "make",
     "gcc",
     "curl",
     "wget",
     "patch",
     "rg",
     AST_GREP,
+    "jq",
+    "pdftotext",
+    "qpdf",
+    "tesseract",
     "grep",
     "sed",
     "awk",
@@ -155,15 +336,16 @@ async def describe_environment(sandbox: Any, image: str, networking: bool) -> st
     if not present:
         return ""
 
-    lines = [f"Sandbox: docker — image {image}, networking {'on' if networking else 'off'}.", ""]
+    network_state = "restricted to an internal Docker network" if networking else "off"
+    lines = [f"Sandbox: docker — image {image}, networking {network_state}.", ""]
     lines.append(f"Available: {', '.join(present)}")
     if missing:
         lines.append(f"Not installed: {', '.join(missing)}")
         if not networking:
             lines.append(
-                "Networking is off, so none of the missing ones can be added: pip install, apt-get and "
-                "git clone all fail to resolve a host. Solve the task with what is listed, and say so "
-                "plainly when it cannot be done rather than retrying installs."
+                "Networking is off, so none of the missing ones can be added: uv add/sync, npm install, "
+                "cargo add, apt-get and git clone all fail to resolve a host. Solve the task with what is "
+                "listed, and say so plainly when it cannot be done rather than retrying installs."
             )
         if AST_GREP in missing:
             lines.append("The ast_grep tool needs the ast-grep binary, which this image lacks — use search_files.")
@@ -176,6 +358,7 @@ async def build_tools(
     mode: str,
     image: str,
     workspace: Path,
+    options: SandboxOptions | None = None,
 ) -> tuple[list[Tool[Any]], str, Path, str]:
     """Return the toolset, a one-line description, the root the tools see, and
     what the sandbox environment offers.
@@ -183,7 +366,10 @@ async def build_tools(
     In a container the workspace is mounted elsewhere than on the host, and the
     system prompt has to state the path the model can actually act on.
     """
+    options = options or SandboxOptions()
     if mode == "none" or (mode == "auto" and not docker_available()):
+        if options.requires_docker:
+            raise RuntimeError("restricted sandbox settings require Docker, but sandbox execution is unavailable")
         result = [t for t in tools if t.name not in SANDBOX_ONLY_TOOL_NAMES]
         if ast_grep_available():
             result.append(Tool(name="ast_grep", handler=_make_host_ast_grep()))
@@ -191,8 +377,26 @@ async def build_tools(
 
     from axio_tools_docker.sandbox import DockerSandbox
 
+    network: bool | str = options.network if options.network is not None else False
+    read_only_volumes = options.read_only_volumes()
+    cargo_config = options.cargo_config()
+    if cargo_config:
+        cargo_config_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="axio-cargo-config-")))
+        cargo_config_file = cargo_config_dir / "config.toml"
+        cargo_config_file.write_text(cargo_config, encoding="utf-8")
+        read_only_volumes[CARGO_CONFIG_PATH] = str(cargo_config_file)
     sandbox = await stack.enter_async_context(
-        DockerSandbox(image=image, volumes={WORKDIR: str(workspace)}, workdir=WORKDIR, network=False)
+        DockerSandbox(
+            image=image,
+            memory=options.memory,
+            cpus=options.cpus,
+            volumes={WORKDIR: str(workspace)},
+            read_only_volumes=read_only_volumes,
+            workdir=WORKDIR,
+            network=network,
+            env=options.environment(),
+            require_internal_network=options.network is not None,
+        )
     )
     available = {t.name: t for t in sandbox.tools}
     overrides = {t.name: t for t in _make_sandbox_overrides(sandbox)}
@@ -206,5 +410,12 @@ async def build_tools(
     merged.extend(overrides.values())
     for name in SANDBOX_ONLY_TOOL_NAMES & available.keys():
         merged.append(available[name])
-    note = await describe_environment(sandbox, image, networking=False)
-    return merged, f"docker — {image}, no network, {workspace} mounted at {WORKDIR}", Path(WORKDIR), note
+    networking = options.network is not None
+    note = await describe_environment(sandbox, image, networking=networking)
+    network_description = f"internal network {options.network}" if options.network else "no network"
+    return (
+        merged,
+        f"docker — {image}, {network_description}, {workspace} mounted at {WORKDIR}",
+        Path(WORKDIR),
+        note,
+    )

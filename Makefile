@@ -3,8 +3,9 @@ PACKAGES := axio axio-audio axio-context-sqlite axio-repl axio-tools-docker \
             axio-transport-codex axio-transport-google axio-transport-openai \
             axio-tui axio-tui-guards examples/gas_town examples/agent_swarm \
             examples/realtime_smoke examples/realtime_chat
+SANDBOX_IMAGE ?= axio-agent-sandbox:standard
 
-.PHONY: $(PACKAGES) all pytest linter typing test tests test-docs
+.PHONY: $(PACKAGES) all pytest linter typing test tests test-docs sandbox-image
 
 all: linter typing pytest test-docs
 
@@ -22,3 +23,6 @@ test-docs:
 
 test: pytest
 tests: pytest
+
+sandbox-image:
+	docker build --tag $(SANDBOX_IMAGE) docker/agent-sandbox

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/agent-python/.venv/bin/python "$@"

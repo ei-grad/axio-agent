@@ -87,10 +87,16 @@ def mock_docker_factory(
     mock_system = MagicMock()
     mock_system.info = AsyncMock(return_value={})  # daemon available by default
 
+    mock_network = MagicMock()
+    mock_network.show = AsyncMock(return_value={"Internal": True, "Id": "verified-network-id"})
+    mock_networks = MagicMock()
+    mock_networks.get = AsyncMock(return_value=mock_network)
+
     mock_client = MagicMock()
     mock_client.containers = mock_containers
     mock_client.images = mock_images
     mock_client.system = mock_system
+    mock_client.networks = mock_networks
     mock_client.close = AsyncMock()
     mock_client._captured_config = captured_config
 
@@ -389,6 +395,15 @@ async def test_volumes_binds() -> None:
     assert "/host/path:/container/path" in config["HostConfig"]["Binds"]
 
 
+async def test_read_only_volumes_binds() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(read_only_volumes={"/datasets": "/host/datasets"}):
+            pass
+    config = client._captured_config[0]
+    assert "/host/datasets:/datasets:ro" in config["HostConfig"]["Binds"]
+
+
 async def test_named_volumes_binds() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
@@ -479,6 +494,75 @@ async def test_network_mode_string() -> None:
             pass
     config = client._captured_config[0]
     assert config["HostConfig"]["NetworkMode"] == "my-project_default"
+
+
+async def test_required_internal_network_is_verified() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(network="agent-egress", require_internal_network=True):
+            pass
+    client.networks.get.assert_awaited_once_with("agent-egress")
+    assert client._captured_config[0]["HostConfig"]["NetworkMode"] == "verified-network-id"
+
+
+async def test_required_internal_network_unavailable_closes_client() -> None:
+    cls, client, container = mock_docker_factory()
+    client.networks.get = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(RuntimeError, match="is unavailable"):
+            async with DockerSandbox(network="missing", require_internal_network=True):
+                pass
+    client.close.assert_awaited_once()
+    container.start.assert_not_awaited()
+
+
+async def test_required_internal_network_create_race_closes_client() -> None:
+    cls, client, container = mock_docker_factory()
+    client.containers.create = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "network gone"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(aiodocker.exceptions.DockerError):
+            async with DockerSandbox(network="agent-egress", require_internal_network=True):
+                pass
+    client.close.assert_awaited_once()
+    container.start.assert_not_awaited()
+
+
+@pytest.mark.parametrize("network_id", [None, "", "   ", " id-with-spaces ", 42])
+async def test_required_internal_network_rejects_missing_stable_id(network_id: object) -> None:
+    cls, client, container = mock_docker_factory()
+    docker_network = await client.networks.get("agent-egress")
+    docker_network.show = AsyncMock(return_value={"Internal": True, "Id": network_id})
+    client.networks.get.reset_mock()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(RuntimeError, match="no stable ID"):
+            async with DockerSandbox(network="agent-egress", require_internal_network=True):
+                pass
+    client.close.assert_awaited_once()
+    container.start.assert_not_awaited()
+
+
+@pytest.mark.parametrize("internal", [False, None, "true", 1])
+async def test_required_internal_network_rejects_routed_or_malformed_network(internal: object) -> None:
+    cls, client, container = mock_docker_factory()
+    docker_network = await client.networks.get("agent-egress")
+    docker_network.show = AsyncMock(return_value={"Internal": internal, "Id": "routed-network-id"})
+    client.networks.get.reset_mock()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(RuntimeError, match="is not internal"):
+            async with DockerSandbox(network="agent-egress", require_internal_network=True):
+                pass
+    client.close.assert_awaited_once()
+    container.start.assert_not_awaited()
+
+
+def test_required_internal_network_needs_named_network() -> None:
+    with pytest.raises(ValueError, match="named Docker network"):
+        DockerSandbox(network=False, require_internal_network=True)
+
+
+def test_required_internal_network_rejects_named_container_reuse() -> None:
+    with pytest.raises(ValueError, match="named-container reuse"):
+        DockerSandbox(network="agent-egress", name="persistent", require_internal_network=True)
 
 
 async def test_network_mode_host() -> None:
