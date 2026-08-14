@@ -11,6 +11,15 @@ B = ModelSpec(id="b", input_cost=2.0)
 C = ModelSpec(id="c", input_cost=3.0)
 
 
+def test_pricing_availability_distinguishes_known_free_from_unavailable() -> None:
+    known_free = ModelSpec(id="free")
+    unavailable = ModelSpec(id="unavailable", pricing_available=False)
+
+    assert known_free.input_cost == known_free.output_cost == 0.0
+    assert known_free.pricing_available is True
+    assert unavailable.pricing_available is False
+
+
 def test_first_single() -> None:
     reg = ModelRegistry([A])
     assert reg.first() == A

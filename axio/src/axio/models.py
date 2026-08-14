@@ -32,6 +32,7 @@ class ModelSpec:
     context_window: int = 128000
     input_cost: float = 0.0
     output_cost: float = 0.0
+    pricing_available: bool = True
 
 
 class ModelRegistry(MutableMapping[str, ModelSpec]):

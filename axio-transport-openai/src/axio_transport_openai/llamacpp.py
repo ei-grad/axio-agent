@@ -28,6 +28,7 @@ _UNSET_MODEL = ModelSpec(
     id="<not initialized: call fetch_models() first>",
     context_window=0,
     max_output_tokens=0,
+    pricing_available=False,
 )
 _USABLE_ROUTER_STATES = frozenset({"loaded", "sleeping"})
 
@@ -127,6 +128,7 @@ def _parse_model(entry: Mapping[str, Any], props: Mapping[str, Any]) -> ModelSpe
         capabilities=_capabilities(entry, props),
         input_cost=0.0,
         output_cost=0.0,
+        pricing_available=False,
     )
 
 
@@ -251,6 +253,9 @@ class LlamaCppTransport(OpenAITransport):
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, session: aiohttp.ClientSession | None = None) -> Self:
         obj = super().from_dict(data, session=session)
+        obj.models = ModelRegistry(
+            dataclasses.replace(model, pricing_available=False) for model in obj.models.values()
+        )
         obj = dataclasses.replace(
             obj,
             name=str(data.get("name", "llama.cpp")),

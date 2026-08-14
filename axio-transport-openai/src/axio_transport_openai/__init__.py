@@ -772,6 +772,7 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
                     "capabilities": sorted(c.value for c in m.capabilities),
                     "input_cost": m.input_cost,
                     "output_cost": m.output_cost,
+                    "pricing_available": m.pricing_available,
                 }
                 for m in self.models.values()
             ],
@@ -793,6 +794,7 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
                     ),
                     input_cost=float(m.get("input_cost", 0.0)),
                     output_cost=float(m.get("output_cost", 0.0)),
+                    pricing_available=bool(m.get("pricing_available", True)),
                 )
                 for m in data.get("models", [])
             ]

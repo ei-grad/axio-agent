@@ -149,6 +149,7 @@ def test_llama_environment_isolated_from_openai(monkeypatch: pytest.MonkeyPatch)
 
 def test_stream_rejected_before_discovery() -> None:
     transport = LlamaCppTransport()
+    assert transport.model.pricing_available is False
     with pytest.raises(RuntimeError, match="fetch_models"):
         transport.stream([], [], "")
 
@@ -178,6 +179,7 @@ async def test_current_single_model_contract_uses_props_and_v1_models(
     )
     assert Capability.reasoning not in model.capabilities
     assert model.input_cost == model.output_cost == 0.0
+    assert model.pricing_available is False
     assert transport.model is model
     assert [(method, path) for method, path, _, _ in server.requests] == [
         ("GET", "/props"),
@@ -444,8 +446,8 @@ async def test_shared_registry_consumer_resyncs_refreshed_model_metadata(
 
 def test_serialization_round_trip_preserves_active_model_and_empty_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
-    first = ModelSpec(id="first", capabilities=frozenset({Capability.text}))
-    active = ModelSpec(id="active", context_window=32_000, max_output_tokens=2_000)
+    first = ModelSpec(id="first", capabilities=frozenset({Capability.text}), pricing_available=False)
+    active = ModelSpec(id="active", context_window=32_000, max_output_tokens=2_000, pricing_available=False)
     transport = LlamaCppTransport(
         base_url="http://llama.local/v1",
         api_key="",
@@ -458,6 +460,19 @@ def test_serialization_round_trip_preserves_active_model_and_empty_key(monkeypat
     assert restored.base_url == "http://llama.local/v1"
     assert restored.api_key == ""
     assert restored.model is restored.models["active"]
+    assert restored.model.pricing_available is False
+
+
+def test_legacy_serialized_models_do_not_gain_pricing() -> None:
+    restored = LlamaCppTransport.from_dict(
+        {
+            "models": [{"id": "legacy", "input_cost": 0.0, "output_cost": 0.0}],
+            "model": "legacy",
+        }
+    )
+
+    assert restored.model is restored.models["legacy"]
+    assert restored.model.pricing_available is False
 
 
 async def test_subclass_uses_inherited_chat_stream_and_reasoning_parser(

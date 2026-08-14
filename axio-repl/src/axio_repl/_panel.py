@@ -38,12 +38,15 @@ class SessionStats:
 
     Cost is priced at the model in use when the tokens were spent, which is the
     right answer for a spawned agent sharing the parent's model and an
-    approximation for one that does not.
+    approximation for one that does not. Models without applicable pricing
+    still contribute token usage and permanently mark the aggregate cost as
+    incomplete, rather than turning missing prices into zero cost.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    cost_is_complete: bool = True
     context_tokens: int = 0
     per_model: dict[str, Usage] = field(default_factory=dict)
 
@@ -55,8 +58,12 @@ class SessionStats:
             # now: it grows with the conversation and drops when it is compacted.
             self.context_tokens = usage.input_tokens
         if model is None:
+            self.cost_is_complete = False
             return
         self.per_model[model.id] = self.per_model.get(model.id, Usage(0, 0)) + usage
+        if not model.pricing_available:
+            self.cost_is_complete = False
+            return
         self.cost += (usage.input_tokens * model.input_cost + usage.output_tokens * model.output_cost) / 1_000_000
 
 
@@ -112,14 +119,15 @@ def agent_summary(now: float | None = None) -> str:
 
 
 def status_line(model: ModelSpec | None, stats: SessionStats, action_status: str = "") -> str:
-    """The whole line: which model, how full, how much spent, what is running."""
+    """The whole line: model, context, usage, applicable cost, and activity."""
     parts: list[str] = []
     if model is not None:
         parts.append(model.id)
         if model.context_window:
             parts.append(f"ctx {compact(stats.context_tokens)}/{compact(model.context_window)}")
     parts.append(f"{compact(stats.input_tokens)} in / {compact(stats.output_tokens)} out")
-    parts.append(format_cost(stats.cost))
+    if model is not None and model.pricing_available and stats.cost_is_complete:
+        parts.append(format_cost(stats.cost))
     agents = agent_summary()
     if agents:
         parts.append(agents)

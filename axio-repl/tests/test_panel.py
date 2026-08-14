@@ -128,7 +128,40 @@ def test_cost_follows_the_model_that_was_charged() -> None:
     stats.record("child", Usage(1_000_000, 1_000_000), cheap)
 
     assert stats.cost == pytest.approx(0.3 + 1.2 + 0.1 + 0.2)
+    assert stats.cost_is_complete is True
     assert stats.per_model["cheap"] == Usage(1_000_000, 1_000_000)
+
+
+def test_unavailable_pricing_permanently_hides_incomplete_cost_across_model_switches() -> None:
+    stats = _panel.SessionStats()
+    stats.record("main", Usage(1_000_000, 1_000_000), _M3)
+    unpriced_models = (
+        ModelSpec(id="local/one", input_cost=99.0, output_cost=99.0, pricing_available=False),
+        ModelSpec(id="local/two", pricing_available=False),
+    )
+
+    for model in unpriced_models:
+        stats.record("main", Usage(10, 20), model)
+        line = _panel.status_line(model, stats)
+
+        assert model.id in line
+        assert "$" not in line
+        assert stats.cost_is_complete is False
+
+    assert (stats.input_tokens, stats.output_tokens) == (1_000_020, 1_000_040)
+    assert stats.cost == pytest.approx(1.5)
+    priced_line = _panel.status_line(_M3, stats)
+    assert "$" not in priced_line
+
+
+def test_known_free_model_still_displays_zero_cost() -> None:
+    known_free = ModelSpec(id="known-free")
+    stats = _panel.SessionStats()
+    stats.record("main", Usage(1_000, 2_000), known_free)
+    line = _panel.status_line(known_free, stats)
+
+    assert stats.cost_is_complete is True
+    assert "$0" in line
 
 
 def test_usage_without_a_model_still_counts_tokens() -> None:
@@ -137,6 +170,7 @@ def test_usage_without_a_model_still_counts_tokens() -> None:
     stats.record("main", Usage(10, 20), None)
 
     assert (stats.input_tokens, stats.output_tokens, stats.cost) == (10, 20, 0.0)
+    assert stats.cost_is_complete is False
 
 
 def test_counts_stay_short_enough_for_one_line() -> None:
