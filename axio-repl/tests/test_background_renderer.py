@@ -38,7 +38,7 @@ from axio_tools_agents.runtime import (
 )
 
 from axio_repl import ReplRenderer, render_runtime_event, run_prompt
-from axio_repl._multiplexer import DisplayMode
+from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
 
@@ -299,6 +299,44 @@ async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exa
     assert output.index("\n\n") < output.index("agent main · shell stdout")
     assert output.index("shell completed") < output.index("child continues")
     assert output.count("unique sibling line") == 1
+
+
+async def test_suspended_tool_collector_obeys_the_total_retained_byte_cap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    retained_limit = 4096
+    suspended = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_bytes=retained_limit,
+        max_retained_bytes=retained_limit,
+        output_chunk_chars=1_000_000,
+    )
+    renderer = ReplRenderer(suspended_action_multiplexer=suspended)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="agent-call", name="run_agent"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="agent-call", partial_json='{"task":"go"}'))
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell-call", name="shell"))
+    await renderer.render("main", ToolInputDelta(index=1, tool_use_id="shell-call", partial_json="{}"))
+    await renderer.enter_foreground("child", "agent-call")
+    capsys.readouterr()
+
+    for _ in range(10_000):
+        await renderer.render(
+            "main",
+            ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="x" * 1024),
+        )
+
+    assert suspended.retained_bytes <= retained_limit
+    assert suspended.retained_collector_bytes == 0
+    assert suspended.retained_tool_count == 0
+    assert suspended.retained_suppression_bytes > 0
+    assert renderer.retained_action_bytes <= renderer.max_retained_action_bytes
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="shell-call", name="shell", is_error=False, content="done"),
+    )
+    assert suspended.retained_tool_count == 0
+    assert suspended.retained_agent_count == 0
 
 
 async def test_real_run_agent_and_streaming_sibling_preserve_nearest_safe_boundary(

@@ -16,6 +16,7 @@ RESET = "\033[0m"
 _CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_MAX_DISPLAY_COUNT = 999_999_999
 
 
 class DisplayMode(StrEnum):
@@ -66,13 +67,20 @@ class ActionFrame:
 class _ToolAction:
     name: str
     arguments: list[str] = field(default_factory=list)
+    arguments_bytes: int = 0
     call_emitted: bool = False
     output: dict[str, str] = field(default_factory=dict)
+    output_bytes: int = 0
     saw_output: bool = False
+
+    @property
+    def retained_bytes(self) -> int:
+        return len(self.name.encode("utf-8")) + self.arguments_bytes + self.output_bytes
 
 
 @dataclass(slots=True)
 class _AgentCollector:
+    identity_bytes: int
     tools: OrderedDict[str, _ToolAction] = field(default_factory=OrderedDict)
 
 
@@ -113,6 +121,7 @@ class ActionMultiplexer:
         max_agents: int = 256,
         max_tools: int = 512,
         max_tools_per_agent: int = 64,
+        max_retained_bytes: int = 512 * 1024,
     ) -> None:
         if (
             min(
@@ -124,10 +133,20 @@ class ActionMultiplexer:
                 max_agents,
                 max_tools,
                 max_tools_per_agent,
+                max_retained_bytes,
             )
             <= 0
         ):
             raise ValueError("multiplexer limits must be positive")
+        largest_suppression = ActionFrame(
+            agent_id="all agents",
+            kind="suppressed",
+            body="999999999+ action frames suppressed; 999999999+ incomplete actions discarded",
+            sequence=0,
+            critical=True,
+        )
+        if max_retained_bytes < len(largest_suppression.render().encode("utf-8")):
+            raise ValueError("max_retained_bytes is too small for the suppression marker")
         self._mode = mode
         self._max_queued_frames = max_queued_frames
         self._max_queued_bytes = max_queued_bytes
@@ -137,12 +156,14 @@ class ActionMultiplexer:
         self._max_agents = max_agents
         self._max_tools = max_tools
         self._max_tools_per_agent = max_tools_per_agent
+        self._max_retained_bytes = max_retained_bytes
         self._collectors: OrderedDict[str, _AgentCollector] = OrderedDict()
         self._tool_order: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._queues: dict[str, deque[ActionFrame]] = {}
         self._round_robin: deque[str] = deque()
         self._scheduled: set[str] = set()
         self._queued_bytes = 0
+        self._collector_bytes = 0
         self._sequence = 0
         self._suppressed_frames = 0
         self._suppressed_state = 0
@@ -158,6 +179,24 @@ class ActionMultiplexer:
     @property
     def queued_bytes(self) -> int:
         return self._queued_bytes
+
+    @property
+    def max_retained_bytes(self) -> int:
+        return self._max_retained_bytes
+
+    @property
+    def retained_collector_bytes(self) -> int:
+        return self._collector_bytes
+
+    @property
+    def retained_suppression_bytes(self) -> int:
+        if not (self._suppressed_frames or self._suppressed_state):
+            return 0
+        return self._frame_size(self._make_suppression_frame(sequence=0))
+
+    @property
+    def retained_bytes(self) -> int:
+        return self._queued_bytes + self._collector_bytes + self.retained_suppression_bytes
 
     @property
     def retained_agent_count(self) -> int:
@@ -180,7 +219,7 @@ class ActionMultiplexer:
         if mode is previous:
             return DisplayModeChange(previous=previous, current=mode)
         discarded_frames = self.queued_count
-        discarded_bytes = self._queued_bytes
+        discarded_bytes = self.retained_bytes
         self._mode = mode
         self._clear()
         return DisplayModeChange(
@@ -203,81 +242,76 @@ class ActionMultiplexer:
     def observe(self, agent_id: str, event: RuntimeEvent) -> None:  # noqa: C901
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
-        match event:
-            case AgentStarted(name=name, kind=kind):
-                self._enqueue(agent_id, "lifecycle", f"started {name} ({kind})")
-            case TurnStarted():
-                self._enqueue(agent_id, "lifecycle", "turn started")
-            case TurnFinished(status=status, error=error):
-                detail = f"turn {status.value}"
-                if error:
-                    detail += f": {error}"
-                self._enqueue(agent_id, "lifecycle", detail, critical=True)
-                self._remove_collector(agent_id, suppress_incomplete=True)
-            case AgentStopped(status=status):
-                self._enqueue(agent_id, "lifecycle", f"stopped ({status.value})", critical=True)
-                self._remove_collector(agent_id, suppress_incomplete=True)
-            case ToolUseStart(tool_use_id=tool_use_id, name=name):
-                self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name))
-            case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
-                collector = self._collectors.get(agent_id)
-                if collector is None:
+        try:
+            match event:
+                case AgentStarted(name=name, kind=kind):
+                    self._enqueue(agent_id, "lifecycle", f"started {name} ({kind})")
+                case TurnStarted():
+                    self._enqueue(agent_id, "lifecycle", "turn started")
+                case TurnFinished(status=status, error=error):
+                    detail = f"turn {status.value}"
+                    if error:
+                        detail += f": {error}"
+                    self._enqueue(agent_id, "lifecycle", detail, critical=True)
+                    self._remove_collector(agent_id, suppress_incomplete=True)
+                case AgentStopped(status=status):
+                    self._enqueue(agent_id, "lifecycle", f"stopped ({status.value})", critical=True)
+                    self._remove_collector(agent_id, suppress_incomplete=True)
+                case ToolUseStart(tool_use_id=tool_use_id, name=name):
+                    self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name))
+                case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
+                    action = self._touch_tool(agent_id, tool_use_id)
+                    if action is None or action.call_emitted or not partial_json:
+                        return
+                    action.arguments.append(partial_json)
+                    fragment_bytes = len(partial_json.encode("utf-8"))
+                    action.arguments_bytes += fragment_bytes
+                    self._collector_bytes += fragment_bytes
+                    self._emit_call_if_complete(agent_id, action)
+                case ToolOutputDelta(tool_use_id=tool_use_id, key=key, delta=delta):
+                    action = self._touch_tool(agent_id, tool_use_id)
+                    if action is None:
+                        return
+                    self._emit_call(agent_id, action, retained=True)
+                    action.saw_output = True
+                    self._set_output_buffer(action, key, action.output.get(key, "") + delta)
+                    self._emit_complete_output(agent_id, action, key)
+                case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
+                    action = self._pop_tool(agent_id, tool_use_id)
+                    if action is None:
+                        self._enqueue(
+                            agent_id,
+                            "tool error" if is_error else "tool result",
+                            f"{'✗' if is_error else '✓'} {name}\n{content}" if content else name,
+                            critical=True,
+                        )
+                        return
+                    self._emit_call(agent_id, action, retained=False)
+                    for key in tuple(action.output):
+                        self._flush_output(agent_id, action, key)
+                    if is_error:
+                        self._enqueue(agent_id, "tool error", f"✗ {action.name}\n{content}", critical=True)
+                    elif action.saw_output:
+                        self._enqueue(agent_id, "tool result", f"✓ {action.name} completed", critical=True)
+                    else:
+                        suffix = f"\n{content}" if content else ""
+                        self._enqueue(agent_id, "tool result", f"✓ {action.name}{suffix}", critical=True)
+                case Error(exception=exception):
+                    self._enqueue(agent_id, "error", f"{type(exception).__name__}: {exception}", critical=True)
+                case SessionEndEvent(stop_reason=stop_reason):
+                    self._enqueue(agent_id, "lifecycle", f"session ended ({stop_reason.value})", critical=True)
+                    self._remove_collector(agent_id, suppress_incomplete=True)
+                case _:
                     return
-                action = collector.tools.get(tool_use_id)
-                if action is None:
-                    return
-                collector.tools.move_to_end(tool_use_id)
-                self._collectors.move_to_end(agent_id)
-                self._tool_order.move_to_end((agent_id, tool_use_id))
-                action.arguments.append(partial_json)
-                self._emit_call_if_complete(agent_id, action)
-            case ToolOutputDelta(tool_use_id=tool_use_id, key=key, delta=delta):
-                collector = self._collectors.get(agent_id)
-                if collector is None:
-                    return
-                action = collector.tools.get(tool_use_id)
-                if action is None:
-                    return
-                collector.tools.move_to_end(tool_use_id)
-                self._collectors.move_to_end(agent_id)
-                self._tool_order.move_to_end((agent_id, tool_use_id))
-                self._emit_call(agent_id, action)
-                action.saw_output = True
-                action.output[key] = action.output.get(key, "") + delta
-                self._emit_complete_output(agent_id, action, key)
-            case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
-                action = self._pop_tool(agent_id, tool_use_id)
-                if action is None:
-                    self._enqueue(
-                        agent_id,
-                        "tool error" if is_error else "tool result",
-                        f"{'✗' if is_error else '✓'} {name}\n{content}" if content else name,
-                        critical=True,
-                    )
-                    return
-                self._emit_call(agent_id, action)
-                for key in tuple(action.output):
-                    self._flush_output(agent_id, action, key)
-                if is_error:
-                    self._enqueue(agent_id, "tool error", f"✗ {action.name}\n{content}", critical=True)
-                elif action.saw_output:
-                    self._enqueue(agent_id, "tool result", f"✓ {action.name} completed", critical=True)
-                else:
-                    suffix = f"\n{content}" if content else ""
-                    self._enqueue(agent_id, "tool result", f"✓ {action.name}{suffix}", critical=True)
-            case Error(exception=exception):
-                self._enqueue(agent_id, "error", f"{type(exception).__name__}: {exception}", critical=True)
-            case SessionEndEvent(stop_reason=stop_reason):
-                self._enqueue(agent_id, "lifecycle", f"session ended ({stop_reason.value})", critical=True)
-                self._remove_collector(agent_id, suppress_incomplete=True)
-            case _:
-                return
+        finally:
+            self._enforce_retained_limit()
 
     def adopt_tool(self, agent_id: str, tool_use_id: str, name: str) -> None:
         """Collect continuation events for a tool call already shown live."""
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
         self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name, call_emitted=True))
+        self._enforce_retained_limit()
 
     def drain(self, *, max_frames: int = 4, max_bytes: int = 16 * 1024) -> list[str]:
         if min(max_frames, max_bytes) <= 0:
@@ -321,9 +355,16 @@ class ActionMultiplexer:
         except json.JSONDecodeError:
             return
         if isinstance(value, dict):
-            self._emit_call(agent_id, action, arguments=value)
+            self._emit_call(agent_id, action, arguments=value, retained=True)
 
-    def _emit_call(self, agent_id: str, action: _ToolAction, *, arguments: object | None = None) -> None:
+    def _emit_call(
+        self,
+        agent_id: str,
+        action: _ToolAction,
+        *,
+        arguments: object | None = None,
+        retained: bool,
+    ) -> None:
         if action.call_emitted:
             return
         action.call_emitted = True
@@ -340,10 +381,13 @@ class ActionMultiplexer:
         else:
             body = f"▶ {action.name}\narguments: {json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
         self._enqueue(agent_id, "tool call", body)
+        if retained:
+            self._collector_bytes -= action.arguments_bytes
+        action.arguments.clear()
+        action.arguments_bytes = 0
 
     def _emit_complete_output(self, agent_id: str, action: _ToolAction, key: str) -> None:
-        buffer = action.output[key]
-        while buffer:
+        while buffer := action.output.get(key, ""):
             newline = buffer.rfind("\n", 0, self._output_chunk_chars + 1)
             if newline >= 0:
                 end = newline + 1
@@ -352,13 +396,25 @@ class ActionMultiplexer:
             else:
                 break
             self._enqueue(agent_id, f"{action.name} {key}", buffer[:end])
-            buffer = buffer[end:]
-        action.output[key] = buffer
+            self._set_output_buffer(action, key, buffer[end:])
 
     def _flush_output(self, agent_id: str, action: _ToolAction, key: str) -> None:
         buffer = action.output.pop(key, "")
         if buffer:
             self._enqueue(agent_id, f"{action.name} {key}", buffer)
+
+    def _set_output_buffer(self, action: _ToolAction, key: str, value: str) -> None:
+        old = action.output.get(key)
+        old_bytes = 0 if old is None else len(key.encode("utf-8")) + len(old.encode("utf-8"))
+        if value:
+            new_bytes = len(key.encode("utf-8")) + len(value.encode("utf-8"))
+            action.output[key] = value
+        else:
+            new_bytes = 0
+            action.output.pop(key, None)
+        delta = new_bytes - old_bytes
+        action.output_bytes += delta
+        self._collector_bytes += delta
 
     def _enqueue(self, agent_id: str, kind: str, body: object, *, critical: bool = False) -> None:
         agent_id = self._queue_agent_id(agent_id)
@@ -448,69 +504,118 @@ class ActionMultiplexer:
         return bool(self._queues.get(agent_id))
 
     def _remember_tool(self, agent_id: str, tool_use_id: str, action: _ToolAction) -> None:
+        # Eviction can remove the agent's last tool and collector, so make room
+        # before resolving the collector that will receive the new action.
+        self._discard_tool(agent_id, tool_use_id, suppress_incomplete=False)
+        while len(self._tool_order) >= self._max_tools:
+            oldest_agent, oldest_tool_id = next(iter(self._tool_order))
+            self._discard_tool(oldest_agent, oldest_tool_id, suppress_incomplete=True)
+
         collector = self._collectors.get(agent_id)
+        while collector is not None and len(collector.tools) >= self._max_tools_per_agent:
+            oldest_tool_id = next(iter(collector.tools))
+            self._discard_tool(agent_id, oldest_tool_id, suppress_incomplete=True)
+            collector = self._collectors.get(agent_id)
+
         if collector is None:
             while len(self._collectors) >= self._max_agents:
                 oldest_agent = next(iter(self._collectors))
                 self._remove_collector(oldest_agent, suppress_incomplete=True)
-            collector = _AgentCollector()
+            collector = _AgentCollector(identity_bytes=len(agent_id.encode("utf-8")))
             self._collectors[agent_id] = collector
+            self._collector_bytes += collector.identity_bytes
         else:
             self._collectors.move_to_end(agent_id)
 
-        if tool_use_id in collector.tools:
-            collector.tools.pop(tool_use_id)
-            self._tool_order.pop((agent_id, tool_use_id), None)
-        while len(collector.tools) >= self._max_tools_per_agent:
-            oldest_tool_id, _ = collector.tools.popitem(last=False)
-            self._tool_order.pop((agent_id, oldest_tool_id), None)
-            self._suppressed_state += 1
-        while len(self._tool_order) >= self._max_tools:
-            (oldest_agent, oldest_tool_id), _ = self._tool_order.popitem(last=False)
-            oldest_collector = self._collectors.get(oldest_agent)
-            if oldest_collector is not None:
-                oldest_collector.tools.pop(oldest_tool_id, None)
-                if not oldest_collector.tools:
-                    self._collectors.pop(oldest_agent, None)
-            self._suppressed_state += 1
         collector.tools[tool_use_id] = action
         self._tool_order[(agent_id, tool_use_id)] = None
+        self._collector_bytes += len(tool_use_id.encode("utf-8")) + action.retained_bytes
+
+    def _touch_tool(self, agent_id: str, tool_use_id: str) -> _ToolAction | None:
+        collector = self._collectors.get(agent_id)
+        if collector is None:
+            return None
+        action = collector.tools.get(tool_use_id)
+        if action is None:
+            return None
+        collector.tools.move_to_end(tool_use_id)
+        self._collectors.move_to_end(agent_id)
+        self._tool_order.move_to_end((agent_id, tool_use_id))
+        return action
 
     def _pop_tool(self, agent_id: str, tool_use_id: str) -> _ToolAction | None:
         collector = self._collectors.get(agent_id)
         if collector is None:
+            self._tool_order.pop((agent_id, tool_use_id), None)
             return None
         action = collector.tools.pop(tool_use_id, None)
         self._tool_order.pop((agent_id, tool_use_id), None)
+        if action is None:
+            return None
+        self._collector_bytes -= len(tool_use_id.encode("utf-8")) + action.retained_bytes
         if not collector.tools:
             self._collectors.pop(agent_id, None)
+            self._collector_bytes -= collector.identity_bytes
         return action
+
+    def _discard_tool(self, agent_id: str, tool_use_id: str, *, suppress_incomplete: bool) -> None:
+        action = self._pop_tool(agent_id, tool_use_id)
+        if action is not None and suppress_incomplete:
+            self._suppressed_state += 1
 
     def _remove_collector(self, agent_id: str, *, suppress_incomplete: bool) -> None:
         collector = self._collectors.pop(agent_id, None)
-        if collector is None:
-            return
-        for tool_use_id in collector.tools:
+        stale_tool_ids = [tool_use_id for owner, tool_use_id in self._tool_order if owner == agent_id]
+        if collector is not None:
+            self._collector_bytes -= collector.identity_bytes
+            self._collector_bytes -= sum(
+                len(tool_use_id.encode("utf-8")) + action.retained_bytes
+                for tool_use_id, action in collector.tools.items()
+            )
+            stale_tool_ids.extend(tool_use_id for tool_use_id in collector.tools if tool_use_id not in stale_tool_ids)
+        for tool_use_id in stale_tool_ids:
             self._tool_order.pop((agent_id, tool_use_id), None)
         if suppress_incomplete:
-            self._suppressed_state += len(collector.tools)
+            self._suppressed_state += len(stale_tool_ids)
 
-    def _suppression_frame(self) -> ActionFrame:
+    def _suppression_body(self) -> str:
         parts: list[str] = []
         if self._suppressed_frames:
             count = self._suppressed_frames
-            parts.append(f"{count} action frame{'s' if count != 1 else ''} suppressed")
+            shown = str(count) if count <= _MAX_DISPLAY_COUNT else f"{_MAX_DISPLAY_COUNT}+"
+            parts.append(f"{shown} action frame{'s' if count != 1 else ''} suppressed")
         if self._suppressed_state:
             count = self._suppressed_state
-            parts.append(f"{count} incomplete action{'s' if count != 1 else ''} discarded")
-        self._sequence += 1
+            shown = str(count) if count <= _MAX_DISPLAY_COUNT else f"{_MAX_DISPLAY_COUNT}+"
+            parts.append(f"{shown} incomplete action{'s' if count != 1 else ''} discarded")
+        return "; ".join(parts)
+
+    def _make_suppression_frame(self, *, sequence: int) -> ActionFrame:
         return ActionFrame(
             agent_id="all agents",
             kind="suppressed",
-            body="; ".join(parts),
-            sequence=self._sequence,
+            body=self._suppression_body(),
+            sequence=sequence,
             critical=True,
         )
+
+    def _suppression_frame(self) -> ActionFrame:
+        self._sequence += 1
+        return self._make_suppression_frame(sequence=self._sequence)
+
+    def _enforce_retained_limit(self) -> None:
+        while self.retained_bytes > self._max_retained_bytes:
+            # Incomplete collector payload has no durable presentation value;
+            # shed it before queued frames, where critical results are preferred.
+            if self._tool_order:
+                agent_id, tool_use_id = next(iter(self._tool_order))
+                self._discard_tool(agent_id, tool_use_id, suppress_incomplete=True)
+                continue
+            oldest_agent = self._oldest_agent()
+            if oldest_agent is not None:
+                self._drop_front(oldest_agent)
+                continue
+            break
 
     def _queue_agent_id(self, agent_id: str) -> str:
         return _fit_utf8(sanitize_terminal_text(agent_id).replace("\n", " "), 80, suffix="…") or "unknown"
@@ -537,5 +642,6 @@ class ActionMultiplexer:
         self._round_robin.clear()
         self._scheduled.clear()
         self._queued_bytes = 0
+        self._collector_bytes = 0
         self._suppressed_frames = 0
         self._suppressed_state = 0

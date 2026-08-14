@@ -429,6 +429,7 @@ class ReplRenderer:
         current_model: Callable[[], ModelSpec | None] | None = None,
         display_mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
         action_multiplexer: ActionMultiplexer | None = None,
+        suspended_action_multiplexer: ActionMultiplexer | None = None,
         action_boundary_frames: int = 4,
         action_boundary_bytes: int = 16 * 1024,
     ) -> None:
@@ -450,7 +451,7 @@ class ReplRenderer:
         self._actions = action_multiplexer or ActionMultiplexer(display_mode)
         # A parent's sibling tool still belongs to the active turn while a child
         # owns the terminal, so it has an always-on queue separate from background actions.
-        self._suspended_actions = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+        self._suspended_actions = suspended_action_multiplexer or ActionMultiplexer(DisplayMode.ALL_ACTIONS)
         self._suspended_tool_calls: set[tuple[str, str]] = set()
         self._action_boundary_frames = action_boundary_frames
         self._action_boundary_bytes = action_boundary_bytes
@@ -470,6 +471,14 @@ class ReplRenderer:
     @property
     def queued_action_count(self) -> int:
         return self._actions.queued_count + self._suspended_actions.queued_count
+
+    @property
+    def retained_action_bytes(self) -> int:
+        return self._actions.retained_bytes + self._suspended_actions.retained_bytes
+
+    @property
+    def max_retained_action_bytes(self) -> int:
+        return self._actions.max_retained_bytes + self._suspended_actions.max_retained_bytes
 
     def action_status(self) -> str:
         status = f"actions: {self.display_mode.value}"
@@ -1127,7 +1136,7 @@ async def _handle_agent_actions(
         return False
     change = await renderer.set_display_mode(mode)
     detail = ""
-    if change.discarded_frames:
+    if change.discarded_frames or change.discarded_bytes:
         detail = f"; discarded {change.discarded_frames} queued frame(s) ({change.discarded_bytes} bytes)"
     print(f"Agent actions: {BOLD}{mode.value}{RESET}{detail}")
     if change.current is not change.previous and publish is not None:

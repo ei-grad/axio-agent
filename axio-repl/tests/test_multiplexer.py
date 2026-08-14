@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from axio.events import SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
@@ -127,6 +128,83 @@ def test_incomplete_calls_are_globally_bounded_and_terminal_events_cleanup_state
     assert any("stopped (cancelled)" in frame for frame in frames)
 
 
+def test_invalid_partial_input_payload_is_included_in_the_global_retained_byte_cap() -> None:
+    retained_limit = 4096
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_bytes=retained_limit,
+        max_retained_bytes=retained_limit,
+    )
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+
+    for _ in range(10_000):
+        mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="x" * 1024))
+
+    assert mux.queued_bytes == 0
+    assert mux.retained_bytes <= retained_limit
+    assert mux.retained_collector_bytes == 0
+    assert mux.retained_tool_count == 0
+    assert mux.retained_suppression_bytes > 0
+    assert mux.retained_bytes == mux.queued_bytes + mux.retained_suppression_bytes
+    assert "incomplete action discarded" in mux.drain(max_frames=1, max_bytes=retained_limit)[0]
+
+
+def test_incomplete_output_fragments_are_included_in_the_global_retained_byte_cap() -> None:
+    retained_limit = 4096
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_queued_bytes=retained_limit,
+        max_retained_bytes=retained_limit,
+        output_chunk_chars=1_000_000,
+    )
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+
+    for _ in range(10_000):
+        mux.observe(
+            "child",
+            ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="x" * 1024),
+        )
+
+    assert mux.retained_bytes <= retained_limit
+    assert mux.retained_collector_bytes == 0
+    assert mux.retained_tool_count == 0
+    assert mux.retained_suppression_bytes > 0
+    assert mux.retained_bytes == mux.queued_bytes + mux.retained_suppression_bytes
+    assert "incomplete action discarded" in mux.drain(max_frames=1, max_bytes=retained_limit)[0]
+
+
+@pytest.mark.parametrize(
+    ("max_tools", "max_tools_per_agent"),
+    [(1, 2), (2, 1), (1, 1), (2, 3), (3, 2)],
+)
+def test_global_and_per_agent_tool_caps_never_leave_detached_indexes(
+    max_tools: int,
+    max_tools_per_agent: int,
+) -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        max_tools=max_tools,
+        max_tools_per_agent=max_tools_per_agent,
+    )
+    tool_ids = [f"call-{index}" for index in range(6)]
+    for index, tool_use_id in enumerate(tool_ids):
+        mux.observe("child", ToolUseStart(index=index, tool_use_id=tool_use_id, name="shell"))
+
+    assert mux.retained_tool_count <= min(max_tools, max_tools_per_agent)
+    for tool_use_id in tool_ids:
+        mux.observe("child", ToolResult(tool_use_id=tool_use_id, name="shell", is_error=False, content="done"))
+    mux.observe(
+        "child",
+        SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(input_tokens=1, output_tokens=1)),
+    )
+
+    assert mux.retained_tool_count == 0
+    assert mux.retained_agent_count == 0
+    assert mux.retained_collector_bytes == 0
+    assert mux.retained_bytes <= mux.max_retained_bytes
+
+
 def test_session_end_cleans_incomplete_collector_but_keeps_lifecycle_frame() -> None:
     mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
     mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
@@ -177,6 +255,20 @@ def test_toggling_has_no_replay_and_reports_discarded_backlog() -> None:
 
     mux.set_mode(DisplayMode.ALL_ACTIONS)
     assert mux.drain() == []
+
+
+def test_disabling_accounts_for_and_clears_unframed_collector_payload() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="incomplete"))
+    retained = mux.retained_bytes
+
+    assert retained > mux.queued_bytes
+    disabled = mux.set_mode(DisplayMode.ACTIVE_ONLY)
+
+    assert disabled.discarded_bytes == retained
+    assert mux.retained_bytes == 0
+    assert mux.retained_tool_count == 0
 
 
 def test_frames_strip_ansi_osc_and_control_characters() -> None:
