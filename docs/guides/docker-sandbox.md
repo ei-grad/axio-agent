@@ -50,10 +50,10 @@ requires changing only the tool list passed to `Agent`.
 
 | Tool | Description |
 |------|-------------|
-| `shell` | Run a shell command. Returns combined stdout/stderr. Supports `timeout`, `cwd`, and `stdin`. |
+| `shell` | Run a shell command with streaming stdout/stderr. Supports `timeout`, `cwd`, and `stdin`. |
 | `write_file` | Create or overwrite a file. Parent directories are created automatically. Accepts `file_path`, `content`, and optional `mode`. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, and `max_chars` truncation. Binary files return hex. |
-| `list_files` | List directory contents. Directories appear first with a trailing `/`. |
+| `list_files` | List immediate directory entries without reading descendant contents. Directories appear first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess inside the container. Supports `timeout`, `cwd`, and `stdin`. |
 | `patch_file` | Replace lines `from_line`..`to_line` (1-indexed, inclusive). Set `to_line = from_line - 1` to insert without deleting. Always read the file first with `line_numbers=True`. |
 
@@ -539,6 +539,7 @@ call these directly for custom container interaction:
 | Method | Description |
 |--------|-------------|
 | `await sandbox.exec(command, timeout=30, stdin=None)` | Run a shell command; returns stdout/stderr as a string. |
+| `sandbox.exec_stream(command, timeout=30, stdin=None)` | Async iterator yielding `(stdout_or_stderr, text)` chunks while a command runs. |
 | `await sandbox.write_file(path, content, mode=0o644)` | Write a string to a file inside the container. |
 | `await sandbox.read_file_bytes(path)` | Read a file and return raw bytes. |
 | `await sandbox.get_archive(path)` | Fetch a path from the container as a `tarfile.TarFile`. |

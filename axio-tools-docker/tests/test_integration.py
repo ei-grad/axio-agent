@@ -79,6 +79,17 @@ async def test_shell_stdin(sandbox: DockerSandbox) -> None:
     assert "hello from stdin" in result
 
 
+async def test_shell_tool_streams_output(sandbox: DockerSandbox) -> None:
+    tool = next(t for t in sandbox.tools if t.name == "shell")
+    assert tool.supports_streaming
+
+    chunks = [chunk async for chunk in tool.call_streaming(command="printf first; printf second >&2; exit 3")]
+
+    assert ("stdout", "first") in chunks
+    assert ("stderr", "second") in chunks
+    assert ("stderr", "[exit code: 3]") in chunks
+
+
 async def test_write_and_read_file(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/test.txt", "line1\nline2\nline3\n")
     raw = await sandbox.read_file_bytes("/workspace/test.txt")
@@ -118,14 +129,33 @@ async def test_list_files(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/listing/a.py", "x")
     await sandbox.write_file("/workspace/listing/b.txt", "y")
     await sandbox.exec("mkdir -p /workspace/listing/subdir")
+    await sandbox.write_file("/workspace/listing/.hidden", "z")
+    await sandbox.write_file("/workspace/listing/name with\nnewline.txt", "odd")
+    await sandbox.write_file("/workspace/listing/subdir/large.bin", "nested")
+    await sandbox.exec("ln -s missing-target /workspace/listing/dangling")
 
     tool = next(t for t in sandbox.tools if t.name == "list_files")
     result = await tool(path="/workspace/listing")
 
     assert "a.py" in result
     assert "b.txt" in result
+    assert ".hidden" in result
+    assert "name with\nnewline.txt" in result
+    assert "dangling" in result
     assert "subdir/" in result
+    assert "large.bin" not in result
     assert result.index("subdir/") < result.index("a.py")
+
+
+async def test_list_files_directory_with_glob_metacharacters(sandbox: DockerSandbox) -> None:
+    await sandbox.exec("mkdir -p '/workspace/list[odd]'")
+    await sandbox.write_file("/workspace/list[odd]/inside.txt", "content")
+
+    tool = next(t for t in sandbox.tools if t.name == "list_files")
+    result = await tool(path="/workspace/list[odd]")
+
+    assert "inside.txt" in result
+    assert "list[odd]" not in result
 
 
 async def test_patch_file(sandbox: DockerSandbox) -> None:

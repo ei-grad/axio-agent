@@ -61,10 +61,10 @@ These mirror `axio-tools-local` exactly - same names and field schemas:
 
 | Tool | Description |
 |---|---|
-| `shell` | Run a shell command; returns stdout + stderr. Supports `timeout`, `cwd`, `stdin`. |
+| `shell` | Run a shell command with streaming stdout/stderr. Supports `timeout`, `cwd`, `stdin`. |
 | `write_file` | Create or overwrite a file. Parent directories are created automatically. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, `max_chars`. |
-| `list_files` | List a directory; directories first with a trailing `/`. |
+| `list_files` | List immediate directory entries without reading descendant contents; directories first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess. Supports `timeout`, `cwd`, `stdin`. |
 | `patch_file` | Replace lines `from_line`..`to_line` (1-indexed, inclusive). `to_line = from_line - 1` inserts. |
 

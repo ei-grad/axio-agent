@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import io
 import logging
@@ -11,6 +12,7 @@ import shlex
 import stat as stat_module
 import tarfile
 import uuid
+from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any, cast
 
@@ -67,15 +69,52 @@ def parse_device(s: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+class _ShellControl(str):
+    pass
+
+
+type _ShellRecord = tuple[float, str, str]
+
+
+def _format_shell_records(records: list[_ShellRecord]) -> str:
+    stdout = "".join(text for _, key, text in records if key == "stdout" and not isinstance(text, _ShellControl))
+    stderr = "".join(text for _, key, text in records if key == "stderr" and not isinstance(text, _ShellControl))
+    controls = [text for _, _, text in records if isinstance(text, _ShellControl)]
+
+    output = stdout
+    if stderr:
+        output += "\n[stderr]\n" + stderr
+    if controls:
+        output += ("\n" if output else "") + "\n".join(controls)
+    return output.strip() or "(no output)"
+
+
+async def _shell_stream(
+    command: str,
+    timeout: float = 5,
+    cwd: str = ".",
+    stdin: str | None = None,
+) -> AsyncGenerator[tuple[str, str], None]:
+    sandbox: DockerSandbox = CONTEXT.get()
+    resolved = _resolve_path(sandbox.workdir, cwd)
+    cmd = f"cd {shlex.quote(resolved)} && {command}"
+    async for chunk in sandbox.exec_stream(cmd, timeout=timeout, stdin=stdin):
+        yield chunk
+
+
 async def shell(command: str, timeout: float = 5, cwd: str = ".", stdin: str | None = None) -> str:
     """Run a shell command and return combined stdout/stderr. Use for git,
     build tools, grep, tests, or any CLI operation. Non-zero exit codes
     are reported. Optionally pass stdin data for commands that read from
     standard input. Prefer short timeouts and avoid interactive commands."""
-    sandbox: DockerSandbox = CONTEXT.get()
-    resolved = _resolve_path(sandbox.workdir, cwd)
-    cmd = f"cd {shlex.quote(resolved)} && {command}"
-    return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
+    records: list[_ShellRecord] = []
+    async for key, text in _shell_stream(command, timeout, cwd, stdin):
+        records.append((0.0, key, text))
+    return _format_shell_records(records)
+
+
+shell.stream = _shell_stream  # type: ignore[attr-defined]
+shell.format_stream_result = staticmethod(_format_shell_records)  # type: ignore[attr-defined]
 
 
 async def write_file(path: str, content: str, mode: int = 0o644) -> str:
@@ -135,43 +174,97 @@ async def list_files(path: str = ".") -> str:
     reading or editing files."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
+    target = shlex.quote(resolved)
+    command = f"""
+target={target}
+if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    printf 'AXIO_LIST_ERROR\\0missing\\0'
+    exit 0
+fi
+if [ ! -d "$target" ]; then
+    printf 'AXIO_LIST_ERROR\\0not-directory\\0'
+    exit 0
+fi
+if [ ! -r "$target" ] || [ ! -x "$target" ]; then
+    printf 'AXIO_LIST_ERROR\\0permission-denied\\0'
+    exit 0
+fi
+printf 'AXIO_LIST_V3\\0'
+cd "$target" || exit 1
+find . ! -path . -prune -exec sh -c '
+    printf "AXIO_LIST_BATCH\\0%s\\0" "$#"
+    for entry in "$@"; do
+        printf "%s\\0" "$entry"
+    done
+    stat -c "%f %s %Y" -- "$@"
+' sh {{}} +
+"""
+    stdout: list[str] = []
+    stderr: list[str] = []
+    controls: list[str] = []
+    async for key, text in sandbox.exec_stream(command):
+        if isinstance(text, _ShellControl):
+            controls.append(text)
+        elif key == "stdout":
+            stdout.append(text)
+        else:
+            stderr.append(text)
+
+    output = "".join(stdout)
+    if stderr or controls:
+        details = []
+        stderr_text = "".join(stderr).strip()
+        if stderr_text:
+            details.append(stderr_text)
+        details.extend(controls)
+        detail = "; ".join(details) or "command failed"
+        raise HandlerError(f"Failed to list directory {resolved}: {detail}")
+
+    fields = output.split("\0", maxsplit=2)
+    if fields[:2] == ["AXIO_LIST_ERROR", "missing"]:
+        raise HandlerError(f"No such file or directory: {resolved}")
+    if fields[:2] == ["AXIO_LIST_ERROR", "not-directory"]:
+        raise HandlerError(f"Not a directory: {resolved}")
+    if fields[:2] == ["AXIO_LIST_ERROR", "permission-denied"]:
+        raise HandlerError(f"Permission denied: {resolved}")
+    if not output.startswith("AXIO_LIST_V3\0"):
+        raise HandlerError(f"Failed to list directory {resolved}: {output}")
+
+    entries: list[tuple[bool, str, int, float, str]] = []
     try:
-        tar = await sandbox.get_archive(resolved)
-    except FileNotFoundError as exc:
-        raise HandlerError(str(exc)) from exc
+        payload = output.removeprefix("AXIO_LIST_V3\0")
+        while payload:
+            batch_header, count_text, payload = payload.split("\0", maxsplit=2)
+            if batch_header != "AXIO_LIST_BATCH":
+                raise ValueError("invalid batch header")
+            entry_count = int(count_text)
+            if entry_count <= 0:
+                raise ValueError("invalid batch entry count")
+            name_fields = payload.split("\0", maxsplit=entry_count)
+            if len(name_fields) != entry_count + 1:
+                raise ValueError("missing entry names")
+            names = name_fields[:entry_count]
+            payload = name_fields[-1]
+            for full_name in names:
+                metadata, separator, payload = payload.partition("\n")
+                if not separator:
+                    raise ValueError("missing entry metadata")
+                mode_text, size_text, mtime_text = metadata.split()
+                mode = int(mode_text, 16)
+                size = int(size_text)
+                mtime = float(mtime_text)
+                name = os.path.basename(full_name)
+                entries.append((stat_module.S_ISDIR(mode), stat_module.filemode(mode), size, mtime, name))
+    except (ValueError, OverflowError) as exc:
+        raise HandlerError(f"Failed to parse directory listing for {resolved}") from exc
 
-    members = tar.getmembers()
-    if not members:
-        return "(empty directory)"
-
-    prefix = members[0].name.rstrip("/") + "/"
-    entries: list[tarfile.TarInfo] = []
-    for member in members:
-        if not member.name.startswith(prefix):
-            continue
-        rel = member.name[len(prefix) :]
-        if not rel or "/" in rel.rstrip("/"):
-            continue
-        entries.append(member)
-
-    entries.sort(key=lambda m: (not m.isdir(), m.name))
+    entries.sort(key=lambda entry: (not entry[0], entry[4]))
     if not entries:
         return "(empty directory)"
-
-    lines: list[str] = []
-    for m in entries:
-        full_mode = m.mode
-        if m.isdir():
-            full_mode |= stat_module.S_IFDIR
-        elif m.issym():
-            full_mode |= stat_module.S_IFLNK
-        else:
-            full_mode |= stat_module.S_IFREG
-        mode_str = stat_module.filemode(full_mode)
-        mtime = datetime.fromtimestamp(m.mtime).strftime("%b %d %H:%M")
-        base = m.name.rstrip("/").split("/")[-1] + ("/" if m.isdir() else "")
-        lines.append(f"{mode_str} {m.size:>8} {mtime} {base}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"{mode} {size:>8} {datetime.fromtimestamp(mtime).strftime('%b %d %H:%M')} {name}{'/' if is_dir else ''}"
+        for is_dir, mode, size, mtime, name in entries
+    )
 
 
 async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str | None = None) -> str:
@@ -539,17 +632,26 @@ class DockerSandbox:
             await self._client.images.pull(self.image)
             logger.info("Image pulled: %s", self.image)
 
-    async def exec(self, command: str, timeout: float = 30, stdin: str | None = None) -> str:
-        """Execute a shell command inside the container and return its output."""
+    async def _prepare_exec_command(self, command: str, stdin: str | None) -> str:
         assert self._container is not None
-
         if stdin is not None:
             stdin_path = f"/tmp/.axio_stdin_{uuid.uuid4().hex}"
             await self.write_file(stdin_path, stdin)
             # Wrap in a subshell so the redirect applies to the whole command,
             # not just the last simple command when the caller's command already
             # uses semicolons (e.g. RunPython's "; exit $_rc" suffix).
-            command = f"( {command} ) < {stdin_path}; _rc=$?; rm -f {stdin_path}; exit $_rc"
+            return f"( {command} ) < {stdin_path}; _rc=$?; rm -f {stdin_path}; exit $_rc"
+        return command
+
+    async def exec_stream(
+        self,
+        command: str,
+        timeout: float = 30,
+        stdin: str | None = None,
+    ) -> AsyncGenerator[tuple[str, str], None]:
+        """Execute a shell command and yield Docker stdout/stderr frames."""
+        assert self._container is not None
+        command = await self._prepare_exec_command(command, stdin)
 
         exec_obj = await self._container.exec(
             cmd=["sh", "-c", command],
@@ -557,39 +659,50 @@ class DockerSandbox:
             stderr=True,
             tty=False,
         )
-        stdout_parts: list[bytes] = []
-        stderr_parts: list[bytes] = []
-
-        async def consume() -> None:
-            stream = exec_obj.start(detach=False)
-            try:
-                while True:
-                    msg = await stream.read_out()
-                    if msg is None:
-                        break
-                    if msg.stream == 1:
-                        stdout_parts.append(msg.data)
-                    else:
-                        stderr_parts.append(msg.data)
-            finally:
-                await stream.close()
-
+        stream = exec_obj.start(detach=False)
+        decoders: dict[int, codecs.IncrementalDecoder] = {
+            1: codecs.getincrementaldecoder("utf-8")(errors="replace"),
+            2: codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        }
+        timed_out = False
+        deadline = asyncio.get_running_loop().time() + timeout
         try:
-            await asyncio.wait_for(consume(), timeout=timeout)
-        except TimeoutError:
-            return f"[timeout after {timeout}s]"
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                try:
+                    msg = await asyncio.wait_for(stream.read_out(), timeout=max(0.0, remaining))
+                except TimeoutError:
+                    timed_out = True
+                    break
+                if msg is None:
+                    break
+                stream_id = 1 if msg.stream == 1 else 2
+                text = decoders[stream_id].decode(msg.data)
+                if text:
+                    yield ("stdout" if stream_id == 1 else "stderr"), text
+        finally:
+            await stream.close()
+
+        for stream_id, decoder in decoders.items():
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                yield ("stdout" if stream_id == 1 else "stderr"), tail
+
+        if timed_out:
+            yield "stderr", _ShellControl(f"[timeout after {timeout}s]")
+            return
 
         info = await exec_obj.inspect()
         exit_code: int = info["ExitCode"]
-
-        # What a command prints is output to show, not a document to validate:
-        # one stray byte from a locale-confused tool must not lose the rest.
-        output = b"".join(stdout_parts).decode(errors="replace")
-        if stderr_parts:
-            output += "\n[stderr]\n" + b"".join(stderr_parts).decode(errors="replace")
         if exit_code != 0:
-            output += f"\n[exit code: {exit_code}]"
-        return output.strip() or "(no output)"
+            yield "stderr", _ShellControl(f"[exit code: {exit_code}]")
+
+    async def exec(self, command: str, timeout: float = 30, stdin: str | None = None) -> str:
+        """Execute a shell command inside the container and return its output."""
+        records: list[_ShellRecord] = []
+        async for key, text in self.exec_stream(command, timeout=timeout, stdin=stdin):
+            records.append((0.0, key, text))
+        return _format_shell_records(records)
 
     async def write_file(self, path: str, content: str, mode: int = 0o644) -> str:
         """Write a string to a file inside the container."""

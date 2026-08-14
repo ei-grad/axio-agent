@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import tarfile
+from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,6 +33,14 @@ def make_tar_bytes(filename: str, content: bytes) -> bytes:
 
 def make_tar_file(filename: str, content: bytes) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(make_tar_bytes(filename, content)))
+
+
+def make_listing_output(*entries: tuple[str, int, int, str]) -> bytes:
+    fields = ["AXIO_LIST_V3"]
+    if entries:
+        fields.extend(("AXIO_LIST_BATCH", str(len(entries)), *(name for _, _, _, name in entries)))
+    metadata = "".join(f"{mode} {size} {mtime}\n" for mode, size, mtime, _ in entries)
+    return (("\0".join(fields) + "\0") + metadata).encode()
 
 
 def mock_docker_factory(
@@ -349,6 +358,83 @@ async def test_exec_timeout() -> None:
     assert "[timeout after 0.01s]" in result
 
 
+async def test_exec_stream_yields_stdout_stderr_and_exit_status() -> None:
+    cls, client, container = mock_docker_factory(
+        exec_messages=[(1, b"first\n"), (2, b"warning\n"), (1, b"second\n")],
+        exec_exit_code=7,
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            chunks = [chunk async for chunk in sb.exec_stream("mixed")]
+
+    assert chunks == [
+        ("stdout", "first\n"),
+        ("stderr", "warning\n"),
+        ("stdout", "second\n"),
+        ("stderr", "[exit code: 7]"),
+    ]
+    container.exec.return_value.start.return_value.close.assert_awaited_once()
+
+
+async def test_exec_stream_preserves_utf8_split_across_frames() -> None:
+    cls, client, container = mock_docker_factory(exec_messages=[(1, b"price: \xe2"), (1, b"\x82\xac\n")])
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            chunks = [chunk async for chunk in sb.exec_stream("unicode")]
+
+    assert chunks == [("stdout", "price: "), ("stdout", "€\n")]
+
+
+async def test_exec_stream_timeout_does_not_cancel_slow_consumer() -> None:
+    calls = 0
+
+    async def read_out() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            msg = MagicMock()
+            msg.stream = 1
+            msg.data = b"started\n"
+            return msg
+        await asyncio.sleep(999)
+
+    cls, client, container = mock_docker_factory()
+    stream = container.exec.return_value.start.return_value
+    stream.read_out = read_out
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            chunks = sb.exec_stream("slow consumer", timeout=0.01)
+            assert await anext(chunks) == ("stdout", "started\n")
+            await asyncio.sleep(0.02)
+            assert await anext(chunks) == ("stderr", "[timeout after 0.01s]")
+            with pytest.raises(StopAsyncIteration):
+                await anext(chunks)
+
+    stream.close.assert_awaited_once()
+
+
+async def test_shell_tool_streams_and_preserves_final_format() -> None:
+    cls, client, container = mock_docker_factory(
+        exec_messages=[(1, b"first\n"), (2, b"warning\n"), (1, b"second\n")],
+        exec_exit_code=7,
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            tool = next(tool for tool in sb.tools if tool.name == "shell")
+            assert tool.supports_streaming
+            chunks = [chunk async for chunk in tool.call_streaming(command="mixed")]
+            records = [(float(index), key, text) for index, (key, text) in enumerate(chunks)]
+            result = tool.format_stream_result(records)
+
+    assert chunks == [
+        ("stdout", "first\n"),
+        ("stderr", "warning\n"),
+        ("stdout", "second\n"),
+        ("stderr", "[exit code: 7]"),
+    ]
+    assert result == "first\nsecond\n\n[stderr]\nwarning\n\n[exit code: 7]"
+
+
 async def test_exec_stdin_writes_temp_file() -> None:
     """When stdin is provided, a temp file is written before the command."""
     cls, client, container = mock_docker_factory()
@@ -479,14 +565,103 @@ async def test_read_file_handler_missing_path_raises_handler_error() -> None:
 
 
 async def test_list_files_handler_missing_path_raises_handler_error() -> None:
-    cls, client, container = mock_docker_factory()
-    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    cls, client, container = mock_docker_factory(exec_messages=[(1, b"AXIO_LIST_ERROR\0missing\0")])
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
                 with pytest.raises(HandlerError, match="missing_dir"):
                     await sandbox_module.list_files(path="missing_dir")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_list_files_uses_depth_one_exec_without_archive() -> None:
+    output = make_listing_output(
+        ("81a4", 3, 1_700_000_000, "/workspace/project/z.txt"),
+        ("41ed", 4096, 1_700_000_001, "/workspace/project/subdir"),
+        ("81a4", 2, 1_700_000_002, "/workspace/project/.hidden"),
+    )
+    cls, client, container = mock_docker_factory(exec_messages=[(1, output)])
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(workdir="/workspace/project") as sb:
+            token = _bind_context(sb)
+            try:
+                result = await sandbox_module.list_files()
+            finally:
+                CONTEXT.reset(token)
+
+    assert result.index("subdir/") < result.index(".hidden") < result.index("z.txt")
+    assert "drwxr-xr-x" in result
+    assert "-rw-r--r--" in result
+    container.get_archive.assert_not_awaited()
+    command = container.exec.await_args.kwargs["cmd"][2]
+    assert command.count("stat -c") == 1
+    assert 'stat -c "%f %s %Y" -- "$@"' in command
+    assert 'cd "$target"' in command
+    assert "find . ! -path ." in command
+    assert "-prune -exec" in command
+
+
+async def test_list_files_empty_directory() -> None:
+    cls, client, container = mock_docker_factory(exec_messages=[(1, make_listing_output())])
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                result = await sandbox_module.list_files(path="empty")
+            finally:
+                CONTEXT.reset(token)
+    assert result == "(empty directory)"
+
+
+async def test_list_files_malformed_metadata_raises_handler_error() -> None:
+    output = make_listing_output(("not-a-mode", 3, 1_700_000_000, "/workspace/project/broken"))
+    cls, client, container = mock_docker_factory(exec_messages=[(1, output)])
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="parse directory listing"):
+                    await sandbox_module.list_files(path="broken")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_list_files_reports_stderr_instead_of_parsing_it() -> None:
+    output = make_listing_output(("81a4", 3, 1_700_000_000, "/workspace/project/vanished"))
+    cls, client, container = mock_docker_factory(
+        exec_messages=[(1, output), (2, b"stat: cannot stat 'vanished': No such file\n")],
+        exec_exit_code=1,
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="cannot stat 'vanished'"):
+                    await sandbox_module.list_files(path="changing")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_list_files_reports_timeout_instead_of_parsing_partial_output() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+
+            async def timed_out_stream(
+                command: str,
+                timeout: float = 30,
+                stdin: str | None = None,
+            ) -> AsyncGenerator[tuple[str, str], None]:
+                yield "stdout", make_listing_output(("81a4", 3, 1_700_000_000, "/workspace/project/partial")).decode()
+                yield "stderr", sandbox_module._ShellControl("[timeout after 30s]")
+
+            sb.exec_stream = timed_out_stream  # type: ignore[method-assign]
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="timeout after 30s"):
+                    await sandbox_module.list_files(path="wide")
             finally:
                 CONTEXT.reset(token)
 
