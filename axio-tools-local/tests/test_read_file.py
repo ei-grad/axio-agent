@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from axio.blocks import ImageBlock, TextBlock, VideoBlock
+from axio.exceptions import HandlerError
 
 from axio_tools_local.read_file import read_file
 
@@ -140,7 +141,7 @@ class TestReadFileRange:
 class TestReadFileTruncation:
     async def test_default_limit_rejects_large_file(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("a" * 32769)
-        with pytest.raises(ValueError, match="explicit max_chars"):
+        with pytest.raises(HandlerError, match="explicit max_chars"):
             await read_file(path="f.txt")
 
     async def test_truncated_at_max_chars(self, tmp_cwd: Path) -> None:
@@ -173,12 +174,12 @@ class TestReadFileBinary:
 
     async def test_binary_default_limit_rejects_large_file(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "b.dat").write_bytes(b"\xff" * 16385)
-        with pytest.raises(ValueError, match="explicit max_chars"):
+        with pytest.raises(HandlerError, match="explicit max_chars"):
             await read_file(path="b.dat", binary_as_hex=True)
 
     async def test_binary_raises_without_hex(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "b.dat").write_bytes(b"\x80\x81\xff")
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(HandlerError, match="not valid UTF-8"):
             await read_file(path="b.dat", binary_as_hex=False)
 
 
@@ -253,5 +254,9 @@ class TestReadFileVideo:
 
 class TestReadFileMisc:
     async def test_file_not_found(self, tmp_cwd: Path) -> None:
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(HandlerError):
+            await read(tmp_cwd, "nope.txt")
+
+    async def test_file_not_found_message_contains_path(self, tmp_cwd: Path) -> None:
+        with pytest.raises(HandlerError, match="nope.txt"):
             await read(tmp_cwd, "nope.txt")

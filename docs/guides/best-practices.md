@@ -86,6 +86,11 @@ async def calculate(a: float, b: float, operation: str) -> str:
 
 ### Raise HandlerError for expected failures
 
+Raise `HandlerError` when the requested operation did not happen and cannot - a
+missing file, invalid input, a misconfiguration, a connection failure. Return
+ordinary output instead when the operation did happen and merely produced an
+unwelcome result: a timeout report, a nonzero exit code, an empty search.
+
 <!-- name: test_handler_error -->
 ```python
 from pathlib import Path
@@ -99,6 +104,11 @@ async def read_file(path: str) -> str:
         raise HandlerError(f"File not found: {path}")
     return p.read_text()
 ```
+
+Let unexpected exceptions escape rather than dressing them up: Axio wraps them in
+`HandlerCrash`, which the agent logs at `ERROR` with a traceback, while a
+`HandlerError` is logged at `INFO`. Catching a bug and re-raising it as
+`HandlerError` hides it from exactly the log level that would have surfaced it.
 
 ### Use guards for validation
 

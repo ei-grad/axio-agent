@@ -166,20 +166,30 @@ sequenceDiagram
 4. Each guard in the `guards` tuple is called sequentially with the fully materialised kwargs.
 5. Guards return a (possibly modified) kwargs dict to allow, or raise `GuardError` to deny.
 6. The handler is called with the materialised kwargs (stray keys stripped unless handler accepts `**kwargs`).
-7. Any exception from the handler is wrapped in `HandlerError`.
+7. A `HandlerError` raised by the handler propagates unchanged; any other exception escaping
+   the handler is wrapped in `HandlerCrash`. Likewise a guard's `GuardError` propagates
+   unchanged, while any other exception from a guard is wrapped in `GuardCrash`.
+
+Invalid input is an expected failure, not a crash: a value that fails type, `Literal`, or
+bounds validation - and a missing required field - raises a plain `HandlerError` before the
+handler runs at all.
 
 ## Exception hierarchy
 
 ```
 AxioError
 └── ToolError
-    ├── GuardError    # Guard denied or crashed
-    └── HandlerError  # Handler raised during execution
+    ├── GuardError        # Guard denied the call
+    │   └── GuardCrash    # Guard implementation itself failed
+    └── HandlerError      # Expected tool failure, reported to the model
+        └── HandlerCrash  # Unexpected exception escaped the handler
 ```
 
-The agent catches both and wraps the error message in a `ToolResultBlock`
+The agent catches all of them and wraps the error message in a `ToolResultBlock`
 with `is_error=True`, so the model can see what went wrong and retry or
-adjust its approach.
+adjust its approach. The two halves differ only in how they are logged: an
+expected failure is logged at `INFO`, a crash at `ERROR` with a traceback, so a
+tool reporting a missing file does not read like a bug in the agent.
 
 ## ToolSelector
 

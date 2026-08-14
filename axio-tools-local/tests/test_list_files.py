@@ -7,6 +7,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from axio.exceptions import HandlerError
 
 from axio_tools_local.list_files import list_files
 
@@ -59,9 +60,14 @@ class TestListFilesBasic:
         result = await ls("sub")
         assert "inner.txt" in result
 
-    async def test_not_a_directory_raises(self, tmp_cwd: Path) -> None:
-        with pytest.raises(FileNotFoundError):
+    async def test_not_a_directory_raises_when_missing(self, tmp_cwd: Path) -> None:
+        with pytest.raises(HandlerError, match="No such file or directory"):
             await ls("nope")
+
+    async def test_not_a_directory_raises_when_wrong_type(self, tmp_cwd: Path) -> None:
+        (tmp_cwd / "afile.txt").write_text("x")
+        with pytest.raises(HandlerError, match="Not a directory"):
+            await ls("afile.txt")
 
     async def test_shows_permissions(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("x")

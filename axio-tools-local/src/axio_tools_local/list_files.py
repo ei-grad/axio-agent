@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import stat as stat_module
 from datetime import datetime
 from pathlib import Path
 
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
 
@@ -15,8 +18,10 @@ async def list_files(path: StrictStr = ".") -> str:
 
     def _blocking() -> str:
         resolved = Path(os.getcwd()) / path
+        if not resolved.exists():
+            raise HandlerError(f"No such file or directory: {path}")
         if not resolved.is_dir():
-            raise FileNotFoundError(f"{path} is not a valid directory")
+            raise HandlerError(f"Not a directory: {path}")
         lines: list[str] = []
         for fpath in sorted(resolved.glob("*"), key=lambda p: (not p.is_dir(), p.name)):
             try:

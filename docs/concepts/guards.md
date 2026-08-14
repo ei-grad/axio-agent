@@ -26,6 +26,11 @@ A guard receives the `Tool` object and the raw keyword arguments, and must eithe
 - **Return** a `dict` of (possibly modified) kwargs to allow execution.
 - **Raise** `GuardError` to deny execution.
 
+`GuardError` means a deliberate denial. Any other exception escaping a guard is a bug
+in the guard, and Axio wraps it in `GuardCrash` (a subclass of `GuardError`) so the
+agent can log it at `ERROR` with a traceback instead of treating it as a policy decision.
+Either way the call is blocked and the message reaches the model.
+
 ## Guard chain
 
 When a `Tool` has multiple guards, they run **sequentially**. Each guard's

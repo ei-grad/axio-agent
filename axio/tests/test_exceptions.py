@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from axio.exceptions import AxioError, GuardError, HandlerError, StreamError, ToolError
+from axio.exceptions import AxioError, GuardCrash, GuardError, HandlerCrash, HandlerError, StreamError, ToolError
 
 
 class TestHierarchy:
@@ -16,6 +16,16 @@ class TestHierarchy:
 
     def test_handler_error_is_tool_error(self) -> None:
         assert issubclass(HandlerError, ToolError)
+
+    def test_handler_crash_is_handler_error(self) -> None:
+        assert issubclass(HandlerCrash, HandlerError)
+
+    def test_guard_crash_is_guard_error(self) -> None:
+        assert issubclass(GuardCrash, GuardError)
+
+    def test_crashes_are_distinct(self) -> None:
+        assert not issubclass(HandlerError, HandlerCrash)
+        assert not issubclass(GuardError, GuardCrash)
 
     def test_stream_error_is_axio_error(self) -> None:
         assert issubclass(StreamError, AxioError)

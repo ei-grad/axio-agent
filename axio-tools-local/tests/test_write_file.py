@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from axio.exceptions import HandlerError
 
 from axio_tools_local.write_file import write_file
 
@@ -71,6 +72,14 @@ class TestWriteFileBasic:
     async def test_no_trailing_newline_preserved(self, tmp_cwd: Path) -> None:
         await write("f.txt", "no newline")
         assert (tmp_cwd / "f.txt").read_text() == "no newline"
+
+
+class TestWriteFileErrors:
+    async def test_path_through_existing_file_raises(self, tmp_cwd: Path) -> None:
+        """Treating an existing file as a parent directory is an OSError, not a crash."""
+        (tmp_cwd / "notadir").write_text("x")
+        with pytest.raises(HandlerError, match="notadir"):
+            await write("notadir/child.txt", "content")
 
 
 class TestWriteFilePermissions:

@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiodocker
 import pytest
+from axio.exceptions import HandlerError
+from axio.tool import CONTEXT
 
+from axio_tools_docker import sandbox as sandbox_module
 from axio_tools_docker.sandbox import DockerSandbox, ImageNotAvailableError, parse_cpus, parse_device, parse_memory
 
 # ---------------------------------------------------------------------------
@@ -425,6 +428,118 @@ async def test_read_file_bytes_extracts_content() -> None:
         async with DockerSandbox() as sb:
             result = await sb.read_file_bytes("/workspace/hello.py")
     assert result == b"print('hi')"
+
+
+# ---------------------------------------------------------------------------
+# get_archive - missing path is FileNotFoundError, other failures propagate
+# ---------------------------------------------------------------------------
+
+
+async def test_get_archive_404_raises_file_not_found() -> None:
+    cls, client, container = mock_docker_factory()
+    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            with pytest.raises(FileNotFoundError, match="/workspace/missing.txt"):
+                await sb.get_archive("/workspace/missing.txt")
+
+
+async def test_get_archive_non_404_propagates_as_docker_error() -> None:
+    cls, client, container = mock_docker_factory()
+    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(500, "daemon error"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            with pytest.raises(aiodocker.exceptions.DockerError, match="daemon error"):
+                await sb.get_archive("/workspace/whatever.txt")
+
+
+# ---------------------------------------------------------------------------
+# Tool handlers - expected failures raise HandlerError, not raw exceptions
+# ---------------------------------------------------------------------------
+
+
+def _bind_context(sb: DockerSandbox) -> Any:
+    """Set CONTEXT the same way Tool.__call__ does, so handlers can be called
+    directly without going through Tool's own catch-all exception wrapping.
+    """
+    return CONTEXT.set(sb)
+
+
+async def test_read_file_handler_missing_path_raises_handler_error() -> None:
+    cls, client, container = mock_docker_factory()
+    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="missing.txt"):
+                    await sandbox_module.read_file(path="missing.txt")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_list_files_handler_missing_path_raises_handler_error() -> None:
+    cls, client, container = mock_docker_factory()
+    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="missing_dir"):
+                    await sandbox_module.list_files(path="missing_dir")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_patch_file_handler_missing_path_raises_handler_error() -> None:
+    cls, client, container = mock_docker_factory()
+    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="missing.txt"):
+                    await sandbox_module.patch_file(path="missing.txt", from_line=1, to_line=1, content="x")
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_read_file_handler_negative_max_chars_raises_handler_error() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="max_chars"):
+                    await sandbox_module.read_file(path="file.txt", max_chars=-1)
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_read_file_handler_non_utf8_without_hex_raises_handler_error() -> None:
+    tar_file = make_tar_file("bin.dat", b"\x80\x81\xff")
+    cls, client, container = mock_docker_factory(archive_content=tar_file)
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="not valid UTF-8"):
+                    await sandbox_module.read_file(path="bin.dat", binary_as_hex=False)
+            finally:
+                CONTEXT.reset(token)
+
+
+async def test_patch_file_handler_non_utf8_target_raises_handler_error() -> None:
+    tar_file = make_tar_file("bin.dat", b"\x80\x81\xff")
+    cls, client, container = mock_docker_factory(archive_content=tar_file)
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match="not valid UTF-8"):
+                    await sandbox_module.patch_file(path="bin.dat", from_line=1, to_line=1, content="x")
+            finally:
+                CONTEXT.reset(token)
 
 
 # ---------------------------------------------------------------------------

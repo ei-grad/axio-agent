@@ -213,11 +213,25 @@ tool = Tool(
 
 ## Error handling
 
-If your handler raises an exception, Axio wraps it in `HandlerError` and
-sends the error message back to the model as a `ToolResultBlock` with
-`is_error=True`. The model sees the error and can adjust its approach.
+For expected failures, raise `HandlerError` with a clear message. It is sent back
+to the model as a `ToolResultBlock` with `is_error=True`, and the agent logs it at
+`INFO` - an expected failure is ordinary agent control flow, not a defect.
 
-For expected failures, raise `HandlerError` directly with a clear message:
+Any other exception escaping your handler is wrapped in `HandlerCrash` (a subclass of
+`HandlerError`) carrying `"<ExceptionType>: <message>"`. The model still sees it, but
+the agent logs it at `ERROR` with a traceback, because nothing in the tool expected it.
+So the distinction is worth making deliberately: a crash means your tool has a bug or
+hit a case you have not handled.
+
+### Raise or return?
+
+Return ordinary output for a negative but valid outcome - a command that timed out, a
+process that exited nonzero, a search with no matches. The operation happened and its
+result, however unwelcome, is the answer the model asked for.
+
+Raise `HandlerError` when the requested operation did not happen and cannot: a missing
+file, invalid input, a misconfiguration, a connection failure. There is no result to
+report, only a reason.
 
 <!--
 name: test_error_handling

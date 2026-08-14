@@ -97,7 +97,7 @@ Common symbols are importable directly from `axio`:
 
 ```python
 from axio import Agent, Tool, Field, PermissionGuard, IterationEnd
-from axio import StopReason, Usage, GuardError, HandlerError
+from axio import StopReason, Usage, GuardError, GuardCrash, HandlerError, HandlerCrash
 from axio import ContextStore, MemoryContextStore, CompletionTransport
 ```
 
@@ -268,7 +268,8 @@ class Tool[T]:
 1. Acquire semaphore (if `concurrency` is set)
 2. Field validation from type hints / `FieldInfo`
 3. Guards run **sequentially**: each receives `(tool, **kwargs)` and returns modified kwargs or raises `GuardError`
-4. `await handler(**kwargs)` - execute handler
+4. `await handler(**kwargs)` - execute handler; an unexpected exception from either step is
+   wrapped in `HandlerCrash` / `GuardCrash`
 
 ### ContextStore (`axio/context.py`)
 
@@ -331,14 +332,26 @@ class ToolError(AxioError):
     """Base for tool-related errors."""
 
 class GuardError(ToolError):
-    """Guard denied or crashed during permission check."""
+    """Guard denied the tool call."""
+
+class GuardCrash(GuardError):
+    """A guard implementation crashed, as opposed to deliberately denying."""
 
 class HandlerError(ToolError):
-    """Handler raised during execution."""
+    """Expected tool failure, reported to the model."""
+
+class HandlerCrash(HandlerError):
+    """An unexpected exception escaped a tool handler."""
 
 class StreamError(AxioError):
     """Error during stream collection."""
 ```
+
+`Tool` raises the `*Crash` variants itself when an exception escapes a handler or a guard;
+a `HandlerError`/`GuardError` raised deliberately propagates unchanged, and so does the
+`HandlerError` produced by input validation. Agent tool dispatch turns every one of them
+into `ToolResultBlock(is_error=True)`, logging expected failures at `INFO` and crashes at
+`ERROR` with a traceback.
 
 ### Testing (`axio/testing.py`)
 

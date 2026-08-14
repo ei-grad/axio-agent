@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import TextIO
 
+from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
 type OutputRecord = tuple[float, str, str]
@@ -229,8 +230,7 @@ async def _shell_stream(
 ) -> AsyncGenerator[tuple[str, str], None]:
     """Yield ``(key, text)`` tuples where *key* is ``"stdout"`` or ``"stderr"``."""
     if max_output_chars < 0:
-        yield ("stderr", "[error: max_output_chars must be >= 0]")
-        return
+        raise HandlerError("max_output_chars must be >= 0")
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -242,8 +242,7 @@ async def _shell_stream(
             start_new_session=True,
         )
     except OSError as exc:
-        yield ("stderr", f"[error: {exc}]")
-        return
+        raise HandlerError(f"Failed to start shell command: {exc}") from exc
 
     if stdin is not None:
         assert proc.stdin is not None

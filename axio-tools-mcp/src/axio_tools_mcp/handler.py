@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from axio.exceptions import HandlerError
 from mcp.types import TextContent
 
 from .session import MCPSession
@@ -26,7 +27,7 @@ def build_handler(
         result = await session.call_tool(mcp_tool_name, kwargs)
         if result.isError:
             parts = [c.text for c in result.content if isinstance(c, TextContent)]
-            raise RuntimeError("\n".join(parts) or "MCP tool error")
+            raise HandlerError("\n".join(parts) or "MCP tool error")
         parts = [c.text for c in result.content if isinstance(c, TextContent)]
         return "\n".join(parts) or ""
 
