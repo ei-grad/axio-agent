@@ -476,7 +476,7 @@ class OpenAITransport(CompletionTransport, EmbeddingTransport):
     name: str = "OpenAI"
     base_url: str = field(default_factory=lambda: os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
     api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
-    model: ModelSpec = field(default_factory=lambda: OPENAI_MODELS["gpt-4.1-mini"])
+    model: ModelSpec = field(default_factory=lambda: OPENAI_MODELS["gpt-5.6-terra"])
     models: ModelRegistry = field(default_factory=lambda: ModelRegistry(OPENAI_MODELS.values()))
     session: aiohttp.ClientSession | None = field(default=None, repr=False, compare=False)
     max_retries: int = 10

@@ -1015,6 +1015,10 @@ def test_openai_models_is_registry() -> None:
     assert "gpt-4.1-mini" in OPENAI_MODELS
 
 
+def test_default_model_is_terra() -> None:
+    assert OpenAITransport().model is OPENAI_MODELS["gpt-5.6-terra"]
+
+
 def test_openai_models_have_costs() -> None:
     for model_id, spec in OPENAI_MODELS.items():
         assert spec.input_cost > 0, f"{model_id} has no input_cost"

@@ -199,7 +199,10 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     assert len(interrupts) == 2
 
 
-async def test_escape_interrupts_and_sends_while_enter_only_sends() -> None:
+async def test_escape_interrupts_and_sends_while_enter_only_sends(
+    tmp_path: Path,
+    repl_history_path: Path,
+) -> None:
     # Enter is "and then this", which belongs after the answer being written.
     # Escape is "stop, do this instead", worth nothing once the thing being
     # stopped has finished.
@@ -227,16 +230,18 @@ async def test_escape_interrupts_and_sends_while_enter_only_sends() -> None:
             assert await session.prompt_async("repl> ") == ""
             assert len(interrupts) == 2
 
+    assert repl_history_path == tmp_path / "history"
+    history = repl_history_path.read_text()
+    assert "sent with enter" in history
+    assert "stop, do this" in history
 
-async def test_up_recalls_the_last_message_for_editing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+async def test_up_recalls_the_last_message_for_editing(repl_history_path: Path) -> None:
     from typing import Any
 
     from prompt_toolkit.application import create_app_session
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
-
-    # Never the user's own history file.
-    monkeypatch.setattr(_panel, "HISTORY_PATH", tmp_path / "history")
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
@@ -248,3 +253,7 @@ async def test_up_recalls_the_last_message_for_editing(tmp_path: Path, monkeypat
             pipe.send_text("\x1b[A")
             pipe.send_text(" and more\x1b")
             assert await session.prompt_async("repl> ") == "first message and more"
+
+    history = repl_history_path.read_text()
+    assert "first message" in history
+    assert "first message and more" in history
