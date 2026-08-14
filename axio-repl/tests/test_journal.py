@@ -231,6 +231,97 @@ async def test_one_shot_background_report_is_displayed_exactly_once_without_pros
         assert "agent one-shot-child" in output
 
 
+async def test_one_shot_root_stdout_keeps_the_unlabelled_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await _run_stub_one_shot(monkeypatch, tmp_path, "--no-session-log")
+
+    output = capsys.readouterr().out
+    assert "stub answer" in output
+    assert "── agent axio-repl (main) ──" not in output
+
+
+@pytest.mark.parametrize("agent_actions", ["off", "on"])
+async def test_one_shot_background_failure_reason_has_one_visible_delivery_and_reaches_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    agent_actions: str,
+) -> None:
+    import axio_repl
+
+    unique_failure = "Stopped after 2 iterations without finishing"
+    parent_prompts: list[str] = []
+
+    class BackgroundFailureTransport(_OneShotTransport):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.parent_calls = 0
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del system
+            if not any(tool.name == "spawn_agent" for tool in tools):
+                yield IterationEnd(
+                    iteration=1,
+                    stop_reason=StopReason.tool_use,
+                    usage=Usage(input_tokens=1, output_tokens=0),
+                )
+                return
+            self.parent_calls += 1
+            parent_prompts.extend(
+                block.text
+                for message in messages
+                if message.role == "user"
+                for block in message.content
+                if isinstance(block, TextBlock)
+            )
+            if self.parent_calls == 1:
+                for event in make_tool_use_response(
+                    "spawn_agent",
+                    tool_id="spawn-call",
+                    tool_input={"task": "fail once", "name": "failing-child"},
+                ):
+                    yield event
+                return
+            yield TextDelta(index=0, delta="parent handled failure")
+            yield IterationEnd(
+                iteration=self.parent_calls,
+                stop_reason=StopReason.end_turn,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (BackgroundFailureTransport, ""))
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "axio-repl",
+            "delegate failure",
+            "--sandbox",
+            "none",
+            "--agent-actions",
+            agent_actions,
+            "--max-iterations",
+            "2",
+            "--no-session-log",
+        ],
+    )
+
+    await main()
+
+    captured = capsys.readouterr()
+    assert captured.out.count(unique_failure) == 1
+    assert unique_failure not in captured.err
+    assert any(unique_failure in prompt for prompt in parent_prompts)
+
+
 def test_default_root_and_session_directory_follow_xdg() -> None:
     configured = default_journal_root(environ={"XDG_STATE_HOME": "/var/tmp/state"})
     fallback = default_journal_root(environ={"XDG_STATE_HOME": "relative"}, home=Path("/home/tester"))

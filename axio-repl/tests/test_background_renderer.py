@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import re
 from collections.abc import AsyncIterator
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
 import pytest
@@ -25,10 +26,11 @@ from axio.events import (
 from axio.messages import Message
 from axio.tool import Tool
 from axio.types import StopReason, Usage
-from axio_tools_agents.peers import run_agent, set_run_agent_factory, set_session_event_hub
+from axio_tools_agents.peers import PeerMessage, run_agent, set_run_agent_factory, set_session_event_hub
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     AgentStarted,
+    AgentStopped,
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
@@ -39,7 +41,7 @@ from axio_tools_agents.runtime import (
     TurnStatus,
 )
 
-from axio_repl import ReplRenderer, render_runtime_event, run_prompt
+from axio_repl import ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
@@ -307,6 +309,73 @@ async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pyt
     assert "foreground agent researcher (child-id) returned its result to the parent" in output
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "main"
+
+
+async def test_foreground_result_suppression_does_not_cross_parent_turns_when_tool_ids_repeat(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(turn_id: str, event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="parent-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=turn_id,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope("parent-turn-1", TurnStarted(prompt="delegate")))
+    await render_runtime_event(
+        renderer,
+        envelope("parent-turn-1", ToolUseStart(index=0, tool_use_id="reused-call", name="run_agent")),
+    )
+    child = AgentEventEnvelope(
+        seq=2,
+        session_id="session",
+        run_id="child-run",
+        agent_id="child",
+        parent_agent_id="main",
+        turn_id="child-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id="reused-call",
+        event=ForegroundEntered(parent_agent_id="main"),
+    )
+    await render_runtime_event(renderer, child)
+    await render_runtime_event(
+        renderer,
+        dataclasses.replace(child, event=ForegroundExited(status=TurnStatus.SUCCEEDED)),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "parent-turn-1",
+            TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="cancelled"),
+        ),
+    )
+    capsys.readouterr()
+
+    await render_runtime_event(renderer, envelope("parent-turn-2", TurnStarted(prompt="retry")))
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "parent-turn-2",
+            ToolResult(
+                tool_use_id="reused-call",
+                name="shell",
+                is_error=False,
+                content="unrelated result",
+            ),
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert "unrelated result" in output
+    assert "foreground agent" not in output
 
 
 async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exactly_once(
@@ -595,14 +664,117 @@ async def test_focused_final_reply_is_not_replayed_by_incoming_delivery(
             )
         ),
     )
+    await render_runtime_event(
+        renderer,
+        envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
+    )
+    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+        "child-id", "child-run", "focused-turn"
+    )
     await renderer.incoming(
         "Report from background agent analyst (child-id):\n\nunique focused final",
         agent_id="child-id",
-        turn_id="focused-turn",
+        agent_name=agent_name,
+        suppress_display=suppress_display,
     )
 
     output = capsys.readouterr().out
     assert output.count("unique focused final") == 1
+    assert "incoming from agent analyst (child-id)" not in output
+
+
+async def test_focusing_a_running_hidden_turn_keeps_the_whole_turn_background(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child-id",
+            parent_agent_id="main",
+            turn_id="child-turn",
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(AgentStarted(name="analyst", kind="spawned-agent")))
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="hidden prefix ")))
+    renderer.set_focus("child-id")
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="hidden suffix")))
+    await render_runtime_event(
+        renderer,
+        envelope(SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(1, 1))),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
+    )
+    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+        "child-id", "child-run", "child-turn"
+    )
+    await renderer.incoming(
+        "Report from background agent analyst (child-id):\n\nhidden prefix hidden suffix",
+        agent_id="child-id",
+        agent_name=agent_name,
+        suppress_display=suppress_display,
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("hidden prefix hidden suffix") == 1
+    assert "── agent analyst (child-id) ──" not in output
+    assert "incoming from agent analyst (child-id)" in output
+
+
+async def test_focusing_away_from_a_running_live_turn_keeps_the_whole_turn_live(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="child-run",
+            agent_id="child-id",
+            parent_agent_id="main",
+            turn_id="child-turn",
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope(AgentStarted(name="analyst", kind="spawned-agent")))
+    renderer.set_focus("child-id")
+    await render_runtime_event(renderer, envelope(TurnStarted(prompt="inspect")))
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="live prefix ")))
+    renderer.set_focus("main")
+    await render_runtime_event(renderer, envelope(TextDelta(index=0, delta="live suffix")))
+    await render_runtime_event(
+        renderer,
+        envelope(SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(1, 1))),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
+    )
+    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+        "child-id", "child-run", "child-turn"
+    )
+    await renderer.incoming(
+        "Report from background agent analyst (child-id):\n\nlive prefix live suffix",
+        agent_id="child-id",
+        agent_name=agent_name,
+        suppress_display=suppress_display,
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("live prefix live suffix") == 1
+    assert output.count("── agent analyst (child-id) ──") == 1
     assert "incoming from agent analyst (child-id)" not in output
 
 
@@ -667,23 +839,7 @@ async def test_actions_off_failure_uses_one_canonical_summary(
 
     output = capsys.readouterr().out
     assert output.count("[background agent analyst (child-id) completed") == 1
-    assert output.count("child failed") == 1
-
-
-async def test_a_background_failure_is_reported_with_its_reason(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # "errors=1" says something went wrong and not what, which is the half that
-    # decides whether to retry, fix, or give up.
-    renderer = ReplRenderer()
-
-    await renderer.render("child", Error(exception=RuntimeError("Stopped after 25 iterations")))
-    await renderer.render(
-        "child",
-        SessionEndEvent(stop_reason=StopReason.error, total_usage=Usage(input_tokens=1, output_tokens=0)),
-    )
-
-    assert "Stopped after 25 iterations" in capsys.readouterr().out
+    assert "child failed" not in output
 
 
 async def test_all_actions_uses_a_labelled_error_frame_instead_of_the_legacy_summary(
@@ -697,8 +853,128 @@ async def test_all_actions_uses_a_labelled_error_frame_instead_of_the_legacy_sum
 
     output = capsys.readouterr().out
     assert "agent child · error" in output
-    assert "RuntimeError: child failed" in output
+    assert "agent stream failed" in output
+    assert "child failed" not in output
     assert "[background" not in output
+
+
+async def test_error_only_turn_is_self_labelled_on_stderr_without_a_stdout_header() -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    renderer = ReplRenderer(main_agent_name="axio-repl")
+    envelope = AgentEventEnvelope(
+        seq=1,
+        session_id="session",
+        run_id="main-run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id="error-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id=None,
+        event=TurnStarted(prompt="fail"),
+    )
+
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        await render_runtime_event(renderer, envelope)
+        assert stdout.getvalue() == ""
+        await render_runtime_event(
+            renderer,
+            dataclasses.replace(envelope, event=Error(exception=RuntimeError("boom"))),
+        )
+        await render_runtime_event(
+            renderer,
+            dataclasses.replace(
+                envelope,
+                event=SessionEndEvent(stop_reason=StopReason.error, total_usage=Usage(1, 0)),
+            ),
+        )
+
+    assert stdout.getvalue() == ""
+    assert "Error from agent axio-repl (main): boom" in stderr.getvalue()
+
+
+async def test_error_after_stdout_keeps_both_source_attributions() -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    renderer = ReplRenderer(main_agent_name="axio-repl")
+    envelope = AgentEventEnvelope(
+        seq=1,
+        session_id="session",
+        run_id="main-run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id="partial-error-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id=None,
+        event=TurnStarted(prompt="fail later"),
+    )
+
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        await render_runtime_event(renderer, envelope)
+        await render_runtime_event(renderer, dataclasses.replace(envelope, event=TextDelta(0, "partial")))
+        await render_runtime_event(
+            renderer,
+            dataclasses.replace(envelope, event=Error(exception=RuntimeError("later boom"))),
+        )
+
+    assert stdout.getvalue().count("── agent axio-repl (main) ──") == 1
+    assert stdout.getvalue().endswith("partial")
+    assert "Error from agent axio-repl (main): later boom" in stderr.getvalue()
+
+
+async def test_agent_lifecycle_and_incoming_labels_do_not_grow_renderer_state() -> None:
+    renderer = ReplRenderer(max_identity_cache=16)
+
+    for index in range(2_000):
+        agent_id = f"child-{index}"
+        base = AgentEventEnvelope(
+            seq=index * 2,
+            session_id="session",
+            run_id=f"run-{index}",
+            agent_id=agent_id,
+            parent_agent_id="main",
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+            parent_tool_use_id="spawn-call",
+            event=AgentStarted(name=f"worker-{index}", kind="spawned-agent"),
+        )
+        await render_runtime_event(renderer, base)
+        await render_runtime_event(
+            renderer,
+            dataclasses.replace(base, event=AgentStopped(status=TurnStatus.SUCCEEDED)),
+        )
+
+    state_count = renderer.retained_agent_state_count
+    identity_count = renderer.retained_identity_count
+    await renderer.incoming("hello", agent_id="unregistered", agent_name="external")
+
+    assert state_count == 1
+    assert renderer.retained_agent_state_count == state_count
+    assert identity_count <= 16
+    assert renderer.retained_identity_count == identity_count
+
+
+def test_peer_identity_is_sanitized_for_display_without_mutating_parent_payload() -> None:
+    raw_name = "analyst\x1b[31m\nnext\tname\x9b2J"
+    raw_id = "peer\x1b]2;owned\x07\x85id\x9dtitle\x9c"
+    message = PeerMessage(
+        id="message",
+        from_id=raw_id,
+        from_name=raw_name,
+        to_id="main",
+        body="body",
+        sent_at=1.0,
+    )
+
+    prompt = _peer_incoming_prompt(message)
+
+    assert raw_name in prompt.text
+    assert raw_id in prompt.text
+    assert prompt.display_text is not None
+    metadata = prompt.display_text.split(":\n\n", 1)[0]
+    assert "analyst next name (peer id)" in metadata
+    assert not any(ord(character) < 32 or 0x7F <= ord(character) <= 0x9F for character in metadata)
+    assert "\x1b" not in metadata
 
 
 async def test_a_half_written_line_waits_while_the_prompt_is_up(

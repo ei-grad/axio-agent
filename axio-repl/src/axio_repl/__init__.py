@@ -18,6 +18,7 @@ import os
 import shutil
 import signal
 import sys
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from importlib.metadata import entry_points
@@ -411,7 +412,6 @@ def build_system_prompt(
 
 class _AgentRenderState:
     def __init__(self) -> None:
-        self.agent_name: str | None = None
         self.in_text = False
         self.in_reasoning = False
         self.arg_streams: dict[str, ToolArgStream] = {}
@@ -421,13 +421,64 @@ class _AgentRenderState:
         self.field_first_delta = True
         self.field_key: str | None = None
         self.background_text: list[str] = []
-        self.background_reported_chars = 0
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
-        self.background_terminal_seen = False
         self.paragraph_newline_pending = False
-        self.header_turn_id: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TurnKey:
+    agent_id: str
+    run_id: str
+    turn_id: str
+
+
+@dataclasses.dataclass(slots=True)
+class _TurnPresentation:
+    key: _TurnKey
+    execution_mode: ExecutionMode
+    live: bool
+    agent_name: str | None
+    header_emitted: bool = False
+    stdout_started: bool = False
+    error_seen: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BackgroundSummary:
+    identity: str
+    reported_chars: int
+    tools: tuple[str, ...]
+    failed: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _CompletedBackgroundTurn:
+    agent_name: str | None
+    suppress_display: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ParentToolKey:
+    parent_agent_id: str
+    parent_run_id: str
+    parent_turn_id: str
+    tool_use_id: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ForegroundCall:
+    parent_key: _ParentToolKey
+    child_agent_id: str
+    child_agent_name: str | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ForegroundResult:
+    child_agent_id: str
+    child_agent_name: str | None
+    status: TurnStatus
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -436,7 +487,17 @@ class _IncomingPrompt:
     display_text: str | None = None
     agent_id: str | None = None
     agent_name: str | None = None
-    turn_id: str | None = None
+    suppress_display: bool = False
+
+
+def _peer_incoming_prompt(message: PeerMessage) -> _IncomingPrompt:
+    identity = format_agent_identity(message.from_id, message.from_name)
+    return _IncomingPrompt(
+        text=format_message_for_dialog(message),
+        display_text=f"Peer message from {identity}:\n\n{message.body}",
+        agent_id=message.from_id,
+        agent_name=normalize_agent_name(message.from_name),
+    )
 
 
 class ReplRenderer:
@@ -451,23 +512,33 @@ class ReplRenderer:
         suspended_action_multiplexer: ActionMultiplexer | None = None,
         action_boundary_frames: int = 4,
         action_boundary_bytes: int = 16 * 1024,
+        show_main_turn_headers: bool = True,
+        max_identity_cache: int = 256,
     ) -> None:
+        if max_identity_cache < 2:
+            raise ValueError("max_identity_cache must be at least 2")
         self._lock = asyncio.Lock()
         # Every agent's events pass through here, which makes this the one place
         # that sees the whole session's spend.
         self._stats = stats
         self._current_model = current_model
         self._states: dict[str, _AgentRenderState] = {"main": _AgentRenderState()}
-        self._states["main"].agent_name = normalize_agent_name(main_agent_name)
+        self._agent_names: OrderedDict[str, str] = OrderedDict()
+        self._max_identity_cache = max_identity_cache
+        self._show_main_turn_headers = show_main_turn_headers
+        if normalized_main_name := normalize_agent_name(main_agent_name):
+            self._agent_names["main"] = normalized_main_name
+        self._turns: dict[_TurnKey, _TurnPresentation] = {}
+        self._current_turn_by_agent: dict[str, _TurnKey] = {}
+        self._completed_background_turns: OrderedDict[_TurnKey, _CompletedBackgroundTurn] = OrderedDict()
         self._active_agent: str | None = None
         self._focused_agent = "main"
         self._foreground_stack: list[str] = []
-        self._foreground_parent_calls: dict[str, str] = {}
-        self._streamed_foreground_calls: dict[str, tuple[str, TurnStatus]] = {}
-        self._visible_turns: dict[str, None] = {}
+        self._foreground_parent_calls: dict[str, _ForegroundCall] = {}
+        self._streamed_foreground_calls: dict[_ParentToolKey, _ForegroundResult] = {}
         self._foreground_streaming = False
         self._safe_boundary_open = False
-        self._background_pending: set[str] = set()
+        self._background_summaries: OrderedDict[_TurnKey, _BackgroundSummary] = OrderedDict()
         self._input_active = False
         self._actions = action_multiplexer or ActionMultiplexer(display_mode)
         # A parent's sibling tool still belongs to the active turn while a child
@@ -501,6 +572,14 @@ class ReplRenderer:
     def max_retained_action_bytes(self) -> int:
         return self._actions.max_retained_bytes + self._suspended_actions.max_retained_bytes
 
+    @property
+    def retained_agent_state_count(self) -> int:
+        return len(self._states)
+
+    @property
+    def retained_identity_count(self) -> int:
+        return len(self._agent_names)
+
     def action_status(self) -> str:
         status = f"actions: {self.display_mode.value}"
         if self.queued_action_count:
@@ -513,28 +592,44 @@ class ReplRenderer:
 
     async def remember_agent(self, agent_id: str, agent_name: str) -> None:
         async with self._lock:
-            self._state(agent_id).agent_name = normalize_agent_name(agent_name)
+            self._remember_agent_locked(agent_id, agent_name)
 
-    def agent_identity(self, agent_id: str) -> str:
-        state = self._states.get(agent_id)
-        return format_agent_identity(agent_id, state.agent_name if state is not None else None)
+    def agent_identity(self, agent_id: str, agent_name: str | None = None) -> str:
+        return format_agent_identity(agent_id, agent_name if agent_name is not None else self._agent_name(agent_id))
 
     async def start_turn(
         self,
         agent_id: str,
         event: TurnStarted,
         *,
+        run_id: str,
         turn_id: str | None,
-        background: bool,
+        execution_mode: ExecutionMode,
     ) -> None:
         async with self._lock:
+            key = _TurnKey(agent_id, run_id, turn_id or "")
+            previous = self._current_turn_by_agent.get(agent_id)
+            if previous is not None and previous != key:
+                self._turns.pop(previous, None)
+            agent_name = self._agent_name(agent_id)
+            live = execution_mode is ExecutionMode.FOREGROUND or agent_id == self.foreground_agent
+            presentation = _TurnPresentation(
+                key=key,
+                execution_mode=execution_mode,
+                live=live,
+                agent_name=agent_name,
+            )
+            self._turns[key] = presentation
+            self._current_turn_by_agent[agent_id] = key
             state = self._state(agent_id)
-            state.background_terminal_seen = False
-            if agent_id == self.foreground_agent:
-                self._start_active_turn_locked(agent_id, turn_id)
+            self._reset_state_for_turn_locked(state)
+            if live:
+                self._foreground_streaming = True
+                self._safe_boundary_open = False
+                self._actions.discard_agent(agent_id)
                 return
-            if background:
-                self._actions.observe(agent_id, event, agent_name=state.agent_name)
+            if execution_mode is ExecutionMode.BACKGROUND:
+                self._actions.observe(agent_id, event, agent_name=agent_name)
                 if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
                     self._drain_safe_boundary_locked(max_frames=1)
 
@@ -543,25 +638,62 @@ class ReplRenderer:
         agent_id: str,
         event: TurnFinished,
         *,
-        background: bool,
+        run_id: str,
+        turn_id: str | None,
+        execution_mode: ExecutionMode,
     ) -> None:
         async with self._lock:
-            if not background or agent_id == self.foreground_agent:
-                return
-            state = self._state(agent_id)
-            self._actions.observe(agent_id, event, agent_name=state.agent_name)
-            if not state.background_terminal_seen:
-                self._finish_background_report_locked(agent_id)
-                self._background_pending.add(agent_id)
-                state.background_terminal_seen = True
-            if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
-                self._drain_safe_boundary_locked(max_frames=1)
-            elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
-                self._flush_background_summaries_locked()
+            key = _TurnKey(agent_id, run_id, turn_id or "")
+            presentation = self._turns.pop(key, None)
+            if self._current_turn_by_agent.get(agent_id) == key:
+                self._current_turn_by_agent.pop(agent_id, None)
+            if presentation is None:
+                presentation = _TurnPresentation(
+                    key=key,
+                    execution_mode=execution_mode,
+                    live=execution_mode is ExecutionMode.FOREGROUND or agent_id == self.foreground_agent,
+                    agent_name=self._agent_name(agent_id),
+                )
+            if execution_mode is ExecutionMode.BACKGROUND:
+                if presentation.live:
+                    completed = _CompletedBackgroundTurn(presentation.agent_name, suppress_display=True)
+                else:
+                    self._actions.observe(agent_id, event, agent_name=presentation.agent_name)
+                    summary = self._background_summary_locked(agent_id, presentation, event)
+                    self._background_summaries[key] = summary
+                    while len(self._background_summaries) > 1024:
+                        self._background_summaries.popitem(last=False)
+                    completed = _CompletedBackgroundTurn(presentation.agent_name, suppress_display=False)
+                self._completed_background_turns[key] = completed
+                while len(self._completed_background_turns) > 1024:
+                    self._completed_background_turns.popitem(last=False)
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                    self._drain_safe_boundary_locked(max_frames=1)
+                elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
+                    self._flush_background_summaries_locked()
+            self._purge_parent_turn_locked(key)
+            self._cleanup_turn_state_locked(agent_id)
 
-    async def enter_foreground(self, agent_id: str, parent_tool_use_id: str | None = None) -> None:
+    async def take_background_outcome_presentation(
+        self,
+        agent_id: str,
+        run_id: str,
+        turn_id: str,
+    ) -> tuple[str | None, bool]:
         async with self._lock:
-            owner = self.foreground_agent
+            completed = self._completed_background_turns.pop(_TurnKey(agent_id, run_id, turn_id), None)
+            if completed is None:
+                return self._agent_name(agent_id), False
+            return completed.agent_name, completed.suppress_display
+
+    async def enter_foreground(
+        self,
+        agent_id: str,
+        parent_tool_use_id: str | None = None,
+        parent_agent_id: str | None = None,
+    ) -> None:
+        async with self._lock:
+            owner = parent_agent_id or self.foreground_agent
             owner_state = self._state(owner)
             for tool_use_id in owner_state.active_tool_ids:
                 if tool_use_id == parent_tool_use_id:
@@ -572,13 +704,24 @@ class ReplRenderer:
                     owner,
                     tool_use_id,
                     name,
-                    agent_name=owner_state.agent_name,
+                    agent_name=self._agent_name(owner),
                 )
             self._foreground_stack.append(agent_id)
             self._safe_boundary_open = False
             self._actions.discard_agent(agent_id)
             if parent_tool_use_id is not None:
-                self._foreground_parent_calls[agent_id] = parent_tool_use_id
+                parent_turn = self._current_turn_by_agent.get(owner)
+                parent_key = _ParentToolKey(
+                    parent_agent_id=owner,
+                    parent_run_id=parent_turn.run_id if parent_turn is not None else "",
+                    parent_turn_id=parent_turn.turn_id if parent_turn is not None else "",
+                    tool_use_id=parent_tool_use_id,
+                )
+                self._foreground_parent_calls[agent_id] = _ForegroundCall(
+                    parent_key=parent_key,
+                    child_agent_id=agent_id,
+                    child_agent_name=self._agent_name(agent_id),
+                )
 
     async def exit_foreground(self, agent_id: str, status: TurnStatus) -> None:
         async with self._lock:
@@ -587,9 +730,20 @@ class ReplRenderer:
             else:
                 with suppress(ValueError):
                     self._foreground_stack.remove(agent_id)
-            parent_tool_use_id = self._foreground_parent_calls.pop(agent_id, None)
-            if parent_tool_use_id is not None:
-                self._streamed_foreground_calls[parent_tool_use_id] = (agent_id, status)
+            call = self._foreground_parent_calls.pop(agent_id, None)
+            if call is not None:
+                current_parent_turn = self._current_turn_by_agent.get(call.parent_key.parent_agent_id)
+                parent_still_matches = not call.parent_key.parent_turn_id or (
+                    current_parent_turn is not None
+                    and current_parent_turn.run_id == call.parent_key.parent_run_id
+                    and current_parent_turn.turn_id == call.parent_key.parent_turn_id
+                )
+                if parent_still_matches:
+                    self._streamed_foreground_calls[call.parent_key] = _ForegroundResult(
+                        child_agent_id=call.child_agent_id,
+                        child_agent_name=call.child_agent_name,
+                        status=status,
+                    )
             self._safe_boundary_open = True
             resumed = self._state(self.foreground_agent)
             self._foreground_streaming = bool(
@@ -599,14 +753,11 @@ class ReplRenderer:
 
     def set_focus(self, agent_id: str) -> None:
         self._focused_agent = agent_id
+        presentation = self._current_presentation(agent_id)
+        if presentation is not None and presentation.agent_name is not None:
+            self._remember_agent_locked(agent_id, presentation.agent_name)
         self._safe_boundary_open = True
         self._actions.discard_agent(agent_id)
-        state = self._state(agent_id)
-        state.background_text.clear()
-        state.background_reported_chars = 0
-        state.background_tools.clear()
-        state.background_errors.clear()
-        self._background_pending.discard(agent_id)
 
     def set_input_active(self, active: bool) -> None:
         self._input_active = active
@@ -637,8 +788,22 @@ class ReplRenderer:
         if not self._input_active:
             sys.stdout.flush()
 
-    async def render(self, agent_id: str, event: StreamEvent) -> None:
+    async def render(
+        self,
+        agent_id: str,
+        event: StreamEvent,
+        *,
+        run_id: str | None = None,
+        turn_id: str | None = None,
+        execution_mode: ExecutionMode | None = None,
+    ) -> None:
         async with self._lock:
+            presentation = self._presentation(agent_id, run_id, turn_id)
+            live = (
+                presentation.live
+                if presentation is not None
+                else execution_mode is ExecutionMode.FOREGROUND or agent_id == self.foreground_agent
+            )
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
                 self._stats.record(agent_id, event.usage, model)
@@ -646,8 +811,8 @@ class ReplRenderer:
                 self._observe_suspended_tool_event_locked(agent_id, event)
                 if self._safe_boundary_open:
                     self._drain_safe_boundary_locked()
-            elif agent_id == self.foreground_agent:
-                self._render_locked(agent_id, event)
+            elif live:
+                self._render_locked(agent_id, event, presentation)
                 if isinstance(event, Error | SessionEndEvent):
                     self._foreground_streaming = False
                     if self.display_mode is DisplayMode.ACTIVE_ONLY:
@@ -655,8 +820,8 @@ class ReplRenderer:
                 elif not isinstance(event, IterationEnd):
                     self._foreground_streaming = True
             else:
-                state = self._state(agent_id)
-                self._actions.observe(agent_id, event, agent_name=state.agent_name)
+                agent_name = presentation.agent_name if presentation is not None else self._agent_name(agent_id)
+                self._actions.observe(agent_id, event, agent_name=agent_name)
                 self._record_background_event_locked(agent_id, event)
                 if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
                     self._drain_safe_boundary_locked(max_frames=1)
@@ -666,10 +831,17 @@ class ReplRenderer:
     async def observe_runtime_event(self, agent_id: str, event: RuntimeEvent) -> None:
         async with self._lock:
             if agent_id != self.foreground_agent:
-                state = self._state(agent_id)
-                self._actions.observe(agent_id, event, agent_name=state.agent_name)
+                self._actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
                 if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
                     self._drain_safe_boundary_locked(max_frames=1)
+
+    async def stop_agent(self, agent_id: str, event: AgentStopped, *, background: bool) -> None:
+        async with self._lock:
+            if background and agent_id != self.foreground_agent:
+                self._actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                    self._drain_safe_boundary_locked(max_frames=1)
+            self._cleanup_agent_locked(agent_id)
 
     async def mark_idle(self) -> None:
         async with self._lock:
@@ -687,7 +859,7 @@ class ReplRenderer:
         *,
         agent_id: str | None = None,
         agent_name: str | None = None,
-        turn_id: str | None = None,
+        suppress_display: bool = False,
     ) -> None:
         """Put an arriving message on screen, not only into the model's prompt.
 
@@ -696,15 +868,16 @@ class ReplRenderer:
         something they could not read.
         """
         async with self._lock:
-            if agent_id is not None and agent_name is not None:
-                self._state(agent_id).agent_name = normalize_agent_name(agent_name)
-            if turn_id is not None and turn_id in self._visible_turns:
-                del self._visible_turns[turn_id]
+            if suppress_display:
                 return
             if self._active_agent is not None and self._state(self._active_agent).in_text:
                 print()
                 self._state(self._active_agent).in_text = False
-            source = f" from agent {self.agent_identity(agent_id)}" if agent_id is not None else ""
+            source = (
+                f" from agent {format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))}"
+                if agent_id is not None
+                else ""
+            )
             print(f"\n{DIM}{'─' * 3} incoming{source} {'─' * 3}{RESET}\n{text}\n")
             self._safe_boundary_open = True
             self._drain_safe_boundary_locked()
@@ -721,48 +894,171 @@ class ReplRenderer:
     def _state(self, agent_id: str) -> _AgentRenderState:
         return self._states.setdefault(agent_id, _AgentRenderState())
 
-    def _start_active_turn_locked(self, agent_id: str, turn_id: str | None) -> None:
-        state = self._state(agent_id)
-        if turn_id is not None and state.header_turn_id == turn_id:
-            return
-        if self._active_agent is not None:
-            active_state = self._state(self._active_agent)
-            if active_state.in_reasoning:
-                sys.stdout.write(f"{RESET}\n")
-                active_state.in_reasoning = False
-            elif active_state.in_text:
-                print()
-                active_state.in_text = False
-        self._active_agent = agent_id
-        state.header_turn_id = turn_id
-        print(f"\n{DIM}── agent {self.agent_identity(agent_id)} ──{RESET}")
-        self._foreground_streaming = True
-        self._safe_boundary_open = False
+    def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
+        state.in_text = False
+        state.in_reasoning = False
+        state.arg_streams.clear()
+        state.active_tool_ids.clear()
+        state.streamed_tool_ids.clear()
+        state.tool_names.clear()
+        state.field_first_delta = True
+        state.field_key = None
+        state.background_text.clear()
+        state.pending_text.clear()
+        state.background_tools.clear()
+        state.background_errors.clear()
+        state.paragraph_newline_pending = False
 
-    def _remember_visible_turn_locked(self, turn_id: str | None) -> None:
-        if turn_id is None:
+    def _remember_agent_locked(self, agent_id: str, agent_name: str) -> None:
+        normalized = normalize_agent_name(agent_name)
+        if normalized is None:
             return
-        self._visible_turns.pop(turn_id, None)
-        self._visible_turns[turn_id] = None
-        while len(self._visible_turns) > 1024:
-            self._visible_turns.pop(next(iter(self._visible_turns)))
+        self._agent_names.pop(agent_id, None)
+        self._agent_names[agent_id] = normalized
+        protected = {"main", self._focused_agent}
+        while len(self._agent_names) > self._max_identity_cache:
+            candidate = next((known_id for known_id in self._agent_names if known_id not in protected), None)
+            if candidate is None:
+                break
+            self._agent_names.pop(candidate, None)
 
-    def _switch_agent(self, agent_id: str) -> _AgentRenderState:
+    def _agent_name(self, agent_id: str) -> str | None:
+        presentation = self._current_presentation(agent_id)
+        if presentation is not None and presentation.agent_name is not None:
+            return presentation.agent_name
+        foreground_call = self._foreground_parent_calls.get(agent_id)
+        if foreground_call is not None and foreground_call.child_agent_name is not None:
+            return foreground_call.child_agent_name
+        return self._agent_names.get(agent_id)
+
+    def _presentation(
+        self,
+        agent_id: str,
+        run_id: str | None,
+        turn_id: str | None,
+    ) -> _TurnPresentation | None:
+        if run_id is not None and turn_id is not None:
+            return self._turns.get(_TurnKey(agent_id, run_id, turn_id))
+        return self._current_presentation(agent_id)
+
+    def _current_presentation(self, agent_id: str) -> _TurnPresentation | None:
+        key = self._current_turn_by_agent.get(agent_id)
+        return self._turns.get(key) if key is not None else None
+
+    def _event_starts_stdout(
+        self,
+        event: StreamEvent,
+        presentation: _TurnPresentation | None,
+    ) -> bool:
+        if presentation is None or presentation.stdout_started:
+            return False
+        match event:
+            case TextDelta(delta=delta) | ToolOutputDelta(delta=delta):
+                return bool(delta)
+            case ReasoningDelta(delta=delta):
+                return bool(delta.lstrip("\n"))
+            case IterationEnd() | Error():
+                return False
+            case SessionEndEvent():
+                return not presentation.error_seen
+            case _:
+                return True
+
+    def _ensure_stdout_header_locked(
+        self,
+        agent_id: str,
+        presentation: _TurnPresentation | None,
+    ) -> None:
+        if presentation is None or presentation.stdout_started:
+            return
+        presentation.stdout_started = True
+        if presentation.header_emitted:
+            return
+        presentation.header_emitted = True
+        if agent_id == "main" and not self._show_main_turn_headers:
+            return
+        identity = format_agent_identity(agent_id, presentation.agent_name)
+        print(f"\n{DIM}── agent {identity} ──{RESET}")
+
+    def _parent_tool_key(
+        self,
+        agent_id: str,
+        tool_use_id: str,
+        presentation: _TurnPresentation | None,
+    ) -> _ParentToolKey:
+        return _ParentToolKey(
+            parent_agent_id=agent_id,
+            parent_run_id=presentation.key.run_id if presentation is not None else "",
+            parent_turn_id=presentation.key.turn_id if presentation is not None else "",
+            tool_use_id=tool_use_id,
+        )
+
+    def _purge_parent_turn_locked(self, key: _TurnKey) -> None:
+        self._streamed_foreground_calls = {
+            parent_key: result
+            for parent_key, result in self._streamed_foreground_calls.items()
+            if not (
+                parent_key.parent_agent_id == key.agent_id
+                and parent_key.parent_run_id == key.run_id
+                and parent_key.parent_turn_id == key.turn_id
+            )
+        }
+        self._foreground_parent_calls = {
+            child_id: call
+            for child_id, call in self._foreground_parent_calls.items()
+            if not (
+                call.parent_key.parent_agent_id == key.agent_id
+                and call.parent_key.parent_run_id == key.run_id
+                and call.parent_key.parent_turn_id == key.turn_id
+            )
+        }
+
+    def _cleanup_turn_state_locked(self, agent_id: str) -> None:
+        if agent_id == "main":
+            return
+        self._states.pop(agent_id, None)
+        if self._active_agent == agent_id:
+            self._active_agent = None
+
+    def _cleanup_agent_locked(self, agent_id: str) -> None:
+        self._cleanup_turn_state_locked(agent_id)
+        self._current_turn_by_agent.pop(agent_id, None)
+        self._turns = {key: value for key, value in self._turns.items() if key.agent_id != agent_id}
+        self._completed_background_turns = OrderedDict(
+            (key, value) for key, value in self._completed_background_turns.items() if key.agent_id != agent_id
+        )
+        if agent_id not in {"main", self._focused_agent}:
+            self._agent_names.pop(agent_id, None)
+        self._foreground_parent_calls.pop(agent_id, None)
+
+    def _switch_agent(self, agent_id: str) -> tuple[_AgentRenderState, bool]:
         switched = self._active_agent != agent_id
         if switched:
-            if self._active_agent is not None and self._state(self._active_agent).in_text:
-                print()
-                self._state(self._active_agent).in_text = False
+            if self._active_agent is not None:
+                active_state = self._state(self._active_agent)
+                if active_state.in_reasoning:
+                    sys.stdout.write(f"{RESET}\n")
+                    active_state.in_reasoning = False
+                elif active_state.in_text:
+                    print()
+                    active_state.in_text = False
             self._active_agent = agent_id
         state = self._state(agent_id)
+        return state, switched
+
+    def _render_locked(
+        self,
+        agent_id: str,
+        event: StreamEvent,
+        presentation: _TurnPresentation | None,
+    ) -> None:  # noqa: C901
+        state, switched = self._switch_agent(agent_id)
+        if self._event_starts_stdout(event, presentation):
+            self._ensure_stdout_header_locked(agent_id, presentation)
         if switched and state.field_key is not None:
             sys.stdout.write(f"\n  {YELLOW}{state.field_key} (continued){RESET}: {DIM}")
             self._flush()
             state.field_first_delta = True
-        return state
-
-    def _render_locked(self, agent_id: str, event: StreamEvent) -> None:  # noqa: C901
-        state = self._switch_agent(agent_id)
         if not isinstance(event, TextDelta):
             state.paragraph_newline_pending = False
         # Reasoning streams in as one delta per token, so the quote marker and
@@ -792,8 +1088,6 @@ class ReplRenderer:
                 self._flush()
 
             case TextDelta(delta=delta):
-                if delta:
-                    self._remember_visible_turn_locked(state.header_turn_id)
                 if not state.in_text:
                     state.in_text = True
                 state.pending_text.append(delta)
@@ -868,10 +1162,14 @@ class ReplRenderer:
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
-                foreground_result = self._streamed_foreground_calls.pop(tid, None)
+                parent_key = self._parent_tool_key(agent_id, tid, presentation)
+                foreground_result = self._streamed_foreground_calls.pop(parent_key, None)
                 if foreground_result is not None:
-                    foreground_agent_id, foreground_status = foreground_result
-                    identity = self.agent_identity(foreground_agent_id)
+                    foreground_status = foreground_result.status
+                    identity = format_agent_identity(
+                        foreground_result.child_agent_id,
+                        foreground_result.child_agent_name,
+                    )
                     if foreground_status is TurnStatus.SUCCEEDED:
                         content = f"[foreground agent {identity} returned its result to the parent]"
                     elif foreground_status is TurnStatus.CANCELLED:
@@ -906,12 +1204,24 @@ class ReplRenderer:
                 state.pending_text.clear()
 
             case Error(exception=exc):
-                self._remember_visible_turn_locked(state.header_turn_id)
-                print(f"\n{RED}Error from agent {self.agent_identity(agent_id)}: {exc}{RESET}", file=sys.stderr)
+                if presentation is not None:
+                    presentation.error_seen = True
+                    if presentation.stdout_started:
+                        sys.stdout.flush()
+                identity = format_agent_identity(
+                    agent_id,
+                    presentation.agent_name if presentation is not None else self._agent_name(agent_id),
+                )
+                print(f"\n{RED}Error from agent {identity}: {exc}{RESET}", file=sys.stderr, flush=True)
                 self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
             case SessionEndEvent(total_usage=usage):
+                if presentation is not None and presentation.error_seen and not presentation.stdout_started:
+                    self._discard_suspended_owner_locked(agent_id)
+                    self._safe_boundary_open = True
+                    self._drain_safe_boundary_locked()
+                    return
                 if state.in_text:
                     print()
                     state.in_text = False
@@ -931,49 +1241,51 @@ class ReplRenderer:
                     state.background_tools.append(name)
             case Error(exception=exc):
                 state.background_errors.append(str(exc))
-            case SessionEndEvent():
-                if not state.background_terminal_seen:
-                    self._finish_background_report_locked(agent_id)
-                    self._background_pending.add(agent_id)
-                    state.background_terminal_seen = True
             case _:
                 pass
 
-    def _finish_background_report_locked(self, agent_id: str) -> None:
-        state = self._state(agent_id)
+    def _background_summary_locked(
+        self,
+        agent_id: str,
+        presentation: _TurnPresentation,
+        event: TurnFinished,
+    ) -> _BackgroundSummary:
+        state = self._states.get(agent_id)
+        if state is None:
+            return _BackgroundSummary(
+                identity=format_agent_identity(agent_id, presentation.agent_name),
+                reported_chars=0,
+                tools=(),
+                failed=event.status is not TurnStatus.SUCCEEDED,
+            )
         text = "".join(state.background_text).strip()
+        summary = _BackgroundSummary(
+            identity=format_agent_identity(agent_id, presentation.agent_name),
+            reported_chars=len(text),
+            tools=tuple(state.background_tools),
+            failed=event.status is not TurnStatus.SUCCEEDED or bool(state.background_errors),
+        )
         state.background_text.clear()
-        if not text:
-            return
-        state.background_reported_chars = len(text)
+        state.background_tools.clear()
+        state.background_errors.clear()
+        return summary
 
     def _flush_background_summaries_locked(self) -> None:
-        if not self._background_pending:
+        if not self._background_summaries:
             return
-        for agent_id in sorted(self._background_pending):
-            state = self._state(agent_id)
-            parts = [f"agent {self.agent_identity(agent_id)} completed"]
-            if state.background_tools:
-                parts.append(f"tools={','.join(state.background_tools)}")
-            if state.background_reported_chars:
-                parts.append(f"reported {state.background_reported_chars} chars")
-            if state.background_errors:
-                # The count alone says something went wrong and not what, which
-                # is the half that decides whether to retry, fix or give up.
-                parts.append(f"error: {state.background_errors[-1]}")
+        for summary in self._background_summaries.values():
+            parts = [f"agent {summary.identity} completed"]
+            if summary.tools:
+                parts.append(f"tools={','.join(summary.tools)}")
+            if summary.reported_chars:
+                parts.append(f"reported {summary.reported_chars} chars")
+            if summary.failed:
+                parts.append("failed; details follow in incoming report")
             print(f"{DIM}[background {'; '.join(parts)}]{RESET}")
-            state.background_reported_chars = 0
-            state.background_tools.clear()
-            state.background_errors.clear()
-        self._background_pending.clear()
+        self._background_summaries.clear()
 
     def _discard_background_summaries_locked(self) -> None:
-        for agent_id in self._background_pending:
-            state = self._state(agent_id)
-            state.background_reported_chars = 0
-            state.background_tools.clear()
-            state.background_errors.clear()
-        self._background_pending.clear()
+        self._background_summaries.clear()
 
     def _drain_safe_boundary_locked(self, *, max_frames: int | None = None) -> None:
         frame_budget = max_frames or self._action_boundary_frames
@@ -1012,7 +1324,7 @@ class ReplRenderer:
 
     def _observe_suspended_tool_event_locked(self, agent_id: str, event: StreamEvent) -> None:
         state = self._state(agent_id)
-        self._suspended_actions.observe(agent_id, event, agent_name=state.agent_name)
+        self._suspended_actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
         match event:
             case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
                 stream = state.arg_streams.get(tool_use_id)
@@ -1089,25 +1401,37 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
             if envelope.execution_mode is ExecutionMode.BACKGROUND:
                 await renderer.observe_runtime_event(envelope.agent_id, envelope.event)
         case ForegroundEntered():
-            await renderer.enter_foreground(envelope.agent_id, envelope.parent_tool_use_id)
+            await renderer.enter_foreground(
+                envelope.agent_id,
+                envelope.parent_tool_use_id,
+                envelope.parent_agent_id,
+            )
         case ForegroundExited(status=status):
             await renderer.exit_foreground(envelope.agent_id, status)
         case TurnStarted() as event:
             await renderer.start_turn(
                 envelope.agent_id,
                 event,
+                run_id=envelope.run_id,
                 turn_id=envelope.turn_id,
-                background=envelope.execution_mode is ExecutionMode.BACKGROUND,
+                execution_mode=envelope.execution_mode,
             )
         case TurnFinished() as event:
             await renderer.finish_turn(
                 envelope.agent_id,
                 event,
+                run_id=envelope.run_id,
+                turn_id=envelope.turn_id,
+                execution_mode=envelope.execution_mode,
+            )
+        case AgentStopped() as event:
+            await renderer.stop_agent(
+                envelope.agent_id,
+                event,
                 background=envelope.execution_mode is ExecutionMode.BACKGROUND,
             )
         case (
-            AgentStopped()
-            | OutcomeDelivered()
+            OutcomeDelivered()
             | InputReceived()
             | ConfigurationChanged()
             | MessageCommitted()
@@ -1117,7 +1441,13 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
             if envelope.execution_mode is ExecutionMode.BACKGROUND:
                 await renderer.observe_runtime_event(envelope.agent_id, envelope.event)
         case event:
-            await renderer.render(envelope.agent_id, event)
+            await renderer.render(
+                envelope.agent_id,
+                event,
+                run_id=envelope.run_id,
+                turn_id=envelope.turn_id,
+                execution_mode=envelope.execution_mode,
+            )
 
 
 async def run_prompt(
@@ -1869,7 +2199,12 @@ async def main() -> None:
 
         async def _queue_background_outcome(outcome: TurnOutcome) -> None:
             agent_id = outcome.identity.agent_id
-            identity = renderer.agent_identity(agent_id)
+            agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+                agent_id,
+                outcome.identity.run_id,
+                outcome.identity.turn_id,
+            )
+            identity = format_agent_identity(agent_id, agent_name)
             if outcome.succeeded and outcome.text.strip():
                 text = f"Report from background agent {agent_id}:\n\n{outcome.text.strip()}"
                 display_text = f"Report from background agent {identity}:\n\n{outcome.text.strip()}"
@@ -1885,7 +2220,8 @@ async def main() -> None:
                     text=text,
                     display_text=display_text,
                     agent_id=agent_id,
-                    turn_id=outcome.identity.turn_id,
+                    agent_name=agent_name,
+                    suppress_display=suppress_display,
                 )
             )
 
@@ -1897,6 +2233,7 @@ async def main() -> None:
             stats=stats,
             current_model=lambda: transport.model,
             display_mode=DisplayMode.parse(args.agent_actions),
+            show_main_turn_headers=args.prompt is None,
         )
 
         async def _render_envelope(envelope: AgentEventEnvelope) -> None:
@@ -1917,13 +2254,7 @@ async def main() -> None:
         peer_server: PeerServer | None = None
 
         async def _on_peer_message(message: PeerMessage) -> None:
-            await peer_queue.put(
-                _IncomingPrompt(
-                    text=format_message_for_dialog(message),
-                    agent_id=message.from_id,
-                    agent_name=message.from_name,
-                )
-            )
+            await peer_queue.put(_peer_incoming_prompt(message))
 
         async def _run_turn(prompt: str, *, source: str) -> None:
             nonlocal main_status, prompt_task
@@ -1979,7 +2310,7 @@ async def main() -> None:
                     prompt.display_text or prompt.text,
                     agent_id=prompt.agent_id,
                     agent_name=prompt.agent_name,
-                    turn_id=prompt.turn_id,
+                    suppress_display=prompt.suppress_display,
                 )
             await _run_turn("\n\n".join(prompt.text for prompt in prompts), source="peer")
 

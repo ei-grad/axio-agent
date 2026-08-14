@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -13,9 +12,6 @@ from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, 
 
 RESET = "\033[0m"
 
-_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _MAX_DISPLAY_COUNT = 999_999_999
 
 
@@ -89,21 +85,90 @@ class _AgentCollector:
 
 def sanitize_terminal_text(value: object) -> str:
     """Remove terminal control sequences while preserving lines and tabs."""
+    return _sanitize_terminal(value, preserve_layout=True)
+
+
+def sanitize_identity_component(value: object) -> str:
+    """Return one line of terminal-safe identity text."""
+    return " ".join(_sanitize_terminal(value, preserve_layout=False).split())
+
+
+def _sanitize_terminal(value: object, *, preserve_layout: bool) -> str:
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    text = _OSC.sub("", text)
-    text = _CSI.sub("", text)
-    return _CONTROL.sub("", text)
+    result: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        codepoint = ord(character)
+        replacement = "" if preserve_layout else " "
+        if character == "\x1b":
+            result.append(replacement)
+            index = _consume_escape_sequence(text, index)
+            continue
+        if codepoint == 0x9B:
+            result.append(replacement)
+            index = _consume_csi(text, index + 1)
+            continue
+        if codepoint in {0x90, 0x9D, 0x9E, 0x9F}:
+            result.append(replacement)
+            index = _consume_control_string(text, index + 1)
+            continue
+        if codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            if preserve_layout and character in {"\n", "\t"}:
+                result.append(character)
+            else:
+                result.append(replacement)
+            index += 1
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _consume_escape_sequence(text: str, index: int) -> int:
+    next_index = index + 1
+    if next_index >= len(text):
+        return next_index
+    introducer = text[next_index]
+    if introducer == "[":
+        return _consume_csi(text, next_index + 1)
+    if introducer in {
+        "]",
+        "P",
+        "^",
+        "_",
+    }:
+        return _consume_control_string(text, next_index + 1)
+    return min(len(text), next_index + 1)
+
+
+def _consume_csi(text: str, index: int) -> int:
+    while index < len(text):
+        if 0x40 <= ord(text[index]) <= 0x7E:
+            return index + 1
+        index += 1
+    return index
+
+
+def _consume_control_string(text: str, index: int) -> int:
+    while index < len(text):
+        if text[index] in {"\x07", "\x9c"}:
+            return index + 1
+        if text[index] == "\x1b" and index + 1 < len(text) and text[index + 1] == "\\":
+            return index + 2
+        index += 1
+    return index
 
 
 def normalize_agent_name(agent_name: str | None) -> str | None:
     if agent_name is None:
         return None
-    return _fit_utf8(sanitize_terminal_text(agent_name).replace("\n", " "), 80, suffix="…").strip() or None
+    return _fit_utf8(sanitize_identity_component(agent_name), 80, suffix="…").strip() or None
 
 
 def format_agent_identity(agent_id: str, agent_name: str | None = None) -> str:
     """Return a terminal-safe identity whose authoritative id is always visible."""
-    clean_id = _fit_utf8(sanitize_terminal_text(agent_id).replace("\n", " "), 80, suffix="…") or "unknown"
+    clean_id = _fit_utf8(sanitize_identity_component(agent_id), 80, suffix="…") or "unknown"
     clean_name = normalize_agent_name(agent_name)
     if clean_name is None:
         return clean_id
@@ -273,10 +338,8 @@ class ActionMultiplexer:
                     self._enqueue(agent_id, "lifecycle", f"started ({kind})", agent_name=agent_name or name)
                 case TurnStarted():
                     self._enqueue(agent_id, "lifecycle", "turn started", agent_name=agent_name)
-                case TurnFinished(status=status, error=error):
+                case TurnFinished(status=status):
                     detail = f"turn {status.value}"
-                    if error:
-                        detail += f": {error}"
                     self._enqueue(agent_id, "lifecycle", detail, critical=True, agent_name=agent_name)
                     self._remove_collector(agent_id, suppress_incomplete=True)
                 case AgentStopped(status=status):
@@ -346,11 +409,11 @@ class ActionMultiplexer:
                             critical=True,
                             agent_name=action.agent_name,
                         )
-                case Error(exception=exception):
+                case Error():
                     self._enqueue(
                         agent_id,
                         "error",
-                        f"{type(exception).__name__}: {exception}",
+                        "agent stream failed",
                         critical=True,
                         agent_name=agent_name,
                     )
