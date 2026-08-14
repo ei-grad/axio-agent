@@ -234,7 +234,6 @@ class TransportRegistry:
 
     async def _reload_one(self, name: str) -> None:
         transport = self._transports[name]
-        transport.models.clear()
         try:
             await transport.fetch_models()
         except Exception:

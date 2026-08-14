@@ -50,6 +50,14 @@ class _OtherTransport:
 
 
 @dataclass(slots=True)
+class _NoOpCustomTransport(_FakeTransport):
+    """Custom-provider shape: its catalogue is configured, not fetched."""
+
+    async def fetch_models(self) -> None:
+        pass
+
+
+@dataclass(slots=True)
 class _FailFetchTransport:
     """Transport whose fetch_models always fails (simulates missing credentials)."""
 
@@ -394,3 +402,31 @@ class TestAuthRefresh:
             await reg.init(session)
         transport = reg.get_transport("fake")
         assert not hasattr(transport, "on_auth_refresh")
+
+
+class TestReloadModels:
+    async def test_failed_refresh_preserves_existing_catalogue(self) -> None:
+        class FailOnRefresh(_FakeTransport):
+            async def fetch_models(self) -> None:
+                raise RuntimeError("refresh failed")
+
+        transport = FailOnRefresh()
+        original_models = transport.models
+        reg = TransportRegistry()
+        reg.register_dynamic("fail", transport)
+
+        await reg.reload_models("fail")
+
+        assert transport.models is original_models
+        assert transport.models.ids() == ["test-chat", "test-vision", "test-embed"]
+
+    async def test_noop_custom_style_refresh_does_not_erase_catalogue(self) -> None:
+        transport = _NoOpCustomTransport()
+        original_models = transport.models
+        reg = TransportRegistry()
+        reg.register_dynamic("custom", transport)
+
+        await reg.reload_models("custom")
+
+        assert transport.models is original_models
+        assert transport.models.ids() == ["test-chat", "test-vision", "test-embed"]

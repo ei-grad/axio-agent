@@ -4,12 +4,14 @@ from __future__ import annotations
 
 try:
     from .custom import CustomHubScreen, ModelEditScreen, ProviderEditScreen
+    from .llamacpp import LlamaCppSettingsScreen
     from .nebius import NebiusSettingsScreen
     from .openai import OpenAISettingsScreen
     from .openrouter import OpenRouterSettingsScreen
 
     __all__ = [
         "CustomHubScreen",
+        "LlamaCppSettingsScreen",
         "ModelEditScreen",
         "NebiusSettingsScreen",
         "OpenAISettingsScreen",

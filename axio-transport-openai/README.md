@@ -15,7 +15,7 @@ Works with any API that speaks the OpenAI chat completions format - OpenAI itsel
 - **Tool calling** - streams tool-use JSON fragments as `ToolInputDelta` events; parallel tool calls supported
 - **Reasoning support** - `<think>...</think>` blocks emitted as `ReasoningDelta` events
 - **Embeddings** - `embed()` method for models that support `/v1/embeddings`
-- **Sub-transports** - `NebiusTransport`, `OpenRouterTransport`, and `OpenAICompatibleTransport` for common providers
+- **Sub-transports** - provider-specific transports for Nebius, OpenRouter, llama.cpp, and custom endpoints
 - **aiohttp-based** - zero blocking I/O
 - **Optional TUI settings screen** - install with `[tui]` extra for a Textual configuration UI
 
@@ -66,6 +66,8 @@ The `session` parameter is **required** for streaming. Create an `aiohttp.Client
 |---|---|
 | `OPENAI_API_KEY` | Default API key if not passed to the constructor |
 | `OPENAI_BASE_URL` | Default base URL (falls back to `https://api.openai.com/v1`) |
+| `LLAMA_API_KEY` | Optional llama.cpp API key (empty by default) |
+| `LLAMA_CPP_BASE_URL` | llama.cpp OpenAI-compatible base URL (defaults to `http://127.0.0.1:8080/v1`) |
 
 ### Local models (Ollama, vLLM, LM Studio)
 
@@ -267,9 +269,53 @@ The JSON configuration format used by the TUI is:
 ]
 ```
 
+### LlamaCppTransport
+
+`LlamaCppTransport` keeps generation on llama.cpp's OpenAI-compatible
+`/v1/chat/completions` endpoint and uses the native read-only endpoints only for
+model discovery:
+
+```python
+from axio_transport_openai.llamacpp import LlamaCppTransport
+
+transport = LlamaCppTransport(session=session)
+await transport.fetch_models()
+```
+
+The default URL is `http://127.0.0.1:8080/v1`. `LLAMA_CPP_BASE_URL` and the
+optional `LLAMA_API_KEY` override the defaults. An explicit empty key stays
+empty and does not fall back to `OPENAI_API_KEY`.
+
+Discovery reads `/props` first and uses its explicit `role: "router"` marker,
+with `/models` status objects as a compatibility fallback, to distinguish the
+two server modes. In single-model mode, model metadata comes from
+`/v1/models`. Use `--alias <stable-name>` when starting `llama-server`;
+otherwise the model ID is normally its GGUF path. Runtime `n_ctx` from `/props`
+takes priority over the training context published in model metadata. A
+positive server `n_predict` limits the advertised output size.
+
+In router mode, discovery first reads native `/models`, then reads
+`/props?model=<id>&autoload=false` only for entries already in `loaded` or
+`sleeping` state. Unloaded, loading, downloading, and failed entries are not
+published in Axio's registry. This avoids presenting a model whose first use
+would silently load it. Refresh is side-effect-free: it never sends
+`reload=1`, calls load/unload/download endpoints, or changes llama.cpp's model
+cache.
+
+Tool use is advertised only when `/props.chat_template_caps` explicitly reports
+both `supports_tools` and `supports_tool_calls`. Run current llama.cpp with
+Jinja chat templating enabled (normally the default; `--jinja` is explicit and
+portable across older versions) and use a model template that supports tool
+calls. Vision, audio, video, and embedding capabilities likewise come only
+from published modality metadata. Text requires explicit text output or
+published chat-template metadata; missing output metadata is not treated as
+proof of completion support. `supports_preserve_reasoning` is not treated as
+proof that a model reasons; streamed `reasoning_content` is still emitted as
+`ReasoningDelta` by the inherited parser.
+
 ## Plugin registration
 
-When installed, this package registers all four transports via entry points so `axio-tui` discovers them automatically:
+When installed, this package registers all five transports via entry points so `axio-tui` discovers them automatically:
 
 ```toml
 [project.entry-points."axio.transport"]
@@ -277,6 +323,7 @@ openai         = "axio_transport_openai:OpenAITransport"
 nebius         = "axio_transport_openai.nebius:NebiusTransport"
 openrouter     = "axio_transport_openai.openrouter:OpenRouterTransport"
 openai-custom  = "axio_transport_openai.custom:OpenAICompatibleTransport"
+llama-cpp      = "axio_transport_openai.llamacpp:LlamaCppTransport"
 ```
 
 ## Part of the axio ecosystem
