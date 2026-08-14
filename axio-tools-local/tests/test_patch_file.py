@@ -164,6 +164,24 @@ class TestEdgeCases:
         with pytest.raises(HandlerError, match="Not a file"):
             await patch(d, 1, 1, "x")
 
+    async def test_non_utf8_file_raises_handler_error(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "b.dat"
+        f.write_bytes(b"\x80\x81\xff")
+        with pytest.raises(HandlerError, match="not valid UTF-8"):
+            await patch(f, 1, 1, "x")
+
+    async def test_permission_denied_raises_handler_error(self, tmp_cwd: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root ignores file permission bits")
+        f = tmp_cwd / "locked.txt"
+        f.write_text("a\nb\n")
+        f.chmod(0o000)
+        try:
+            with pytest.raises(HandlerError, match="locked.txt"):
+                await patch(f, 1, 1, "x")
+        finally:
+            f.chmod(0o644)
+
     async def test_returns_bytes_written_message(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\n")
