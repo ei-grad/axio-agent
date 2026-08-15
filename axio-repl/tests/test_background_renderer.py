@@ -311,6 +311,51 @@ async def test_background_actions_wait_for_all_parallel_active_tools(
     assert "agent child · tool call" in capsys.readouterr().out
 
 
+async def test_background_actions_stream_while_monitor_is_waiting(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="wait", name="monitor"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="wait",
+            partial_json='{"agents":["child"],"timeout":120}',
+        ),
+    )
+    capsys.readouterr()
+
+    await _queue_background_tool_action(renderer)
+
+    output = capsys.readouterr().out
+    assert "agent child · tool call" in output
+    assert renderer.queued_action_count == 0
+
+
+async def test_monitor_does_not_open_boundary_for_parallel_foreground_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="wait", name="monitor"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="wait", partial_json='{"agents":["child"]}'),
+    )
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell", name="shell"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=1, tool_use_id="shell", partial_json='{"command":"sleep 1"}'),
+    )
+    await _queue_background_tool_action(renderer)
+
+    assert "agent child" not in capsys.readouterr().out
+
+    await renderer.render("main", ToolResult(tool_use_id="shell", name="shell", is_error=False, content=""))
+
+    assert "agent child · tool call" in capsys.readouterr().out
+
+
 async def test_active_stream_is_identical_when_there_are_no_background_actions() -> None:
     events: list[StreamEvent] = [
         TextDelta(index=0, delta="live"),

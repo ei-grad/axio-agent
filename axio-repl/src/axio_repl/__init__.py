@@ -18,7 +18,7 @@ import os
 import shutil
 import signal
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from importlib.metadata import entry_points
@@ -501,6 +501,32 @@ class _IncomingPrompt:
     agent_id: str | None = None
     agent_name: str | None = None
     suppress_display: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _QueuedInteractiveInput:
+    text: str
+    target_agent_id: str
+
+
+def _pending_prompt_count(
+    peer_queue: asyncio.Queue[_IncomingPrompt],
+    buffered_prompts: deque[_IncomingPrompt],
+    inbox_task: asyncio.Task[_IncomingPrompt] | None,
+) -> int:
+    claimed_by_inbox = int(inbox_task is not None and inbox_task.done() and not inbox_task.cancelled())
+    return peer_queue.qsize() + len(buffered_prompts) + claimed_by_inbox
+
+
+async def _cancel_and_settle_tasks(*tasks: asyncio.Task[Any] | None) -> tuple[Any, ...]:
+    """Cancel unfinished coordinator tasks and retrieve every task outcome."""
+    managed_tasks = tuple(task for task in tasks if task is not None)
+    for task in managed_tasks:
+        if not task.done():
+            task.cancel()
+    if not managed_tasks:
+        return ()
+    return tuple(await asyncio.gather(*managed_tasks, return_exceptions=True))
 
 
 def _peer_incoming_prompt(message: PeerMessage) -> _IncomingPrompt:
@@ -1180,6 +1206,9 @@ class ReplRenderer:
                         sys.stdout.write("\n")
                         self._flush()
                         del state.arg_streams[tid]
+                        if self._only_passive_tools_active(state):
+                            self._safe_boundary_open = True
+                            self._drain_safe_boundary_locked()
 
             case ToolOutputDelta(tool_use_id=tid, key=key, delta=delta):
                 self._safe_boundary_open = False
@@ -1221,7 +1250,7 @@ class ReplRenderer:
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
                 state.tool_names.pop(tid, None)
-                if not state.active_tool_ids and not state.arg_streams:
+                if (not state.active_tool_ids and not state.arg_streams) or self._only_passive_tools_active(state):
                     self._safe_boundary_open = True
                     self._drain_safe_boundary_locked()
                 else:
@@ -1274,6 +1303,14 @@ class ReplRenderer:
                 state.background_errors.append(str(exc))
             case _:
                 pass
+
+    @staticmethod
+    def _only_passive_tools_active(state: _AgentRenderState) -> bool:
+        return (
+            bool(state.active_tool_ids)
+            and not state.arg_streams
+            and all(state.tool_names.get(tool_use_id) == "monitor" for tool_use_id in state.active_tool_ids)
+        )
 
     def _background_summary_locked(
         self,
@@ -2357,6 +2394,7 @@ async def main() -> None:
 
         loop = asyncio.get_event_loop()
         peer_queue: asyncio.Queue[_IncomingPrompt] = asyncio.Queue()
+        pending_peer_prompts: deque[_IncomingPrompt] = deque()
 
         async def _queue_background_outcome(outcome: TurnOutcome) -> None:
             agent_id = outcome.identity.agent_id
@@ -2407,13 +2445,14 @@ async def main() -> None:
         )
         terminal = TerminalUI(prompt_session)
         prompt_task: asyncio.Task[TurnOutcome] | None = None
+        foreground_task: asyncio.Task[None] | None = None
         input_task: asyncio.Task[str] | None = None
         inbox_task: asyncio.Task[_IncomingPrompt] | None = None
         terminal_failure_task: asyncio.Task[None] | None = None
         main_status = TurnStatus.SUCCEEDED
         # Lets monitor() see messages that arrived but have not been read:
         # they cannot be delivered until the current turn finishes.
-        set_pending_message_probe(peer_queue.qsize)
+        set_pending_message_probe(lambda: _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task))
         peer_server: PeerServer | None = None
 
         async def _on_peer_message(message: PeerMessage) -> None:
@@ -2479,8 +2518,7 @@ async def main() -> None:
                 except asyncio.QueueEmpty:
                     return prompts
 
-        async def _run_peer_turn(first: _IncomingPrompt) -> None:
-            prompts = _collect_queued(first)
+        async def _run_peer_prompts(prompts: list[_IncomingPrompt]) -> None:
             for prompt in prompts:
                 await renderer.incoming(
                     prompt.display_text or prompt.text,
@@ -2489,6 +2527,9 @@ async def main() -> None:
                     suppress_display=prompt.suppress_display,
                 )
             await _run_turn("\n\n".join(prompt.text for prompt in prompts), source="peer")
+
+        async def _run_peer_turn(first: _IncomingPrompt) -> None:
+            await _run_peer_prompts(_collect_queued(first))
 
         async def _drain_peer_messages() -> None:
             try:
@@ -2551,13 +2592,171 @@ async def main() -> None:
             print(f"REPL ready ({label}). Enter sends, Esc interrupts and sends, Up recalls.")
             print(f"Commands: {commands_list}")
 
+            pending_inputs: deque[_QueuedInteractiveInput] = deque()
+            input_closed = False
+            last_foreground_source: str | None = None
+            max_pending_inputs = 32
+
+            async def _dispatch_command(user_input: str) -> tuple[bool, bool]:
+                lowered = user_input.lower()
+                if lowered in {"/quit", "/exit", "/q"}:
+                    return True, True
+                if lowered == "/help":
+                    tool_list = ", ".join(t.name for t in tools)
+                    print(f"Type your request. Tools: {tool_list}")
+                    print(f"Commands: {commands_list}")
+                    return True, False
+                if lowered == "/agents":
+                    _show_agents(renderer)
+                    return True, False
+                if lowered == "/agent-actions" or lowered.startswith("/agent-actions "):
+                    raw_mode = user_input[len("/agent-actions") :].strip()
+                    await _handle_agent_actions(renderer, raw_mode, _publish_main_event)
+                    return True, False
+                if lowered == "/agent-focus" or lowered.startswith("/agent-focus "):
+                    arg = user_input[len("/agent-focus") :].strip()
+                    if not arg:
+                        _show_agents(renderer)
+                        return True, False
+                    agent_id = _resolve_local_agent_id(arg)
+                    if agent_id is None:
+                        print(f"No local agent matching {arg!r}")
+                        return True, False
+                    renderer.set_focus(agent_id)
+                    print(f"Focused agent: {BOLD}{agent_id}{RESET}")
+                    await _publish_main_event(
+                        ConfigurationChanged(name="input_target", value=agent_id, source="interactive")
+                    )
+                    return True, False
+                if lowered == "/agent-stop" or lowered.startswith("/agent-stop "):
+                    arg = user_input[len("/agent-stop") :].strip() or renderer.focused_agent
+                    agent_id = _resolve_command_agent_id(arg, renderer)
+                    if agent_id is None:
+                        print(f"No local agent matching {arg!r}")
+                        return True, False
+                    if agent_id == "main":
+                        print("Use /quit to exit the main REPL agent.")
+                        return True, False
+                    print(await stop_agent(agent_id, reason="user requested stop"))
+                    if renderer.focused_agent == agent_id:
+                        await renderer.mark_idle()
+                        renderer.set_focus("main")
+                        print(f"Focused agent: {BOLD}main{RESET}")
+                    return True, False
+                if lowered == "/agent-interrupt" or lowered.startswith("/agent-interrupt "):
+                    arg = user_input[len("/agent-interrupt") :].strip() or renderer.focused_agent
+                    agent_id = _resolve_command_agent_id(arg, renderer)
+                    if agent_id is None:
+                        print(f"No local agent matching {arg!r}")
+                        return True, False
+                    if agent_id == "main":
+                        print("Press Ctrl-C while the main agent is streaming to interrupt it.")
+                        return True, False
+                    print(await interrupt_agent(agent_id, reason="user requested interrupt"))
+                    if renderer.focused_agent == agent_id:
+                        await renderer.mark_idle()
+                    return True, False
+
+                for prefix, cmd in commands.items():
+                    if lowered != prefix and not lowered.startswith(prefix + " "):
+                        continue
+                    cmd_arg = user_input[len(prefix) :].strip() or None
+                    if cmd_arg is None:
+                        cmd.show()
+                    else:
+                        previous_value = _command_configuration(prefix)
+                        previous_effort = effort.state.to_dict() if prefix == "/model" else None
+                        cmd.apply(cmd_arg)
+                        current_value = _command_configuration(prefix)
+                        if current_value != previous_value:
+                            await _publish_main_event(
+                                ConfigurationChanged(
+                                    name=prefix.removeprefix("/"),
+                                    value=current_value,
+                                    source="interactive",
+                                )
+                            )
+                        if previous_effort is not None and effort.state.to_dict() != previous_effort:
+                            await _publish_main_event(
+                                ConfigurationChanged(
+                                    name="effort",
+                                    value=effort.state.to_dict(),
+                                    source="interactive",
+                                )
+                            )
+                    return True, False
+                return False, False
+
+            def _can_dispatch_during_foreground(user_input: str) -> bool:
+                command = user_input.lower().split(maxsplit=1)[0]
+                if command in {"/help", "/agents", "/agent-actions"}:
+                    return True
+                return command in commands and command == user_input.lower()
+
+            async def _run_targeted_input(queued: _QueuedInteractiveInput) -> None:
+                if queued.target_agent_id == "main":
+                    await _run_turn(queued.text, source="interactive")
+                    return
+                if is_local_background_agent(queued.target_agent_id):
+                    delivered = await enqueue_local_agent_prompt(queued.target_agent_id, queued.text, wait=True)
+                    await renderer.mark_idle()
+                    if not delivered:
+                        print(f"Agent {queued.target_agent_id!r} is no longer running.")
+                        if renderer.focused_agent == queued.target_agent_id:
+                            renderer.set_focus("main")
+                    return
+                print(f"Agent {queued.target_agent_id!r} is no longer local.")
+                if renderer.focused_agent == queued.target_agent_id:
+                    renderer.set_focus("main")
+
+            async def _start_next_foreground() -> bool:
+                nonlocal foreground_task, last_foreground_source
+                while foreground_task is None:
+                    run_peer = bool(pending_peer_prompts) and (
+                        not pending_inputs or last_foreground_source == "interactive"
+                    )
+                    if run_peer:
+                        prompts = list(pending_peer_prompts)
+                        pending_peer_prompts.clear()
+                        foreground_task = asyncio.create_task(
+                            _run_peer_prompts(prompts),
+                            name="axio-repl-peer-turn",
+                        )
+                        last_foreground_source = "peer"
+                        return False
+                    if not pending_inputs:
+                        return False
+
+                    queued = pending_inputs.popleft()
+                    handled, should_exit = await _dispatch_command(queued.text)
+                    if should_exit:
+                        return True
+                    if handled:
+                        continue
+                    foreground_task = asyncio.create_task(
+                        _run_targeted_input(queued),
+                        name="axio-repl-interactive-turn",
+                    )
+                    last_foreground_source = "interactive"
+                return False
+
             while True:
-                if input_task is None:
+                if foreground_task is None:
+                    if input_closed and not pending_inputs:
+                        break
+                    if await _start_next_foreground():
+                        break
+
+                if input_task is None and not input_closed and len(pending_inputs) < max_pending_inputs:
                     input_task = asyncio.create_task(_read_input_async(prompt_session, renderer, _on_sigint))
                 if inbox_task is None:
                     inbox_task = asyncio.create_task(peer_queue.get())
 
-                wait_tasks: set[asyncio.Task[Any]] = {input_task, inbox_task}
+                wait_tasks: set[asyncio.Task[Any]] = {inbox_task}
+                if input_task is not None:
+                    wait_tasks.add(input_task)
+                if foreground_task is not None:
+                    wait_tasks.add(foreground_task)
                 if terminal_failure_task is not None:
                     wait_tasks.add(terminal_failure_task)
                 done, _ = await asyncio.wait(
@@ -2569,133 +2768,46 @@ async def main() -> None:
                     await terminal_failure_task
                     raise RuntimeError("terminal failure monitor stopped unexpectedly")
 
-                if inbox_task in done:
-                    peer_prompt = inbox_task.result()
-                    inbox_task = None
-                    await _run_peer_turn(peer_prompt)
-                    continue
+                if foreground_task is not None and foreground_task in done:
+                    foreground_task.result()
+                    foreground_task = None
 
-                if input_task not in done:
+                if inbox_task in done:
+                    pending_peer_prompts.append(inbox_task.result())
+                    inbox_task = None
+
+                if input_task is None or input_task not in done:
                     continue
 
                 try:
                     user_input = input_task.result()
                 except EOFError:
                     print()
-                    break
+                    input_closed = True
+                    continue
                 finally:
                     input_task = None
-                # Back before the turn runs, not after it. A turn is exactly
-                # when the prompt is wanted: to read the status line, and to
-                # type the next thing without waiting for the answer.
-                input_task = asyncio.create_task(_read_input_async(prompt_session, renderer, _on_sigint))
 
                 if not user_input:
                     continue
                 lowered = user_input.lower()
                 if lowered.startswith("/"):
                     await _publish_main_event(InputReceived(text=user_input, source="interactive-command"))
-                if lowered in {"/quit", "/exit", "/q"}:
-                    break
-                if lowered == "/help":
-                    tool_list = ", ".join(t.name for t in tools)
-                    print(f"Type your request. Tools: {tool_list}")
-                    print(f"Commands: {commands_list}")
-                    continue
-                if lowered == "/agents":
-                    _show_agents(renderer)
-                    continue
-                if lowered == "/agent-actions" or lowered.startswith("/agent-actions "):
-                    raw_mode = user_input[len("/agent-actions") :].strip()
-                    await _handle_agent_actions(renderer, raw_mode, _publish_main_event)
-                    continue
-                if lowered == "/agent-focus" or lowered.startswith("/agent-focus "):
-                    arg = user_input[len("/agent-focus") :].strip()
-                    if not arg:
-                        _show_agents(renderer)
-                        continue
-                    agent_id = _resolve_local_agent_id(arg)
-                    if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
-                        continue
-                    renderer.set_focus(agent_id)
-                    print(f"Focused agent: {BOLD}{agent_id}{RESET}")
-                    await _publish_main_event(
-                        ConfigurationChanged(name="input_target", value=agent_id, source="interactive")
-                    )
-                    continue
-                if lowered == "/agent-stop" or lowered.startswith("/agent-stop "):
-                    arg = user_input[len("/agent-stop") :].strip() or renderer.focused_agent
-                    agent_id = _resolve_command_agent_id(arg, renderer)
-                    if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
-                        continue
-                    if agent_id == "main":
-                        print("Use /quit to exit the main REPL agent.")
-                        continue
-                    print(await stop_agent(agent_id, reason="user requested stop"))
-                    if renderer.focused_agent == agent_id:
-                        await renderer.mark_idle()
-                        renderer.set_focus("main")
-                        print(f"Focused agent: {BOLD}main{RESET}")
-                    continue
-                if lowered == "/agent-interrupt" or lowered.startswith("/agent-interrupt "):
-                    arg = user_input[len("/agent-interrupt") :].strip() or renderer.focused_agent
-                    agent_id = _resolve_command_agent_id(arg, renderer)
-                    if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
-                        continue
-                    if agent_id == "main":
-                        print("Press Ctrl-C while the main agent is streaming to interrupt it.")
-                        continue
-                    print(await interrupt_agent(agent_id, reason="user requested interrupt"))
-                    if renderer.focused_agent == agent_id:
-                        await renderer.mark_idle()
-                    continue
-
-                matched = False
-                for prefix, cmd in commands.items():
-                    if lowered == prefix or lowered.startswith(prefix + " "):
-                        cmd_arg = user_input[len(prefix) :].strip() or None
-                        if cmd_arg is None:
-                            cmd.show()
-                        else:
-                            previous_value = _command_configuration(prefix)
-                            previous_effort = effort.state.to_dict() if prefix == "/model" else None
-                            cmd.apply(cmd_arg)
-                            current_value = _command_configuration(prefix)
-                            if current_value != previous_value:
-                                await _publish_main_event(
-                                    ConfigurationChanged(
-                                        name=prefix.removeprefix("/"),
-                                        value=current_value,
-                                        source="interactive",
-                                    )
-                                )
-                            if previous_effort is not None and effort.state.to_dict() != previous_effort:
-                                await _publish_main_event(
-                                    ConfigurationChanged(
-                                        name="effort",
-                                        value=effort.state.to_dict(),
-                                        source="interactive",
-                                    )
-                                )
-                        matched = True
+                if foreground_task is None or _can_dispatch_during_foreground(user_input):
+                    handled, should_exit = await _dispatch_command(user_input)
+                    if should_exit:
                         break
-                if matched:
-                    continue
+                    if handled:
+                        continue
 
-                if renderer.focused_agent == "main":
-                    await _run_turn(user_input, source="interactive")
-                elif is_local_background_agent(renderer.focused_agent):
-                    delivered = await enqueue_local_agent_prompt(renderer.focused_agent, user_input, wait=True)
-                    await renderer.mark_idle()
-                    if not delivered:
-                        print(f"Agent {renderer.focused_agent!r} is no longer running.")
-                        renderer.set_focus("main")
-                else:
-                    print(f"Agent {renderer.focused_agent!r} is no longer local; focusing main.")
-                    renderer.set_focus("main")
+                pending_inputs.append(
+                    _QueuedInteractiveInput(
+                        text=user_input,
+                        target_agent_id=renderer.focused_agent,
+                    )
+                )
+                if lowered in {"/quit", "/exit", "/q"}:
+                    input_closed = True
         except asyncio.CancelledError:
             main_status = TurnStatus.CANCELLED
             raise
@@ -2703,18 +2815,7 @@ async def main() -> None:
             main_status = TurnStatus.FAILED
             raise
         finally:
-            pending_tasks = [
-                task
-                for task in (input_task, inbox_task, terminal_failure_task)
-                if task is not None and not task.done()
-            ]
-            for task in pending_tasks:
-                task.cancel()
-            if pending_tasks:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-            if terminal_failure_task is not None and terminal_failure_task.done():
-                with suppress(asyncio.CancelledError):
-                    terminal_failure_task.exception()
+            await _cancel_and_settle_tasks(foreground_task, input_task, inbox_task, terminal_failure_task)
             try:
                 await stop_local_background_agents()
                 await ctx.close()
