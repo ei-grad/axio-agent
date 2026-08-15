@@ -170,6 +170,19 @@ rejected because Docker's bind-string representation cannot encode them safely.
 
 ### Restricted packages and datasets
 
+Axio does not deploy a proxy, registry cache, or dataset broker. It validates
+the sandbox network, injects client configuration, and mounts operator-provided
+files. The surrounding infrastructure enforces policy and obtains approved
+artifacts.
+
+Registry and proxy settings route well-behaved clients; they are not a security
+boundary. An agent can change environment variables or pass a different
+registry on a command line. The boundary that prevents direct Internet egress
+is a Docker network with `Internal=true`, plus firewalling on services that
+have upstream access.
+
+#### Network topology
+
 Create a user-defined internal network and attach only the sandbox and trusted
 service endpoints to it:
 
@@ -212,11 +225,12 @@ axio-repl --sandbox docker \
   --sandbox-network axio-agent-egress \
   --sandbox-proxy http://mitmania:3128 \
   --sandbox-no-proxy nexus \
-  --sandbox-pypi-index http://nexus:8081/repository/pypi/simple \
-  --sandbox-npm-registry http://nexus:8081/repository/npm/ \
-  --sandbox-cargo-index sparse+http://nexus:8081/repository/cargo/ \
-  --sandbox-go-proxy http://nexus:8081/repository/go/ \
+  --sandbox-pypi-index https://nexus:8081/repository/pypi/simple \
+  --sandbox-npm-registry https://nexus:8081/repository/npm/ \
+  --sandbox-cargo-index sparse+https://nexus:8081/repository/cargo/ \
+  --sandbox-go-proxy https://nexus:8081/repository/go/ \
   --sandbox-go-sumdb 'sum.golang.org https://nexus:8081/repository/sumdb/sum.golang.org' \
+  --sandbox-ca-cert /srv/axio-pki/egress-ca-bundle.pem \
   --sandbox-datasets /srv/axio-datasets
 ```
 
@@ -228,55 +242,170 @@ configuration, and non-default resource limits are rejected instead of silently
 falling back to the host when `--sandbox none` is selected or `--sandbox auto`
 cannot use Docker.
 
+#### Configuration mapping
+
+The flags map to these container settings:
+
+| REPL option | Container configuration | Purpose |
+|---|---|---|
+| `--sandbox-proxy` | `HTTP_PROXY`, `HTTPS_PROXY`, and lowercase variants | HTTP(S) policy proxy |
+| `--sandbox-no-proxy` | `NO_PROXY`, `no_proxy` | Trusted internal proxy bypass |
+| `--sandbox-pypi-index` | `UV_DEFAULT_INDEX`, `PIP_INDEX_URL` | Python package index |
+| `--sandbox-npm-registry` | `NPM_CONFIG_REGISTRY` | npm registry |
+| `--sandbox-cargo-index` | generated Cargo source replacement and `CARGO_HOME` | crates.io replacement |
+| `--sandbox-go-proxy` | `GOPROXY` | Go module proxy |
+| `--sandbox-go-sumdb` | `GOSUMDB` | Go checksum database/proxy |
+| `--sandbox-ca-cert` | read-only `/etc/axio/egress-ca.pem` plus client variables | Private PKI or TLS interception |
+| `--sandbox-datasets` | read-only `/datasets` | Approved dataset snapshots |
+
+These settings are visible to processes inside the container and are not
+secret storage. Do not embed credentials in endpoint URLs: command lines,
+shell history, process metadata, and Docker container configuration can expose
+them. Prefer a cache reachable only on the internal network, or keep narrowly
+scoped upstream credentials in the proxy/cache without exposing them to the
+sandbox.
+
+`--sandbox-no-proxy` is appropriate only for trusted service names on the
+internal network. It bypasses the HTTP proxy, not the internal-network
+containment boundary.
+
+#### Python and uv
+
+`--sandbox-pypi-index` sets both `UV_DEFAULT_INDEX` and
+`PIP_INDEX_URL`. The URL must use HTTP(S), contain a hostname, contain no
+whitespace, and omit credentials, query parameters, and fragments.
+
 For an HTTP PyPI mirror, the REPL validates the URL and derives
 `PIP_TRUSTED_HOST` and `UV_INSECURE_HOST` from its host and optional port. This
 is intentionally weaker transport security and should be limited to the
-isolated internal network; prefer an HTTPS mirror. Credentials, query strings,
-and fragments are rejected in the configured URL.
+isolated internal network; prefer an HTTPS mirror.
+
+Ubuntu's system Python in the standard image is externally managed under
+PEP 668. Use `uv add`, `uv sync`, or `uvx` rather than global
+`pip install`. The `python-data` command selects the baked data-analysis
+environment.
+
+#### npm
+
+`--sandbox-npm-registry` sets `NPM_CONFIG_REGISTRY`. Standard npm commands
+use that endpoint, while the external cache controls upstream repositories,
+retention, and package policy. A command-line registry override remains
+possible, but it cannot create an Internet route through an internal-only
+network.
+
+#### Cargo
 
 Cargo source replacement cannot be implemented by changing the registry-index
 environment variable alone. The REPL generates a temporary Cargo config with
-`[source.crates-io] replace-with = "axio-mirror"`, mounts it read-only at
-`/tmp/axio-cargo/config.toml`, and points `CARGO_HOME` there. It does not modify
-the project's `.cargo/config.toml`. A project-local Cargo config has higher
-precedence, so the internal Docker network and proxy policy remain the actual
+`[source.crates-io] replace-with = "axio-mirror"`. The generated
+configuration is equivalent to:
+
+```toml
+[source.crates-io]
+replace-with = "axio-mirror"
+
+[source.axio-mirror]
+registry = "sparse+https://nexus:8081/repository/cargo/"
+```
+
+Axio mounts the file read-only at
+`/tmp/axio-home/.cargo/config.toml`, sets
+`CARGO_HOME=/tmp/axio-home/.cargo`, and does not modify the project's
+`.cargo/config.toml`. Sparse registry URLs must end in `/`.
+
+A project-local Cargo config has higher precedence and can change source
+selection, so the internal network and proxy/firewall policy remain the actual
 fail-closed egress boundary.
 
-`GOPROXY` controls Go module downloads but does not by itself proxy the public
-checksum database. By default the REPL leaves Go's `GOSUMDB` behavior unchanged;
-the policy proxy must allow that traffic or the operator must explicitly set an
-internal checksum database/proxy with `--sandbox-go-sumdb`. Do not silently set
+#### Go modules
+
+`GOPROXY` controls Go module downloads. It carries checksum-database traffic
+only when the endpoint implements the GOPROXY protocol's `/sumdb/` routes;
+otherwise the Go command falls back to the checksum database directly, through
+`HTTPS_PROXY` when configured. By default the REPL leaves Go's `GOSUMDB`
+behavior unchanged. The selected proxy must mirror the checksum database, the
+policy proxy must allow the fallback, or the operator must explicitly select an
+internal checksum database with `--sandbox-go-sumdb`. Do not silently set
 `GOSUMDB=off`: that removes an integrity check.
 
-Do not embed credentials in endpoint URLs: command lines, shell history, and
-Docker container metadata are not secret stores. Prefer an unauthenticated
-cache reachable only on the internal network, or let mitmania/broker policy
-inject narrowly scoped credentials without exposing them to the sandbox.
+#### Other package and data clients
 
-The dataset path is mounted read-only at `/datasets`. A broker outside the
-sandbox should validate provider, dataset ID, immutable revision, license, file
-types, and size; download to content-addressed storage; then publish an approved
-snapshot under that host directory. The `kaggle` and `hf` binaries in the image
-do not bypass this policy. Avoid passing upload/delete credentials to the
-sandbox if its job is dataset consumption.
+Axio does not have a dedicated `apt` mirror option. Tools without a dedicated
+sandbox setting can use the generic proxy when policy permits it. For
+reproducible builds, configure the internal package source in the image instead
+of changing the system package manager at runtime.
 
-For TLS interception, add `--sandbox-ca-cert /path/to/egress-ca-bundle.pem`.
-This must be a complete CA bundle containing the normal system roots plus the
-interception CA: several of the Python, uv, Git, curl, and Cargo variables set
-by this flag replace those clients' default bundle rather than extending it
-(`NODE_EXTRA_CA_CERTS` extends Node's trust instead).
-Java tools need a corresponding JVM truststore baked into the image or
-configured through Maven/Gradle; the PEM flag does not mutate the system or JVM
-trust stores. `wget` does not honor these per-client CA variables; use `curl` or
-configure its trust separately. With mitmania `mitm:false`, no interception CA
-is needed and TLS remains end-to-end. `--sandbox-no-proxy` is only for trusted
-internal service names: it bypasses the HTTP proxy, not the internal-network
-containment boundary.
+The standard image includes the `kaggle` and `hf` CLIs, but Axio does not
+configure provider-specific endpoints or credentials for them. A generic proxy
+is sufficient only when its policy can constrain those clients to approved
+operations. Prefer an internal dataset broker and immutable snapshots when
+access requires credentials or a review of licenses, file types, or size.
 
-Ubuntu's system Python in the standard image is externally managed under PEP
-668. Use `uv add`, `uv sync`, or `uvx` for project dependencies and one-off
-tools; do not rely on global `pip install`. The `python-data` command selects
-the baked data-analysis environment.
+Package-manager caches normally live below the sandbox's temporary `HOME` and
+disappear when the sandbox closes. A reusable cache therefore has to be an
+explicit external service or mount; Axio does not provide one.
+
+#### Dataset snapshots
+
+`--sandbox-datasets` mounts one host directory read-only at `/datasets`. A
+typical broker workflow is:
+
+1. Validate the provider, dataset identifier, and immutable revision.
+2. Enforce license, file-type, and size policy before download.
+3. Fetch with narrowly scoped credentials that are never exposed to the
+   sandbox.
+4. Publish a content-addressed or otherwise immutable snapshot into the
+   approved host directory.
+
+The read-only mount prevents ordinary sandbox processes from modifying the
+published snapshot. The broker, not the sandbox, owns upstream credentials and
+public network access.
+
+#### CA bundles and TLS interception
+
+For TLS interception, pass `--sandbox-ca-cert /path/to/egress-ca-bundle.pem`.
+The file is mounted read-only at
+`/etc/axio/egress-ca.pem` and exposed to supported clients as follows:
+
+| Client | Environment variable |
+|---|---|
+| OpenSSL-compatible tools and uv | `SSL_CERT_FILE` |
+| Requests | `REQUESTS_CA_BUNDLE` |
+| curl | `CURL_CA_BUNDLE` |
+| Git | `GIT_SSL_CAINFO` |
+| Node.js | `NODE_EXTRA_CA_CERTS` |
+| Cargo | `CARGO_HTTP_CAINFO` |
+
+Supply a complete PEM bundle containing the normal system roots plus the
+private or interception CA. Most variables in the table replace that client's
+default bundle; `NODE_EXTRA_CA_CERTS` extends Node's default trust instead.
+
+The flag does not mutate the system CA store or a JVM truststore. Java,
+Maven, and Gradle therefore need an appropriate JKS or PKCS12 truststore baked
+into the image or configured separately. `wget` does not honor these
+per-client variables; use `curl` or configure wget's trust explicitly. With
+mitmania `mitm:false`, no interception CA is needed and TLS remains end to end.
+
+#### Operational checks
+
+Before treating the setup as restricted egress, verify all of the following:
+
+1. `docker network inspect` reports `Internal: true` for the sandbox network.
+2. The sandbox container is attached only to that network.
+3. mitmania, registry caches, and the dataset broker have separately controlled
+   upstream access; the sandbox does not share their upstream network.
+4. Internal service names resolve from the sandbox and approved package
+   downloads succeed through the intended endpoint.
+5. An unapproved public hostname is unreachable directly, including when a
+   package manager is given an explicit command-line registry override.
+6. Go uses the intended checksum database path, or any decision to disable it
+   is explicit and documented as an integrity trade-off.
+7. The CA bundle, generated Cargo configuration, host account databases
+   (`/etc/passwd` and `/etc/group`), and dataset snapshots have the expected
+   read-only mounts. The project directory is intentionally writable.
+
+A successful package install tests routing. The negative direct-egress test is
+what demonstrates containment.
 
 ## Container lifecycle
 
