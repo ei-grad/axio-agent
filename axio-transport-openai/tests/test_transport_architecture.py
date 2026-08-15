@@ -9,7 +9,7 @@ from pathlib import Path
 import axio_transport_openai
 import axio_transport_openai.responses as responses
 from axio_transport_openai import ChatCompletionsTransport, OpenAITransport
-from axio_transport_openai.custom import CustomChatCompletionsTransport
+from axio_transport_openai.custom import CustomChatCompletionsTransport, OpenAICompatibleTransport
 from axio_transport_openai.llamacpp import LlamaCppTransport
 from axio_transport_openai.nebius import NebiusTransport
 from axio_transport_openai.openrouter import OpenRouterTransport
@@ -38,7 +38,7 @@ def test_chat_compatible_providers_use_chat_completions() -> None:
 def test_removed_transport_names_are_not_exported() -> None:
     assert not hasattr(axio_transport_openai, "OpenAIResponsesTransport")
     assert not hasattr(responses, "OpenAIResponsesTransport")
-    assert not hasattr(axio_transport_openai, "OpenAICompatibleTransport")
+    assert OpenAICompatibleTransport is CustomChatCompletionsTransport
 
 
 def test_transport_entry_points_are_unambiguous() -> None:
@@ -48,13 +48,14 @@ def test_transport_entry_points_are_unambiguous() -> None:
 
     assert entry_points["openai"] == "axio_transport_openai:OpenAITransport"
     assert "openai-responses" not in entry_points
-    assert entry_points["openai-custom"].endswith(":CustomChatCompletionsTransport")
+    assert entry_points["openai-custom"].endswith(":OpenAICompatibleTransport")
 
 
 def test_installed_openai_entry_point_loads_responses_transport() -> None:
     transport_entries = {entry.name: entry for entry in entry_points(group="axio.transport")}
 
     assert transport_entries["openai"].load() is OpenAITransport
+    assert transport_entries["openai-custom"].load() is CustomChatCompletionsTransport
     assert "openai-responses" not in transport_entries
 
 

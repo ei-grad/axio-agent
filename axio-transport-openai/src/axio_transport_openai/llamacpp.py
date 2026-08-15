@@ -169,7 +169,8 @@ class LlamaCppTransport(ChatCompletionsTransport):
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         if not self._sync_active_model():
             raise RuntimeError("LlamaCppTransport: call fetch_models() before building a payload")
-        return super().build_payload(messages, tools, system)
+        # Python 3.12 slots dataclasses replace the class, so zero-argument super() captures the discarded class.
+        return super(LlamaCppTransport, self).build_payload(messages, tools, system)  # noqa: UP008
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -245,14 +246,14 @@ class LlamaCppTransport(ChatCompletionsTransport):
         logger.info("Loaded %d usable models from llama.cpp (%s mode)", len(self.models), mode)
 
     def to_dict(self) -> dict[str, Any]:
-        data = super().to_dict()
+        data = super(LlamaCppTransport, self).to_dict()  # noqa: UP008
         if self.model.id in self.models:
             data["model"] = self.model.id
         return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, session: aiohttp.ClientSession | None = None) -> Self:
-        obj = super().from_dict(data, session=session)
+        obj = super(LlamaCppTransport, cls).from_dict(data, session=session)  # noqa: UP008
         obj.models = ModelRegistry(
             dataclasses.replace(model, pricing_available=False) for model in obj.models.values()
         )

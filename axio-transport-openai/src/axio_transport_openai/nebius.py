@@ -59,7 +59,8 @@ class NebiusTransport(ThinkingMixin, ChatCompletionsTransport):
 
     def configure_effort(self, requested: str | None) -> EffortState:
         self.thinking = False
-        return super().configure_effort(requested)
+        # Python 3.12 slots dataclasses replace the class, so zero-argument super() captures the discarded class.
+        return super(NebiusTransport, self).configure_effort(requested)  # noqa: UP008
 
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[Any]:
         if self.model is _UNSET:

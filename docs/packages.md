@@ -74,7 +74,7 @@ OpenAI Responses and OpenAI-compatible Chat Completions transports using
 | `nebius` | `NebiusTransport` | Nebius AI Studio |
 | `openrouter` | `OpenRouterTransport` | OpenRouter |
 | `llama-cpp` | `LlamaCppTransport` | Local llama.cpp server |
-| `openai-custom` | `CustomChatCompletionsTransport` | Any Chat Completions endpoint |
+| `openai-custom` | `OpenAICompatibleTransport` | Any Chat Completions endpoint |
 
 Settings screens are registered under `axio.transport.settings` for each.
 

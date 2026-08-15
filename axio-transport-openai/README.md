@@ -232,6 +232,9 @@ user-defined providers. Instances are created by the TUI hub screen and
 persisted to `~/.local/share/axio/openai-custom.json`. You can also instantiate
 them directly:
 
+`OpenAICompatibleTransport` remains a public compatibility alias for this
+class and is also the target of the `openai-custom` plugin entry point.
+
 ```python
 from axio.models import ModelSpec, ModelRegistry, Capability
 from axio_transport_openai.custom import CustomChatCompletionsTransport
@@ -330,7 +333,7 @@ When installed, this package registers five completion transports via entry poin
 openai         = "axio_transport_openai:OpenAITransport"
 nebius         = "axio_transport_openai.nebius:NebiusTransport"
 openrouter     = "axio_transport_openai.openrouter:OpenRouterTransport"
-openai-custom  = "axio_transport_openai.custom:CustomChatCompletionsTransport"
+openai-custom  = "axio_transport_openai.custom:OpenAICompatibleTransport"
 llama-cpp      = "axio_transport_openai.llamacpp:LlamaCppTransport"
 ```
 
@@ -338,10 +341,11 @@ llama-cpp      = "axio_transport_openai.llamacpp:LlamaCppTransport"
 
 `OpenAITransport` now means the official OpenAI Responses API exclusively.
 Use `ChatCompletionsTransport` for generic compatible endpoints. The former
-`OpenAIResponsesTransport`, `OpenAICompatibleTransport`, and
-`openai-responses` entry point were removed without aliases. Persisted TUI role
-bindings named `openai-responses:<model>` are migrated once to
-`openai:<model>`; command-line selections must use `openai`.
+`OpenAIResponsesTransport` and the `openai-responses` entry point were removed
+without aliases. `OpenAICompatibleTransport` remains as an alias for the
+explicit `CustomChatCompletionsTransport`. Persisted TUI role bindings named
+`openai-responses:<model>` are migrated once to `openai:<model>`; command-line
+selections must use `openai`.
 
 ## Part of the axio ecosystem
 

@@ -80,7 +80,8 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
         return PromptEffortAdapter().configure_effort(level)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
-        payload = super().build_payload(messages, tools, system)
+        # Python 3.12 slots dataclasses replace the class, so zero-argument super() captures the discarded class.
+        payload = super(OpenRouterTransport, self).build_payload(messages, tools, system)  # noqa: UP008
         # ThinkingMixin asks for enable_thinking, which OpenRouter does not
         # understand: it takes a reasoning object and returns the trace in
         # delta.reasoning.

@@ -73,3 +73,6 @@ class CustomChatCompletionsTransport(ChatCompletionsTransport):
         """
         obj = super().from_dict(data, session=session)
         return dataclasses.replace(obj, base_url=str(data.get("base_url", "")), api_key=str(data.get("api_key", "")))
+
+
+OpenAICompatibleTransport = CustomChatCompletionsTransport
