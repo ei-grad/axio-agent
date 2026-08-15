@@ -216,6 +216,7 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     # raw mode - so Ctrl+C arrives as a keypress, not as SIGINT, and the handler
     # that used to stop a running turn never fires.
     from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
 
     interrupts: list[int] = []
     answers: list[object] = [KeyboardInterrupt(), KeyboardInterrupt(), "carry on"]
@@ -227,19 +228,254 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
                 raise answer
             return str(answer)
 
-    result = await _read_input_async(_Session(), ReplRenderer(), lambda: interrupts.append(1))
+    renderer = ReplRenderer()
+    renderer.set_focus("child")
 
-    assert result == "carry on"
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        del reserved_seq
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id="input-1",
+            arrival_seq=1,
+        )
+
+    result = await _read_input_async(_Session(), renderer, lambda: interrupts.append(1), admit)
+
+    assert result.text == "carry on"
+    assert result.target_agent_id == "child"
     assert len(interrupts) == 2
 
 
-async def test_escape_interrupts_and_sends_while_enter_only_sends(
+async def test_enter_admission_completes_before_editor_clear_even_when_reader_is_cancelled() -> None:
+    from axio_tools_agents.runtime import AgentEventEnvelope, ExecutionMode, RuntimeEvent
+
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._coordinator import PendingInputCoordinator
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    published = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish(event: RuntimeEvent) -> AgentEventEnvelope:
+        published.set()
+        await release.wait()
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id="run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    coordinator = PendingInputCoordinator(publish)
+
+    class Buffer:
+        text = "queued text"
+        _axio_accepted_target = "child-at-enter"
+
+        def reset(self) -> None:
+            self.text = ""
+
+    class Session:
+        default_buffer = Buffer()
+
+        async def prompt_async(self, prompt: str) -> str:
+            assert prompt == "repl> "
+            return self.default_buffer.text
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id=entry.id,
+            arrival_seq=entry.arrival_seq,
+        )
+
+    session = Session()
+    renderer = ReplRenderer()
+    renderer.set_focus("main")
+    reader = asyncio.create_task(_read_input_async(session, renderer, lambda: None, admit))
+    await asyncio.wait_for(published.wait(), timeout=1)
+
+    assert session.default_buffer.text == "queued text"
+    reader.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+
+    assert session.default_buffer.text == ""
+    assert coordinator.pending_count == 1
+    assert coordinator.state.pending[0].intended_target_agent_id == "child-at-enter"
+
+
+async def test_reader_cancellation_after_accept_cannot_abandon_reserved_sequence() -> None:
+    from axio_tools_agents.runtime import (
+        AgentEventEnvelope,
+        ExecutionMode,
+        InputReceived,
+        RuntimeEvent,
+        SessionEventHub,
+    )
+
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._coordinator import PendingInputCoordinator
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    hub = SessionEventHub(session_id="session")
+    accepted = asyncio.Event()
+
+    async def publish_main(event: RuntimeEvent, reserved_seq: int | None = None) -> AgentEventEnvelope:
+        return await hub.publish(
+            event,
+            run_id="run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            reserved_seq=reserved_seq,
+        )
+
+    coordinator = PendingInputCoordinator(
+        publish_main,
+        lambda event, sequence: publish_main(event, sequence),
+    )
+
+    class Buffer:
+        text = "accepted draft"
+        _axio_accepted_target = ""
+        _axio_accepted_seq = 0
+
+        def reset(self) -> None:
+            self.text = ""
+
+    class Session:
+        default_buffer = Buffer()
+
+        async def prompt_async(self, prompt: str) -> str:
+            assert prompt == "repl> "
+            self.default_buffer._axio_accepted_target = "main"
+            self.default_buffer._axio_accepted_seq = hub.reserve_sequence()
+            accepted.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id=entry.id,
+            arrival_seq=entry.arrival_seq,
+        )
+
+    reader = asyncio.create_task(_read_input_async(Session(), ReplRenderer(), lambda: None, admit))
+    await asyncio.wait_for(accepted.wait(), timeout=1)
+    reader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+
+    peer = await asyncio.wait_for(
+        hub.publish(
+            InputReceived(text="later", source="peer"),
+            run_id="peer",
+            agent_id="peer",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+        ),
+        timeout=1,
+    )
+    assert coordinator.state.pending[0].arrival_seq == 1
+    assert peer.seq == 2
+
+
+async def test_prompt_failure_after_accept_completes_reservation_before_reraising() -> None:
+    from axio_tools_agents.runtime import (
+        AgentEventEnvelope,
+        ExecutionMode,
+        InputReceived,
+        RuntimeEvent,
+        SessionEventHub,
+    )
+
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._coordinator import PendingInputCoordinator
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    hub = SessionEventHub(session_id="session")
+
+    async def publish_main(event: RuntimeEvent, reserved_seq: int | None = None) -> AgentEventEnvelope:
+        return await hub.publish(
+            event,
+            run_id="run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            reserved_seq=reserved_seq,
+        )
+
+    coordinator = PendingInputCoordinator(
+        publish_main,
+        lambda event, sequence: publish_main(event, sequence),
+    )
+
+    class Buffer:
+        text = "accepted before failure"
+        _axio_accepted_target = "main"
+        _axio_accepted_seq = hub.reserve_sequence()
+
+        def reset(self) -> None:
+            self.text = ""
+
+    class Session:
+        default_buffer = Buffer()
+
+        async def prompt_async(self, prompt: str) -> str:
+            assert prompt == "repl> "
+            raise OSError("prompt teardown failed")
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id=entry.id,
+            arrival_seq=entry.arrival_seq,
+        )
+
+    with pytest.raises(OSError, match="prompt teardown failed"):
+        await _read_input_async(Session(), ReplRenderer(), lambda: None, admit)
+
+    peer = await asyncio.wait_for(
+        hub.publish(
+            InputReceived(text="later", source="peer"),
+            run_id="peer",
+            agent_id="peer",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+        ),
+        timeout=1,
+    )
+    assert coordinator.state.pending[0].arrival_seq == 1
+    assert peer.seq == 2
+
+
+async def test_escape_interrupts_without_submitting_or_changing_editor(
     tmp_path: Path,
     repl_history_path: Path,
 ) -> None:
-    # Enter is "and then this", which belongs after the answer being written.
-    # Escape is "stop, do this instead", worth nothing once the thing being
-    # stopped has finished.
     from typing import Any
 
     from prompt_toolkit.application import create_app_session
@@ -247,30 +483,140 @@ async def test_escape_interrupts_and_sends_while_enter_only_sends(
     from prompt_toolkit.output import DummyOutput
 
     interrupts: list[int] = []
+    interrupted = asyncio.Event()
+
+    def interrupt() -> None:
+        interrupts.append(1)
+        interrupted.set()
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", on_interrupt=lambda: interrupts.append(1))
+            session: Any = _panel.make_session(lambda: "status", on_interrupt=interrupt)
 
             pipe.send_text("sent with enter\r")
             assert await session.prompt_async("repl> ") == "sent with enter"
+            _panel.commit_history(session, ("sent with enter",))
             assert interrupts == []
 
-            pipe.send_text("stop, do this\x1b")
-            assert await session.prompt_async("repl> ") == "stop, do this"
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("unfinished editor\x1b")
+            await asyncio.wait_for(interrupted.wait(), timeout=1)
+            assert prompt.done() is False
             assert len(interrupts) == 1
 
+            interrupted.clear()
             pipe.send_text("\x1b")
-            assert await session.prompt_async("repl> ") == ""
+            await asyncio.wait_for(interrupted.wait(), timeout=1)
+            assert prompt.done() is False
             assert len(interrupts) == 2
+
+            pipe.send_text(" completed\r")
+            assert await prompt == "unfinished editor completed"
+            _panel.commit_history(session, ("unfinished editor completed",))
 
     assert repl_history_path == tmp_path / "history"
     history = repl_history_path.read_text()
     assert "sent with enter" in history
-    assert "stop, do this" in history
+    assert "unfinished editor completed" in history
 
 
-async def test_up_recalls_the_last_message_for_editing(repl_history_path: Path) -> None:
+async def test_repeated_escape_stress_never_submits_or_mutates_editor() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    interrupt_count = 0
+
+    def interrupt() -> None:
+        nonlocal interrupt_count
+        interrupt_count += 1
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", on_interrupt=interrupt)
+            session.app.ttimeoutlen = 0.001
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            await asyncio.sleep(0.05)
+            pipe.send_text("editor stays")
+
+            pipe.send_text("\x1b" * 500)
+            for _ in range(1_000):
+                if interrupt_count == 500:
+                    break
+                await asyncio.sleep(0.001)
+            assert interrupt_count == 500
+            assert prompt.done() is False
+
+            pipe.send_text(" intact\r")
+            assert await prompt == "editor stays intact"
+
+
+async def test_up_recalls_all_pending_messages_as_one_editor_value(repl_history_path: Path) -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    pending = ["first pending", "second pending"]
+    recalled = asyncio.Event()
+
+    async def recall_pending() -> str | None:
+        recalled.set()
+        if not pending:
+            return None
+        result = "\n\n".join(pending)
+        pending.clear()
+        return result
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", recall_pending=recall_pending)
+
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("\x1b[A")
+            await asyncio.wait_for(recalled.wait(), timeout=1)
+            await asyncio.sleep(0)
+            pipe.send_text(" and more\r")
+            assert await prompt == "first pending\n\nsecond pending and more"
+            _panel.commit_history(session, ("first pending\n\nsecond pending and more",))
+
+    history = repl_history_path.read_text()
+    assert "first pending" in history
+    assert "second pending and more" in history
+
+
+async def test_up_falls_back_to_prompt_history_when_pending_is_empty(repl_history_path: Path) -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    async def no_pending() -> str | None:
+        return None
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", recall_pending=no_pending)
+
+            pipe.send_text("history item\r")
+            assert await session.prompt_async("repl> ") == "history item"
+            _panel.commit_history(session, ("history item",))
+
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("\x1b[A")
+            await asyncio.sleep(0.05)
+            pipe.send_text(" edited\r")
+            assert await prompt == "history item edited"
+            _panel.commit_history(session, ("history item edited",))
+
+    assert "history item edited" in repl_history_path.read_text()
+
+
+async def test_unclaimed_enter_is_not_exposed_by_persistent_history() -> None:
     from typing import Any
 
     from prompt_toolkit.application import create_app_session
@@ -281,13 +627,248 @@ async def test_up_recalls_the_last_message_for_editing(repl_history_path: Path) 
         with create_app_session(input=pipe, output=DummyOutput()):
             session: Any = _panel.make_session(lambda: "status")
 
-            pipe.send_text("first message\x1b")
-            assert await session.prompt_async("repl> ") == "first message"
+            pipe.send_text("still pending\r")
+            assert await session.prompt_async("repl> ") == "still pending"
 
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("\x1b[Anew text\r")
+            assert await prompt == "new text"
+
+
+async def test_enter_captures_focus_before_prompt_teardown() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    focused = {"agent_id": "child-at-enter"}
+
+    def capture_target() -> str:
+        accepted = focused["agent_id"]
+        focused["agent_id"] = "main-after-accept"
+        return accepted
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", capture_target=capture_target)
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("targeted input\r")
+
+            assert await prompt == "targeted input"
+            assert focused["agent_id"] == "main-after-accept"
+            assert _panel.accepted_target(session, focused["agent_id"]) == "child-at-enter"
+
+
+async def test_enter_reservation_precedes_peer_published_after_accept_handler() -> None:
+    from typing import Any
+
+    from axio_tools_agents.runtime import (
+        AgentEventEnvelope,
+        ExecutionMode,
+        InputBuffered,
+        InputReceived,
+        RuntimeEvent,
+        SessionEventHub,
+    )
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._coordinator import PendingInputCoordinator
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    hub = SessionEventHub(session_id="session")
+    observed: list[AgentEventEnvelope] = []
+    peer_tasks: list[asyncio.Task[AgentEventEnvelope]] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        observed.append(envelope)
+
+    hub.subscribe(collect)
+
+    async def publish_main(event: RuntimeEvent, reserved_seq: int | None = None) -> AgentEventEnvelope:
+        return await hub.publish(
+            event,
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            reserved_seq=reserved_seq,
+        )
+
+    coordinator = PendingInputCoordinator(
+        publish_main,
+        lambda event, sequence: publish_main(event, sequence),
+    )
+
+    def schedule_peer_after_accept() -> str:
+        def publish_peer() -> None:
+            peer_tasks.append(
+                asyncio.create_task(
+                    hub.publish(
+                        InputReceived(text="peer", source="peer"),
+                        run_id="peer-run",
+                        agent_id="peer",
+                        parent_agent_id=None,
+                        turn_id=None,
+                        execution_mode=ExecutionMode.BACKGROUND,
+                    )
+                )
+            )
+
+        asyncio.get_running_loop().call_soon(publish_peer)
+        return "main"
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id=entry.id,
+            arrival_seq=entry.arrival_seq,
+        )
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(
+                lambda: "status",
+                capture_target=schedule_peer_after_accept,
+                reserve_sequence=hub.reserve_sequence,
+            )
+            reader = asyncio.create_task(_read_input_async(session, ReplRenderer(), lambda: None, admit))
+            pipe.send_text("queued before peer\r")
+            submitted = await asyncio.wait_for(reader, timeout=1)
+            await asyncio.gather(*peer_tasks)
+
+    assert submitted.arrival_seq == 1
+    assert isinstance(observed[0].event, InputBuffered)
+    assert isinstance(observed[1].event, InputReceived)
+    assert [envelope.seq for envelope in observed] == [1, 2]
+
+
+async def test_empty_ctrl_d_requires_two_presses_but_nonempty_ctrl_d_deletes_forward() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    presses: list[float] = []
+
+    def arm_exit(now: float) -> bool:
+        presses.append(now)
+        return len(presses) == 2
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", on_empty_eof=arm_exit)
+
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("ab\x1b[D\x04\r")
+            assert await prompt == "a"
+            assert presses == []
+
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("\x04")
+            await asyncio.sleep(0.05)
+            assert prompt.done() is False
+            assert len(presses) == 1
+
+            pipe.send_text("\x04")
+            with pytest.raises(EOFError):
+                await prompt
+            assert len(presses) == 2
+
+
+def test_editor_text_reads_without_mutating_default_buffer() -> None:
+    class Buffer:
+        text = "unsent editor"
+
+    class Session:
+        default_buffer = Buffer()
+
+    session = Session()
+
+    assert _panel.editor_text(session) == "unsent editor"
+    assert session.default_buffer.text == "unsent editor"
+
+
+async def test_cancelling_prompt_keeps_unsent_editor_available_for_shutdown_snapshot() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status")
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("unsent editor")
+            for _ in range(100):
+                if _panel.editor_text(session) == "unsent editor":
+                    break
+                await asyncio.sleep(0.01)
+            assert _panel.editor_text(session) == "unsent editor"
+
+            prompt.cancel()
+            await asyncio.gather(prompt, return_exceptions=True)
+
+            assert _panel.editor_text(session) == "unsent editor"
+
+
+async def test_ctrl_c_requests_shutdown_without_exiting_or_clearing_editor() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    shutdown = asyncio.Event()
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", on_shutdown=shutdown.set)
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            pipe.send_text("unsaved draft\x03")
+            await asyncio.wait_for(shutdown.wait(), timeout=1)
+
+            assert not prompt.done()
+            assert _panel.editor_text(session) == "unsaved draft"
+
+            prompt.cancel()
+            await asyncio.gather(prompt, return_exceptions=True)
+            assert _panel.editor_text(session) == "unsaved draft"
+
+
+async def test_prompt_cancellation_cannot_split_recall_from_editor_update() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    recall_started = asyncio.Event()
+    release_recall = asyncio.Event()
+
+    async def recall_pending() -> str:
+        recall_started.set()
+        await release_recall.wait()
+        return "first\n\nsecond"
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", recall_pending=recall_pending)
+            prompt = asyncio.create_task(session.prompt_async("repl> "))
             pipe.send_text("\x1b[A")
-            pipe.send_text(" and more\x1b")
-            assert await session.prompt_async("repl> ") == "first message and more"
+            await asyncio.wait_for(recall_started.wait(), timeout=1)
 
-    history = repl_history_path.read_text()
-    assert "first message" in history
-    assert "first message and more" in history
+            prompt.cancel()
+            await asyncio.sleep(0)
+            release_recall.set()
+            await asyncio.gather(prompt, return_exceptions=True)
+
+            assert _panel.editor_text(session) == "first\n\nsecond"

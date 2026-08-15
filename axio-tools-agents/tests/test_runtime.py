@@ -35,6 +35,7 @@ from axio_tools_agents.runtime import (
     current_turn_identity,
     new_turn_identity,
     observe_agent_turn,
+    observe_agent_turn_messages,
 )
 
 
@@ -67,6 +68,94 @@ async def test_event_hub_fans_out_one_total_order_to_every_subscriber() -> None:
 
     assert first == list(range(1, 21))
     assert second == first
+
+
+async def test_event_hub_holds_later_publication_until_reserved_ingress_arrives() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    observed: list[tuple[int, str]] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        assert isinstance(envelope.event, TextDelta)
+        observed.append((envelope.seq, envelope.event.delta))
+
+    hub.subscribe(collect)
+    accepted_enter_seq = hub.reserve_sequence()
+    later = asyncio.create_task(
+        hub.publish(
+            TextDelta(index=0, delta="peer-after-enter"),
+            run_id="run",
+            agent_id="peer",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not later.done()
+    assert observed == []
+
+    enter = await hub.publish(
+        TextDelta(index=0, delta="enter"),
+        run_id="run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        reserved_seq=accepted_enter_seq,
+    )
+    peer = await later
+
+    assert enter.seq == accepted_enter_seq == 1
+    assert peer.seq == 2
+    assert observed == [(1, "enter"), (2, "peer-after-enter")]
+
+
+async def test_event_hub_cancellation_does_not_strand_a_later_publication() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    delivering_reserved = asyncio.Event()
+    observed: list[str] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        assert isinstance(envelope.event, TextDelta)
+        if envelope.event.delta == "reserved":
+            delivering_reserved.set()
+            await asyncio.Future()
+        observed.append(envelope.event.delta)
+
+    hub.subscribe(collect)
+    reserved_seq = hub.reserve_sequence()
+    later = asyncio.create_task(
+        hub.publish(
+            TextDelta(index=0, delta="later"),
+            run_id="run",
+            agent_id="peer",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+        )
+    )
+    await asyncio.sleep(0)
+    reserved = asyncio.create_task(
+        hub.publish(
+            TextDelta(index=0, delta="reserved"),
+            run_id="run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            reserved_seq=reserved_seq,
+        )
+    )
+    await asyncio.wait_for(delivering_reserved.wait(), timeout=1)
+
+    reserved.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reserved
+    peer = await asyncio.wait_for(later, timeout=1)
+
+    assert peer.seq == 2
+    assert observed == ["later"]
 
 
 async def test_event_hub_isolates_a_failed_observer_from_other_observers() -> None:
@@ -133,6 +222,40 @@ async def test_observed_turn_forwards_full_stream_and_finishes_with_typed_outcom
     )
 
 
+async def test_observed_turn_preserves_a_distinct_ordered_input_batch() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    events: list[object] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        events.append(envelope.event)
+
+    hub.subscribe(collect)
+    context = MemoryContextStore()
+    messages = (
+        Message(role="user", content=[TextBlock(text="first")]),
+        Message(role="user", content=[TextBlock(text="peer")]),
+        Message(role="user", content=[TextBlock(text="second")]),
+    )
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="run-1",
+    )
+
+    outcome = await observe_agent_turn_messages(
+        agent=Agent(system="main", transport=StubTransport([make_text_response("answer")])),
+        context=context,
+        messages=messages,
+        identity=identity,
+        hub=hub,
+    )
+
+    assert outcome.succeeded
+    assert (await context.get_history())[:3] == list(messages)
+    assert events[0] == TurnStarted(prompt="first\n\npeer\n\nsecond")
+
+
 async def test_observed_context_publishes_commits_and_forks_with_context_ids() -> None:
     hub = SessionEventHub(session_id="session-1")
     envelopes: list[AgentEventEnvelope] = []
@@ -172,6 +295,40 @@ async def test_observed_context_publishes_commits_and_forks_with_context_ids() -
     assert forked.context_id == context.session_id
     assert forked.event.source_context_id == context.session_id
     assert forked.event.child_context_id == child.session_id
+
+
+async def test_observed_input_batch_correlates_only_its_source_messages() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    events: list[object] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        events.append(envelope.event)
+
+    hub.subscribe(collect)
+    context = ObservedContextStore(MemoryContextStore(), hub)
+    messages = (
+        Message(role="user", content=[TextBlock(text="interactive")]),
+        Message(role="user", content=[TextBlock(text="peer")]),
+    )
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="run-1",
+        context_id=context.session_id,
+    )
+
+    await observe_agent_turn_messages(
+        agent=Agent(system="main", transport=StubTransport([make_text_response("answer")])),
+        context=context,
+        messages=messages,
+        identity=identity,
+        hub=hub,
+        source_input_ids=("input-1", None),
+    )
+
+    commits = [event for event in events if isinstance(event, MessageCommitted)]
+    assert [event.source_input_id for event in commits] == ["input-1", None, None]
 
 
 async def test_failed_context_append_is_not_reported_as_committed() -> None:
@@ -393,3 +550,50 @@ async def test_cancel_closes_child_stream_and_records_cancelled_turn() -> None:
     assert transport.closed.is_set()
     assert finished[-1].status is TurnStatus.CANCELLED
     assert current_turn_identity() is None
+
+
+class _PartialBlockingTransport:
+    def __init__(self) -> None:
+        self.partial_sent = asyncio.Event()
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools, system
+        yield TextDelta(index=0, delta="available partial")
+        self.partial_sent.set()
+        await asyncio.Future()
+
+
+async def test_cancelled_observed_turn_commits_available_partial_text_once() -> None:
+    transport = _PartialBlockingTransport()
+    context = MemoryContextStore()
+    identity = new_turn_identity(
+        agent_id="child",
+        parent_agent_id="main",
+        execution_mode=ExecutionMode.BACKGROUND,
+    )
+    task = asyncio.create_task(
+        observe_agent_turn(
+            agent=Agent(system="child", transport=transport),
+            context=context,
+            prompt="work",
+            identity=identity,
+            hub=SessionEventHub(),
+        )
+    )
+    await transport.partial_sent.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    partial_messages = [
+        message
+        for message in await context.get_history()
+        if message.role == "assistant" and message.content == [TextBlock(text="available partial")]
+    ]
+    assert len(partial_messages) == 1

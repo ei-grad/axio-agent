@@ -46,12 +46,30 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   an `AGENTS.md` file in the working directory.
 - **Multiline paste** — pasting multi-line text into the prompt is handled
   gracefully with continuation markers (`...`).
-- **Graceful interruption** — Ctrl-C cancels the running agent loop, preserving
-  partial tool output in conversation context so the model knows what happened.
+- **Graceful interruption** — Escape cancels the captured agent turn without
+  submitting the editor and preserves available partial output for context or
+  recovery.
 - **Readline history** — persisted across sessions in `~/.axio_repl_history`.
 - **Session journals** — every main, foreground, and background agent event is
   written to a private JSONL journal for later inspection.
 - **Single-prompt mode** — pass a prompt as argument for scripting and non-interactive use.
+
+## Interactive controls
+
+- **Enter** queues the current editor as one user message without interrupting
+  the active turn. At the bounded pending limit, the prompt remains active for
+  Escape and Up, and an additional submission is restored to the editor instead
+  of being dropped.
+- **Up** recalls all user messages not yet claimed by an agent and joins their
+  text in the editor with an empty line between messages.
+- **Escape** interrupts the captured turn and delivers only messages previously
+  submitted with Enter. Pending messages remain separate conversation objects;
+  editor text is never submitted or changed by Escape. Without pending user
+  input, no replacement model turn starts.
+- **Ctrl-D** on an empty editor warns once; a second press within two seconds
+  exits gracefully.
+- **Ctrl-C** starts graceful shutdown. It does not submit or clear the editor;
+  the shutdown journal retains it for `--resume`.
 
 ## Install
 
@@ -97,6 +115,9 @@ axio-repl --effort high
 axio-repl --session-log-dir ./axio-session-logs
 axio-repl --no-session-log
 
+# Resume an interrupted interactive session into a new journal
+axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.jsonl
+
 # Show framed tool and lifecycle actions from background agents
 axio-repl --agent-actions on
 ```
@@ -113,6 +134,16 @@ The REPL prints the exact path when the session starts. In single-prompt mode it
 prints the path to stderr, leaving the streamed answer on stdout. Use
 `--session-log-dir <directory>` to select another root or `--no-session-log` to
 disable journaling.
+
+`--resume <events.jsonl>` validates a stopped session's journal, replays its
+main-agent context, restores pending input and the last durable editor snapshot,
+and materializes available partial text, reasoning, tool arguments, and tool
+output from unfinished main and background-agent turns. Unavailable background
+contexts and cancelled deferred tools become labelled notices in the restored
+main context with their original identities. Resume creates a new journal and
+records which recovery artifacts were applied. Continue a recovery chain from
+that new journal; `--resume` cannot be combined with `--no-session-log` or
+one-shot mode.
 
 The append-only journal contains user input, model stream events, committed
 context messages, configuration changes, agent lifecycle events, subagent

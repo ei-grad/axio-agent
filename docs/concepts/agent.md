@@ -91,6 +91,14 @@ flowchart TD
 `run(user_message, context) -> str`
 : Convenience wrapper that consumes the stream and returns the final text.
 
+`run_stream_messages(messages, context) -> AgentStream`
+: Appends an ordered batch of distinct `Message` objects, then starts one model
+  operation. Messages are never joined. Use this when several chronological
+  inputs must become visible at the same provider boundary.
+
+`run_messages(messages, context) -> str`
+: Convenience wrapper for `run_stream_messages()`.
+
 ## Concurrent tool dispatch
 
 When the model requests multiple tool calls in a single response, the agent

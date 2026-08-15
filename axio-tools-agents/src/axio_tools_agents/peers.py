@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
 import json
 import os
 import re
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -20,6 +21,7 @@ from axio.context import ContextStore
 from axio.events import StreamEvent
 from axio.exceptions import HandlerError
 from axio.field import StrictStr
+from axio.messages import Message
 from axio.tool import CURRENT_TOOL_CALL
 
 from axio_tools_agents.names import generate_name
@@ -30,13 +32,22 @@ from axio_tools_agents.runtime import (
     ConfigurationChanged,
     ContextCleared,
     ContextForked,
+    EditorSnapshot,
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
+    InputBuffered,
+    InputClaimed,
+    InputDelivered,
+    InputRecalled,
     InputReceived,
+    InterruptionCommitted,
+    InterruptionRequested,
     MessageCommitted,
     OutcomeDelivered,
+    RecoveryApplied,
     SessionEventHub,
+    ShutdownRecorded,
     TurnFinished,
     TurnIdentity,
     TurnOutcome,
@@ -45,6 +56,7 @@ from axio_tools_agents.runtime import (
     current_turn_identity,
     new_turn_identity,
     observe_agent_turn,
+    observe_agent_turn_messages,
 )
 
 MAX_MESSAGE_CHARS = 200_000
@@ -114,6 +126,7 @@ StopHandler = Callable[[str, str], Awaitable[None]]
 SpawnAgentFactory = Callable[[bool], Awaitable[tuple[Agent, ContextStore]]]
 AgentEventHandler = Callable[[str, StreamEvent], Awaitable[None]]
 BackgroundOutcomeHandler = Callable[[TurnOutcome], Awaitable[None]]
+BackgroundInputAdmittedHandler = Callable[[str, str | None], None]
 
 _current_peer: contextvars.ContextVar[PeerServer | None] = contextvars.ContextVar(
     "axio_tools_agents_current_peer",
@@ -123,6 +136,7 @@ _spawn_agent_factory: SpawnAgentFactory | None = None
 _run_agent_factory: SpawnAgentFactory | None = None
 _agent_event_handler: AgentEventHandler | None = None
 _background_outcome_handler: BackgroundOutcomeHandler | None = None
+_background_input_admitted_handler: BackgroundInputAdmittedHandler | None = None
 _session_event_hub = SessionEventHub()
 _legacy_event_unsubscribe: Callable[[], None] | None = None
 
@@ -130,8 +144,16 @@ _legacy_event_unsubscribe: Callable[[], None] | None = None
 @dataclass(slots=True)
 class _QueuedPrompt:
     prompt: str | None
+    messages: tuple[Message, ...] = ()
+    source_input_ids: tuple[str | None, ...] | None = None
     done: asyncio.Future[None] | None = None
     parent_tool_use_id: str | None = None
+    on_input_committed: Callable[[], Awaitable[None]] | None = None
+    context_only: bool = False
+
+    @property
+    def is_stop(self) -> bool:
+        return self.prompt is None and not self.messages
 
 
 @dataclass(slots=True)
@@ -143,6 +165,7 @@ class _BackgroundAgent:
     idle_waiters: list[asyncio.Future[None]] = field(default_factory=list)
     runner: asyncio.Task[None] | None = None
     current_turn: asyncio.Task[TurnOutcome] | None = None
+    current_identity: TurnIdentity | None = None
     stopping: bool = False
     # A failed turn leaves the agent alive and waiting, so without this the
     # parent cannot tell a crashed agent from one that finished its work.
@@ -167,6 +190,14 @@ _background_agents: dict[str, _BackgroundAgent] = {}
 def _is_background_idle(background: _BackgroundAgent) -> bool:
     current_turn = background.current_turn
     return (current_turn is None or current_turn.done()) and background.inbox.empty()
+
+
+def _enqueue_background_input(background: _BackgroundAgent, queued: _QueuedPrompt) -> None:
+    background.inbox.put_nowait(queued)
+    handler = _background_input_admitted_handler
+    if handler is not None:
+        identity = background.current_identity
+        handler(background.peer.id, identity.turn_id if identity is not None else None)
 
 
 _message_waiters: list[asyncio.Future[PeerMessage]] = []
@@ -401,6 +432,11 @@ def set_background_outcome_handler(handler: BackgroundOutcomeHandler | None) -> 
     _background_outcome_handler = handler
 
 
+def set_background_input_admitted_handler(handler: BackgroundInputAdmittedHandler | None) -> None:
+    global _background_input_admitted_handler
+    _background_input_admitted_handler = handler
+
+
 def session_event_hub() -> SessionEventHub:
     return _session_event_hub
 
@@ -425,6 +461,15 @@ def _subscribe_legacy_event_handler() -> None:
                 ForegroundExited,
                 OutcomeDelivered,
                 InputReceived,
+                InputBuffered,
+                InputRecalled,
+                InputClaimed,
+                InputDelivered,
+                InterruptionRequested,
+                InterruptionCommitted,
+                EditorSnapshot,
+                ShutdownRecorded,
+                RecoveryApplied,
                 ConfigurationChanged,
                 MessageCommitted,
                 ContextForked,
@@ -778,9 +823,19 @@ async def _run_agent_turn(
     queued: _QueuedPrompt,
     identity: TurnIdentity,
 ) -> TurnOutcome:
-    if queued.prompt is None:
-        raise RuntimeError("cannot run an empty background prompt")
     with peer_context(background.peer):
+        if queued.messages:
+            return await observe_agent_turn_messages(
+                agent=background.agent,
+                context=background.context,
+                messages=queued.messages,
+                identity=identity,
+                hub=_session_event_hub,
+                on_input_committed=queued.on_input_committed,
+                source_input_ids=queued.source_input_ids,
+            )
+        if queued.prompt is None:
+            raise RuntimeError("cannot run an empty background prompt")
         return await observe_agent_turn(
             agent=background.agent,
             context=background.context,
@@ -794,10 +849,27 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
     try:
         while True:
             queued = await background.inbox.get()
-            if queued.prompt is None or background.stopping:
+            if queued.is_stop or background.stopping:
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
                 break
+            if queued.context_only:
+                try:
+                    with peer_context(background.peer):
+                        await background.context.append_many(list(queued.messages))
+                        if queued.on_input_committed is not None:
+                            await queued.on_input_committed()
+                except Exception as exc:
+                    # ContextStore backends can fail with backend-specific exception types.
+                    background.last_error = f"{type(exc).__name__}: {exc}"
+                    if queued.done is not None and not queued.done.done():
+                        queued.done.set_exception(exc)
+                else:
+                    if queued.done is not None and not queued.done.done():
+                        queued.done.set_result(None)
+                finally:
+                    _notify_idle(background)
+                continue
             identity = new_turn_identity(
                 agent_id=background.peer.id,
                 parent_agent_id=background.parent_agent_id,
@@ -808,6 +880,7 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
             )
             turn = asyncio.create_task(_run_agent_turn(background=background, queued=queued, identity=identity))
             background.current_turn = turn
+            background.current_identity = identity
             background.last_error = None
             background.reported_to = None
             background.interrupted = False
@@ -824,10 +897,13 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                 background.last_error = f"{type(exc).__name__}: {exc}"
             finally:
                 background.current_turn = None
+                background.current_identity = None
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
-                _notify_idle(background)
-                await _deliver_background_turn(background, outcome, identity)
+                try:
+                    await _deliver_background_turn(background, outcome, identity)
+                finally:
+                    _notify_idle(background)
             if background.stopping:
                 break
     finally:
@@ -879,7 +955,7 @@ async def _start_background_agent(
         async with accept_lock:
             if background.stopping:
                 raise RuntimeError("agent is no longer accepting messages")
-            background.inbox.put_nowait(_QueuedPrompt(format_message_for_dialog(message)))
+            _enqueue_background_input(background, _QueuedPrompt(format_message_for_dialog(message)))
 
     async def _on_stop(_from_id: str, _reason: str) -> None:
         async with accept_lock:
@@ -915,7 +991,7 @@ async def _start_background_agent(
     # Between turns the agent is not draining anything, so its own notifications
     # — a detached call finishing, a child of its own going idle — arrive as the
     # prompt that starts the next turn.
-    notify.add_listener(peer.id, lambda text: background.inbox.put_nowait(_QueuedPrompt(text)))
+    notify.add_listener(peer.id, lambda text: _enqueue_background_input(background, _QueuedPrompt(text)))
     # A subscriber failure or task cancellation happens after registration;
     # both must unwind every resource allocated above.
     try:
@@ -950,6 +1026,21 @@ def is_local_background_agent(agent_id: str) -> bool:
     return agent_id in _background_agents
 
 
+def interrupt_local_agent_turn(agent_id: str, turn_id: str) -> bool:
+    """Cancel only the matching in-process turn generation."""
+
+    background = _background_agents.get(agent_id)
+    if background is None or background.stopping:
+        return False
+    identity = background.current_identity
+    current_turn = background.current_turn
+    if identity is None or identity.turn_id != turn_id or current_turn is None or current_turn.done():
+        return False
+    background.interrupted = True
+    current_turn.cancel()
+    return True
+
+
 async def wait_local_background_agents_idle(agent_ids: list[str] | None = None) -> None:
     selected = set(agent_ids) if agent_ids is not None else None
     while True:
@@ -974,7 +1065,72 @@ async def enqueue_local_agent_prompt(agent_id: str, prompt: str, *, wait: bool =
     done: asyncio.Future[None] | None = None
     if wait:
         done = asyncio.get_running_loop().create_future()
-    background.inbox.put_nowait(_QueuedPrompt(prompt, done))
+    _enqueue_background_input(background, _QueuedPrompt(prompt, done=done))
+    if done is not None:
+        await done
+    return True
+
+
+async def enqueue_local_agent_messages(
+    agent_id: str,
+    messages: Sequence[Message],
+    *,
+    wait: bool = False,
+    on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    source_input_ids: Sequence[str | None] | None = None,
+) -> bool:
+    """Queue one ordered Message batch as one local background-agent turn."""
+
+    if not messages:
+        raise ValueError("messages must not be empty")
+    captured_input_ids = tuple(source_input_ids) if source_input_ids is not None else None
+    if captured_input_ids is not None and len(captured_input_ids) != len(messages):
+        raise ValueError("source_input_ids must align with messages")
+    background = _background_agents.get(agent_id)
+    if background is None or background.stopping:
+        return False
+    done: asyncio.Future[None] | None = None
+    if wait:
+        done = asyncio.get_running_loop().create_future()
+    _enqueue_background_input(
+        background,
+        _QueuedPrompt(
+            None,
+            messages=tuple(copy.deepcopy(messages)),
+            source_input_ids=captured_input_ids,
+            done=done,
+            on_input_committed=on_input_committed,
+        ),
+    )
+    if done is not None:
+        await done
+    return True
+
+
+async def enqueue_local_agent_context(
+    agent_id: str,
+    messages: Sequence[Message],
+    *,
+    wait: bool = False,
+) -> bool:
+    """Commit messages through a local agent's inbox without starting a turn."""
+
+    if not messages:
+        raise ValueError("messages must not be empty")
+    background = _background_agents.get(agent_id)
+    if background is None or background.stopping:
+        return False
+    done: asyncio.Future[None] | None = None
+    if wait:
+        done = asyncio.get_running_loop().create_future()
+    background.inbox.put_nowait(
+        _QueuedPrompt(
+            None,
+            messages=tuple(copy.deepcopy(messages)),
+            done=done,
+            context_only=True,
+        )
+    )
     if done is not None:
         await done
     return True

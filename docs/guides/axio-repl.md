@@ -73,6 +73,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
+| `--resume EVENTS_JSONL` | none | Resume a stopped interactive session into a new journal |
 | `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
 | `--sandbox-image` | `axio-agent-sandbox:standard` | Locally built image for `--sandbox docker` |
 | `--sandbox-network` | none | User-defined internal Docker network for restricted service access |
@@ -125,6 +126,22 @@ corruption rather than silently skipped.
 
 This recovery rule does not mask storage-media corruption or broader filesystem
 failures; those remain hard errors.
+
+To resume, pass the stopped session's exact journal path:
+
+```bash
+axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.jsonl
+```
+
+The new session replays main-agent context as distinct messages, restores
+pending Enter submissions and the last durable editor snapshot, and
+materializes available partial text, reasoning, tool arguments, and tool output
+from unfinished main or background-agent turns. A background agent cannot be
+recreated after process death, so its available partial output becomes a
+labelled user notice in the restored main context. Cancelled deferred tools are
+also materialized with their original agent, turn, and call IDs. The new session
+writes `RecoveryApplied` records; use that new journal for a later resume.
+Recovery is interactive-only and cannot be combined with `--no-session-log`.
 
 Session directories use mode `0700` and journal or attachment files use `0600`.
 Known secret-shaped fields and common token formats are redacted recursively,
@@ -267,8 +284,35 @@ You> Refactor this function:
 ...     return x+1
 ```
 
-## Interrupting the agent
+## Interactive input and interruption
 
-Press **Ctrl-C** to cancel the running agent loop. Partial tool output (stdout
-already captured, files already written) is preserved in conversation context
-so the model sees what happened and can resume cleanly.
+Only **Enter** submits editor text. While an agent turn is running, each Enter
+durably records a separate pending user message before opening a fresh editor.
+The pending queue is bounded. At its limit the prompt remains active for Escape
+and Up, and another submitted value is restored to the editor with a warning
+instead of being dropped.
+
+Press **Up** to take every user message that has not yet been claimed by an
+agent back out of the pending buffer. Their text is placed in the editor in
+submission order, with one empty line between the original messages. Sending
+that edited text with Enter creates one new pending message.
+
+Press **Escape** to interrupt the turn that was active when the keypress was
+accepted. Escape never submits, clears, or changes the editor. It claims every
+user message previously submitted with Enter and delivers each as a separate
+conversation message to the currently focused agent. Peer messages, background
+outcomes, tool events, and the interruption notice retain their chronological
+order around the interrupt barrier.
+
+If no user message is pending, Escape is an interrupt only. Partial output and
+queued events are committed to context, the editor stays unchanged, and no
+replacement model turn starts.
+
+On an empty editor, the first **Ctrl-D** warns that exit is armed for two
+seconds. A second Ctrl-D during that window starts graceful shutdown. With text
+in the editor, Ctrl-D keeps its normal forward-delete behavior.
+
+**Ctrl-C** starts graceful REPL shutdown and neither submits nor clears the
+editor. Its current text is included in the shutdown snapshot and restored by
+`--resume`. Use Escape to interrupt only the captured agent turn while keeping
+the session running.

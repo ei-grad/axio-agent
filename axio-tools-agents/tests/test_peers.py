@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from axio import notify
 from axio.agent import Agent
-from axio.blocks import ToolResultBlock, ToolUseBlock
+from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import HandlerError
@@ -22,9 +22,12 @@ from axio_tools_agents.peers import (
     PeerRecord,
     PeerServer,
     background_agent_state,
+    enqueue_local_agent_context,
+    enqueue_local_agent_messages,
     enqueue_local_agent_prompt,
     format_message_for_dialog,
     interrupt_agent,
+    interrupt_local_agent_turn,
     is_local_background_agent,
     list_peer_records,
     list_peers,
@@ -33,6 +36,7 @@ from axio_tools_agents.peers import (
     run_agent,
     send_message,
     set_agent_event_handler,
+    set_background_input_admitted_handler,
     set_background_outcome_handler,
     set_run_agent_factory,
     set_session_event_hub,
@@ -67,6 +71,7 @@ async def peer_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIter
     await stop_local_background_agents()
     set_agent_event_handler(None)
     set_background_outcome_handler(None)
+    set_background_input_admitted_handler(None)
     set_run_agent_factory(None)
     set_spawn_agent_factory(None)
     set_session_event_hub(None)
@@ -347,6 +352,62 @@ async def test_interrupt_agent_cancels_current_turn_without_stopping(tmp_path: P
         await sender.close()
 
 
+class _GenerationTransport:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = (asyncio.Event(), asyncio.Event())
+        self.cancelled = (asyncio.Event(), asyncio.Event())
+        self.release_second = asyncio.Event()
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        del messages, tools, system
+        index = self.calls
+        self.calls += 1
+        self.started[index].set()
+        try:
+            if index == 0:
+                await asyncio.Future()
+            else:
+                await self.release_second.wait()
+                yield TextDelta(index=0, delta="done")
+                yield IterationEnd(iteration=2, stop_reason=StopReason.end_turn, usage=Usage(0, 0))
+        except asyncio.CancelledError:
+            self.cancelled[index].set()
+            raise
+
+
+async def test_local_interrupt_is_generation_checked_and_input_admission_reports_owner() -> None:
+    transport = _GenerationTransport()
+    admitted: list[tuple[str, str | None]] = []
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    set_background_input_admitted_handler(lambda agent_id, turn_id: admitted.append((agent_id, turn_id)))
+    agent_id = _spawn_id(await spawn_agent(task="first"))
+    await asyncio.wait_for(transport.started[0].wait(), timeout=1)
+
+    assert await enqueue_local_agent_prompt(agent_id, "second")
+    captured_turn_id = admitted[-1][1]
+    assert captured_turn_id is not None
+    assert interrupt_local_agent_turn(agent_id, captured_turn_id)
+    await asyncio.wait_for(transport.cancelled[0].wait(), timeout=1)
+    await asyncio.wait_for(transport.started[1].wait(), timeout=1)
+
+    assert not interrupt_local_agent_turn(agent_id, captured_turn_id)
+    await asyncio.sleep(0)
+    assert not transport.cancelled[1].is_set()
+
+    transport.release_second.set()
+    await wait_local_background_agents_idle([agent_id])
+
+
 async def test_stop_agent_releases_waiting_local_prompt(tmp_path: Path) -> None:
     transport = _InterruptibleTransport()
     sender = await PeerServer("sender", kind="test", handler=_noop_handler, project=str(tmp_path)).start()
@@ -367,6 +428,70 @@ async def test_stop_agent_releases_waiting_local_prompt(tmp_path: Path) -> None:
         assert await asyncio.wait_for(waiter, timeout=1)
     finally:
         await sender.close()
+
+
+class _BatchCapturingTransport:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[Tool[object]],
+        system: str,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls.append(messages)
+        yield TextDelta(index=0, delta="done")
+        yield IterationEnd(iteration=len(self.calls), stop_reason=StopReason.end_turn, usage=Usage(0, 0))
+
+
+async def test_local_agent_message_batch_stays_distinct_in_one_turn(tmp_path: Path) -> None:
+    transport = _BatchCapturingTransport()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    result = await spawn_agent(task="initial")
+    agent_id = result.split("agent_id=", 1)[1].split(" ", 1)[0]
+    await wait_local_background_agents_idle([agent_id])
+    committed: list[str] = []
+    first = Message(role="user", content=[TextBlock(text="first")])
+    second = Message(role="user", content=[TextBlock(text="second")])
+
+    async def input_committed() -> None:
+        committed.append("yes")
+
+    delivered = await enqueue_local_agent_messages(
+        agent_id,
+        (first, second),
+        wait=True,
+        on_input_committed=input_committed,
+    )
+
+    assert delivered
+    assert committed == ["yes"]
+    assert transport.calls[1][-2:] == [first, second]
+
+
+async def test_local_agent_context_batch_does_not_start_replacement_turn(tmp_path: Path) -> None:
+    transport = _BatchCapturingTransport()
+    context = MemoryContextStore()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=transport), context
+
+    set_spawn_agent_factory(factory)
+    result = await spawn_agent(task="initial")
+    agent_id = result.split("agent_id=", 1)[1].split(" ", 1)[0]
+    await wait_local_background_agents_idle([agent_id])
+    notice = Message(role="user", content=[TextBlock(text="interrupt notice")])
+
+    delivered = await enqueue_local_agent_context(agent_id, (notice,), wait=True)
+
+    assert delivered
+    assert len(transport.calls) == 1
+    assert (await context.get_history())[-1] == notice
 
 
 class _DelayedTransport:

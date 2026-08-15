@@ -24,10 +24,14 @@ from axio.tool import Tool
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
+    EditorSnapshot,
     ExecutionMode,
     ObservedContextStore,
     OutcomeDelivered,
+    RecoveryApplied,
+    RuntimeEvent,
     SessionEventHub,
+    ShutdownRecorded,
     TurnFinished,
     TurnStatus,
     new_turn_identity,
@@ -696,6 +700,53 @@ async def test_completed_turn_is_a_durable_boundary_without_syncing_stream_delta
         "session_start",
         "stream_event",
         "turn_finished",
+    ]
+    await journal.close()
+
+
+@pytest.mark.parametrize(
+    ("event", "kind"),
+    [
+        (EditorSnapshot("draft"), "editor_snapshot"),
+        (
+            ShutdownRecorded(
+                reason="double_eof",
+                pending_input_ids=("input",),
+                deferred_tool_use_ids=("tool",),
+            ),
+            "shutdown_recorded",
+        ),
+        (
+            RecoveryApplied(source_session_id="source", recovery_ids=("source:turn",)),
+            "recovery_applied",
+        ),
+    ],
+)
+async def test_recovery_lifecycle_records_are_durable_boundaries(
+    tmp_path: Path,
+    event: RuntimeEvent,
+    kind: str,
+) -> None:
+    journal = await SessionJournal.open(session_id=f"boundary-{kind}", root=tmp_path)
+    await _write_runtime_event(
+        journal,
+        AgentEventEnvelope(
+            seq=1,
+            session_id=journal.session_id,
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+            context_id="context-1",
+        ),
+    )
+
+    assert [record["kind"] for record in read_journal(journal.events_path).records] == [
+        "session_start",
+        kind,
     ]
     await journal.close()
 

@@ -287,6 +287,41 @@ async def test_multiline_tool_output_reapplies_its_style_after_newlines(
     assert f"{DIM}one{RESET}\n{DIM}two{RESET}\n{DIM}three{RESET}" in output
 
 
+async def test_agent_switch_closes_reasoning_style_before_other_agent_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+
+    await renderer.render("main", ReasoningDelta(index=0, delta="main reasoning"))
+    await renderer.render(
+        "child",
+        TextDelta(index=0, delta="child answer"),
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render("main", TextDelta(index=0, delta="main answer"))
+
+    output = capsys.readouterr().out
+    assert f"{DIM}> main reasoning{RESET}\n" in output
+    assert "child answer" in output
+    assert output.endswith("main answer")
+
+
+async def test_structured_tool_field_closes_dim_style_before_answer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"command":"first\\nsecond"}'),
+    )
+    await renderer.render("main", TextDelta(index=0, delta="answer"))
+
+    output = capsys.readouterr().out
+    assert f"{DIM}first{RESET}\n{DIM}second{RESET}" in output
+    assert output.endswith("\nanswer")
+
+
 async def test_background_actions_wait_for_all_parallel_active_tools(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

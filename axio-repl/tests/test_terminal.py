@@ -18,7 +18,7 @@ from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 
 from axio_repl import _panel
-from axio_repl._terminal import MAX_PENDING_CHARS, RESET, TerminalUI
+from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
 
 
 class _RecordingOutput(DummyOutput):
@@ -129,7 +129,8 @@ async def test_terminal_ui_surfaces_write_failure_and_restores_streams() -> None
     with pytest.raises(RuntimeError, match="terminal output consumer failed"):
         await asyncio.wait_for(terminal.wait_failed(), timeout=1)
     with pytest.raises(RuntimeError, match="terminal output consumer failed"):
-        print("later line")
+        await terminal.drain()
+    print("later line")
     with pytest.raises(RuntimeError, match="terminal output consumer failed"):
         await terminal.close()
 
@@ -137,33 +138,268 @@ async def test_terminal_ui_surfaces_write_failure_and_restores_streams() -> None
     assert sys.stderr is original_stderr
 
 
-async def test_write_above_prompt_releases_waiters_when_redraw_fails() -> None:
-    class _Renderer:
-        def erase(self) -> None:
+async def test_terminal_ui_is_single_use_even_when_closed_before_start() -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+
+    await terminal.close()
+
+    assert terminal.phase is TerminalPhase.CLOSED
+    with pytest.raises(RuntimeError, match="cannot start from closed"):
+        await terminal.start()
+
+
+async def test_terminal_ui_rolls_back_partial_logging_rebind_when_start_fails() -> None:
+    class FailingRebindHandler(logging.StreamHandler[Any]):
+        def setStream(self, stream: Any) -> None:
+            del stream
+            raise OSError("logging rebind failed")
+
+    output = _RecordingOutput()
+    terminal = TerminalUI(_Session(output))
+    logger = logging.getLogger("axio-repl-terminal-start-rollback")
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    first = logging.StreamHandler(original_stdout)
+    failing = FailingRebindHandler(original_stdout)
+    previous_handlers = list(logger.handlers)
+    previous_propagate = logger.propagate
+    logger.handlers[:] = [first, failing]
+    logger.propagate = False
+
+    try:
+        with pytest.raises(OSError, match="logging rebind failed"):
+            await terminal.start()
+
+        assert terminal.phase is TerminalPhase.CLOSED
+        assert sys.stdout is original_stdout
+        assert sys.stderr is original_stderr
+        assert first.stream is original_stdout
+        assert failing.stream is original_stdout
+        assert terminal._consumer is None or terminal._consumer.done()
+        await terminal.close()
+    finally:
+        logger.handlers[:] = previous_handlers
+        logger.propagate = previous_propagate
+
+
+async def test_terminal_ui_rejects_restart_while_running() -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+    try:
+        with pytest.raises(RuntimeError, match="cannot start from running"):
+            await terminal.start()
+    finally:
+        await terminal.close()
+
+
+async def test_terminal_ui_fails_posix_check_before_mutating_process_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    stdout = sys.stdout
+    stderr = sys.stderr
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    with pytest.raises(RuntimeError, match="requires POSIX"):
+        await terminal.start()
+
+    assert terminal.phase is TerminalPhase.NEW
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+    await terminal.close()
+
+
+async def test_terminal_stream_facade_validates_writes_and_flushes_partial_text() -> None:
+    output = _RecordingOutput()
+    terminal = TerminalUI(_Session(output))
+    await terminal.start()
+    try:
+        stream = terminal.stdout
+        assert stream is not None
+        assert stream.writable()
+        assert stream.isatty() is False
+        assert stream.encoding
+        assert stream.errors is not None
+        try:
+            stream.fileno()
+        except OSError:
             pass
+        assert stream.write("") == 0
+        with pytest.raises(TypeError, match="must be str"):
+            stream.write(cast(Any, 1))
+        with pytest.raises(AttributeError, match="read-only"):
+            stream.encoding = "ascii"
+        with pytest.raises(AttributeError, match="read-only"):
+            stream.errors = "strict"
+        stream.write("line\npartial")
+        stream.flush()
+        await terminal.drain()
+    finally:
+        await terminal.close()
 
-        def reset(self) -> None:
-            raise OSError("redraw failed")
+    rendered = "".join(output.raw)
+    assert "line\n" in rendered
+    assert "partial" in rendered
 
-    app = type(
-        "App",
-        (),
-        {
-            "_running_in_terminal_f": None,
-            "_running_in_terminal": False,
-            "_request_absolute_cursor_position": lambda self: None,
-            "_redraw": lambda self: None,
-            "is_running": True,
-            "output": type("Output", (), {"responds_to_cpr": False})(),
-            "renderer": _Renderer(),
-        },
-    )()
 
-    with pytest.raises(OSError, match="redraw failed"):
-        await TerminalUI._write_above_prompt(app, lambda: None)
+async def test_drain_and_failure_wait_before_start_have_explicit_contracts() -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
 
-    assert app._running_in_terminal is False
-    assert app._running_in_terminal_f.done()
+    await terminal.drain()
+    assert terminal.pending_char_count == 0
+    terminal.submit(OutputFrame(""))
+    with pytest.raises(RuntimeError, match="has not started"):
+        await terminal.wait_failed()
+
+
+async def test_terminal_ui_concurrent_close_is_idempotent() -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+    print("before close")
+
+    await asyncio.gather(terminal.close(), terminal.close())
+
+    assert terminal.phase is TerminalPhase.CLOSED
+
+
+async def test_submit_before_start_and_retained_wrapper_after_close_use_fallback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    terminal.submit(OutputFrame("before start\n"))
+
+    await terminal.start()
+    retained = terminal.stdout
+    assert retained is not None
+    await terminal.close()
+    retained.write("after close\n")
+    retained.flush()
+
+    captured = capsys.readouterr().out
+    assert "before start\n" in captured
+    assert "after close\n" in captured
+
+
+async def test_write_through_retained_wrapper_during_close_is_flushed_after_restore(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+    retained = terminal.stdout
+    assert retained is not None
+    restore = terminal._restore_terminal
+
+    def write_during_restore() -> None:
+        retained.write("late during close\n")
+        restore()
+
+    monkeypatch.setattr(terminal, "_restore_terminal", write_during_restore)
+    await terminal.close()
+
+    assert "late during close\n" in capsys.readouterr().out
+
+
+async def test_late_output_overflow_is_reported_after_terminal_restore(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+    retained = terminal.stderr
+    assert retained is not None
+    restore = terminal._restore_terminal
+
+    def overflow_during_restore() -> None:
+        retained.write("x" * (64 * 1024 + 1) + "\n")
+        restore()
+
+    monkeypatch.setattr(terminal, "_restore_terminal", overflow_during_restore)
+    await terminal.close()
+
+    assert "late terminal output skipped: 1 frame" in capsys.readouterr().err
+
+
+async def test_restore_failure_still_closes_ingress_and_process_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    stdout = sys.stdout
+    stderr = sys.stderr
+    await terminal.start()
+
+    def fail_restore() -> None:
+        raise OSError("restore failed")
+
+    monkeypatch.setattr(terminal, "_restore_terminal", fail_restore)
+    with pytest.raises(OSError, match="restore failed"):
+        await terminal.close()
+
+    assert terminal.phase is TerminalPhase.CLOSED
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+
+
+async def test_flush_failure_still_drains_and_closes_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+    assert terminal.stdout is not None
+
+    def fail_flush() -> None:
+        raise OSError("flush failed")
+
+    monkeypatch.setattr(terminal.stdout, "flush_all", fail_flush)
+    with pytest.raises(OSError, match="flush failed"):
+        await terminal.close()
+
+    assert terminal.phase is TerminalPhase.CLOSED
+
+
+async def test_late_flush_failure_still_marks_terminal_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    await terminal.start()
+
+    def fail_late_flush(_ingress: object) -> None:
+        raise OSError("late flush failed")
+
+    monkeypatch.setattr(terminal, "_flush_late_output", fail_late_flush)
+    with pytest.raises(OSError, match="late flush failed"):
+        await terminal.close()
+
+    assert terminal.phase is TerminalPhase.CLOSED
+
+
+async def test_close_does_not_overwrite_streams_replaced_by_the_application() -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput()))
+    stdout = sys.stdout
+    stderr = sys.stderr
+    await terminal.start()
+    sys.stdout = stdout
+    sys.stderr = stderr
+
+    await terminal.close()
+
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
+
+
+async def test_consumer_task_failure_is_propagated_while_process_state_is_restored() -> None:
+    class CrashingTerminal(TerminalUI):
+        async def _consume(self) -> None:
+            raise RuntimeError("consumer task crashed")
+
+    terminal = CrashingTerminal(_Session(_RecordingOutput()))
+    stdout = sys.stdout
+    stderr = sys.stderr
+    await terminal.start()
+    await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="consumer task crashed"):
+        await terminal.close()
+
+    assert terminal.phase is TerminalPhase.CLOSED
+    assert sys.stdout is stdout
+    assert sys.stderr is stderr
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal and termios test")
@@ -221,6 +457,7 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
         assert "asynchronous output" in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
+        assert after[1] == before[1]
         assert termios.ICANON & after[3] == termios.ICANON & before[3]
         assert termios.ECHO & after[3] == termios.ECHO & before[3]
     finally:
@@ -232,11 +469,12 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal and termios test")
-async def test_escape_during_redraw_stays_raw_and_submits_immediately(
+async def test_escape_during_redraw_stays_raw_without_submitting_editor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = os.openpty()
+    before = termios.tcgetattr(slave_fd)
     reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
     writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
     terminal_input = create_input(reader)
@@ -284,8 +522,15 @@ async def test_escape_during_redraw_stays_raw_and_submits_immediately(
                 os.write(master_fd, b"queued message")
                 await asyncio.sleep(0.05)
                 turn = asyncio.create_task(simulated_turn())
-                assert await asyncio.wait_for(prompt, timeout=1) == "queued message"
+                for _ in range(100):
+                    if interrupts:
+                        break
+                    await asyncio.sleep(0.01)
+                assert interrupts == [1]
+                assert prompt.done() is False
                 assert not turn.done()
+                os.write(master_fd, b"\r")
+                assert await asyncio.wait_for(prompt, timeout=1) == "queued message"
                 finish_turn.set()
                 await turn
             finally:
@@ -299,12 +544,12 @@ async def test_escape_during_redraw_stays_raw_and_submits_immediately(
                     await asyncio.gather(prompt, return_exceptions=True)
                 await terminal.close()
 
-        assert len(interrupts) == 1
         assert len(input_modes) == 1
         during_redraw = input_modes[0]
         local_flags = cast(int, during_redraw[3])
         assert termios.ICANON & local_flags == 0
         assert termios.ECHO & local_flags == 0
+        assert during_redraw[1] == before[1]
 
         os.set_blocking(master_fd, False)
         chunks: list[bytes] = []

@@ -61,14 +61,17 @@ from axio_tools_agents.monitoring import monitor
 from axio_tools_agents.peers import (
     PeerMessage,
     PeerServer,
-    enqueue_local_agent_prompt,
+    enqueue_local_agent_context,
+    enqueue_local_agent_messages,
     format_message_for_dialog,
     interrupt_agent,
+    interrupt_local_agent_turn,
     is_local_background_agent,
     list_peers,
     local_background_agent_records,
     run_agent,
     send_message,
+    set_background_input_admitted_handler,
     set_background_outcome_handler,
     set_pending_message_probe,
     set_run_agent_factory,
@@ -86,21 +89,32 @@ from axio_tools_agents.runtime import (
     ConfigurationChanged,
     ContextCleared,
     ContextForked,
+    EditorSnapshot,
     ExecutionMode,
     ForegroundEntered,
     ForegroundExited,
+    InputBuffered,
+    InputClaimed,
+    InputDelivered,
+    InputRecalled,
     InputReceived,
+    InterruptionCommitted,
+    InterruptionRequested,
     MessageCommitted,
     ObservedContextStore,
     OutcomeDelivered,
+    RecoveryApplied,
     RuntimeEvent,
     SessionEventHub,
+    ShutdownRecorded,
     TurnFinished,
+    TurnIdentity,
     TurnOutcome,
     TurnStarted,
     TurnStatus,
     new_turn_identity,
     observe_agent_turn,
+    observe_agent_turn_messages,
 )
 from axio_tools_local.list_files import list_files
 from axio_tools_local.patch_file import patch_file
@@ -109,6 +123,18 @@ from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
 from axio_repl import _journal, _panel, _sandbox, _search
+from axio_repl._coordinator import (
+    ClaimBatch,
+    ContextArrival,
+    ForegroundCoordinatorState,
+    PendingInputCoordinator,
+    PendingInputStatus,
+    claim_batch_arrivals,
+    ordered_arrivals,
+)
+from axio_repl._deferred_tools import DeferredToolNotification, DeferredToolRegistry
+from axio_repl._input import ExitArmingState, InputSubmitted, SubmissionDisposition
+from axio_repl._input import InterruptRequested as PromptInterruptRequested
 from axio_repl._multiplexer import (
     ActionMultiplexer,
     DisplayMode,
@@ -116,6 +142,7 @@ from axio_repl._multiplexer import (
     format_agent_identity,
     normalize_agent_name,
 )
+from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
 from axio_repl._terminal import TerminalUI
 
 LAST_ITERATION_HINT = Message(
@@ -138,6 +165,7 @@ it gets silence where the report should be.
 """
 
 AGENT_NAME = "axio-repl"
+MAX_PENDING_INPUTS = 32
 AGENT_VERSION = "0.2.3"
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
@@ -423,21 +451,43 @@ def build_system_prompt(
 # ── Event rendering ──────────────────────────────────────────────────
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BoundaryMode:
+    pass
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TextMode:
+    paragraph_newline_pending: bool = False
+    paragraph_boundary_open: bool = False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ReasoningMode:
+    pass
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ToolFieldMode:
+    tool_use_id: str
+    key: str
+    first_delta: bool = True
+
+
+type _StructuralMode = _BoundaryMode | _TextMode | _ReasoningMode | _ToolFieldMode
+
+
 class _AgentRenderState:
     def __init__(self) -> None:
-        self.in_text = False
-        self.in_reasoning = False
+        self.mode: _StructuralMode = _BoundaryMode()
         self.arg_streams: dict[str, ToolArgStream] = {}
         self.active_tool_ids: set[str] = set()
         self.streamed_tool_ids: set[str] = set()
         self.tool_names: dict[str, str] = {}
-        self.field_first_delta = True
-        self.field_key: str | None = None
         self.background_text: list[str] = []
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
-        self.paragraph_newline_pending = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -497,6 +547,7 @@ class _ForegroundResult:
 @dataclasses.dataclass(frozen=True, slots=True)
 class _IncomingPrompt:
     text: str
+    arrival_seq: int | None = None
     display_text: str | None = None
     agent_id: str | None = None
     agent_name: str | None = None
@@ -504,9 +555,24 @@ class _IncomingPrompt:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _QueuedInteractiveInput:
-    text: str
-    target_agent_id: str
+class _InterruptTransaction:
+    request_seq: int
+    request: PromptInterruptRequested
+    claimed: ClaimBatch | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _AcceptedInterrupt:
+    request_seq: int
+    request: PromptInterruptRequested
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ReadyClaim:
+    batch: ClaimBatch
+    messages: tuple[Message, ...]
+    source_input_ids: tuple[str | None, ...]
+    source: str
 
 
 def _pending_prompt_count(
@@ -576,7 +642,6 @@ class ReplRenderer:
         self._foreground_parent_calls: dict[str, _ForegroundCall] = {}
         self._streamed_foreground_calls: dict[_ParentToolKey, _ForegroundResult] = {}
         self._foreground_streaming = False
-        self._safe_boundary_open = False
         self._background_summaries: OrderedDict[_TurnKey, _BackgroundSummary] = OrderedDict()
         self._input_active = False
         self._actions = action_multiplexer or ActionMultiplexer(display_mode)
@@ -590,6 +655,11 @@ class ReplRenderer:
     @property
     def focused_agent(self) -> str:
         return self._focused_agent
+
+    @property
+    def focused_turn_id(self) -> str | None:
+        key = self._current_turn_by_agent.get(self._focused_agent)
+        return key.turn_id if key is not None else None
 
     @property
     def foreground_agent(self) -> str:
@@ -664,12 +734,11 @@ class ReplRenderer:
             self._reset_state_for_turn_locked(state)
             if live:
                 self._foreground_streaming = True
-                self._safe_boundary_open = False
                 self._actions.discard_agent(agent_id)
                 return
             if execution_mode is ExecutionMode.BACKGROUND:
                 self._actions.observe(agent_id, event, agent_name=agent_name)
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked(max_frames=1)
 
     async def finish_turn(
@@ -706,7 +775,7 @@ class ReplRenderer:
                 self._completed_background_turns[key] = completed
                 while len(self._completed_background_turns) > 1024:
                     self._completed_background_turns.popitem(last=False)
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked(max_frames=1)
                 elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
                     self._flush_background_summaries_locked()
@@ -746,7 +815,6 @@ class ReplRenderer:
                     agent_name=self._agent_name(owner),
                 )
             self._foreground_stack.append(agent_id)
-            self._safe_boundary_open = False
             self._actions.discard_agent(agent_id)
             if parent_tool_use_id is not None:
                 parent_turn = self._current_turn_by_agent.get(owner)
@@ -783,10 +851,9 @@ class ReplRenderer:
                         child_agent_name=call.child_agent_name,
                         status=status,
                     )
-            self._safe_boundary_open = True
             resumed = self._state(self.foreground_agent)
             self._foreground_streaming = bool(
-                resumed.in_text or resumed.in_reasoning or resumed.active_tool_ids or resumed.arg_streams
+                not isinstance(resumed.mode, _BoundaryMode) or resumed.active_tool_ids or resumed.arg_streams
             )
             self._drain_safe_boundary_locked()
 
@@ -795,7 +862,6 @@ class ReplRenderer:
         presentation = self._current_presentation(agent_id)
         if presentation is not None and presentation.agent_name is not None:
             self._remember_agent_locked(agent_id, presentation.agent_name)
-        self._safe_boundary_open = True
         self._actions.discard_agent(agent_id)
 
     def set_input_active(self, active: bool) -> None:
@@ -848,7 +914,7 @@ class ReplRenderer:
                 self._stats.record(agent_id, event.usage, model)
             if self._is_suspended_tool_event(agent_id, event):
                 self._observe_suspended_tool_event_locked(agent_id, event)
-                if self._safe_boundary_open:
+                if self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked()
             elif live:
                 self._render_locked(agent_id, event, presentation)
@@ -862,7 +928,7 @@ class ReplRenderer:
                 agent_name = presentation.agent_name if presentation is not None else self._agent_name(agent_id)
                 self._actions.observe(agent_id, event, agent_name=agent_name)
                 self._record_background_event_locked(agent_id, event)
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked(max_frames=1)
                 elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
                     self._flush_background_summaries_locked()
@@ -871,21 +937,20 @@ class ReplRenderer:
         async with self._lock:
             if agent_id != self.foreground_agent:
                 self._actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked(max_frames=1)
 
     async def stop_agent(self, agent_id: str, event: AgentStopped, *, background: bool) -> None:
         async with self._lock:
             if background and agent_id != self.foreground_agent:
                 self._actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_open:
+                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
                     self._drain_safe_boundary_locked(max_frames=1)
             self._cleanup_agent_locked(agent_id)
 
     async def mark_idle(self) -> None:
         async with self._lock:
             self._foreground_streaming = False
-            self._safe_boundary_open = True
             self._drain_all_actions_locked()
             if self.display_mode is DisplayMode.ALL_ACTIONS:
                 self._discard_background_summaries_locked()
@@ -909,44 +974,38 @@ class ReplRenderer:
         async with self._lock:
             if suppress_display:
                 return
-            if self._active_agent is not None and self._state(self._active_agent).in_text:
+            if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
                 print()
-                self._state(self._active_agent).in_text = False
+                self._state(self._active_agent).mode = _BoundaryMode()
             source = (
                 f" from agent {format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))}"
                 if agent_id is not None
                 else ""
             )
             print(f"\n{DIM}{'─' * 3} incoming{source} {'─' * 3}{RESET}\n{text}\n")
-            self._safe_boundary_open = True
             self._drain_safe_boundary_locked()
 
     async def notice(self, text: str) -> None:
         async with self._lock:
-            if self._active_agent is not None and self._state(self._active_agent).in_text:
+            if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
                 print()
-                self._state(self._active_agent).in_text = False
+                self._state(self._active_agent).mode = _BoundaryMode()
             print(_styled(DIM, text))
-            self._safe_boundary_open = True
             self._drain_safe_boundary_locked()
 
     def _state(self, agent_id: str) -> _AgentRenderState:
         return self._states.setdefault(agent_id, _AgentRenderState())
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
-        state.in_text = False
-        state.in_reasoning = False
+        state.mode = _BoundaryMode()
         state.arg_streams.clear()
         state.active_tool_ids.clear()
         state.streamed_tool_ids.clear()
         state.tool_names.clear()
-        state.field_first_delta = True
-        state.field_key = None
         state.background_text.clear()
         state.pending_text.clear()
         state.background_tools.clear()
         state.background_errors.clear()
-        state.paragraph_newline_pending = False
 
     def _remember_agent_locked(self, agent_id: str, agent_name: str) -> None:
         normalized = normalize_agent_name(agent_name)
@@ -1094,12 +1153,14 @@ class ReplRenderer:
         if switched:
             if self._active_agent is not None:
                 active_state = self._state(self._active_agent)
-                if active_state.in_reasoning:
+                if isinstance(active_state.mode, _ReasoningMode):
                     sys.stdout.write("\n")
-                    active_state.in_reasoning = False
-                elif active_state.in_text:
+                    active_state.mode = _BoundaryMode()
+                elif isinstance(active_state.mode, _TextMode):
                     print()
-                    active_state.in_text = False
+                    active_state.mode = _BoundaryMode()
+                elif isinstance(active_state.mode, _ToolFieldMode):
+                    sys.stdout.write("\n")
             self._active_agent = agent_id
         state = self._state(agent_id)
         return state, switched
@@ -1113,83 +1174,70 @@ class ReplRenderer:
         state, switched = self._switch_agent(agent_id)
         if self._event_starts_stdout(event, presentation):
             self._ensure_stdout_header_locked(agent_id, presentation)
-        if switched and state.field_key is not None:
-            sys.stdout.write(f"\n  {YELLOW}{state.field_key} (continued){RESET}: ")
+        if switched and isinstance(state.mode, _ToolFieldMode):
+            sys.stdout.write(f"  {YELLOW}{state.mode.key} (continued){RESET}: ")
             self._flush()
-            state.field_first_delta = True
-        if not isinstance(event, TextDelta):
-            state.paragraph_newline_pending = False
-        if state.in_reasoning and not isinstance(event, ReasoningDelta):
+            state.mode = dataclasses.replace(state.mode, first_delta=True)
+        if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
             sys.stdout.write("\n")
             self._flush()
-            state.in_reasoning = False
-            self._safe_boundary_open = True
+            state.mode = _BoundaryMode()
             self._drain_safe_boundary_locked()
         match event:
             case ReasoningDelta(delta=delta):
-                self._safe_boundary_open = False
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
-                if not state.in_reasoning:
+                    state.mode = _BoundaryMode()
+                if not isinstance(state.mode, _ReasoningMode):
                     # <think> is usually followed by a newline, which would open
                     # the quote with an empty line.
                     delta = delta.lstrip("\n")
                     if not delta:
                         return
                     delta = f"> {delta}"
-                    state.in_reasoning = True
+                    state.mode = _ReasoningMode()
                 sys.stdout.write(_styled(DIM, delta.replace("\n", "\n> ")))
                 self._flush()
 
             case TextDelta(delta=delta):
-                if not state.in_text:
-                    state.in_text = True
+                if not isinstance(state.mode, _TextMode):
+                    state.mode = _TextMode()
                 state.pending_text.append(delta)
                 if "[Output truncated:" in delta:
                     sys.stdout.write(f"\n{_styled(RED, delta.strip())}\n")
-                    state.in_text = False
-                    state.paragraph_newline_pending = False
-                    self._safe_boundary_open = True
+                    state.mode = _BoundaryMode()
                     self._drain_safe_boundary_locked()
                 else:
                     self._render_text_delta_locked(state, delta)
 
             case ImageOutput(data=data, media_type=mt):
-                self._safe_boundary_open = False
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
+                    state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
                 print(f"{GREEN}[image saved: {path}]{RESET}")
-                self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
             case AudioOutput(data=data, media_type=mt):
-                self._safe_boundary_open = False
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
+                    state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
                 print(f"{GREEN}[audio saved: {path}]{RESET}")
-                self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
             case VideoOutput(data=data, media_type=mt):
-                self._safe_boundary_open = False
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
+                    state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
                 print(f"{GREEN}[video saved: {path}]{RESET}")
-                self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
             case ToolUseStart(index=index, tool_use_id=tid, name=name):
-                self._safe_boundary_open = False
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
+                    state.mode = _BoundaryMode()
                 sys.stdout.write(f"\n{BOLD}{CYAN}\u25b6 {name}{RESET}")
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
@@ -1197,21 +1245,18 @@ class ReplRenderer:
                 state.tool_names[tid] = name
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
-                self._safe_boundary_open = False
                 stream = state.arg_streams.get(tid)
                 if stream:
                     for fe in stream.feed(pj):
-                        self._render_field_event(state, fe)
+                        self._render_field_event(state, tid, fe)
                     if stream.done:
                         sys.stdout.write("\n")
                         self._flush()
                         del state.arg_streams[tid]
                         if self._only_passive_tools_active(state):
-                            self._safe_boundary_open = True
                             self._drain_safe_boundary_locked()
 
             case ToolOutputDelta(tool_use_id=tid, key=key, delta=delta):
-                self._safe_boundary_open = False
                 if tid not in state.streamed_tool_ids:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
@@ -1251,10 +1296,7 @@ class ReplRenderer:
                 state.arg_streams.pop(tid, None)
                 state.tool_names.pop(tid, None)
                 if (not state.active_tool_ids and not state.arg_streams) or self._only_passive_tools_active(state):
-                    self._safe_boundary_open = True
                     self._drain_safe_boundary_locked()
-                else:
-                    self._safe_boundary_open = False
 
             case IterationEnd():
                 # The agent has written this iteration into the context itself;
@@ -1272,23 +1314,20 @@ class ReplRenderer:
                     presentation.agent_name if presentation is not None else self._agent_name(agent_id),
                 )
                 print(f"\n{_styled(RED, f'Error from agent {identity}: {exc}')}", file=sys.stderr, flush=True)
-                self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
             case SessionEndEvent(total_usage=usage):
                 self._purge_legacy_foreground_parent_locked(agent_id)
                 if presentation is not None and presentation.error_seen and not presentation.stdout_started:
                     self._discard_suspended_owner_locked(agent_id)
-                    self._safe_boundary_open = True
                     self._drain_safe_boundary_locked()
                     return
-                if state.in_text:
+                if isinstance(state.mode, _TextMode):
                     print()
-                    state.in_text = False
+                    state.mode = _BoundaryMode()
                 print(f"{DIM}[{usage.input_tokens}in/{usage.output_tokens}out tokens]{RESET}")
-                state.paragraph_newline_pending = False
+                state.mode = _BoundaryMode()
                 self._discard_suspended_owner_locked(agent_id)
-                self._safe_boundary_open = True
                 self._drain_safe_boundary_locked()
 
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
@@ -1311,6 +1350,16 @@ class ReplRenderer:
             and not state.arg_streams
             and all(state.tool_names.get(tool_use_id) == "monitor" for tool_use_id in state.active_tool_ids)
         )
+
+    def _safe_boundary_is_open_locked(self) -> bool:
+        if self._active_agent is None:
+            return True
+        state = self._state(self._active_agent)
+        if isinstance(state.mode, _TextMode):
+            return state.mode.paragraph_boundary_open
+        if not isinstance(state.mode, _BoundaryMode):
+            return False
+        return not state.active_tool_ids or self._only_passive_tools_active(state)
 
     def _background_summary_locked(
         self,
@@ -1400,7 +1449,8 @@ class ReplRenderer:
                     tuple(stream.feed(partial_json))
                     if stream.done:
                         state.arg_streams.pop(tool_use_id, None)
-                        state.field_key = None
+                        if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                            state.mode = _BoundaryMode()
             case ToolOutputDelta(tool_use_id=tool_use_id):
                 state.streamed_tool_ids.add(tool_use_id)
             case ToolResult(tool_use_id=tool_use_id):
@@ -1418,48 +1468,63 @@ class ReplRenderer:
         }
 
     def _render_text_delta_locked(self, state: _AgentRenderState, delta: str) -> None:
+        if not isinstance(state.mode, _TextMode):
+            raise RuntimeError("text delta requires text render mode")
+        mode = state.mode
         if delta:
-            self._safe_boundary_open = False
+            mode = dataclasses.replace(mode, paragraph_boundary_open=False)
         start = 0
         for index, character in enumerate(delta):
             if character == "\n":
-                if state.paragraph_newline_pending:
+                if mode.paragraph_newline_pending:
                     sys.stdout.write(delta[start : index + 1])
                     self._flush()
-                    self._safe_boundary_open = True
+                    mode = dataclasses.replace(
+                        mode,
+                        paragraph_newline_pending=False,
+                        paragraph_boundary_open=True,
+                    )
+                    state.mode = mode
                     self._drain_safe_boundary_locked()
                     start = index + 1
-                    state.paragraph_newline_pending = False
                 else:
-                    state.paragraph_newline_pending = True
+                    mode = dataclasses.replace(mode, paragraph_newline_pending=True)
             else:
-                state.paragraph_newline_pending = False
+                mode = dataclasses.replace(
+                    mode,
+                    paragraph_newline_pending=False,
+                    paragraph_boundary_open=False,
+                )
         if start < len(delta):
-            self._safe_boundary_open = False
             sys.stdout.write(delta[start:])
             self._flush()
+        state.mode = mode
 
     def _render_field_event(
         self,
         state: _AgentRenderState,
+        tool_use_id: str,
         event: ToolFieldStart | ToolFieldDelta | ToolFieldEnd,
     ) -> None:
         match event:
             case ToolFieldStart(key=key):
                 sys.stdout.write(f"\n  {YELLOW}{key}{RESET}: ")
                 self._flush()
-                state.field_key = key
-                state.field_first_delta = True
+                state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
             case ToolFieldDelta(text=text):
-                if state.field_first_delta and "\n" in text:
+                mode = state.mode
+                if not isinstance(mode, _ToolFieldMode) or mode.tool_use_id != tool_use_id:
+                    raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
+                if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
-                state.field_first_delta = False
+                state.mode = dataclasses.replace(mode, first_delta=False)
                 sys.stdout.write(_styled(DIM, text))
                 self._flush()
             case ToolFieldEnd():
                 sys.stdout.write(RESET)
                 self._flush()
-                state.field_key = None
+                if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                    state.mode = _BoundaryMode()
 
 
 async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvelope) -> None:
@@ -1501,6 +1566,15 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
         case (
             OutcomeDelivered()
             | InputReceived()
+            | InputBuffered()
+            | InputRecalled()
+            | InputClaimed()
+            | InputDelivered()
+            | InterruptionRequested()
+            | InterruptionCommitted()
+            | EditorSnapshot()
+            | ShutdownRecorded()
+            | RecoveryApplied()
             | ConfigurationChanged()
             | MessageCommitted()
             | ContextForked()
@@ -1536,6 +1610,41 @@ async def run_prompt(
     )
     await event_hub.publish_for(identity, InputReceived(text=prompt, source=source))
     return await observe_agent_turn(agent=agent, context=ctx, prompt=prompt, identity=identity, hub=event_hub)
+
+
+async def run_prompt_messages(
+    agent: Agent,
+    ctx: ContextStore,
+    messages: tuple[Message, ...],
+    event_hub: SessionEventHub,
+    run_id: str,
+    *,
+    source: str,
+    identity: TurnIdentity | None = None,
+    on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    source_input_ids: tuple[str | None, ...] | None = None,
+) -> TurnOutcome:
+    if not messages:
+        raise ValueError("messages must not be empty")
+    turn_identity = identity or new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id=run_id,
+        context_id=ctx.session_id,
+    )
+    for message in messages:
+        text = "".join(block.text for block in message.content if isinstance(block, TextBlock))
+        await event_hub.publish_for(turn_identity, InputReceived(text=text, source=source))
+    return await observe_agent_turn_messages(
+        agent=agent,
+        context=ctx,
+        messages=messages,
+        identity=turn_identity,
+        hub=event_hub,
+        on_input_committed=on_input_committed,
+        source_input_ids=source_input_ids,
+    )
 
 
 def _clone_transport_for_spawn(transport: Any) -> Any:
@@ -1599,18 +1708,89 @@ def _save_media(data: bytes, media_type: str) -> str:
 # ── Input handling ───────────────────────────────────────────────────
 
 
-async def _read_input_async(session: Any, renderer: ReplRenderer, on_interrupt: Callable[[], None]) -> str:
+async def _read_input_async(
+    session: Any,
+    renderer: ReplRenderer,
+    on_interrupt: Callable[[], None],
+    admit_submission: Callable[[str, str, int | None], Awaitable[InputSubmitted]],
+    initial_text: str = "",
+) -> InputSubmitted:
+    async def finish_submission(
+        editor_value: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        prior_failure: BaseException | None = None,
+    ) -> InputSubmitted:
+        admission: asyncio.Future[InputSubmitted] = asyncio.ensure_future(
+            admit_submission(editor_value.strip(), target_agent_id, reserved_seq)
+        )
+        failure = prior_failure
+        while True:
+            try:
+                submitted = await asyncio.shield(admission)
+                break
+            except asyncio.CancelledError as exc:
+                if admission.done():
+                    submitted = admission.result()
+                    failure = failure or exc
+                    break
+                failure = failure or exc
+        _panel.complete_submission(
+            session,
+            editor_value,
+            clear_editor=submitted.disposition is SubmissionDisposition.PENDING,
+        )
+        if failure is not None:
+            raise failure
+        return submitted
+
     renderer.set_input_active(True)
     try:
         while True:
             try:
-                return str(await session.prompt_async("repl> ")).strip()
-            except KeyboardInterrupt:
+                if initial_text:
+                    value = await session.prompt_async("repl> ", default=initial_text)
+                    initial_text = ""
+                else:
+                    value = await session.prompt_async("repl> ")
+                editor_value = str(value)
+                text = editor_value.strip()
+                if text:
+                    target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
+                    return await finish_submission(
+                        editor_value,
+                        target_agent_id,
+                        _panel.accepted_sequence(session),
+                    )
+                _panel.complete_submission(session, editor_value, clear_editor=True)
+            except KeyboardInterrupt as exc:
                 # The prompt is up for the whole session now, and it puts the
                 # terminal in raw mode - so Ctrl+C arrives here as a keypress
                 # and never reaches the signal handler that used to stop a
                 # running turn. Do its job, and go back to waiting.
+                reserved_seq = _panel.accepted_sequence(session)
+                if reserved_seq is not None:
+                    editor_value = _panel.editor_text(session)
+                    target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
+                    await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                    raise exc
                 on_interrupt()
+            except asyncio.CancelledError as exc:
+                reserved_seq = _panel.accepted_sequence(session)
+                if reserved_seq is None:
+                    raise
+                editor_value = _panel.editor_text(session)
+                target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
+                await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                raise exc
+            except BaseException as exc:
+                reserved_seq = _panel.accepted_sequence(session)
+                if reserved_seq is None:
+                    raise
+                editor_value = _panel.editor_text(session)
+                target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
+                await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                raise exc
     finally:
         renderer.set_input_active(False)
 
@@ -1652,7 +1832,7 @@ def _show_agents(renderer: ReplRenderer) -> None:
 async def _handle_agent_actions(
     renderer: ReplRenderer,
     value: str,
-    publish: Callable[[RuntimeEvent], Awaitable[None]] | None = None,
+    publish: Callable[[RuntimeEvent], Awaitable[object]] | None = None,
 ) -> bool:
     """Show or update the observation-only background action policy."""
     if not value:
@@ -2008,6 +2188,15 @@ _JOURNAL_EVENT_KINDS: dict[type[object], str] = {
     ForegroundExited: "foreground_exited",
     OutcomeDelivered: "outcome_delivered",
     InputReceived: "input_received",
+    InputBuffered: "input_buffered",
+    InputRecalled: "input_recalled",
+    InputClaimed: "input_claimed",
+    InputDelivered: "input_delivered",
+    InterruptionRequested: "interruption_requested",
+    InterruptionCommitted: "interruption_committed",
+    EditorSnapshot: "editor_snapshot",
+    ShutdownRecorded: "shutdown_recorded",
+    RecoveryApplied: "recovery_applied",
     ConfigurationChanged: "configuration_changed",
     MessageCommitted: "message_committed",
     ContextForked: "context_forked",
@@ -2020,6 +2209,15 @@ _DURABLE_JOURNAL_EVENTS = (
     ContextCleared,
     TurnFinished,
     OutcomeDelivered,
+    InputBuffered,
+    InputRecalled,
+    InputClaimed,
+    InputDelivered,
+    InterruptionRequested,
+    InterruptionCommitted,
+    EditorSnapshot,
+    ShutdownRecorded,
+    RecoveryApplied,
     AgentStopped,
 )
 
@@ -2033,6 +2231,7 @@ async def _write_runtime_event(journal: _journal.SessionJournal, envelope: Agent
             "hub_seq": envelope.seq,
             "run_id": envelope.run_id,
             "message": event.message,
+            "source_input_id": event.source_input_id,
         }
     else:
         payload = {
@@ -2139,6 +2338,13 @@ def _build_argument_parser() -> Any:
     )
     parser.add_argument("--no-session-log", action="store_true", help="Do not write the session JSONL journal")
     parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        metavar="EVENTS_JSONL",
+        help="Recover context, pending input, and editor state from a stopped session journal",
+    )
+    parser.add_argument(
         "--session-log-dir",
         type=Path,
         default=None,
@@ -2199,6 +2405,16 @@ def _build_argument_parser() -> Any:
 async def main() -> None:
     parser = _build_argument_parser()
     args = parser.parse_args()
+    recovery: RecoveryMaterialization | None = None
+    if args.resume is not None:
+        if args.prompt is not None:
+            parser.error("--resume is interactive-only and cannot be combined with a one-shot prompt")
+        if args.no_session_log:
+            parser.error("--resume requires a new session journal; remove --no-session-log")
+        try:
+            recovery = materialize_recovery(args.resume.expanduser().resolve())
+        except (OSError, RecoveryError) as error:
+            parser.error(f"cannot recover session: {error}")
 
     try:
         sandbox_options = _sandbox.SandboxOptions(
@@ -2235,10 +2451,12 @@ async def main() -> None:
             root=journal_root,
             one_shot=args.prompt is not None,
             cwd=root,
-        ),
+        ) as session_journal,
         aiohttp.ClientSession() as session,
         AsyncExitStack() as stack,
     ):
+        if recovery is not None and session_journal is None:
+            parser.error("recovery stopped because the new session journal could not be opened")
         transport_cls, _ = _select_transport(args.transport)
         agents_text = load_agents_instructions(root)
         transport = transport_cls(session=session)
@@ -2290,8 +2508,12 @@ async def main() -> None:
         set_session_event_hub(event_hub)
         parent_peer_id: str | None = None
 
-        async def _publish_main_event(event: Any) -> None:
-            await event_hub.publish(
+        async def _publish_main_event(
+            event: RuntimeEvent,
+            *,
+            reserved_seq: int | None = None,
+        ) -> AgentEventEnvelope:
+            return await event_hub.publish(
                 event,
                 run_id=main_run_id,
                 agent_id="main",
@@ -2299,6 +2521,7 @@ async def main() -> None:
                 turn_id=None,
                 execution_mode=ExecutionMode.FOREGROUND,
                 context_id=ctx.session_id,
+                reserved_seq=reserved_seq,
             )
 
         await _publish_main_event(AgentStarted(name=AGENT_NAME, kind="repl-agent"))
@@ -2313,6 +2536,17 @@ async def main() -> None:
             ("agent_actions", args.agent_actions),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
+
+        if recovery is not None and recovery.messages:
+            recovery_identity = new_turn_identity(
+                agent_id="main",
+                parent_agent_id=None,
+                execution_mode=ExecutionMode.FOREGROUND,
+                run_id=main_run_id,
+                context_id=ctx.session_id,
+            )
+            ctx.bind_identity(recovery_identity)
+            await ctx.append_many(list(recovery.messages))
 
         def _command_configuration(command_name: str) -> object:
             match command_name:
@@ -2355,6 +2589,7 @@ async def main() -> None:
                 tools=child_tools,
                 max_iterations=agent.max_iterations,
                 last_iteration_message=LAST_ITERATION_HINT,
+                deferred_tool_sink=None if foreground else deferred_tools,
             ), child_ctx
 
         async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, ContextStore]:
@@ -2395,6 +2630,45 @@ async def main() -> None:
         loop = asyncio.get_event_loop()
         peer_queue: asyncio.Queue[_IncomingPrompt] = asyncio.Queue()
         pending_peer_prompts: deque[_IncomingPrompt] = deque()
+        arrival_handlers: list[Callable[[], None]] = []
+
+        async def _sequence_incoming(prompt: _IncomingPrompt, *, source: str) -> _IncomingPrompt:
+            if prompt.arrival_seq is not None:
+                return prompt
+            envelope = await _publish_main_event(InputReceived(text=prompt.text, source=source))
+            return dataclasses.replace(prompt, arrival_seq=envelope.seq)
+
+        async def _admit_incoming(prompt: _IncomingPrompt, *, source: str) -> None:
+            _preempt_active_tool_dispatch()
+            await peer_queue.put(await _sequence_incoming(prompt, source=source))
+            for handler in tuple(arrival_handlers):
+                handler()
+
+        async def _deliver_deferred_tool(notification: DeferredToolNotification) -> None:
+            text = notification.as_user_text()
+            if notification.agent_id != "main" and is_local_background_agent(notification.agent_id):
+                await event_hub.publish(
+                    InputReceived(text=text, source="deferred-tool"),
+                    run_id=notification.run_id,
+                    agent_id=notification.agent_id,
+                    parent_agent_id="main",
+                    turn_id=None,
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                delivered = await enqueue_local_agent_messages(
+                    notification.agent_id,
+                    (Message(role="user", content=[TextBlock(text=text)]),),
+                )
+                if delivered:
+                    return
+                text = f"[Deferred result from stopped agent {notification.agent_id}]\n\n{text}"
+            await _admit_incoming(
+                _IncomingPrompt(text=text, display_text=text),
+                source="deferred-tool",
+            )
+
+        deferred_tools = DeferredToolRegistry(_deliver_deferred_tool)
+        agent.deferred_tool_sink = deferred_tools
 
         async def _queue_background_outcome(outcome: TurnOutcome) -> None:
             agent_id = outcome.identity.agent_id
@@ -2414,14 +2688,15 @@ async def main() -> None:
                 detail = outcome.error or "unknown error"
                 text = f"[agent {agent_id}] turn failed: {detail}"
                 display_text = f"[agent {identity}] turn failed: {detail}"
-            peer_queue.put_nowait(
+            await _admit_incoming(
                 _IncomingPrompt(
                     text=text,
                     display_text=display_text,
                     agent_id=agent_id,
                     agent_name=agent_name,
                     suppress_display=suppress_display,
-                )
+                ),
+                source="background-outcome",
             )
 
         set_background_outcome_handler(_queue_background_outcome)
@@ -2439,28 +2714,181 @@ async def main() -> None:
             await render_runtime_event(renderer, envelope)
 
         unsubscribe_renderer = event_hub.subscribe(_render_envelope)
+        pending_input = PendingInputCoordinator(
+            _publish_main_event,
+            lambda event, sequence: _publish_main_event(event, reserved_seq=sequence),
+        )
+        initial_editor_text = recovery.editor_text if recovery is not None else ""
+        if recovery is not None:
+            remapped_targets: set[str] = set()
+            for recovered_input in recovery.pending_inputs:
+                target_agent_id = recovered_input.target_agent_id
+                if target_agent_id != "main":
+                    remapped_targets.add(target_agent_id)
+                    target_agent_id = "main"
+                await pending_input.admit(recovered_input.text, target_agent_id)
+            application_ids = [*recovery.recovery_ids]
+            application_ids.extend(
+                f"{recovery.source_session_id}:pending:{recovered_input.source_id}"
+                for recovered_input in recovery.pending_inputs
+            )
+            if recovery.editor_text:
+                application_ids.append(f"{recovery.source_session_id}:editor")
+            await _publish_main_event(EditorSnapshot(recovery.editor_text))
+            await _publish_main_event(
+                RecoveryApplied(
+                    source_session_id=recovery.source_session_id,
+                    recovery_ids=tuple(application_ids),
+                )
+            )
+            if recovery.discarded_tail_bytes:
+                print(f"{DIM}[ignored {recovery.discarded_tail_bytes} unterminated journal byte(s)]{RESET}")
+            if remapped_targets:
+                names = ", ".join(sorted(remapped_targets))
+                print(f"{DIM}[recovered pending input retargeted from unavailable agent(s): {names}]{RESET}")
+        interrupt_queue: asyncio.Queue[_AcceptedInterrupt] = asyncio.Queue()
+        shutdown_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+        shutdown_queued = False
+        foreground_state = ForegroundCoordinatorState()
+        exit_arming = ExitArmingState()
+
+        def _queue_shutdown(reason: str) -> None:
+            nonlocal shutdown_queued
+            if shutdown_queued:
+                return
+            shutdown_queued = True
+            shutdown_queue.put_nowait(reason)
+
+        def _on_sigint() -> None:
+            _queue_shutdown("sigint")
+
+        def _on_sigterm() -> None:
+            _queue_shutdown("sigterm")
+
+        async def _recall_pending_input() -> str | None:
+            batch = await pending_input.recall_all()
+            return batch.editor_text if batch is not None else None
+
+        def _queue_escape() -> None:
+            target_agent_id = renderer.focused_agent
+            request = PromptInterruptRequested(
+                target_agent_id=target_agent_id,
+                captured_turn_id=(
+                    foreground_state.active_turn_id("main") if target_agent_id == "main" else renderer.focused_turn_id
+                ),
+            )
+            task = asyncio.create_task(
+                _admit_escape(request),
+                name="axio-repl-escape-admission",
+            )
+            incoming_admission_tasks.add(task)
+            task.add_done_callback(incoming_admission_tasks.discard)
+
+        def _handle_empty_eof(now: float) -> bool:
+            nonlocal exit_arming
+            exit_arming, should_exit = exit_arming.press(now)
+            if not should_exit:
+                print(f"\n{DIM}[press Ctrl-D again within 2 seconds to exit]{RESET}")
+            return should_exit
+
         prompt_session = _panel.make_session(
             lambda: _panel.status_line(transport.model, stats, renderer.action_status()),
-            on_interrupt=lambda: _on_sigint(),
+            on_interrupt=_queue_escape,
+            on_shutdown=_on_sigint,
+            recall_pending=_recall_pending_input,
+            on_empty_eof=_handle_empty_eof,
+            capture_target=lambda: renderer.focused_agent,
+            reserve_sequence=event_hub.reserve_sequence,
         )
         terminal = TerminalUI(prompt_session)
+        terminal_started = False
+        shutdown_reason = "complete"
         prompt_task: asyncio.Task[TurnOutcome] | None = None
         foreground_task: asyncio.Task[None] | None = None
-        input_task: asyncio.Task[str] | None = None
+        input_task: asyncio.Task[InputSubmitted] | None = None
         inbox_task: asyncio.Task[_IncomingPrompt] | None = None
+        interrupt_task: asyncio.Task[_AcceptedInterrupt] | None = None
         terminal_failure_task: asyncio.Task[None] | None = None
+        shutdown_task: asyncio.Task[str] | None = None
         main_status = TurnStatus.SUCCEEDED
         # Lets monitor() see messages that arrived but have not been read:
         # they cannot be delivered until the current turn finishes.
         set_pending_message_probe(lambda: _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task))
         peer_server: PeerServer | None = None
+        incoming_admission_tasks: set[asyncio.Task[None]] = set()
+
+        async def _admit_escape(request: PromptInterruptRequested) -> None:
+            envelope = await _publish_main_event(
+                InterruptionRequested(
+                    target_agent_id=request.target_agent_id,
+                    captured_turn_id=request.captured_turn_id,
+                )
+            )
+            if (
+                request.target_agent_id == "main"
+                and request.captured_turn_id is not None
+                and request.captured_turn_id == foreground_state.active_turn_id("main")
+                and prompt_task is not None
+                and not prompt_task.done()
+            ):
+                deferred_tools.request_preemption(request.captured_turn_id)
+                prompt_task.cancel()
+            await interrupt_queue.put(_AcceptedInterrupt(envelope.seq, request))
+
+        def _queue_notification(text: str) -> None:
+            task = asyncio.create_task(
+                _admit_incoming(_IncomingPrompt(text=text), source="notification"),
+                name="axio-repl-notification-admission",
+            )
+            incoming_admission_tasks.add(task)
+            task.add_done_callback(incoming_admission_tasks.discard)
 
         async def _on_peer_message(message: PeerMessage) -> None:
-            await peer_queue.put(_peer_incoming_prompt(message))
+            await _admit_incoming(_peer_incoming_prompt(message), source="peer")
 
-        async def _run_turn(prompt: str, *, source: str) -> None:
-            nonlocal main_status, prompt_task
-            prompt_task = asyncio.create_task(run_prompt(agent, ctx, prompt, event_hub, main_run_id, source=source))
+        interrupted_partials: dict[str, str] = {}
+
+        async def _run_turn(
+            prompt: str | None = None,
+            *,
+            messages: tuple[Message, ...] = (),
+            source: str,
+            on_input_committed: Callable[[], Awaitable[None]] | None = None,
+            source_input_ids: tuple[str | None, ...] | None = None,
+        ) -> None:
+            nonlocal foreground_state, main_status, prompt_task, shutdown_reason
+            if (prompt is None) == (not messages):
+                raise ValueError("exactly one of prompt or messages is required")
+            identity = new_turn_identity(
+                agent_id="main",
+                parent_agent_id=None,
+                execution_mode=ExecutionMode.FOREGROUND,
+                run_id=main_run_id,
+                context_id=ctx.session_id,
+            )
+            foreground_state = foreground_state.start("main", identity.turn_id)
+            if prompt is not None:
+                await event_hub.publish_for(identity, InputReceived(text=prompt, source=source))
+                turn = observe_agent_turn(
+                    agent=agent,
+                    context=ctx,
+                    prompt=prompt,
+                    identity=identity,
+                    hub=event_hub,
+                )
+            else:
+                turn = run_prompt_messages(
+                    agent,
+                    ctx,
+                    messages,
+                    event_hub,
+                    main_run_id,
+                    source=source,
+                    identity=identity,
+                    on_input_committed=on_input_committed,
+                    source_input_ids=source_input_ids,
+                )
+            prompt_task = asyncio.create_task(turn)
             try:
                 if terminal_failure_task is None:
                     outcome = await prompt_task
@@ -2470,6 +2898,7 @@ async def main() -> None:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if terminal_failure_task in done:
+                        shutdown_reason = "terminal_failure"
                         if not prompt_task.done():
                             prompt_task.cancel()
                             await asyncio.gather(prompt_task, return_exceptions=True)
@@ -2479,22 +2908,27 @@ async def main() -> None:
                 main_status = outcome.status
             except asyncio.CancelledError:
                 main_status = TurnStatus.CANCELLED
-                # Keep the half-written answer. The agent stores an iteration
-                # once the model stops talking, so an interrupted one is on
-                # screen and nowhere else - and the next turn would be answered
-                # by a model with no memory of saying it.
+                if prompt_task is not None and not prompt_task.done():
+                    prompt_task.cancel()
+                    await asyncio.gather(prompt_task, return_exceptions=True)
                 partial = renderer.take_pending_text("main")
                 if partial:
-                    await ctx.append(Message(role="assistant", content=[TextBlock(text=partial)]))
+                    interrupted_partials[identity.turn_id] = partial
                 print(f"\n{DIM}[interrupted]{RESET}")
             finally:
                 prompt_task = None
+                foreground_state = foreground_state.complete("main", identity.turn_id)
                 await renderer.mark_idle()
 
-        async def _interrupt_focused_agent(agent_id: str) -> None:
-            await interrupt_agent(agent_id, reason="SIGINT")
+        async def _interrupt_focused_agent(agent_id: str, turn_id: str) -> bool:
+            if not interrupt_local_agent_turn(agent_id, turn_id):
+                return False
+            partial = renderer.take_pending_text(agent_id)
+            if partial:
+                interrupted_partials[turn_id] = partial
             await renderer.notice("[interrupted]")
             await renderer.mark_idle()
+            return True
 
         async def _run_one_shot_background_agents() -> None:
             records = local_background_agent_records()
@@ -2526,7 +2960,8 @@ async def main() -> None:
                     agent_name=prompt.agent_name,
                     suppress_display=prompt.suppress_display,
                 )
-            await _run_turn("\n\n".join(prompt.text for prompt in prompts), source="peer")
+            messages = tuple(Message(role="user", content=[TextBlock(text=prompt.text)]) for prompt in prompts)
+            await _run_turn(messages=messages, source="peer")
 
         async def _run_peer_turn(first: _IncomingPrompt) -> None:
             await _run_peer_prompts(_collect_queued(first))
@@ -2538,14 +2973,48 @@ async def main() -> None:
                 return
             await _run_peer_turn(first)
 
-        def _on_sigint() -> None:
-            nonlocal prompt_task
-            if renderer.focused_agent != "main":
-                asyncio.create_task(_interrupt_focused_agent(renderer.focused_agent))
-            elif prompt_task is not None and not prompt_task.done():
-                prompt_task.cancel()
+        def _preempt_active_tool_dispatch() -> None:
+            current = prompt_task
+            active_turn_id = foreground_state.active_turn_id("main")
+            if current is not None and not current.done() and deferred_tools.has_active_dispatch(active_turn_id):
+                deferred_tools.request_preemption(active_turn_id)
+                current.cancel()
+
+        def _request_target_tool_preemption(target_agent_id: str) -> str | None:
+            if target_agent_id == "main":
+                _preempt_active_tool_dispatch()
+                return None
+            turn_id = renderer.focused_turn_id if renderer.focused_agent == target_agent_id else None
+            if deferred_tools.request_preemption(turn_id):
+                return turn_id
+            return None
+
+        def _preempt_background_tool_dispatch(agent_id: str, turn_id: str | None) -> None:
+            if turn_id is not None and deferred_tools.request_preemption(turn_id):
+                interrupt_local_agent_turn(agent_id, turn_id)
+
+        def _on_tool_dispatch_started(agent_id: str, turn_id: str | None) -> None:
+            if agent_id == "main":
+                if turn_id != foreground_state.active_turn_id("main"):
+                    return
+                if pending_input.pending_count or pending_peer_prompts or not peer_queue.empty():
+                    _preempt_active_tool_dispatch()
+                return
+            has_queued_input = any(
+                (entry.status is PendingInputStatus.PENDING and entry.intended_target_agent_id == agent_id)
+                or (entry.status is PendingInputStatus.CLAIMED and entry.claimed_target_agent_id == agent_id)
+                for entry in pending_input.state.entries
+            )
+            if has_queued_input and deferred_tools.request_preemption(turn_id):
+                if turn_id is not None:
+                    interrupt_local_agent_turn(agent_id, turn_id)
+
+        deferred_tools.set_dispatch_started_handler(_on_tool_dispatch_started)
+        set_background_input_admitted_handler(_preempt_background_tool_dispatch)
+        arrival_handlers.append(_preempt_active_tool_dispatch)
 
         loop.add_signal_handler(signal.SIGINT, _on_sigint)
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
 
         try:
             try:
@@ -2568,11 +3037,11 @@ async def main() -> None:
                 )
                 notify.add_listener(
                     peer_server.id,
-                    lambda text: peer_queue.put_nowait(_IncomingPrompt(text=text)),
+                    _queue_notification,
                 )
             except OSError as exc:
                 print(f"{DIM}[peer messaging disabled: {exc}]{RESET}")
-                notify.add_listener(None, lambda text: peer_queue.put_nowait(_IncomingPrompt(text=text)))
+                notify.add_listener(None, _queue_notification)
 
             if args.prompt:
                 await _run_turn(args.prompt, source="one-shot")
@@ -2582,6 +3051,7 @@ async def main() -> None:
                 return
 
             await terminal.start()
+            terminal_started = True
             terminal_failure_task = asyncio.create_task(
                 terminal.wait_failed(),
                 name="axio-repl-terminal-failure",
@@ -2589,13 +3059,14 @@ async def main() -> None:
             agent_commands = ["/agents", "/agent-actions", "/agent-focus", "/agent-interrupt", "/agent-stop"]
             commands_list = ", ".join(["/help", *commands, *agent_commands, "/quit"])
             label = getattr(transport, "name", "unknown")
-            print(f"REPL ready ({label}). Enter sends, Esc interrupts and sends, Up recalls.")
+            print(
+                f"REPL ready ({label}). Enter queues, Esc interrupts without changing the editor, Up recalls pending."
+            )
             print(f"Commands: {commands_list}")
 
-            pending_inputs: deque[_QueuedInteractiveInput] = deque()
+            ready_claims: deque[_ReadyClaim] = deque()
+            settling_interrupts: deque[_InterruptTransaction] = deque()
             input_closed = False
-            last_foreground_source: str | None = None
-            max_pending_inputs = 32
 
             async def _dispatch_command(user_input: str) -> tuple[bool, bool]:
                 lowered = user_input.lower()
@@ -2650,7 +3121,7 @@ async def main() -> None:
                         print(f"No local agent matching {arg!r}")
                         return True, False
                     if agent_id == "main":
-                        print("Press Ctrl-C while the main agent is streaming to interrupt it.")
+                        print("Press Escape while the main agent is streaming to interrupt it.")
                         return True, False
                     print(await interrupt_agent(agent_id, reason="user requested interrupt"))
                     if renderer.focused_agent == agent_id:
@@ -2693,66 +3164,304 @@ async def main() -> None:
                     return True
                 return command in commands and command == user_input.lower()
 
-            async def _run_targeted_input(queued: _QueuedInteractiveInput) -> None:
-                if queued.target_agent_id == "main":
-                    await _run_turn(queued.text, source="interactive")
+            def _is_known_command(user_input: str) -> bool:
+                command = user_input.lower().split(maxsplit=1)[0]
+                return command in {
+                    "/quit",
+                    "/exit",
+                    "/q",
+                    "/help",
+                    "/agents",
+                    "/agent-actions",
+                    "/agent-focus",
+                    "/agent-interrupt",
+                    "/agent-stop",
+                    *commands,
+                }
+
+            async def _admit_editor_submission(
+                text: str,
+                target_agent_id: str,
+                reserved_seq: int | None,
+            ) -> InputSubmitted:
+                if _is_known_command(text) and (foreground_task is None or _can_dispatch_during_foreground(text)):
+                    await _publish_main_event(
+                        InputReceived(text=text, source="interactive-command"),
+                        reserved_seq=reserved_seq,
+                    )
+                    return InputSubmitted(
+                        text=text,
+                        target_agent_id=target_agent_id,
+                        disposition=SubmissionDisposition.COMMAND,
+                    )
+                if pending_input.pending_count >= MAX_PENDING_INPUTS:
+                    await _publish_main_event(
+                        InputReceived(text=text, source="interactive-retained"),
+                        reserved_seq=reserved_seq,
+                    )
+                    return InputSubmitted(
+                        text=text,
+                        target_agent_id=target_agent_id,
+                        disposition=SubmissionDisposition.RETAINED,
+                    )
+                child_turn_to_interrupt = _request_target_tool_preemption(target_agent_id)
+                entry = await pending_input.admit(text, target_agent_id, reserved_seq=reserved_seq)
+                if child_turn_to_interrupt is not None:
+                    interrupt_local_agent_turn(target_agent_id, child_turn_to_interrupt)
+                return InputSubmitted(
+                    text=text,
+                    target_agent_id=target_agent_id,
+                    disposition=SubmissionDisposition.PENDING,
+                    input_id=entry.id,
+                    arrival_seq=entry.arrival_seq,
+                )
+
+            async def _run_targeted_claim(ready: _ReadyClaim) -> None:
+                target_agent_id = ready.batch.target_agent_id
+
+                async def mark_delivered() -> None:
+                    await pending_input.mark_delivered(ready.batch)
+
+                if target_agent_id == "main":
+                    await _run_turn(
+                        messages=ready.messages,
+                        source=ready.source,
+                        on_input_committed=mark_delivered,
+                        source_input_ids=ready.source_input_ids,
+                    )
                     return
-                if is_local_background_agent(queued.target_agent_id):
-                    delivered = await enqueue_local_agent_prompt(queued.target_agent_id, queued.text, wait=True)
-                    await renderer.mark_idle()
+                if is_local_background_agent(target_agent_id):
+                    delivered = await enqueue_local_agent_messages(
+                        target_agent_id,
+                        ready.messages,
+                        on_input_committed=mark_delivered,
+                        source_input_ids=ready.source_input_ids,
+                    )
                     if not delivered:
-                        print(f"Agent {queued.target_agent_id!r} is no longer running.")
-                        if renderer.focused_agent == queued.target_agent_id:
+                        print(f"Agent {target_agent_id!r} is no longer running; claimed input remains recoverable.")
+                        if renderer.focused_agent == target_agent_id:
                             renderer.set_focus("main")
                     return
-                print(f"Agent {queued.target_agent_id!r} is no longer local.")
-                if renderer.focused_agent == queued.target_agent_id:
+                print(f"Agent {target_agent_id!r} is no longer local; claimed input remains recoverable.")
+                if renderer.focused_agent == target_agent_id:
                     renderer.set_focus("main")
 
+            async def _finalize_interrupt(transaction: _InterruptTransaction) -> None:
+                request = transaction.request
+                partial = (
+                    interrupted_partials.pop(request.captured_turn_id, "")
+                    if request.captured_turn_id is not None
+                    else ""
+                )
+                claimed_ids = (
+                    tuple(entry.id for entry in transaction.claimed.entries) if transaction.claimed is not None else ()
+                )
+                barrier = await _publish_main_event(
+                    InterruptionCommitted(
+                        request_seq=transaction.request_seq,
+                        target_agent_id=request.target_agent_id,
+                        captured_turn_id=request.captured_turn_id,
+                        reason="escape",
+                        claimed_input_ids=claimed_ids,
+                        partial_text=partial,
+                    )
+                )
+                while True:
+                    try:
+                        pending_peer_prompts.append(peer_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                ordered_peers = sorted(
+                    pending_peer_prompts,
+                    key=lambda prompt: prompt.arrival_seq if prompt.arrival_seq is not None else sys.maxsize,
+                )
+                pending_peer_prompts.clear()
+                pending_peer_prompts.extend(ordered_peers)
+                turn_label = request.captured_turn_id or "idle"
+                notice = Message(
+                    role="user",
+                    content=[TextBlock(text=f"[Turn {turn_label} was interrupted by Escape.]")],
+                )
+                arrivals = list(claim_batch_arrivals(transaction.claimed)) if transaction.claimed is not None else []
+                if request.target_agent_id == "main":
+                    retained_peers: deque[_IncomingPrompt] = deque()
+                    while pending_peer_prompts:
+                        prompt = pending_peer_prompts.popleft()
+                        if prompt.arrival_seq is not None and prompt.arrival_seq <= barrier.seq:
+                            await renderer.incoming(
+                                prompt.display_text or prompt.text,
+                                agent_id=prompt.agent_id,
+                                agent_name=prompt.agent_name,
+                                suppress_display=prompt.suppress_display,
+                            )
+                            arrivals.append(
+                                ContextArrival(
+                                    seq=prompt.arrival_seq,
+                                    target_agent_id="main",
+                                    message=Message(role="user", content=[TextBlock(text=prompt.text)]),
+                                    source="peer",
+                                )
+                            )
+                        else:
+                            retained_peers.append(prompt)
+                    pending_peer_prompts.extend(retained_peers)
+                arrivals.append(
+                    ContextArrival(
+                        seq=transaction.request_seq,
+                        target_agent_id=request.target_agent_id,
+                        message=notice,
+                        source="interrupt",
+                    )
+                )
+                ordered = ordered_arrivals(tuple(arrivals), request.target_agent_id, through_seq=barrier.seq)
+                messages = tuple(arrival.message for arrival in ordered)
+                source_input_ids = tuple(arrival.source_input_id for arrival in ordered)
+                if transaction.claimed is None:
+                    if request.target_agent_id == "main":
+                        await ctx.append_many(list(messages))
+                    elif is_local_background_agent(request.target_agent_id):
+                        delivered = await enqueue_local_agent_context(
+                            request.target_agent_id,
+                            messages,
+                            wait=True,
+                        )
+                        if not delivered:
+                            print(f"Agent {request.target_agent_id!r} stopped before interruption context commit.")
+                    return
+                ready_claims.append(
+                    _ReadyClaim(
+                        batch=transaction.claimed,
+                        messages=messages,
+                        source_input_ids=source_input_ids,
+                        source="interactive-interrupt",
+                    )
+                )
+
+            async def _accept_interrupt(accepted: _AcceptedInterrupt) -> None:
+                nonlocal foreground_state
+                request = accepted.request
+                foreground_state, should_apply = foreground_state.request_interrupt(
+                    request.target_agent_id,
+                    request.captured_turn_id,
+                )
+                if not should_apply:
+                    return
+                claimed = await pending_input.claim_all_for_interrupt(request.target_agent_id)
+                if claimed is not None:
+                    _panel.commit_history(prompt_session, tuple(entry.text for entry in claimed.entries))
+                transaction = _InterruptTransaction(accepted.request_seq, request, claimed)
+
+                if request.target_agent_id != "main":
+                    if request.captured_turn_id is not None:
+                        deferred_tools.request_preemption(request.captured_turn_id)
+                        await _interrupt_focused_agent(request.target_agent_id, request.captured_turn_id)
+                    await _finalize_interrupt(transaction)
+                    return
+
+                current_prompt_task = prompt_task
+                current_matches = (
+                    request.captured_turn_id is not None
+                    and request.captured_turn_id == foreground_state.active_turn_id("main")
+                    and foreground_task is not None
+                    and not foreground_task.done()
+                )
+                if current_matches:
+                    if current_prompt_task is not None and not current_prompt_task.done():
+                        current_prompt_task.cancel()
+                    settling_interrupts.append(transaction)
+                    return
+                await _finalize_interrupt(transaction)
+
             async def _start_next_foreground() -> bool:
-                nonlocal foreground_task, last_foreground_source
+                nonlocal foreground_task
                 while foreground_task is None:
-                    run_peer = bool(pending_peer_prompts) and (
-                        not pending_inputs or last_foreground_source == "interactive"
+                    oldest_user_seq = (
+                        pending_input.state.pending[0].arrival_seq if pending_input.state.pending else None
+                    )
+                    oldest_peer_seq = pending_peer_prompts[0].arrival_seq if pending_peer_prompts else None
+                    run_peer = (
+                        not ready_claims
+                        and oldest_peer_seq is not None
+                        and (oldest_user_seq is None or oldest_peer_seq < oldest_user_seq)
                     )
                     if run_peer:
-                        prompts = list(pending_peer_prompts)
-                        pending_peer_prompts.clear()
+                        prompts: list[_IncomingPrompt] = []
+                        while pending_peer_prompts:
+                            candidate = pending_peer_prompts[0]
+                            if candidate.arrival_seq is None:
+                                break
+                            if oldest_user_seq is not None and candidate.arrival_seq > oldest_user_seq:
+                                break
+                            prompts.append(pending_peer_prompts.popleft())
                         foreground_task = asyncio.create_task(
                             _run_peer_prompts(prompts),
                             name="axio-repl-peer-turn",
                         )
-                        last_foreground_source = "peer"
                         return False
-                    if not pending_inputs:
-                        return False
+                    ready = ready_claims.popleft() if ready_claims else None
+                    if ready is None:
+                        claimed = await pending_input.claim_oldest()
+                        if claimed is None:
+                            return False
+                        _panel.commit_history(prompt_session, tuple(entry.text for entry in claimed.entries))
+                        messages = tuple(arrival.message for arrival in claim_batch_arrivals(claimed))
+                        source_input_ids = tuple(entry.id for entry in claimed.entries)
+                        ready = _ReadyClaim(
+                            batch=claimed,
+                            messages=messages,
+                            source_input_ids=source_input_ids,
+                            source="interactive",
+                        )
 
-                    queued = pending_inputs.popleft()
-                    handled, should_exit = await _dispatch_command(queued.text)
+                    if len(ready.batch.entries) == 1:
+                        handled, should_exit = await _dispatch_command(ready.batch.entries[0].text)
+                    else:
+                        handled, should_exit = False, False
                     if should_exit:
+                        await pending_input.mark_delivered(ready.batch)
                         return True
                     if handled:
+                        await pending_input.mark_delivered(ready.batch)
                         continue
                     foreground_task = asyncio.create_task(
-                        _run_targeted_input(queued),
+                        _run_targeted_claim(ready),
                         name="axio-repl-interactive-turn",
                     )
-                    last_foreground_source = "interactive"
                 return False
 
             while True:
                 if foreground_task is None:
-                    if input_closed and not pending_inputs:
+                    if (
+                        input_closed
+                        and pending_input.pending_count == 0
+                        and not ready_claims
+                        and not pending_peer_prompts
+                        and peer_queue.empty()
+                        and not incoming_admission_tasks
+                    ):
                         break
                     if await _start_next_foreground():
                         break
 
-                if input_task is None and not input_closed and len(pending_inputs) < max_pending_inputs:
-                    input_task = asyncio.create_task(_read_input_async(prompt_session, renderer, _on_sigint))
+                if input_task is None and not input_closed:
+                    input_task = asyncio.create_task(
+                        _read_input_async(
+                            prompt_session,
+                            renderer,
+                            _on_sigint,
+                            _admit_editor_submission,
+                            initial_editor_text,
+                        )
+                    )
+                    initial_editor_text = ""
                 if inbox_task is None:
                     inbox_task = asyncio.create_task(peer_queue.get())
+                if interrupt_task is None:
+                    interrupt_task = asyncio.create_task(interrupt_queue.get())
+                if shutdown_task is None:
+                    shutdown_task = asyncio.create_task(shutdown_queue.get())
 
-                wait_tasks: set[asyncio.Task[Any]] = {inbox_task}
+                wait_tasks: set[asyncio.Task[Any]] = {inbox_task, interrupt_task, shutdown_task}
                 if input_task is not None:
                     wait_tasks.add(input_task)
                 if foreground_task is not None:
@@ -2765,59 +3474,133 @@ async def main() -> None:
                 )
 
                 if terminal_failure_task is not None and terminal_failure_task in done:
+                    shutdown_reason = "terminal_failure"
                     await terminal_failure_task
                     raise RuntimeError("terminal failure monitor stopped unexpectedly")
+
+                if shutdown_task in done:
+                    shutdown_reason = shutdown_task.result()
+                    main_status = TurnStatus.CANCELLED
+                    shutdown_task = None
+                    break
+
+                if inbox_task in done:
+                    pending_peer_prompts.append(inbox_task.result())
+                    ordered_peers = sorted(
+                        pending_peer_prompts,
+                        key=lambda prompt: prompt.arrival_seq if prompt.arrival_seq is not None else sys.maxsize,
+                    )
+                    pending_peer_prompts.clear()
+                    pending_peer_prompts.extend(ordered_peers)
+                    inbox_task = None
 
                 if foreground_task is not None and foreground_task in done:
                     foreground_task.result()
                     foreground_task = None
+                    while settling_interrupts:
+                        await _finalize_interrupt(settling_interrupts.popleft())
 
-                if inbox_task in done:
-                    pending_peer_prompts.append(inbox_task.result())
-                    inbox_task = None
+                if interrupt_task in done:
+                    await _accept_interrupt(interrupt_task.result())
+                    interrupt_task = None
 
                 if input_task is None or input_task not in done:
                     continue
 
                 try:
-                    user_input = input_task.result()
+                    submitted = input_task.result()
                 except EOFError:
                     print()
+                    shutdown_reason = "double_eof"
                     input_closed = True
-                    continue
+                    break
                 finally:
                     input_task = None
 
-                if not user_input:
-                    continue
-                lowered = user_input.lower()
-                if lowered.startswith("/"):
-                    await _publish_main_event(InputReceived(text=user_input, source="interactive-command"))
-                if foreground_task is None or _can_dispatch_during_foreground(user_input):
-                    handled, should_exit = await _dispatch_command(user_input)
-                    if should_exit:
-                        break
-                    if handled:
-                        continue
-
-                pending_inputs.append(
-                    _QueuedInteractiveInput(
-                        text=user_input,
-                        target_agent_id=renderer.focused_agent,
+                user_input = submitted.text
+                if submitted.disposition is SubmissionDisposition.RETAINED:
+                    initial_editor_text = user_input
+                    await renderer.notice(
+                        f"[pending input limit ({MAX_PENDING_INPUTS}) reached; press Up to recall queued input]"
                     )
-                )
-                if lowered in {"/quit", "/exit", "/q"}:
-                    input_closed = True
+                    continue
+                if submitted.disposition is SubmissionDisposition.COMMAND:
+                    handled, should_exit = await _dispatch_command(user_input)
+                    if not handled:
+                        raise RuntimeError("accepted REPL command has no dispatcher")
+                    if should_exit:
+                        _panel.complete_submission(
+                            prompt_session,
+                            _panel.editor_text(prompt_session),
+                            clear_editor=True,
+                        )
+                        shutdown_reason = "command"
+                        break
+                    _panel.complete_submission(
+                        prompt_session,
+                        _panel.editor_text(prompt_session),
+                        clear_editor=True,
+                    )
+                    continue
         except asyncio.CancelledError:
             main_status = TurnStatus.CANCELLED
+            shutdown_reason = "outer_cancellation"
             raise
         except BaseException:
             main_status = TurnStatus.FAILED
+            if shutdown_reason == "complete":
+                shutdown_reason = "internal_failure"
             raise
         finally:
-            await _cancel_and_settle_tasks(foreground_task, input_task, inbox_task, terminal_failure_task)
+            shutdown_turn_id = foreground_state.active_turn_id("main")
+            foreground_state = foreground_state.request_shutdown(shutdown_reason)
+            await _cancel_and_settle_tasks(
+                foreground_task,
+                input_task,
+                inbox_task,
+                interrupt_task,
+                terminal_failure_task,
+                shutdown_task,
+                *tuple(incoming_admission_tasks),
+            )
             try:
+                deferred_snapshots = deferred_tools.snapshots()
+                if terminal_started:
+                    partial_text = (
+                        interrupted_partials.pop(shutdown_turn_id, "") if shutdown_turn_id is not None else ""
+                    )
+                    pending_ids = tuple(
+                        entry.id
+                        for entry in pending_input.state.entries
+                        if entry.status in {PendingInputStatus.PENDING, PendingInputStatus.CLAIMED}
+                    )
+                    deferred_ids = tuple(
+                        tool_use_id for snapshot in deferred_snapshots for tool_use_id in snapshot.tool_use_ids
+                    )
+                    deferred_agent_ids = tuple(
+                        snapshot.agent_id for snapshot in deferred_snapshots for _ in snapshot.tool_use_ids
+                    )
+                    deferred_turn_ids = tuple(
+                        snapshot.turn_id for snapshot in deferred_snapshots for _ in snapshot.tool_use_ids
+                    )
+                    deferred_phases = tuple(
+                        snapshot.phase.value for snapshot in deferred_snapshots for _ in snapshot.tool_use_ids
+                    )
+                    await _publish_main_event(EditorSnapshot(_panel.editor_text(prompt_session)))
+                    await _publish_main_event(
+                        ShutdownRecorded(
+                            reason=shutdown_reason,
+                            pending_input_ids=pending_ids,
+                            deferred_tool_use_ids=deferred_ids,
+                            interrupted_turn_id=shutdown_turn_id,
+                            partial_text=partial_text,
+                            deferred_tool_agent_ids=deferred_agent_ids,
+                            deferred_tool_turn_ids=deferred_turn_ids,
+                            deferred_tool_phases=deferred_phases,
+                        )
+                    )
                 await stop_local_background_agents()
+                await deferred_tools.close()
                 await ctx.close()
                 await _publish_main_event(AgentStopped(status=main_status))
                 notify.remove_listener(peer_server.id if peer_server is not None else None)
@@ -2826,12 +3609,15 @@ async def main() -> None:
             finally:
                 unsubscribe_renderer()
                 set_background_outcome_handler(None)
+                set_background_input_admitted_handler(None)
                 set_run_agent_factory(None)
                 set_spawn_agent_factory(None)
                 set_session_event_hub(None)
                 set_pending_message_probe(None)
                 loop.remove_signal_handler(signal.SIGINT)
+                loop.remove_signal_handler(signal.SIGTERM)
                 await terminal.close()
+                foreground_state = foreground_state.mark_stopped()
 
 
 def main_sync() -> None:

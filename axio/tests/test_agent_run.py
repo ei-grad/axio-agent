@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
-from axio.agent import Agent
-from axio.blocks import TextBlock
+import pytest
+
+from axio.agent import Agent, ToolDispatch
+from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     Error,
@@ -96,6 +99,155 @@ class TestRun:
         agent = Agent(system="test", tools=[], transport=transport)
         result = await agent.run("hi", MemoryContextStore())
         assert result == "Hello world"
+
+
+class TestMessageBatchRun:
+    async def test_preserves_distinct_ordered_messages_for_one_model_operation(self) -> None:
+        transport = CapturingTransport([make_text_response("Done", 1)])
+        agent = Agent(system="test", tools=[], transport=transport)
+        context = MemoryContextStore()
+        first = Message(role="user", content=[TextBlock(text="first")])
+        peer = Message(role="user", content=[TextBlock(text="peer")])
+        second = Message(role="user", content=[TextBlock(text="second")])
+
+        result = await agent.run_messages((first, peer, second), context)
+
+        assert result == "Done"
+        history = await context.get_history()
+        assert history[:3] == [first, peer, second]
+        assert transport.calls[0][:3] == [first, peer, second]
+        assert history[0] is not history[1]
+
+    async def test_rejects_an_empty_message_batch_before_starting(self) -> None:
+        agent = Agent(system="test", tools=[], transport=StubTransport([make_text_response("unused")]))
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            agent.run_stream_messages((), MemoryContextStore())
+
+    async def test_input_commit_hook_runs_after_context_append_and_before_transport(self) -> None:
+        transport = CapturingTransport([make_text_response("Done", 1)])
+        agent = Agent(system="test", tools=[], transport=transport)
+        context = MemoryContextStore()
+        message = Message(role="user", content=[TextBlock(text="queued")])
+        observations: list[tuple[list[Message], int]] = []
+
+        async def input_committed() -> None:
+            observations.append((await context.get_history(), len(transport.calls)))
+
+        await agent.run_messages((message,), context, on_input_committed=input_committed)
+
+        assert observations == [([message], 0)]
+
+
+class _RecordingDeferredSink:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.events: list[str] = []
+        self.dispatch: ToolDispatch | None = None
+
+    def dispatch_started(self, dispatch: ToolDispatch) -> None:
+        self.dispatch = dispatch
+        self.events.append("started")
+        self.started.set()
+
+    def dispatch_finished(self, dispatch: ToolDispatch) -> None:
+        assert dispatch is self.dispatch
+        self.events.append("finished")
+
+    def defer(self, dispatch: ToolDispatch) -> None:
+        assert dispatch is self.dispatch
+        self.events.append("deferred")
+
+    def should_defer(self, dispatch: ToolDispatch) -> bool:
+        assert dispatch is self.dispatch
+        return True
+
+    def protocol_closed(self, dispatch: ToolDispatch) -> None:
+        assert dispatch is self.dispatch
+        self.events.append("protocol-closed")
+
+
+async def test_cancelled_tool_dispatch_can_be_deferred_after_protocol_placeholder() -> None:
+    release = asyncio.Event()
+
+    async def slow_tool() -> str:
+        await release.wait()
+        return "actual result"
+
+    sink = _RecordingDeferredSink()
+    context = MemoryContextStore()
+    agent = Agent(
+        system="test",
+        tools=[Tool[Any](name="slow", handler=slow_tool)],
+        transport=StubTransport([make_tool_use_response("slow", "call-1", {})]),
+        deferred_tool_sink=sink,
+    )
+
+    async def consume() -> None:
+        async for _event in agent.run_stream("run", context):
+            pass
+
+    turn = asyncio.create_task(consume())
+    await asyncio.wait_for(sink.started.wait(), timeout=1)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert sink.events == ["started", "deferred", "protocol-closed"]
+    assert sink.dispatch is not None
+    assert not sink.dispatch.task.done()
+    history = await context.get_history()
+    assistant = history[-2]
+    placeholder_message = history[-1]
+    assert any(isinstance(block, ToolUseBlock) and block.id == "call-1" for block in assistant.content)
+    placeholders = [block for block in placeholder_message.content if isinstance(block, ToolResultBlock)]
+    assert len(placeholders) == 1
+    assert placeholders[0].tool_use_id == "call-1"
+    assert "continues after interruption" in str(placeholders[0].content)
+
+    release.set()
+    results = await asyncio.wait_for(sink.dispatch.task, timeout=1)
+    assert results[0].content == "actual result"
+
+
+async def test_cancelled_tool_dispatch_stops_when_sink_does_not_authorize_deferral() -> None:
+    tool_cancelled = asyncio.Event()
+
+    async def slow_tool() -> str:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            tool_cancelled.set()
+            raise
+        return "unreachable"
+
+    class NonDeferringSink(_RecordingDeferredSink):
+        def should_defer(self, dispatch: ToolDispatch) -> bool:
+            assert dispatch is self.dispatch
+            return False
+
+    sink = NonDeferringSink()
+    context = MemoryContextStore()
+    agent = Agent(
+        system="test",
+        tools=[Tool[Any](name="slow", handler=slow_tool)],
+        transport=StubTransport([make_tool_use_response("slow", "call-1", {})]),
+        deferred_tool_sink=sink,
+    )
+
+    turn = asyncio.create_task(agent.run("run", context))
+    await asyncio.wait_for(sink.started.wait(), timeout=1)
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert sink.events == ["started", "finished"]
+    await asyncio.wait_for(tool_cancelled.wait(), timeout=1)
+    history = await context.get_history()
+    results = [block for block in history[-1].content if isinstance(block, ToolResultBlock)]
+    assert len(results) == 1
+    assert results[0].is_error
+    assert results[0].content == "[interrupted by user]"
 
 
 class TestMultiIteration:

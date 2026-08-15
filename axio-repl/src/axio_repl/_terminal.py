@@ -6,25 +6,30 @@ import asyncio
 import logging
 import sys
 import threading
-from collections import deque
-from collections.abc import Callable
-from dataclasses import dataclass
+from enum import StrEnum
 from io import TextIOBase
-from typing import Any, Literal, TextIO, cast
+from typing import Any, TextIO, cast
 
-RESET = "\033[0m"
-MAX_PENDING_CHARS = 256 * 1024
-MAX_BATCH_CHARS = 32 * 1024
+from axio_repl._prompt_terminal import PromptToolkitInlineOutput
+from axio_repl._terminal_ingress import (
+    MAX_BATCH_CHARS,
+    MAX_PENDING_CHARS,
+    RESET,
+    IngressDestination,
+    OutputFrame,
+    OutputStream,
+    TerminalIngress,
+)
 
-type OutputStream = Literal["stdout", "stderr"]
+__all__ = ["MAX_BATCH_CHARS", "MAX_PENDING_CHARS", "RESET", "OutputFrame", "TerminalPhase", "TerminalUI"]
 
 
-@dataclass(frozen=True, slots=True)
-class OutputFrame:
-    """One atomic write accepted by the terminal owner."""
-
-    content: str
-    stream: OutputStream = "stdout"
+class TerminalPhase(StrEnum):
+    NEW = "new"
+    RUNNING = "running"
+    FAILED = "failed"
+    DRAINING = "draining"
+    CLOSED = "closed"
 
 
 class _TerminalStream(TextIOBase):
@@ -119,71 +124,102 @@ class TerminalUI:
     def __init__(self, prompt_session: Any) -> None:
         self._session = prompt_session
         self._output = prompt_session.app.output
+        self._inline_output = PromptToolkitInlineOutput(prompt_session)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._consumer: asyncio.Task[None] | None = None
         self._consumer_error: BaseException | None = None
         self._state_lock = threading.RLock()
-        self._pending: deque[OutputFrame] = deque()
-        self._pending_chars = 0
-        self._dropped_frames = 0
-        self._dropped_chars = 0
+        self._fallback_lock = threading.RLock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._phase = TerminalPhase.NEW
+        self._ingress: TerminalIngress | None = None
         self._wake: asyncio.Event | None = None
         self._drained: asyncio.Event | None = None
         self._failed: asyncio.Event | None = None
-        self._wake_scheduled = False
-        self._writing = False
-        self._closing = False
-        self._active = False
-        self._original_stdout: TextIO | None = None
-        self._original_stderr: TextIO | None = None
+        self._initial_stdout = cast(TextIO, sys.stdout)
+        self._initial_stderr = cast(TextIO, sys.stderr)
+        self._original_stdout: TextIO | None = self._initial_stdout
+        self._original_stderr: TextIO | None = self._initial_stderr
         self.stdout: _TerminalStream | None = None
         self.stderr: _TerminalStream | None = None
 
+    @property
+    def phase(self) -> TerminalPhase:
+        with self._state_lock:
+            return self._phase
+
     async def start(self) -> None:
-        if self._active:
-            raise RuntimeError("terminal UI is already active")
-        self._loop = asyncio.get_running_loop()
-        self._original_stdout = cast(TextIO, sys.stdout)
-        self._original_stderr = cast(TextIO, sys.stderr)
-        self.stdout = _TerminalStream(self, "stdout", self._original_stdout)
-        self.stderr = _TerminalStream(self, "stderr", self._original_stderr)
-        self._wake = asyncio.Event()
-        self._drained = asyncio.Event()
-        self._drained.set()
-        self._failed = asyncio.Event()
-        self._active = True
-        self._consumer = asyncio.create_task(self._consume(), name="axio-repl-terminal-output")
-        self._rebind_logging(self._original_stdout, cast(TextIO, self.stdout))
-        self._rebind_logging(self._original_stderr, cast(TextIO, self.stderr))
-        sys.stdout = self.stdout
-        sys.stderr = self.stderr
+        async with self._lifecycle_lock:
+            if self._phase is not TerminalPhase.NEW:
+                raise RuntimeError(f"terminal UI cannot start from {self._phase.value} state")
+            if sys.platform == "win32":
+                raise RuntimeError("interactive axio-repl terminal UI requires POSIX")
+            self._loop = asyncio.get_running_loop()
+            self._original_stdout = cast(TextIO, sys.stdout)
+            self._original_stderr = cast(TextIO, sys.stderr)
+            self.stdout = _TerminalStream(self, "stdout", self._original_stdout)
+            self.stderr = _TerminalStream(self, "stderr", self._original_stderr)
+            ingress = TerminalIngress()
+            self._ingress = ingress
+            self._wake = asyncio.Event()
+            self._drained = asyncio.Event()
+            self._drained.set()
+            self._failed = asyncio.Event()
+            self._consumer_error = None
+            rebound_handlers: list[tuple[Any, TextIO]] = []
+            try:
+                self._rebind_logging_recorded(
+                    self._original_stdout,
+                    cast(TextIO, self.stdout),
+                    rebound_handlers,
+                )
+                self._rebind_logging_recorded(
+                    self._original_stderr,
+                    cast(TextIO, self.stderr),
+                    rebound_handlers,
+                )
+                sys.stdout = self.stdout
+                sys.stderr = self.stderr
+                self._consumer = asyncio.create_task(self._consume(), name="axio-repl-terminal-output")
+                with self._state_lock:
+                    self._phase = TerminalPhase.RUNNING
+            except BaseException:
+                if sys.stdout is self.stdout:
+                    sys.stdout = self._original_stdout
+                if sys.stderr is self.stderr:
+                    sys.stderr = self._original_stderr
+                self._restore_recorded_logging(rebound_handlers)
+                consumer = self._consumer
+                if consumer is not None and not consumer.done():
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+                if ingress.phase.value == "open":
+                    ingress.seal()
+                ingress.close_late()
+                with self._state_lock:
+                    self._phase = TerminalPhase.CLOSED
+                raise
 
     def submit(self, frame: OutputFrame) -> None:
         if not frame.content:
             return
-        loop = self._loop
-        fallback: TextIO | None = None
-        consumer_error: BaseException | None = None
-        schedule_wake = False
+        loop: asyncio.AbstractEventLoop | None
+        ingress: TerminalIngress | None
+        fallback: TextIO
         with self._state_lock:
-            if not self._active or loop is None:
-                fallback = self._original_stderr if frame.stream == "stderr" else self._original_stdout
-            elif self._consumer_error is not None:
-                consumer_error = self._consumer_error
-            else:
-                self._enqueue_locked(frame)
-                if not self._wake_scheduled:
-                    self._wake_scheduled = True
-                    schedule_wake = True
-        if fallback is not None:
-            fallback.write(frame.content)
-            fallback.flush()
+            loop = self._loop
+            ingress = self._ingress
+            fallback = self._fallback_stream_locked(frame.stream)
+            active = self._phase in {TerminalPhase.RUNNING, TerminalPhase.FAILED, TerminalPhase.DRAINING}
+        if not active or ingress is None or loop is None:
+            self._write_fallback(fallback, frame.content)
             return
-        if consumer_error is not None:
-            raise RuntimeError("terminal output consumer failed") from consumer_error
-        if not schedule_wake:
+        admission = ingress.submit(frame)
+        if admission.destination is IngressDestination.FALLBACK:
+            self._write_fallback(fallback, frame.content)
             return
-        assert loop is not None
+        if not admission.wake_consumer:
+            return
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -195,61 +231,73 @@ class TerminalUI:
 
     async def drain(self) -> None:
         await asyncio.sleep(0)
-        assert self._drained is not None
+        ingress = self._ingress
+        drained = self._drained
+        if ingress is None or drained is None:
+            return
         while True:
             with self._state_lock:
                 consumer_error = self._consumer_error
-                idle = (
-                    not self._pending and not self._dropped_frames and not self._writing and not self._wake_scheduled
-                )
             if consumer_error is not None:
                 raise RuntimeError("terminal output consumer failed") from consumer_error
-            if idle:
+            if ingress.idle:
                 return
-            self._drained.clear()
-            with self._state_lock:
-                idle = (
-                    not self._pending and not self._dropped_frames and not self._writing and not self._wake_scheduled
-                )
-            if idle:
-                self._drained.set()
+            drained.clear()
+            if ingress.idle:
+                drained.set()
                 continue
-            await self._drained.wait()
+            await drained.wait()
 
     async def wait_failed(self) -> None:
-        assert self._failed is not None
-        await self._failed.wait()
-        assert self._consumer_error is not None
-        raise RuntimeError("terminal output consumer failed") from self._consumer_error
+        failed = self._failed
+        if failed is None:
+            raise RuntimeError("terminal UI has not started")
+        await failed.wait()
+        with self._state_lock:
+            consumer_error = self._consumer_error
+        assert consumer_error is not None
+        raise RuntimeError("terminal output consumer failed") from consumer_error
 
     @property
     def pending_char_count(self) -> int:
-        with self._state_lock:
-            return self._pending_chars
+        ingress = self._ingress
+        return 0 if ingress is None else ingress.pending_char_count
 
     async def close(self) -> None:
-        if not self._active:
-            return
-        assert self.stdout is not None
-        assert self.stderr is not None
-        assert self._original_stdout is not None
-        assert self._original_stderr is not None
+        async with self._lifecycle_lock:
+            with self._state_lock:
+                if self._phase is TerminalPhase.CLOSED:
+                    return
+                if self._phase is TerminalPhase.NEW:
+                    self._phase = TerminalPhase.CLOSED
+                    return
+                self._phase = TerminalPhase.DRAINING
+                consumer_error = self._consumer_error
+                error: BaseException | None = None
+                if consumer_error is not None:
+                    error = RuntimeError("terminal output consumer failed")
+                    error.__cause__ = consumer_error
+            assert self.stdout is not None
+            assert self.stderr is not None
+            assert self._original_stdout is not None
+            assert self._original_stderr is not None
+            assert self._ingress is not None
 
-        error: BaseException | None = None
-        try:
-            if sys.stdout is self.stdout:
-                sys.stdout = self._original_stdout
-            if sys.stderr is self.stderr:
-                sys.stderr = self._original_stderr
-            self._rebind_logging(self.stdout, self._original_stdout)
-            self._rebind_logging(self.stderr, self._original_stderr)
-            self.stdout.flush_all()
-            self.stderr.flush_all()
-            await self.drain()
-        except BaseException as exc:
-            error = exc
-        finally:
-            self._request_close()
+            try:
+                if sys.stdout is self.stdout:
+                    sys.stdout = self._original_stdout
+                if sys.stderr is self.stderr:
+                    sys.stderr = self._original_stderr
+                self._rebind_logging(self.stdout, self._original_stdout)
+                self._rebind_logging(self.stderr, self._original_stderr)
+                self.stdout.flush_all()
+                self.stderr.flush_all()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+
+            if self._ingress.seal():
+                self._notify_consumer()
             consumer = self._consumer
             if consumer is not None:
                 try:
@@ -257,28 +305,40 @@ class TerminalUI:
                 except BaseException as exc:
                     if error is None:
                         error = exc
+            with self._state_lock:
+                consumer_error = self._consumer_error
+            if error is None and consumer_error is not None:
+                error = RuntimeError("terminal output consumer failed")
+                error.__cause__ = consumer_error
             try:
                 self._restore_terminal()
             except BaseException as exc:
                 if error is None:
                     error = exc
-            self._active = False
-        if error is not None:
-            raise error
+            try:
+                self._flush_late_output(self._ingress)
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            finally:
+                with self._state_lock:
+                    self._phase = TerminalPhase.CLOSED
+            if error is not None:
+                raise error
 
     async def _consume(self) -> None:
         assert self._wake is not None
         assert self._drained is not None
+        assert self._ingress is not None
         while True:
             await self._wake.wait()
             self._wake.clear()
+            self._ingress.wake_delivered()
             while True:
-                content = self._next_batch()
+                content = self._ingress.next_batch()
                 if content is None:
                     self._drained.set()
-                    with self._state_lock:
-                        closing = self._closing
-                    if closing:
+                    if self._ingress.consumer_should_stop:
                         return
                     break
                 try:
@@ -286,79 +346,29 @@ class TerminalUI:
                 except BaseException as exc:
                     self._record_failure(exc)
                     return
-
-    def _enqueue_locked(self, frame: OutputFrame) -> None:
-        size = len(frame.content)
-        if self._dropped_frames or self._pending_chars + size > MAX_PENDING_CHARS:
-            self._dropped_frames += 1
-            self._dropped_chars += size
-            return
-        if (
-            self._pending
-            and self._pending[-1].stream == frame.stream
-            and len(self._pending[-1].content) + size <= MAX_BATCH_CHARS
-        ):
-            previous = self._pending[-1]
-            self._pending[-1] = OutputFrame(previous.content + frame.content, frame.stream)
-        else:
-            self._pending.append(frame)
-        self._pending_chars += size
+                finally:
+                    self._ingress.finish_batch()
 
     def _notify_consumer(self) -> None:
         assert self._wake is not None
         assert self._drained is not None
-        with self._state_lock:
-            self._wake_scheduled = False
+        assert self._ingress is not None
+        self._ingress.wake_delivered()
         self._drained.clear()
         self._wake.set()
-
-    def _next_batch(self) -> str | None:
-        with self._state_lock:
-            if self._pending:
-                batch = [self._pending.popleft()]
-                size = len(batch[0].content)
-                while self._pending and size + len(self._pending[0].content) <= MAX_BATCH_CHARS:
-                    frame = self._pending.popleft()
-                    batch.append(frame)
-                    size += len(frame.content)
-                self._pending_chars -= size
-                self._writing = True
-                return "".join(frame.content for frame in batch)
-            if self._dropped_frames:
-                dropped_frames = self._dropped_frames
-                chars = self._dropped_chars
-                self._dropped_frames = 0
-                self._dropped_chars = 0
-                self._writing = True
-                return f"{RESET}\n[terminal output skipped: {dropped_frames} frame(s), {chars} character(s)]\n"
-            self._writing = False
-            return None
 
     def _record_failure(self, exc: BaseException) -> None:
         assert self._failed is not None
         assert self._drained is not None
         with self._state_lock:
-            self._consumer_error = exc
-            self._pending.clear()
-            self._pending_chars = 0
-            self._dropped_frames = 0
-            self._dropped_chars = 0
-            self._writing = False
+            if self._consumer_error is None:
+                self._consumer_error = exc
+            if self._phase is TerminalPhase.RUNNING:
+                self._phase = TerminalPhase.FAILED
+        assert self._ingress is not None
+        self._ingress.fail()
         self._failed.set()
         self._drained.set()
-
-    def _request_close(self) -> None:
-        loop = self._loop
-        if loop is None:
-            return
-        schedule_wake = False
-        with self._state_lock:
-            self._closing = True
-            if not self._wake_scheduled:
-                self._wake_scheduled = True
-                schedule_wake = True
-        if schedule_wake:
-            self._notify_consumer()
 
     async def _write(self, content: str) -> None:
         def write_and_flush() -> None:
@@ -366,41 +376,33 @@ class TerminalUI:
             self._output.write_raw(content)
             self._output.flush()
 
-        app = self._session.app
-        if app.is_running:
-            await self._write_above_prompt(app, write_and_flush)
-        else:
-            write_and_flush()
+        await self._inline_output.write(write_and_flush)
 
-    @staticmethod
-    async def _write_above_prompt(app: Any, write: Callable[[], None]) -> None:
-        """Suspend rendering without prompt_toolkit's cooked input mode."""
-        previous = app._running_in_terminal_f
-        completed = asyncio.get_running_loop().create_future()
-        app._running_in_terminal_f = completed
-        rendering_suspended = False
-        try:
-            if previous is not None:
-                await asyncio.shield(previous)
-            if app.output.responds_to_cpr:
-                await app.renderer.wait_for_cpr_responses()
-            if not app.is_running:
-                write()
-                return
-            app.renderer.erase()
-            app._running_in_terminal = True
-            rendering_suspended = True
-            write()
-        finally:
-            try:
-                if rendering_suspended:
-                    app._running_in_terminal = False
-                    app.renderer.reset()
-                    app._request_absolute_cursor_position()
-                    app._redraw()
-            finally:
-                if not completed.done():
-                    completed.set_result(None)
+    def _flush_late_output(self, ingress: TerminalIngress) -> None:
+        assert self._original_stdout is not None
+        assert self._original_stderr is not None
+        with self._fallback_lock:
+            late = ingress.close_late()
+            for frame in late.frames:
+                fallback = self._original_stderr if frame.stream == "stderr" else self._original_stdout
+                fallback.write(frame.content)
+                fallback.flush()
+            if late.dropped_frames:
+                self._original_stderr.write(
+                    f"{RESET}\n[late terminal output skipped: {late.dropped_frames} frame(s), "
+                    f"{late.dropped_chars} character(s)]\n"
+                )
+                self._original_stderr.flush()
+
+    def _fallback_stream_locked(self, stream: OutputStream) -> TextIO:
+        if stream == "stderr":
+            return self._original_stderr or self._initial_stderr
+        return self._original_stdout or self._initial_stdout
+
+    def _write_fallback(self, fallback: TextIO, content: str) -> None:
+        with self._fallback_lock:
+            fallback.write(content)
+            fallback.flush()
 
     def _restore_terminal(self) -> None:
         self._output.reset_attributes()
@@ -419,3 +421,29 @@ class TerminalUI:
             for handler in logger.handlers:
                 if isinstance(handler, logging.StreamHandler) and handler.stream is previous:
                     handler.setStream(current)
+
+    @staticmethod
+    def _rebind_logging_recorded(
+        previous: object,
+        current: TextIO,
+        rebound_handlers: list[tuple[Any, TextIO]],
+    ) -> None:
+        root = logging.getLogger()
+        loggers = [root]
+        loggers.extend(
+            logger for logger in logging.Logger.manager.loggerDict.values() if isinstance(logger, logging.Logger)
+        )
+        for logger in loggers:
+            for handler in logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.stream is previous:
+                    rebound_handlers.append((handler, cast(TextIO, previous)))
+                    handler.setStream(current)
+
+    @staticmethod
+    def _restore_recorded_logging(rebound_handlers: list[tuple[Any, TextIO]]) -> None:
+        for handler, previous in reversed(rebound_handlers):
+            handler.acquire()
+            try:
+                handler.stream = previous
+            finally:
+                handler.release()

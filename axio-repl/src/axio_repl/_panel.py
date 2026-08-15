@@ -11,6 +11,10 @@ says can be tested without a terminal.
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -146,13 +150,18 @@ arrive split across two reads, and the gap has to outlast that.
 """
 
 
-def submit_bindings(on_interrupt: Any) -> Any:
-    """Escape cuts the turn short and sends what is typed; Enter waits its turn.
+def input_bindings(
+    on_interrupt: Callable[[], None],
+    on_shutdown: Callable[[], None],
+    recall_pending: Callable[[], Awaitable[str | None]],
+    on_empty_eof: Callable[[float], bool],
+) -> Any:
+    """Bind interruption and pending recall without submitting the editor.
 
-    The two are different intentions. Enter is "and then this", which belongs
-    after the answer being written. Escape is "stop, do this instead", which is
-    worth nothing if it takes effect once the thing being stopped has finished.
-    An empty buffer makes it a plain interrupt.
+    Enter remains prompt_toolkit's only submit operation. Escape records an
+    interruption while leaving the current editor untouched. Up first asks the
+    coordinator for every still-pending user message; only when there is no
+    such input does it fall back to prompt history or multiline navigation.
 
     Bound eagerly, because forty of the default bindings begin with Escape - all
     the Alt+key ones - and a lone press is ambiguous against every one of them,
@@ -160,41 +169,188 @@ def submit_bindings(on_interrupt: Any) -> Any:
     Alt+b, Alt+f and their relatives no longer reach the buffer. Word motions
     are worth less here than a key that answers when pressed.
     """
+    from prompt_toolkit.document import Document
     from prompt_toolkit.key_binding import KeyBindings
 
     bindings = KeyBindings()
+    recall_in_flight = False
 
     @bindings.add("escape", eager=True)
-    def _interrupt_and_submit(event: Any) -> None:
+    def _interrupt(event: Any) -> None:
         on_interrupt()
-        event.current_buffer.validate_and_handle()
+        event.app.invalidate()
+
+    @bindings.add("c-c", eager=True)
+    def _shutdown(event: Any) -> None:
+        on_shutdown()
+        event.app.invalidate()
+
+    @bindings.add("up")
+    def _recall_or_history(event: Any) -> None:
+        nonlocal recall_in_flight
+        if recall_in_flight:
+            return
+        recall_in_flight = True
+
+        async def apply_recall() -> None:
+            nonlocal recall_in_flight
+            cancellation: asyncio.CancelledError | None = None
+            try:
+                recall_task: asyncio.Future[str | None] = asyncio.ensure_future(recall_pending())
+                while True:
+                    try:
+                        text = await asyncio.shield(recall_task)
+                        break
+                    except asyncio.CancelledError as exc:
+                        if recall_task.done():
+                            text = recall_task.result()
+                            cancellation = cancellation or exc
+                            break
+                        cancellation = cancellation or exc
+                buffer = event.current_buffer
+                if text is None:
+                    buffer.auto_up(count=event.arg)
+                else:
+                    buffer.set_document(Document(text, cursor_position=len(text)))
+                event.app.invalidate()
+                if cancellation is not None:
+                    raise cancellation
+            finally:
+                recall_in_flight = False
+
+        event.app.create_background_task(apply_recall())
+
+    @bindings.add("c-d", eager=True)
+    def _forward_delete_or_exit(event: Any) -> None:
+        buffer = event.current_buffer
+        if buffer.text:
+            buffer.delete()
+        elif on_empty_eof(time.monotonic()):
+            event.app.exit(exception=EOFError())
 
     return bindings
 
 
-def make_session(status: Any = None, on_interrupt: Any = None) -> Any:
-    """A prompt session with history, the status line, and Escape to send.
+def make_session(
+    status: Any = None,
+    on_interrupt: Callable[[], None] | None = None,
+    on_shutdown: Callable[[], None] | None = None,
+    recall_pending: Callable[[], Awaitable[str | None]] | None = None,
+    on_empty_eof: Callable[[float], bool] | None = None,
+    capture_target: Callable[[], str] | None = None,
+    reserve_sequence: Callable[[], int] | None = None,
+) -> Any:
+    """A prompt session with history, a status line, and explicit controls.
 
     The default toolbar style is reverse video, which paints a solid white band
     across the bottom of the terminal. Dim text on the terminal's own background
     keeps the line readable without turning it into a wall.
 
-    Enter sends, as it always did, and what it sends waits for the turn in
-    flight. Escape interrupts that turn and sends immediately. Up walks back
-    through history, so the message just sent comes back to be edited rather
-    than retyped.
+    Enter submits the editor. Escape never submits or modifies it. Up recalls
+    pending input before walking through persistent prompt history.
     """
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.history import FileHistory, History
     from prompt_toolkit.styles import Style
 
+    class ClaimedHistory(History):
+        def __init__(self, filename: Path) -> None:
+            super().__init__()
+            self._stored = FileHistory(str(filename))
+
+        def load_history_strings(self) -> Iterable[str]:
+            return self._stored.load_history_strings()
+
+        def store_string(self, string: str) -> None:
+            self._stored.store_string(string)
+
+        def append_string(self, string: str) -> None:
+            del string
+
+        def commit(self, strings: tuple[str, ...]) -> None:
+            for string in strings:
+                if string:
+                    History.append_string(self, string)
+
+    async def no_pending_input() -> str | None:
+        return None
+
+    history = ClaimedHistory(HISTORY_PATH)
     session: Any = PromptSession(
-        history=FileHistory(str(HISTORY_PATH)),
+        history=history,
         bottom_toolbar=status or (lambda: agent_summary() or None),
         style=Style.from_dict({"bottom-toolbar": "noreverse bg:default fg:#808080"}),
-        key_bindings=submit_bindings(on_interrupt or (lambda: None)),
+        key_bindings=input_bindings(
+            on_interrupt or (lambda: None),
+            on_shutdown or (lambda: None),
+            recall_pending or no_pending_input,
+            on_empty_eof or (lambda _now: True),
+        ),
         # Redraw while idle so finished agents show up without a keypress.
         refresh_interval=0.5,
     )
+    session._axio_claimed_history = history
+    original_accept = session.default_buffer.accept_handler
+    if original_accept is None:
+        raise RuntimeError("prompt session does not expose an accept handler")
+
+    def capture_accept(buffer: Any) -> bool:
+        target_agent_id = (capture_target or (lambda: "main"))()
+        if not target_agent_id:
+            raise RuntimeError("focused input target must not be empty")
+        keep_text = bool(original_accept(buffer))
+        buffer._axio_accepted_target = target_agent_id
+        if str(buffer.text).strip() and reserve_sequence is not None:
+            buffer._axio_accepted_seq = reserve_sequence()
+        return keep_text
+
+    session.default_buffer.accept_handler = capture_accept
     session.app.ttimeoutlen = ESCAPE_FLUSH_SECONDS
     return session
+
+
+def commit_history(session: Any, texts: tuple[str, ...]) -> None:
+    """Make claimed editor submissions available to persistent history."""
+
+    history = getattr(session, "_axio_claimed_history", None)
+    if history is None or not hasattr(history, "commit"):
+        raise RuntimeError("prompt session does not expose claimed-input history")
+    history.commit(texts)
+
+
+def editor_text(session: Any) -> str:
+    """Return the current editor without submitting or mutating it."""
+
+    buffer = getattr(session, "default_buffer", None)
+    text = getattr(buffer, "text", "")
+    return text if isinstance(text, str) else ""
+
+
+def accepted_target(session: Any, fallback: str) -> str:
+    """Return the focus captured by the accept handler for the last Enter."""
+
+    buffer = getattr(session, "default_buffer", None)
+    value = getattr(buffer, "_axio_accepted_target", fallback)
+    return value if isinstance(value, str) and value else fallback
+
+
+def accepted_sequence(session: Any) -> int | None:
+    """Return the logical sequence reserved by the last non-empty Enter."""
+
+    buffer = getattr(session, "default_buffer", None)
+    value = getattr(buffer, "_axio_accepted_seq", None)
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def complete_submission(session: Any, text: str, *, clear_editor: bool) -> None:
+    """Finish one accepted Enter after its coordinator transaction settles."""
+
+    buffer = getattr(session, "default_buffer", None)
+    if buffer is None:
+        return
+    if clear_editor and getattr(buffer, "text", None) == text:
+        buffer.reset()
+    with suppress(AttributeError):
+        del buffer._axio_accepted_target
+    with suppress(AttributeError):
+        del buffer._axio_accepted_seq

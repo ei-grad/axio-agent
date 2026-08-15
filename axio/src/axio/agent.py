@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, Iterable, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Self
+from typing import Any, Protocol, Self
 
 from . import background, notify
 from .blocks import AudioBlock, ContentBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
@@ -149,6 +150,27 @@ async def _tool_result_text(tool: Tool[Any], args: dict[str, Any]) -> str:
     return result if isinstance(result, str) else str(result)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolDispatch:
+    """One concurrent tool batch whose task can outlive its originating turn."""
+
+    blocks: tuple[ToolUseBlock, ...]
+    task: asyncio.Task[list[ToolResultBlock]]
+    owner: str | None
+
+
+class DeferredToolSink(Protocol):
+    def dispatch_started(self, dispatch: ToolDispatch) -> None: ...
+
+    def dispatch_finished(self, dispatch: ToolDispatch) -> None: ...
+
+    def defer(self, dispatch: ToolDispatch) -> None: ...
+
+    def should_defer(self, dispatch: ToolDispatch) -> bool: ...
+
+    def protocol_closed(self, dispatch: ToolDispatch) -> None: ...
+
+
 @dataclass(slots=True)
 class Agent:
     system: str
@@ -157,16 +179,46 @@ class Agent:
     selector: ToolSelector | None = field(default=None)
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
+    deferred_tool_sink: DeferredToolSink | None = field(default=None)
 
     def copy(self, **overrides: Any) -> Self:
         """Return a new Agent with *overrides* applied."""
         return dataclasses.replace(self, **overrides)
 
     def run_stream(self, user_message: str, context: ContextStore) -> AgentStream:
-        return AgentStream(self._run_loop(user_message, context))
+        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        message = Message(role="user", content=[TextBlock(text=f"[{ts}] {user_message}")])
+        return self.run_stream_messages((message,), context)
 
     async def run(self, user_message: str, context: ContextStore) -> str:
         return await self.run_stream(user_message, context).get_final_text()
+
+    def run_stream_messages(
+        self,
+        messages: Sequence[Message],
+        context: ContextStore,
+        *,
+        on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    ) -> AgentStream:
+        """Start one model operation after appending an ordered Message batch."""
+
+        if not messages:
+            raise ValueError("messages must not be empty")
+        initial_messages = tuple(copy.deepcopy(messages))
+        return AgentStream(self._run_loop(initial_messages, context, on_input_committed))
+
+    async def run_messages(
+        self,
+        messages: Sequence[Message],
+        context: ContextStore,
+        *,
+        on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    ) -> str:
+        return await self.run_stream_messages(
+            messages,
+            context,
+            on_input_committed=on_input_committed,
+        ).get_final_text()
 
     async def dispatch_tools(self, blocks: list[ToolUseBlock], iteration: int) -> list[ToolResultBlock]:
         logger.info("Dispatching %d tool(s): %r", len(blocks), blocks)
@@ -355,12 +407,18 @@ class Agent:
             return tools
         return await self.selector.select(history, tools)
 
-    async def _run_loop(self, user_message: str, context: ContextStore) -> AsyncGenerator[StreamEvent, None]:
+    async def _run_loop(
+        self,
+        initial_messages: tuple[Message, ...],
+        context: ContextStore,
+        on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         total_usage = Usage(0, 0)
         session_end_emitted = False
         owner = notify.current_owner()
-        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        await self._append(context, Message(role="user", content=[TextBlock(text=f"[{ts}] {user_message}")]))
+        await context.append_many(list(initial_messages))
+        if on_input_committed is not None:
+            await on_input_committed()
 
         try:
             with notify.turn_scope(owner):
@@ -469,6 +527,7 @@ class Agent:
                         partial_output: dict[str, list[tuple[float, str, str]]] = {}
                         t0_map: dict[str, float] = {}
                         dispatch_task: asyncio.Task[list[ToolResultBlock]] | None = None
+                        dispatch: ToolDispatch | None = None
                         try:
                             if valid:
                                 has_streaming = any(
@@ -484,6 +543,9 @@ class Agent:
                                             output_queue.put_nowait(None)
 
                                     dispatch_task = asyncio.create_task(_dispatch_and_signal())
+                                    dispatch = ToolDispatch(tuple(valid), dispatch_task, owner)
+                                    if self.deferred_tool_sink is not None:
+                                        self.deferred_tool_sink.dispatch_started(dispatch)
                                     while True:
                                         ev = await output_queue.get()
                                         if ev is None:
@@ -494,19 +556,66 @@ class Agent:
                                             (time.monotonic() - t0_map[ev.tool_use_id], ev.key, ev.delta)
                                         )
                                         yield ev
-                                    dispatched = await dispatch_task
+                                    dispatched = await asyncio.shield(dispatch_task)
                                 else:
-                                    dispatched = await self.dispatch_tools(valid, iteration)
+                                    dispatch_task = asyncio.create_task(self.dispatch_tools(valid, iteration))
+                                    dispatch = ToolDispatch(tuple(valid), dispatch_task, owner)
+                                    if self.deferred_tool_sink is not None:
+                                        self.deferred_tool_sink.dispatch_started(dispatch)
+                                    dispatched = await asyncio.shield(dispatch_task)
                             else:
                                 dispatched = []
                             results = dispatched + error_results
                         except asyncio.CancelledError:
-                            if dispatch_task is not None:
-                                if not dispatch_task.done():
-                                    dispatch_task.cancel()
-                                await asyncio.gather(dispatch_task, return_exceptions=True)
+                            completed_results: dict[str, ToolResultBlock] = {}
+                            deferred = False
+                            if dispatch is not None and dispatch_task is not None:
+                                prefer_deferral = (
+                                    self.deferred_tool_sink is not None
+                                    and self.deferred_tool_sink.should_defer(dispatch)
+                                )
+                                if prefer_deferral and self.deferred_tool_sink is not None:
+                                    self.deferred_tool_sink.defer(dispatch)
+                                    deferred = True
+                                elif dispatch_task.done() and not dispatch_task.cancelled():
+                                    try:
+                                        completed_results = {
+                                            result.tool_use_id: result for result in dispatch_task.result()
+                                        }
+                                    except BaseException:
+                                        completed_results = {}
+                                    if self.deferred_tool_sink is not None:
+                                        self.deferred_tool_sink.dispatch_finished(dispatch)
+                                else:
+                                    if not dispatch_task.done():
+                                        dispatch_task.cancel()
+                                        await asyncio.gather(dispatch_task, return_exceptions=True)
+                                    if self.deferred_tool_sink is not None:
+                                        self.deferred_tool_sink.dispatch_finished(dispatch)
                             interrupted_results: list[ToolResultBlock] = []
                             for b in tool_blocks:
+                                completed = completed_results.get(b.id)
+                                if completed is not None:
+                                    interrupted_results.append(completed)
+                                    continue
+                                if deferred and b.id not in malformed:
+                                    interrupted_results.append(
+                                        ToolResultBlock(
+                                            tool_use_id=b.id,
+                                            content=(
+                                                f"Tool {b.name} continues after interruption. "
+                                                "Its actual result will arrive as a later user message."
+                                            ),
+                                        )
+                                    )
+                                    continue
+                                malformed_result = next(
+                                    (result for result in error_results if result.tool_use_id == b.id),
+                                    None,
+                                )
+                                if malformed_result is not None:
+                                    interrupted_results.append(malformed_result)
+                                    continue
                                 chunks = partial_output.get(b.id, [])
                                 tool = self._find_tool(b.name)
                                 if chunks and tool:
@@ -524,7 +633,19 @@ class Agent:
                                     Message(role="user", content=list(interrupted_results)),
                                 ]
                             )
+                            if deferred and dispatch is not None and self.deferred_tool_sink is not None:
+                                self.deferred_tool_sink.protocol_closed(dispatch)
                             raise
+                        except BaseException:
+                            if dispatch_task is not None and not dispatch_task.done():
+                                dispatch_task.cancel()
+                                await asyncio.gather(dispatch_task, return_exceptions=True)
+                            if dispatch is not None and self.deferred_tool_sink is not None:
+                                self.deferred_tool_sink.dispatch_finished(dispatch)
+                            raise
+
+                        if dispatch is not None and self.deferred_tool_sink is not None:
+                            self.deferred_tool_sink.dispatch_finished(dispatch)
 
                         await context.append_many(
                             [

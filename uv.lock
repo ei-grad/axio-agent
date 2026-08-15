@@ -483,7 +483,7 @@ requires-dist = [
     { name = "axio-tools-docker", marker = "extra == 'docker'", editable = "axio-tools-docker" },
     { name = "axio-tools-local", editable = "axio-tools-local" },
     { name = "axio-transport-openai", editable = "axio-transport-openai" },
-    { name = "prompt-toolkit", specifier = ">=3.0" },
+    { name = "prompt-toolkit", specifier = ">=3.0.53,<3.1" },
 ]
 provides-extras = ["docker"]
 
