@@ -32,6 +32,39 @@ uv run axio-repl
 axio-repl
 ```
 
+## Platform and terminal model
+
+`axio-repl` is POSIX-only. Interactive mode requires a terminal with POSIX
+`termios` behavior; Windows is not supported.
+
+The interactive UI stays on the terminal's primary screen buffer. It does not
+enter the alternate screen and does not reserve a scroll region, so completed
+REPL output remains in the terminal's normal scrollback. `prompt_toolkit` owns
+only the editor and status lines. Before asynchronous output is written, those
+temporary lines are erased; one serialized terminal owner writes the output and
+then redraws the editor at its previous cursor position.
+
+All interactive stdout, stderr, logging, background-agent output, and prompt
+redraws pass through that owner. Its queues are bounded; sustained overload is
+reported with an explicit `terminal output skipped` marker instead of growing
+memory without limit. Terminal write failures stop the session rather than
+silently losing later output. On shutdown the REPL restores the cursor,
+autowrap, process streams, and terminal input state.
+
+Reasoning, answer text, tool fields, and tool output establish and reset their
+own style on every physical terminal line. A later block therefore cannot
+inherit an earlier block's colour after a newline or asynchronous redraw.
+
+The bottom panel continuously reports the active agent phase: idle, waiting for
+the model, reasoning, responding, or the names and counts of active tools. REPL
+startup details, slash-command help/results, queue warnings, and interruption
+causes are temporary panel feedback, not conversation output. Background
+lifecycle summaries use the panel too; the actual background report remains in
+the conversation log and model context. Accepting a slash command therefore
+creates neither an `InputReceived` journal record nor a model message. A command
+that changes durable configuration still records the resulting
+`ConfigurationChanged` event.
+
 The REPL picks the first transport whose environment variable is set:
 
 | Transport | Env Variable | Package |
@@ -112,8 +145,10 @@ Media bytes are stored by content hash in an adjacent `attachments/` directory.
 hot streaming path only admits records to a bounded in-memory queue; admission
 does not claim that an individual record is durable. The journal drains and
 fsyncs at successfully committed context mutations, completed turns, outcome
-delivery, agent shutdown, and clean session shutdown. This preserves live
-streaming while giving completed work explicit durability boundaries.
+delivery, pending-input buffer/recall/claim/delivery transitions, interruption
+barriers, editor snapshots, recovery application, agent shutdown, and clean
+session shutdown. This preserves live streaming while making every state
+transition needed for deterministic recovery an explicit durability boundary.
 
 If the process stops abruptly, every record through the last successful
 boundary is retained. Every record accepted after that boundary may
@@ -150,6 +185,11 @@ recognized. Treat journals as sensitive local data.
 
 ## REPL commands
 
+Command output is shown in the temporary bottom panel and disappears when the
+next editor submission is accepted. Commands entered during an unsafe active
+turn are queued in the UI plane and applied at the next turn boundary; they are
+not converted into pending user messages.
+
 | Command | Description |
 |---|---|
 | `/model` | Show current model and list available models |
@@ -162,6 +202,8 @@ recognized. Treat journals as sensitive local data.
 | `/agent-actions [on\|off]` | Show or toggle actions from non-active agents |
 | `/agents` | List local background agents |
 | `/agent-focus <id>` | Change the input target without changing execution mode |
+| `/agent-interrupt [id]` | Interrupt a background agent's current turn; defaults to the focused agent |
+| `/agent-stop [id]` | Stop a background agent; defaults to the focused agent |
 | `/help` | List all tools and commands |
 | `/quit`, `/exit`, `/q` | Exit the REPL |
 
@@ -212,6 +254,24 @@ For a single-prompt invocation, spawned background agents are joined before the
 process exits. Their final reports use the normal incoming-outcome path exactly
 once; the REPL does not temporarily focus an agent and replay its hidden prose.
 
+### Chronological arrivals and deferred tools
+
+User submissions, peer messages, background outcomes, interruption events, and
+deferred-tool results share one monotonic session order. A non-empty Enter
+reserves its position before the prompt accepts another event, so a peer message
+that arrives immediately afterwards cannot overtake it. Ordered batches are
+appended as distinct `Message` objects; they are not joined into one text block.
+
+An arrival cannot be inserted into a provider response that is already
+streaming, so the coordinator exposes it at the earliest safe model boundary.
+If the active turn is blocked in a foreground tool dispatch, the REPL requests
+preemption instead of waiting for the tool to finish. The interrupted tool-use
+protocol is closed with a placeholder saying that the call continues, while the
+session retains ownership of the actual task. Its eventual result is delivered
+once as a labelled user message in session order; it is never emitted as a
+second `ToolResult` for the closed call. On process shutdown, unfinished
+deferred calls are cancelled and their identities are preserved for recovery.
+
 ## Tools
 
 | Tool | Description |
@@ -224,6 +284,13 @@ once; the REPL does not temporarily focus an agent and replay its hidden prose.
 | `shell` | Run shell commands with streaming stdout/stderr |
 | `generate_image` | Generate images via Gemini (Google transport only) |
 | `generate_video` | Generate videos via Veo (Google transport only) |
+| `list_peers` | List running local agents |
+| `send_message` | Send a message to a local agent by global id |
+| `run_agent` | Run one foreground child turn and return its answer |
+| `spawn_agent` | Start a persistent background child agent |
+| `monitor` | Wait inside a tool call for agents, tasks, paths, processes, or messages |
+| `interrupt_agent` | Interrupt a background agent's current turn |
+| `stop_agent` | Stop a background agent |
 
 ## Sandbox
 
@@ -275,13 +342,15 @@ with `/model` recalculates capabilities and rewrites the prompt automatically:
 
 ## Multiline input
 
-Paste multi-line text directly into the prompt. The REPL detects continuation
-lines and joins them before sending:
+Bracketed multi-line paste is preserved in one `prompt_toolkit` editor value.
+Pressing Enter submits the complete value as one user message; the REPL does not
+split or rejoin it through a separate continuation-line protocol. Displayed
+continuation and wrapping are controlled by the terminal and `prompt_toolkit`:
 
 ```
-You> Refactor this function:
-...   def old(x):
-...     return x+1
+repl> Refactor this function:
+      def old(x):
+          return x + 1
 ```
 
 ## Interactive input and interruption
@@ -295,7 +364,9 @@ instead of being dropped.
 Press **Up** to take every user message that has not yet been claimed by an
 agent back out of the pending buffer. Their text is placed in the editor in
 submission order, with one empty line between the original messages. Sending
-that edited text with Enter creates one new pending message.
+that edited text with Enter creates one new pending message. If no pending input
+exists, Up falls back to normal prompt history or movement within a multi-line
+editor value.
 
 Press **Escape** to interrupt the turn that was active when the keypress was
 accepted. Escape never submits, clears, or changes the editor. It claims every
@@ -307,6 +378,11 @@ order around the interrupt barrier.
 If no user message is pending, Escape is an interrupt only. Partial output and
 queued events are committed to context, the editor stays unchanged, and no
 replacement model turn starts.
+
+A lone Escape is distinguished from an escape-prefixed key sequence with a
+200 ms timeout. Escape is bound eagerly so interruption remains responsive;
+standard Alt-key word-motion bindings such as Alt+B and Alt+F are therefore not
+available in this prompt.
 
 On an empty editor, the first **Ctrl-D** warns that exit is armed for two
 seconds. A second Ctrl-D during that window starts graceful shutdown. With text

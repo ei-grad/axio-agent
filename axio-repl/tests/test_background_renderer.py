@@ -55,6 +55,63 @@ async def _queue_background_tool_action(renderer: ReplRenderer, agent_id: str = 
     )
 
 
+async def test_panel_status_tracks_main_agent_phase() -> None:
+    renderer = ReplRenderer()
+
+    assert renderer.agent_status() == "main: idle"
+    await renderer.start_turn(
+        "main",
+        TurnStarted(prompt="inspect"),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    assert renderer.agent_status() == "main: waiting for model"
+
+    await renderer.render(
+        "main",
+        ReasoningDelta(index=0, delta="thinking"),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    assert renderer.agent_status() == "main: reasoning"
+
+    await renderer.render(
+        "main",
+        ToolUseStart(index=0, tool_use_id="one", name="spawn_agent"),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render(
+        "main",
+        ToolUseStart(index=1, tool_use_id="two", name="spawn_agent"),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    assert renderer.agent_status() == "main: tools: spawn_agent ×2"
+
+    await renderer.finish_turn(
+        "main",
+        TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    assert renderer.agent_status() == "main: idle"
+
+
+async def test_ui_notice_stays_in_panel_and_is_terminal_safe(capsys: pytest.CaptureFixture[str]) -> None:
+    renderer = ReplRenderer()
+
+    await renderer.notice(f"{DIM}queued command{RESET}")
+
+    assert capsys.readouterr().out == ""
+    assert renderer.panel_message == "queued command"
+
+
 async def test_focusing_an_agent_does_not_replay_hidden_prose(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1029,7 +1086,8 @@ async def test_actions_off_failure_uses_one_canonical_summary(
     await renderer.mark_idle()
 
     output = capsys.readouterr().out
-    assert output.count("[background agent analyst (child-id) completed") == 1
+    assert "[background" not in output
+    assert renderer.panel_message.count("Background agent analyst (child-id) completed") == 1
     assert "child failed" not in output
 
 

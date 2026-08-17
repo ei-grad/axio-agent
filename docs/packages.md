@@ -1,6 +1,6 @@
 # Packages
 
-The Axio monorepo contains 13 packages, each with a focused responsibility.
+The Axio monorepo contains 14 packages, each with a focused responsibility.
 Each package is a top-level directory in the monorepo root (e.g., `axio/`, `axio-tui/`)
 and all are managed as a uv workspace.
 
@@ -15,6 +15,7 @@ and all are managed as a uv workspace.
 | `axio-transport-codex` | ChatGPT (Codex) OAuth transport | `axio.transport`, `axio.transport.settings` |
 | `axio-transport-google` | Google Gemini transport + Gemini Live realtime | `axio.transport`, `axio.transport.realtime`, `axio.transport.settings`, `axio.tools` |
 | `axio-audio` | Microphone and speaker helpers for realtime agents | - |
+| `axio-tools-agents` | Local agent lifecycle, messaging, monitoring, and ordered runtime events | `axio.tools` |
 | `axio-tools-local` | Filesystem & shell tools | `axio.tools` |
 | `axio-tools-mcp` | MCP tool loader | `axio.tools.settings` |
 | `axio-tools-docker` | Docker sandbox tools | - |
@@ -129,6 +130,20 @@ Dependencies: `axio`, `sounddevice>=0.5`, `numpy>=2`
 
 ## Tools
 
+### axio-tools-agents
+
+Local agent-to-agent runtime used by `axio-repl` and other hosts. It provides
+persistent background agents, one-shot foreground children, peer messaging,
+interrupt/stop operations, blocking condition monitoring, and
+`SessionEventHub` for one monotonic order across agent, input, context, and tool
+events.
+
+The `axio.tools` entry-point group registers `interrupt_agent`, `list_peers`,
+`send_message`, `spawn_agent`, and `stop_agent`. Hosts that can provide child
+agent factories may also expose `run_agent` and `monitor` directly.
+
+Dependencies: `axio`
+
 ### axio-tools-local
 
 Filesystem and shell tool handlers for local development:
@@ -197,13 +212,18 @@ Dependencies: `axio`, `axio-tui`
 
 ### axio-repl
 
-Terminal coding assistant. Runs an agent loop with file/shell tools, streams
-every token and tool call to the terminal, and auto-detects the transport from
-environment variables. Supports model switching, streaming tool arguments and
+POSIX terminal coding assistant. Runs an agent loop with file, shell, and local
+agent tools; serializes interactive output on the primary screen buffer; and
+auto-detects the transport from environment variables. Supports model
+switching, chronological pending input and peer delivery, interruption with
+deferred tool completion, session recovery, streaming tool arguments and
 output, vision, and workspace-level `AGENTS.md` instructions.
 
 Console script: `axio-repl = "axio_repl:main_sync"`
 
 See the {doc}`guides/axio-repl` guide.
 
-Dependencies: `axio`, `axio-tools-local`, `axio-transport-openai`, `aiohttp>=3.11`
+Dependencies: `axio`, `axio-tools-agents`, `axio-tools-local`,
+`axio-transport-openai`, `aiohttp>=3.11`, `prompt-toolkit>=3.0.53,<3.1`
+
+Optional Docker sandbox dependency: `axio-tools-docker`

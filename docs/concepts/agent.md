@@ -12,6 +12,7 @@ name: test_agent_dataclass
 ```python
 from dataclasses import dataclass, field
 from axio import Tool, CompletionTransport, ToolSelector
+from axio.agent import DeferredToolSink
 from axio.messages import Message
 
 
@@ -23,6 +24,7 @@ class Agent:
     selector: ToolSelector | None = field(default=None)
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
+    deferred_tool_sink: DeferredToolSink | None = field(default=None)
 ```
 
 `system`
@@ -49,6 +51,13 @@ class Agent:
   final iteration (when `max_iterations` is about to be exceeded). Useful for
   injecting a stop instruction such as "you must answer now without calling
   more tools" to coerce a final response before the loop terminates.
+
+`deferred_tool_sink`
+: An advanced host hook for transferring ownership of an in-flight tool batch
+  when its originating turn is cancelled. The default is `None`, which keeps
+  ordinary cancellation semantics. REPL-like hosts can use the hook to close
+  the original tool protocol with a placeholder and deliver the eventual
+  result later through a new user message.
 
 ## How the loop works
 
@@ -81,7 +90,7 @@ flowchart TD
 
 ## Streaming API
 
-`Agent` exposes two methods:
+`Agent` exposes four run methods:
 
 `run_stream(user_message, context) -> AgentStream`
 : Returns an `AgentStream` - an async iterator over `StreamEvent` values.
@@ -91,13 +100,20 @@ flowchart TD
 `run(user_message, context) -> str`
 : Convenience wrapper that consumes the stream and returns the final text.
 
-`run_stream_messages(messages, context) -> AgentStream`
+`run_stream_messages(messages, context, *, on_input_committed=None) -> AgentStream`
 : Appends an ordered batch of distinct `Message` objects, then starts one model
   operation. Messages are never joined. Use this when several chronological
-  inputs must become visible at the same provider boundary.
+  inputs must become visible at the same provider boundary. The input sequence
+  is deep-copied before the asynchronous run starts.
 
-`run_messages(messages, context) -> str`
+`run_messages(messages, context, *, on_input_committed=None) -> str`
 : Convenience wrapper for `run_stream_messages()`.
+
+Both batch methods call `ContextStore.append_many()` once. Persistent stores
+should implement that operation atomically. If `on_input_committed` is supplied,
+the agent awaits it immediately after `append_many()` succeeds and before the
+first transport request; hosts use this barrier to mark queued input as
+delivered without guessing from equal message text.
 
 ## Concurrent tool dispatch
 
@@ -120,6 +136,30 @@ If a tool's JSON arguments could not be parsed from the stream, the agent
 returns a `ToolResultBlock` with `is_error=True` and a message asking the
 model to retry with valid JSON, rather than passing malformed input to the
 handler.
+
+### Cancellation and deferred tool dispatch
+
+Tool execution starts before the assistant tool-use message is appended to
+context. This prevents cancellation from leaving an orphaned `ToolUseBlock`
+without a matching result.
+
+With the default `deferred_tool_sink=None`, cancelling a turn also cancels an
+unfinished tool batch. The agent appends the assistant tool-use message and one
+interrupted `ToolResultBlock` per call before propagating cancellation. Already
+completed calls keep their real results.
+
+When a host supplies a `DeferredToolSink`, it is notified when a dispatch starts
+and may request deferral for a particular cancellation. The agent then:
+
+1. transfers the still-running task to the sink;
+2. appends a protocol-safe placeholder result stating that the tool continues;
+3. notifies the sink only after that original protocol has been closed in
+   context; and
+4. propagates cancellation of the originating turn.
+
+The sink owns eventual result delivery. It must not append another
+`ToolResultBlock` for the closed call; a REPL host delivers the result as a new,
+labelled user message instead.
 
 ## ToolSelector
 

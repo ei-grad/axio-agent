@@ -30,10 +30,12 @@ class InputSubmitted:
         correlated = self.input_id is not None and self.arrival_seq is not None
         if self.disposition is SubmissionDisposition.PENDING and not correlated:
             raise ValueError("pending submission requires input_id and arrival_seq")
-        if self.disposition is not SubmissionDisposition.PENDING and (
+        if self.disposition is SubmissionDisposition.COMMAND and self.input_id is not None:
+            raise ValueError("command submissions may carry only an arrival sequence")
+        if self.disposition is SubmissionDisposition.RETAINED and (
             self.input_id is not None or self.arrival_seq is not None
         ):
-            raise ValueError("only pending submissions may carry input correlation")
+            raise ValueError("retained submissions cannot carry input correlation")
         if self.input_id == "":
             raise ValueError("input_id must not be empty")
         if self.arrival_seq is not None and self.arrival_seq < 1:

@@ -5,6 +5,7 @@ import sys
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
@@ -180,6 +181,7 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
     inputs: asyncio.Queue[str] = asyncio.Queue()
     observed_calls: list[list[str]] = []
     interrupt_callbacks: list[Callable[[], None]] = []
+    status_callbacks: list[Callable[[], str]] = []
     active_calls = 0
     max_active_calls = 0
 
@@ -233,8 +235,18 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
             finally:
                 active_calls -= 1
 
+    class Buffer:
+        text = ""
+
+        def reset(self) -> None:
+            self.text = ""
+
     class PromptSession:
-        previous: str | None = None
+        def __init__(self, capture_target: Callable[[], str], reserve_sequence: Callable[[], int]) -> None:
+            self.previous: str | None = None
+            self.default_buffer = Buffer()
+            self._capture_target = capture_target
+            self._reserve_sequence = reserve_sequence
 
         async def prompt_async(self, prompt: str) -> str:
             assert prompt == "repl> "
@@ -242,6 +254,10 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
                 waiting_after_queued.set()
             result = await inputs.get()
             self.previous = result
+            self.default_buffer.text = result
+            setattr(self.default_buffer, "_axio_accepted_target", self._capture_target())
+            if result.strip():
+                setattr(self.default_buffer, "_axio_accepted_seq", self._reserve_sequence())
             return result
 
     class InertTerminal:
@@ -267,18 +283,18 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
     ) -> PromptSession:
-        del on_empty_eof, on_shutdown, recall_pending, reserve_sequence, status, capture_target
+        del on_empty_eof, on_shutdown, recall_pending
+        status_callbacks.append(cast(Callable[[], str], status))
         interrupt_callbacks.append(on_interrupt)
-        return PromptSession()
+        return PromptSession(capture_target, reserve_sequence)
 
-    async def wait_for_output(fragment: str) -> str:
-        output = ""
+    async def wait_for_panel(fragment: str) -> str:
         for _ in range(100):
-            output += capsys.readouterr().out
-            if fragment in output:
-                return output
+            panel = status_callbacks[0]() if status_callbacks else ""
+            if fragment in panel:
+                return panel
             await asyncio.sleep(0.01)
-        pytest.fail(f"output did not contain {fragment!r}: {output!r}")
+        pytest.fail(f"panel did not contain {fragment!r}")
 
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
     monkeypatch.setattr(axio_repl, "MAX_PENDING_INPUTS", 4)
@@ -295,7 +311,7 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["axio-repl", "--sandbox", "none", "--no-session-log"],
+        ["axio-repl", "--sandbox", "none", "--session-log-dir", str(tmp_path / "journals")],
     )
 
     await inputs.put("first request")
@@ -305,7 +321,10 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         await inputs.put("/agent-focus child")
         await inputs.put("/agent-focus main")
         await inputs.put("/help")
-        output = await wait_for_output("Type your request. Tools:")
+        panel = await wait_for_panel("Type your request. Tools:")
+        output = capsys.readouterr().out
+        assert "Commands: /help" in panel
+        assert "Type your request. Tools:" not in output
         assert "answer 1" not in output
         assert "Focused agent: \x1b[1mchild" not in output
 
@@ -320,11 +339,28 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         assert second_call[first_index : first_index + 2] == ["queued request 1", "queued request 2"]
         assert second_call[-1].startswith("[Turn ")
         assert max_active_calls == 1
+        assert not any(text.startswith("/") for call in observed_calls for text in call)
 
         await inputs.put("/quit")
         await asyncio.sleep(0)
         assert not repl_task.done()
         await asyncio.wait_for(repl_task, timeout=1)
+        journal_paths = list((tmp_path / "journals").rglob("events.jsonl"))
+        assert len(journal_paths) == 1
+        records = read_journal(journal_paths[0]).records
+        assert all(
+            command not in repr(record)
+            for record in records
+            for command in ("/help", "/agent-focus child", "/agent-focus main")
+        )
+        for record in records:
+            if record["kind"] != "input_received":
+                continue
+            payload = record["payload"]
+            assert isinstance(payload, dict)
+            event = payload.get("event")
+            assert isinstance(event, dict)
+            assert event.get("text") != "/help"
     finally:
         release_first.set()
         if not repl_task.done():
@@ -346,6 +382,7 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
     third_started = asyncio.Event()
     inputs: asyncio.Queue[str] = asyncio.Queue()
     calls: list[list[Message]] = []
+    status_callbacks: list[Callable[[], str]] = []
 
     async def slow_tool() -> str:
         tool_started.set()
@@ -427,7 +464,8 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, status
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence
+        status_callbacks.append(cast(Callable[[], str], status))
         return PromptSession()
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
@@ -446,8 +484,18 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
     repl_task = asyncio.create_task(main())
     try:
         await asyncio.wait_for(tool_started.wait(), timeout=1)
+        await inputs.put("/help")
+        for _ in range(100):
+            if status_callbacks and "Type your request. Tools:" in status_callbacks[0]():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("help feedback did not reach the panel")
+        assert not second_started.is_set()
+
         await inputs.put("message before tool result")
         await asyncio.wait_for(second_started.wait(), timeout=1)
+        assert "Main turn preempted for queued user input" in status_callbacks[0]()
 
         tool_use_index = next(
             index
