@@ -211,6 +211,30 @@ def test_status_line_reports_action_visibility_and_backlog() -> None:
     assert "actions: on (3 queued)" in status
 
 
+def test_status_line_reports_agent_phase_and_temporary_panel_feedback() -> None:
+    from axio.models import ModelSpec
+
+    status = _panel.status_line(
+        ModelSpec(id="test"),
+        _panel.SessionStats(),
+        "actions: off",
+        agent_status="main: reasoning",
+        panel_message="Commands: /help, /quit\nTool results remain in the dialog",
+    )
+
+    assert "main: reasoning │ 0 in / 0 out" in status
+    assert status.endswith("Commands: /help, /quit\nTool results remain in the dialog")
+
+
+def test_panel_feedback_is_bounded() -> None:
+    message = "\n".join(f"line {index}" for index in range(_panel.MAX_PANEL_MESSAGE_LINES + 3))
+
+    bounded = _panel.bounded_panel_message(message)
+
+    assert bounded.splitlines()[:-1] == [f"line {index}" for index in range(_panel.MAX_PANEL_MESSAGE_LINES)]
+    assert bounded.splitlines()[-1] == "… 3 more line(s)"
+
+
 async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> None:
     # The prompt is up for the whole session now, and it puts the terminal in
     # raw mode - so Ctrl+C arrives as a keypress, not as SIGINT, and the handler

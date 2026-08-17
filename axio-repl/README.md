@@ -108,6 +108,13 @@ restored during shutdown or failure handling. ANSI styles are reset and
 re-established on each physical line so reasoning or tool colours cannot leak
 into a later answer block.
 
+The bottom panel shows whether the active agent is idle, waiting for the model,
+reasoning, responding, or running named tools. Startup details, command output,
+queue warnings, background lifecycle summaries, and interruption causes stay in
+that temporary panel instead of entering terminal scrollback or model context.
+Slash-command acceptance is not journaled as user input; durable command effects
+are recorded separately as configuration changes.
+
 ## Usage
 
 ```bash
@@ -195,6 +202,10 @@ reliably. Treat the journal as sensitive local session data and apply an
 appropriate retention policy.
 
 ## REPL Commands
+
+Command feedback appears in the temporary bottom panel. A command that is unsafe
+to apply during an active turn waits in a UI-only command queue until the next
+turn boundary; it never becomes a pending conversation message.
 
 | Command              | Description                                    |
 |----------------------|------------------------------------------------|

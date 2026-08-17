@@ -55,6 +55,16 @@ Reasoning, answer text, tool fields, and tool output establish and reset their
 own style on every physical terminal line. A later block therefore cannot
 inherit an earlier block's colour after a newline or asynchronous redraw.
 
+The bottom panel continuously reports the active agent phase: idle, waiting for
+the model, reasoning, responding, or the names and counts of active tools. REPL
+startup details, slash-command help/results, queue warnings, and interruption
+causes are temporary panel feedback, not conversation output. Background
+lifecycle summaries use the panel too; the actual background report remains in
+the conversation log and model context. Accepting a slash command therefore
+creates neither an `InputReceived` journal record nor a model message. A command
+that changes durable configuration still records the resulting
+`ConfigurationChanged` event.
+
 The REPL picks the first transport whose environment variable is set:
 
 | Transport | Env Variable | Package |
@@ -174,6 +184,11 @@ but a secret embedded in arbitrary prose or tool output cannot always be
 recognized. Treat journals as sensitive local data.
 
 ## REPL commands
+
+Command output is shown in the temporary bottom panel and disappears when the
+next editor submission is accepted. Commands entered during an unsafe active
+turn are queued in the UI plane and applied at the next turn boundary; they are
+not converted into pending user messages.
 
 | Command | Description |
 |---|---|

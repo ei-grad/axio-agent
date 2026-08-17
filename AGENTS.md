@@ -274,6 +274,13 @@ for the closed call.
   every exit path after accept must complete that reservation.
 - Enter is the only operation that queues editor text. Up recalls every still-pending message and joins text only in
   the editor with `"\n\n"`; a later Enter creates one new message. Escape never submits, clears, or modifies the editor.
+- Persistent scrollback and model context are two views of the same semantic conversation stream. Render UI-only
+  state such as startup details, command feedback, queue warnings, lifecycle summaries, and interruption causes in
+  the temporary panel; do not mix it into conversation output.
+- Slash commands belong to the UI plane. Discard their reserved ingress sequence, show their bounded feedback only in
+  the temporary panel, and queue unsafe commands separately until a turn boundary. Do not publish them as
+  `InputReceived`, put them in pending user input, append them to model context, or print their output into scrollback.
+  Durable effects such as a model or configuration change still get their typed runtime event.
 - Escape claims **all** pending messages and sends them to the focused agent as distinct `Message` objects. With no
   pending input it records an interrupt only and starts no replacement turn. Repeated Escape for the same captured
   turn is idempotent; stale interrupts must not cancel a replacement turn.

@@ -19,8 +19,9 @@ import shutil
 import signal
 import sys
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import MappingProxyType
@@ -61,6 +62,7 @@ from axio_tools_agents.monitoring import monitor
 from axio_tools_agents.peers import (
     PeerMessage,
     PeerServer,
+    background_agent_state,
     enqueue_local_agent_context,
     enqueue_local_agent_messages,
     format_message_for_dialog,
@@ -141,6 +143,7 @@ from axio_repl._multiplexer import (
     DisplayModeChange,
     format_agent_identity,
     normalize_agent_name,
+    sanitize_terminal_text,
 )
 from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
 from axio_repl._terminal import TerminalUI
@@ -644,6 +647,7 @@ class ReplRenderer:
         self._foreground_streaming = False
         self._background_summaries: OrderedDict[_TurnKey, _BackgroundSummary] = OrderedDict()
         self._input_active = False
+        self._panel_message = ""
         self._actions = action_multiplexer or ActionMultiplexer(display_mode)
         # A parent's sibling tool still belongs to the active turn while a child
         # owns the terminal, so it has an always-on queue separate from background actions.
@@ -694,6 +698,37 @@ class ReplRenderer:
         if self.queued_action_count:
             status += f" ({self.queued_action_count} queued)"
         return status
+
+    def agent_status(self) -> str:
+        agent_id = self._status_agent_id()
+        turn = self._current_turn_by_agent.get(agent_id)
+        if turn is None:
+            phase = "idle" if agent_id == "main" else background_agent_state(agent_id)[0]
+        else:
+            state = self._state(agent_id)
+            if state.active_tool_ids:
+                phase = f"tools: {self._active_tool_summary(state)}"
+            elif isinstance(state.mode, _ReasoningMode):
+                phase = "reasoning"
+            elif isinstance(state.mode, _TextMode):
+                phase = "responding"
+            else:
+                phase = "waiting for model" if agent_id == "main" else "running"
+        identity = self._panel_identity(agent_id)
+        status = f"{identity}: {phase}"
+        if agent_id != self._focused_agent:
+            status += f"; focus {self._panel_identity(self._focused_agent)}"
+        return status
+
+    @property
+    def panel_message(self) -> str:
+        return self._panel_message
+
+    def show_panel(self, text: str) -> None:
+        self._panel_message = sanitize_terminal_text(text).strip()
+
+    def clear_panel(self) -> None:
+        self._panel_message = ""
 
     async def set_display_mode(self, mode: DisplayMode) -> DisplayModeChange:
         async with self._lock:
@@ -987,11 +1022,7 @@ class ReplRenderer:
 
     async def notice(self, text: str) -> None:
         async with self._lock:
-            if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
-                print()
-                self._state(self._active_agent).mode = _BoundaryMode()
-            print(_styled(DIM, text))
-            self._drain_safe_boundary_locked()
+            self.show_panel(text)
 
     def _state(self, agent_id: str) -> _AgentRenderState:
         return self._states.setdefault(agent_id, _AgentRenderState())
@@ -1028,6 +1059,27 @@ class ReplRenderer:
         if foreground_call is not None and foreground_call.child_agent_name is not None:
             return foreground_call.child_agent_name
         return self._agent_names.get(agent_id)
+
+    def _status_agent_id(self) -> str:
+        for agent_id in reversed(self._foreground_stack):
+            if agent_id in self._current_turn_by_agent:
+                return agent_id
+        if "main" in self._current_turn_by_agent:
+            return "main"
+        if self._focused_agent in self._current_turn_by_agent:
+            return self._focused_agent
+        return self._focused_agent
+
+    def _panel_identity(self, agent_id: str) -> str:
+        return self._agent_name(agent_id) or agent_id
+
+    @staticmethod
+    def _active_tool_summary(state: _AgentRenderState) -> str:
+        names = [name for tool_use_id, name in state.tool_names.items() if tool_use_id in state.active_tool_ids]
+        counts: OrderedDict[str, int] = OrderedDict()
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+        return ", ".join(f"{name} ×{count}" if count > 1 else name for name, count in counts.items())
 
     def _presentation(
         self,
@@ -1316,7 +1368,7 @@ class ReplRenderer:
                 print(f"\n{_styled(RED, f'Error from agent {identity}: {exc}')}", file=sys.stderr, flush=True)
                 self._drain_safe_boundary_locked()
 
-            case SessionEndEvent(total_usage=usage):
+            case SessionEndEvent():
                 self._purge_legacy_foreground_parent_locked(agent_id)
                 if presentation is not None and presentation.error_seen and not presentation.stdout_started:
                     self._discard_suspended_owner_locked(agent_id)
@@ -1325,7 +1377,6 @@ class ReplRenderer:
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
-                print(f"{DIM}[{usage.input_tokens}in/{usage.output_tokens}out tokens]{RESET}")
                 state.mode = _BoundaryMode()
                 self._discard_suspended_owner_locked(agent_id)
                 self._drain_safe_boundary_locked()
@@ -1390,6 +1441,7 @@ class ReplRenderer:
     def _flush_background_summaries_locked(self) -> None:
         if not self._background_summaries:
             return
+        notices: list[str] = []
         for summary in self._background_summaries.values():
             parts = [f"agent {summary.identity} completed"]
             if summary.tools:
@@ -1398,7 +1450,8 @@ class ReplRenderer:
                 parts.append(f"reported {summary.reported_chars} chars")
             if summary.failed:
                 parts.append("failed; details follow in incoming report")
-            print(f"{DIM}[background {'; '.join(parts)}]{RESET}")
+            notices.append(f"Background {'; '.join(parts)}")
+        self.show_panel("\n".join(notices))
         self._background_summaries.clear()
 
     def _discard_background_summaries_locked(self) -> None:
@@ -1819,14 +1872,14 @@ def _resolve_command_agent_id(value: str, renderer: ReplRenderer) -> str | None:
 
 
 def _show_agents(renderer: ReplRenderer) -> None:
-    print(f"Focused agent: {BOLD}{renderer.focused_agent}{RESET}")
+    _command_print(f"Focused agent: {BOLD}{renderer.focused_agent}{RESET}")
     records = local_background_agent_records()
     if not records:
-        print("No local background agents.")
+        _command_print("No local background agents.")
         return
     for record in records:
         marker = "*" if record.id == renderer.focused_agent else " "
-        print(f"{marker} {record.id} name={record.name!r} kind={record.kind} pid={record.pid}")
+        _command_print(f"{marker} {record.id} name={record.name!r} kind={record.kind} pid={record.pid}")
 
 
 async def _handle_agent_actions(
@@ -1836,18 +1889,20 @@ async def _handle_agent_actions(
 ) -> bool:
     """Show or update the observation-only background action policy."""
     if not value:
-        print(f"Agent actions: {BOLD}{renderer.display_mode.value}{RESET}; {renderer.queued_action_count} queued")
+        _command_print(
+            f"Agent actions: {BOLD}{renderer.display_mode.value}{RESET}; {renderer.queued_action_count} queued"
+        )
         return True
     try:
         mode = DisplayMode.parse(value)
     except ValueError as exc:
-        print(str(exc))
+        _command_print(str(exc))
         return False
     change = await renderer.set_display_mode(mode)
     detail = ""
     if change.discarded_frames or change.discarded_bytes:
         detail = f"; discarded {change.discarded_frames} queued frame(s) ({change.discarded_bytes} bytes)"
-    print(f"Agent actions: {BOLD}{mode.value}{RESET}{detail}")
+    _command_print(f"Agent actions: {BOLD}{mode.value}{RESET}{detail}")
     if change.current is not change.previous and publish is not None:
         await publish(ConfigurationChanged(name="agent_actions", value=mode.value, source="interactive"))
     return True
@@ -1861,6 +1916,27 @@ class Command(NamedTuple):
 
     show: Callable[[], None]
     apply: Callable[[str], object]
+
+
+_COMMAND_OUTPUT: ContextVar[list[str] | None] = ContextVar("axio_repl_command_output", default=None)
+
+
+def _command_print(*values: object, sep: str = " ", end: str = "\n") -> None:
+    output = _COMMAND_OUTPUT.get()
+    if output is None:
+        print(*values, sep=sep, end=end)
+        return
+    output.append(sep.join(str(value) for value in values) + end)
+
+
+@contextmanager
+def _capture_command_output() -> Iterator[list[str]]:
+    output: list[str] = []
+    token = _COMMAND_OUTPUT.set(output)
+    try:
+        yield output
+    finally:
+        _COMMAND_OUTPUT.reset(token)
 
 
 # CLI arg attr → slash command name (for unified init).
@@ -1929,12 +2005,12 @@ def _columnise(items: list[str], width: int, gap: int = 2) -> list[str]:
 def _show_model(transport: Any) -> None:
     model = transport.model
     caps = ", ".join(sorted(c.value for c in model.capabilities))
-    print(f"Current model: {BOLD}{model.id}{RESET}")
-    print(f"Capabilities: {caps}")
-    print("Available:")
+    _command_print(f"Current model: {BOLD}{model.id}{RESET}")
+    _command_print(f"Capabilities: {caps}")
+    _command_print("Available:")
     width = shutil.get_terminal_size((100, 24)).columns
     for line in _columnise(sorted(transport.models.keys()), max(20, width - 2)):
-        print(f"  {line}")
+        _command_print(f"  {line}")
 
 
 def _resolve_model_arg(transport: Any, model_id: str) -> ModelSpec:
@@ -1975,9 +2051,9 @@ def _choose_model(transport: Any, arg: str) -> ModelSpec | None:
         return cast(ModelSpec, exact[0])
 
     if not matches:
-        print(f"No model matching {arg!r}. Available: {', '.join(transport.models.keys())}")
+        _command_print(f"No model matching {arg!r}. Available: {', '.join(transport.models.keys())}")
     else:
-        print(f"Ambiguous — matches: {', '.join(matches.keys())}")
+        _command_print(f"Ambiguous — matches: {', '.join(matches.keys())}")
     return None
 
 
@@ -2018,14 +2094,16 @@ def _apply_model(
         state = None
         reset_reason = None
         agent.system = base_system
-    print(f"Switched to {BOLD}{transport.model.id}{RESET}")
+    _command_print(f"Switched to {BOLD}{transport.model.id}{RESET}")
     if reset_reason is not None:
-        print(f"Effort {BOLD}{requested}{RESET} is unavailable for this model; reset to {BOLD}default{RESET}.")
-        print(reset_reason)
+        _command_print(
+            f"Effort {BOLD}{requested}{RESET} is unavailable for this model; reset to {BOLD}default{RESET}."
+        )
+        _command_print(reset_reason)
     elif state is not None and state.requested is not None:
-        print(f"Effort reapplied: {BOLD}{state.requested}{RESET} via {state.mechanism.value}")
+        _command_print(f"Effort reapplied: {BOLD}{state.requested}{RESET} via {state.mechanism.value}")
         if state.note:
-            print(state.note)
+            _command_print(state.note)
 
 
 # ── effort ──
@@ -2034,7 +2112,7 @@ def _apply_model(
 def _show_effort(effort: EffortRuntime) -> None:
     state = effort.state
     requested = state.requested or "default"
-    print(f"Requested effort: {BOLD}{requested}{RESET}")
+    _command_print(f"Requested effort: {BOLD}{requested}{RESET}")
     if state.provider_value is None:
         detail = ""
     elif state.mechanism.value == "native-budget" and isinstance(state.provider_value, int):
@@ -2043,18 +2121,18 @@ def _show_effort(effort: EffortRuntime) -> None:
         detail = f" (thinking level: {state.provider_value})"
     else:
         detail = f" (provider effort: {state.provider_value})"
-    print(f"Effective mechanism: {BOLD}{state.mechanism.value}{RESET}{detail}")
+    _command_print(f"Effective mechanism: {BOLD}{state.mechanism.value}{RESET}{detail}")
     if state.note:
-        print(f"Limitation: {state.note}")
+        _command_print(f"Limitation: {state.note}")
     values = ", ".join(("default", *state.allowed))
-    print(f"Valid values: {values}")
+    _command_print(f"Valid values: {values}")
 
 
 def _apply_effort(effort: EffortRuntime, arg: str) -> EffortState | None:
     try:
         state = effort.configure(arg)
     except ValueError as exc:
-        print(str(exc))
+        _command_print(str(exc))
         return None
     _show_effort(effort)
     return state
@@ -2090,43 +2168,45 @@ def _apply_agent_effort(
 
 def _show_temperature(transport: Any) -> None:
     temp = getattr(transport, "temperature", None)
-    print(f"Temperature: {BOLD}{temp if temp is not None else 'default'}{RESET}")
+    _command_print(f"Temperature: {BOLD}{temp if temp is not None else 'default'}{RESET}")
 
 
 def _apply_temperature(transport: Any, arg: str) -> None:
     try:
         val = float(arg)
     except ValueError:
-        print(f"Invalid temperature: {arg!r}")
+        _command_print(f"Invalid temperature: {arg!r}")
         return
     if hasattr(transport, "temperature"):
         transport.temperature = val
-        print(f"Temperature: {BOLD}{val}{RESET}")
+        _command_print(f"Temperature: {BOLD}{val}{RESET}")
     else:
-        print("Transport does not support temperature")
+        _command_print("Transport does not support temperature")
 
 
 # ── iterations ──
 
 
 def _show_iterations(agent: Agent) -> None:
-    print(f"Max iterations: {BOLD}{agent.max_iterations}{RESET}")
+    _command_print(f"Max iterations: {BOLD}{agent.max_iterations}{RESET}")
 
 
 def _apply_iterations(agent: Agent, arg: str) -> None:
     try:
         val = int(arg)
     except ValueError:
-        print(f"Invalid value: {arg!r}")
+        _command_print(f"Invalid value: {arg!r}")
         return
     if val < 1:
         # Zero reads as "no limit" and means the opposite: the loop runs no
         # iterations at all, so the agent answers nothing and reports that it
         # ran out. There is no unlimited - a large number is how you say it.
-        print(f"Max iterations must be at least 1. The default, {BOLD}1000{RESET}, is already out of the way.")
+        _command_print(
+            f"Max iterations must be at least 1. The default, {BOLD}1000{RESET}, is already out of the way."
+        )
         return
     agent.max_iterations = val
-    print(f"Max iterations: {BOLD}{val}{RESET}")
+    _command_print(f"Max iterations: {BOLD}{val}{RESET}")
 
 
 # ── max-tokens ──
@@ -2136,24 +2216,24 @@ def _show_max_tokens(transport: Any) -> None:
     cur = getattr(transport, "max_output_tokens", None)
     model_default = getattr(getattr(transport, "model", None), "max_output_tokens", None)
     if cur:
-        print(f"Max output tokens: {BOLD}{cur}{RESET} (model default: {model_default})")
+        _command_print(f"Max output tokens: {BOLD}{cur}{RESET} (model default: {model_default})")
     else:
-        print(f"Max output tokens: {BOLD}{model_default}{RESET} (model default)")
+        _command_print(f"Max output tokens: {BOLD}{model_default}{RESET} (model default)")
 
 
 def _apply_max_tokens(transport: Any, arg: str) -> None:
     model_default = getattr(getattr(transport, "model", None), "max_output_tokens", None)
     if arg == "default":
         transport.max_output_tokens = None
-        print(f"Max output tokens: {BOLD}{model_default}{RESET} (model default)")
+        _command_print(f"Max output tokens: {BOLD}{model_default}{RESET} (model default)")
         return
     try:
         val = int(arg)
     except ValueError:
-        print(f"Invalid value: {arg!r}")
+        _command_print(f"Invalid value: {arg!r}")
         return
     transport.max_output_tokens = val
-    print(f"Max output tokens: {BOLD}{val}{RESET}")
+    _command_print(f"Max output tokens: {BOLD}{val}{RESET}")
 
 
 # ── debug ──
@@ -2161,19 +2241,19 @@ def _apply_max_tokens(transport: Any, arg: str) -> None:
 
 def _show_debug(transport: Any) -> None:
     cur = getattr(transport, "debug", False)
-    print(f"Debug: {BOLD}{'on' if cur else 'off'}{RESET}")
+    _command_print(f"Debug: {BOLD}{'on' if cur else 'off'}{RESET}")
 
 
 def _apply_debug(transport: Any, arg: str) -> None:
     val = arg.lower()
     if val == "on":
         transport.debug = True
-        print(f"Debug: {BOLD}on{RESET} (request/response bodies logged to stderr)")
+        _command_print(f"Debug: {BOLD}on{RESET} (request/response bodies logged to stderr)")
     elif val == "off":
         transport.debug = False
-        print(f"Debug: {BOLD}off{RESET}")
+        _command_print(f"Debug: {BOLD}off{RESET}")
     else:
-        print("Usage: /debug on|off")
+        _command_print("Usage: /debug on|off")
 
 
 # ── Session journal ──
@@ -2295,7 +2375,8 @@ async def _session_journal(
         yield None
         return
 
-    print(f"Session log: {journal.events_path}", file=sys.stderr if one_shot else sys.stdout)
+    if one_shot:
+        print(f"Session log: {journal.events_path}", file=sys.stderr)
 
     async def record(envelope: AgentEventEnvelope) -> None:
         await _write_runtime_event(journal, envelope)
@@ -2493,7 +2574,8 @@ async def main() -> None:
             )
         except RuntimeError as exc:
             parser.error(str(exc))
-        print(f"Tools: {BOLD}{sandbox_desc}{RESET}")
+        if args.prompt is not None:
+            print(f"Tools: {sandbox_desc}", file=sys.stderr)
         system = effort.system_prompt(
             build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)
         )
@@ -2630,7 +2712,6 @@ async def main() -> None:
         loop = asyncio.get_event_loop()
         peer_queue: asyncio.Queue[_IncomingPrompt] = asyncio.Queue()
         pending_peer_prompts: deque[_IncomingPrompt] = deque()
-        arrival_handlers: list[Callable[[], None]] = []
 
         async def _sequence_incoming(prompt: _IncomingPrompt, *, source: str) -> _IncomingPrompt:
             if prompt.arrival_seq is not None:
@@ -2639,10 +2720,8 @@ async def main() -> None:
             return dataclasses.replace(prompt, arrival_seq=envelope.seq)
 
         async def _admit_incoming(prompt: _IncomingPrompt, *, source: str) -> None:
-            _preempt_active_tool_dispatch()
             await peer_queue.put(await _sequence_incoming(prompt, source=source))
-            for handler in tuple(arrival_handlers):
-                handler()
+            _preempt_active_tool_dispatch(f"incoming {source.replace('-', ' ')}")
 
         async def _deliver_deferred_tool(notification: DeferredToolNotification) -> None:
             text = notification.as_user_text()
@@ -2709,6 +2788,7 @@ async def main() -> None:
             display_mode=DisplayMode.parse(args.agent_actions),
             show_main_turn_headers=args.prompt is None,
         )
+        startup_notices: list[str] = []
 
         async def _render_envelope(envelope: AgentEventEnvelope) -> None:
             await render_runtime_event(renderer, envelope)
@@ -2742,10 +2822,10 @@ async def main() -> None:
                 )
             )
             if recovery.discarded_tail_bytes:
-                print(f"{DIM}[ignored {recovery.discarded_tail_bytes} unterminated journal byte(s)]{RESET}")
+                startup_notices.append(f"Ignored {recovery.discarded_tail_bytes} unterminated journal byte(s).")
             if remapped_targets:
                 names = ", ".join(sorted(remapped_targets))
-                print(f"{DIM}[recovered pending input retargeted from unavailable agent(s): {names}]{RESET}")
+                startup_notices.append(f"Recovered pending input retargeted from unavailable agent(s): {names}.")
         interrupt_queue: asyncio.Queue[_AcceptedInterrupt] = asyncio.Queue()
         shutdown_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         shutdown_queued = False
@@ -2788,11 +2868,17 @@ async def main() -> None:
             nonlocal exit_arming
             exit_arming, should_exit = exit_arming.press(now)
             if not should_exit:
-                print(f"\n{DIM}[press Ctrl-D again within 2 seconds to exit]{RESET}")
+                renderer.show_panel("Press Ctrl-D again within 2 seconds to exit.")
             return should_exit
 
         prompt_session = _panel.make_session(
-            lambda: _panel.status_line(transport.model, stats, renderer.action_status()),
+            lambda: _panel.status_line(
+                transport.model,
+                stats,
+                renderer.action_status(),
+                agent_status=renderer.agent_status(),
+                panel_message=renderer.panel_message,
+            ),
             on_interrupt=_queue_escape,
             on_shutdown=_on_sigint,
             recall_pending=_recall_pending_input,
@@ -2847,6 +2933,7 @@ async def main() -> None:
             await _admit_incoming(_peer_incoming_prompt(message), source="peer")
 
         interrupted_partials: dict[str, str] = {}
+        tool_preemption_reasons: dict[str, str] = {}
 
         async def _run_turn(
             prompt: str | None = None,
@@ -2914,8 +3001,13 @@ async def main() -> None:
                 partial = renderer.take_pending_text("main")
                 if partial:
                     interrupted_partials[identity.turn_id] = partial
-                print(f"\n{DIM}[interrupted]{RESET}")
+                reason = tool_preemption_reasons.pop(identity.turn_id, None)
+                if reason is None:
+                    renderer.show_panel("Main turn interrupted.")
+                else:
+                    renderer.show_panel(f"Main turn preempted for {reason}; unfinished tools continue.")
             finally:
+                tool_preemption_reasons.pop(identity.turn_id, None)
                 prompt_task = None
                 foreground_state = foreground_state.complete("main", identity.turn_id)
                 await renderer.mark_idle()
@@ -2973,16 +3065,18 @@ async def main() -> None:
                 return
             await _run_peer_turn(first)
 
-        def _preempt_active_tool_dispatch() -> None:
+        def _preempt_active_tool_dispatch(reason: str) -> None:
             current = prompt_task
             active_turn_id = foreground_state.active_turn_id("main")
             if current is not None and not current.done() and deferred_tools.has_active_dispatch(active_turn_id):
+                if active_turn_id is not None:
+                    tool_preemption_reasons.setdefault(active_turn_id, reason)
                 deferred_tools.request_preemption(active_turn_id)
                 current.cancel()
 
         def _request_target_tool_preemption(target_agent_id: str) -> str | None:
             if target_agent_id == "main":
-                _preempt_active_tool_dispatch()
+                _preempt_active_tool_dispatch("queued user input")
                 return None
             turn_id = renderer.focused_turn_id if renderer.focused_agent == target_agent_id else None
             if deferred_tools.request_preemption(turn_id):
@@ -2997,8 +3091,10 @@ async def main() -> None:
             if agent_id == "main":
                 if turn_id != foreground_state.active_turn_id("main"):
                     return
-                if pending_input.pending_count or pending_peer_prompts or not peer_queue.empty():
-                    _preempt_active_tool_dispatch()
+                if pending_input.pending_count:
+                    _preempt_active_tool_dispatch("queued user input")
+                elif pending_peer_prompts or not peer_queue.empty():
+                    _preempt_active_tool_dispatch("incoming message")
                 return
             has_queued_input = any(
                 (entry.status is PendingInputStatus.PENDING and entry.intended_target_agent_id == agent_id)
@@ -3011,7 +3107,6 @@ async def main() -> None:
 
         deferred_tools.set_dispatch_started_handler(_on_tool_dispatch_started)
         set_background_input_admitted_handler(_preempt_background_tool_dispatch)
-        arrival_handlers.append(_preempt_active_tool_dispatch)
 
         loop.add_signal_handler(signal.SIGINT, _on_sigint)
         loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
@@ -3040,7 +3135,7 @@ async def main() -> None:
                     _queue_notification,
                 )
             except OSError as exc:
-                print(f"{DIM}[peer messaging disabled: {exc}]{RESET}")
+                startup_notices.append(f"Peer messaging disabled: {exc}")
                 notify.add_listener(None, _queue_notification)
 
             if args.prompt:
@@ -3059,10 +3154,15 @@ async def main() -> None:
             agent_commands = ["/agents", "/agent-actions", "/agent-focus", "/agent-interrupt", "/agent-stop"]
             commands_list = ", ".join(["/help", *commands, *agent_commands, "/quit"])
             label = getattr(transport, "name", "unknown")
-            print(
-                f"REPL ready ({label}). Enter queues, Esc interrupts without changing the editor, Up recalls pending."
-            )
-            print(f"Commands: {commands_list}")
+            startup_panel = [
+                f"REPL ready ({label}). Enter queues, Esc interrupts without changing the editor, Up recalls pending.",
+                f"Tools: {sandbox_desc}",
+                f"Commands: {commands_list}",
+            ]
+            if session_journal is not None:
+                startup_panel.append(f"Session log: {session_journal.events_path}")
+            startup_panel.extend(startup_notices)
+            renderer.show_panel("\n".join(startup_panel))
 
             ready_claims: deque[_ReadyClaim] = deque()
             settling_interrupts: deque[_InterruptTransaction] = deque()
@@ -3074,8 +3174,8 @@ async def main() -> None:
                     return True, True
                 if lowered == "/help":
                     tool_list = ", ".join(t.name for t in tools)
-                    print(f"Type your request. Tools: {tool_list}")
-                    print(f"Commands: {commands_list}")
+                    _command_print(f"Type your request. Tools: {tool_list}")
+                    _command_print(f"Commands: {commands_list}")
                     return True, False
                 if lowered == "/agents":
                     _show_agents(renderer)
@@ -3091,10 +3191,10 @@ async def main() -> None:
                         return True, False
                     agent_id = _resolve_local_agent_id(arg)
                     if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
+                        _command_print(f"No local agent matching {arg!r}")
                         return True, False
                     renderer.set_focus(agent_id)
-                    print(f"Focused agent: {BOLD}{agent_id}{RESET}")
+                    _command_print(f"Focused agent: {BOLD}{agent_id}{RESET}")
                     await _publish_main_event(
                         ConfigurationChanged(name="input_target", value=agent_id, source="interactive")
                     )
@@ -3103,27 +3203,27 @@ async def main() -> None:
                     arg = user_input[len("/agent-stop") :].strip() or renderer.focused_agent
                     agent_id = _resolve_command_agent_id(arg, renderer)
                     if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
+                        _command_print(f"No local agent matching {arg!r}")
                         return True, False
                     if agent_id == "main":
-                        print("Use /quit to exit the main REPL agent.")
+                        _command_print("Use /quit to exit the main REPL agent.")
                         return True, False
-                    print(await stop_agent(agent_id, reason="user requested stop"))
+                    _command_print(await stop_agent(agent_id, reason="user requested stop"))
                     if renderer.focused_agent == agent_id:
                         await renderer.mark_idle()
                         renderer.set_focus("main")
-                        print(f"Focused agent: {BOLD}main{RESET}")
+                        _command_print(f"Focused agent: {BOLD}main{RESET}")
                     return True, False
                 if lowered == "/agent-interrupt" or lowered.startswith("/agent-interrupt "):
                     arg = user_input[len("/agent-interrupt") :].strip() or renderer.focused_agent
                     agent_id = _resolve_command_agent_id(arg, renderer)
                     if agent_id is None:
-                        print(f"No local agent matching {arg!r}")
+                        _command_print(f"No local agent matching {arg!r}")
                         return True, False
                     if agent_id == "main":
-                        print("Press Escape while the main agent is streaming to interrupt it.")
+                        _command_print("Press Escape while the main agent is streaming to interrupt it.")
                         return True, False
-                    print(await interrupt_agent(agent_id, reason="user requested interrupt"))
+                    _command_print(await interrupt_agent(agent_id, reason="user requested interrupt"))
                     if renderer.focused_agent == agent_id:
                         await renderer.mark_idle()
                     return True, False
@@ -3158,6 +3258,13 @@ async def main() -> None:
                     return True, False
                 return False, False
 
+            async def _dispatch_command_to_panel(user_input: str) -> tuple[bool, bool]:
+                with _capture_command_output() as output:
+                    handled, should_exit = await _dispatch_command(user_input)
+                if output:
+                    renderer.show_panel("".join(output))
+                return handled, should_exit
+
             def _can_dispatch_during_foreground(user_input: str) -> bool:
                 command = user_input.lower().split(maxsplit=1)[0]
                 if command in {"/help", "/agents", "/agent-actions"}:
@@ -3184,15 +3291,15 @@ async def main() -> None:
                 target_agent_id: str,
                 reserved_seq: int | None,
             ) -> InputSubmitted:
-                if _is_known_command(text) and (foreground_task is None or _can_dispatch_during_foreground(text)):
-                    await _publish_main_event(
-                        InputReceived(text=text, source="interactive-command"),
-                        reserved_seq=reserved_seq,
-                    )
+                renderer.clear_panel()
+                if _is_known_command(text):
+                    if reserved_seq is not None:
+                        await event_hub.discard_reserved_sequence(reserved_seq)
                     return InputSubmitted(
                         text=text,
                         target_agent_id=target_agent_id,
                         disposition=SubmissionDisposition.COMMAND,
+                        arrival_seq=reserved_seq,
                     )
                 if pending_input.pending_count >= MAX_PENDING_INPUTS:
                     await _publish_main_event(
@@ -3204,8 +3311,8 @@ async def main() -> None:
                         target_agent_id=target_agent_id,
                         disposition=SubmissionDisposition.RETAINED,
                     )
-                child_turn_to_interrupt = _request_target_tool_preemption(target_agent_id)
                 entry = await pending_input.admit(text, target_agent_id, reserved_seq=reserved_seq)
+                child_turn_to_interrupt = _request_target_tool_preemption(target_agent_id)
                 if child_turn_to_interrupt is not None:
                     interrupt_local_agent_turn(target_agent_id, child_turn_to_interrupt)
                 return InputSubmitted(
@@ -3238,11 +3345,15 @@ async def main() -> None:
                         source_input_ids=ready.source_input_ids,
                     )
                     if not delivered:
-                        print(f"Agent {target_agent_id!r} is no longer running; claimed input remains recoverable.")
+                        await renderer.notice(
+                            f"Agent {target_agent_id!r} is no longer running; claimed input remains recoverable."
+                        )
                         if renderer.focused_agent == target_agent_id:
                             renderer.set_focus("main")
                     return
-                print(f"Agent {target_agent_id!r} is no longer local; claimed input remains recoverable.")
+                await renderer.notice(
+                    f"Agent {target_agent_id!r} is no longer local; claimed input remains recoverable."
+                )
                 if renderer.focused_agent == target_agent_id:
                     renderer.set_focus("main")
 
@@ -3326,7 +3437,9 @@ async def main() -> None:
                             wait=True,
                         )
                         if not delivered:
-                            print(f"Agent {request.target_agent_id!r} stopped before interruption context commit.")
+                            await renderer.notice(
+                                f"Agent {request.target_agent_id!r} stopped before interruption context commit."
+                            )
                     return
                 ready_claims.append(
                     _ReadyClaim(
@@ -3379,10 +3492,30 @@ async def main() -> None:
                         pending_input.state.pending[0].arrival_seq if pending_input.state.pending else None
                     )
                     oldest_peer_seq = pending_peer_prompts[0].arrival_seq if pending_peer_prompts else None
+                    oldest_command_seq = pending_commands[0].arrival_seq if pending_commands else None
+                    oldest_ready_seq = ready_claims[0].batch.entries[0].arrival_seq if ready_claims else None
+                    command_precedes_dialog = oldest_command_seq is not None and all(
+                        sequence is None or oldest_command_seq < sequence
+                        for sequence in (oldest_user_seq, oldest_peer_seq, oldest_ready_seq)
+                    )
+                    if pending_commands and (
+                        command_precedes_dialog
+                        or (oldest_user_seq is None and oldest_peer_seq is None and oldest_ready_seq is None)
+                    ):
+                        command = pending_commands.popleft()
+                        handled, should_exit = await _dispatch_command_to_panel(command.text)
+                        if not handled:
+                            raise RuntimeError("queued REPL command has no dispatcher")
+                        if should_exit:
+                            return True
+                        continue
                     run_peer = (
                         not ready_claims
                         and oldest_peer_seq is not None
-                        and (oldest_user_seq is None or oldest_peer_seq < oldest_user_seq)
+                        and all(
+                            sequence is None or oldest_peer_seq < sequence
+                            for sequence in (oldest_user_seq, oldest_command_seq)
+                        )
                     )
                     if run_peer:
                         prompts: list[_IncomingPrompt] = []
@@ -3391,6 +3524,8 @@ async def main() -> None:
                             if candidate.arrival_seq is None:
                                 break
                             if oldest_user_seq is not None and candidate.arrival_seq > oldest_user_seq:
+                                break
+                            if oldest_command_seq is not None and candidate.arrival_seq > oldest_command_seq:
                                 break
                             prompts.append(pending_peer_prompts.popleft())
                         foreground_task = asyncio.create_task(
@@ -3414,7 +3549,7 @@ async def main() -> None:
                         )
 
                     if len(ready.batch.entries) == 1:
-                        handled, should_exit = await _dispatch_command(ready.batch.entries[0].text)
+                        handled, should_exit = await _dispatch_command_to_panel(ready.batch.entries[0].text)
                     else:
                         handled, should_exit = False, False
                     if should_exit:
@@ -3428,6 +3563,8 @@ async def main() -> None:
                         name="axio-repl-interactive-turn",
                     )
                 return False
+
+            pending_commands: deque[InputSubmitted] = deque()
 
             while True:
                 if foreground_task is None:
@@ -3525,7 +3662,16 @@ async def main() -> None:
                     )
                     continue
                 if submitted.disposition is SubmissionDisposition.COMMAND:
-                    handled, should_exit = await _dispatch_command(user_input)
+                    if foreground_task is not None and not _can_dispatch_during_foreground(user_input):
+                        pending_commands.append(submitted)
+                        _panel.complete_submission(
+                            prompt_session,
+                            _panel.editor_text(prompt_session),
+                            clear_editor=True,
+                        )
+                        renderer.show_panel(f"Queued command: {user_input}")
+                        continue
+                    handled, should_exit = await _dispatch_command_to_panel(user_input)
                     if not handled:
                         raise RuntimeError("accepted REPL command has no dispatcher")
                     if should_exit:

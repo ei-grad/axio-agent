@@ -111,6 +111,39 @@ async def test_event_hub_holds_later_publication_until_reserved_ingress_arrives(
     assert observed == [(1, "enter"), (2, "peer-after-enter")]
 
 
+async def test_event_hub_discarded_ingress_slot_releases_later_publication() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    observed: list[tuple[int, str]] = []
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        assert isinstance(envelope.event, TextDelta)
+        observed.append((envelope.seq, envelope.event.delta))
+
+    hub.subscribe(collect)
+    command_seq = hub.reserve_sequence()
+    later = asyncio.create_task(
+        hub.publish(
+            TextDelta(index=0, delta="peer-after-command"),
+            run_id="run",
+            agent_id="peer",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.BACKGROUND,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not later.done()
+    await hub.discard_reserved_sequence(command_seq)
+    peer = await asyncio.wait_for(later, timeout=1)
+
+    assert command_seq == 1
+    assert peer.seq == 2
+    assert observed == [(2, "peer-after-command")]
+    with pytest.raises(ValueError, match="is not reserved"):
+        await hub.discard_reserved_sequence(command_seq)
+
+
 async def test_event_hub_cancellation_does_not_strand_a_later_publication() -> None:
     hub = SessionEventHub(session_id="session-1")
     delivering_reserved = asyncio.Event()

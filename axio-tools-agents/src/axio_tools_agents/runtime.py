@@ -270,6 +270,7 @@ class SessionEventHub:
         self._seq = 0
         self._sequence_lock = threading.Lock()
         self._reserved_sequences: set[int] = set()
+        self._discarded_sequences: set[int] = set()
         self._next_publication_seq = 1
         self._pending_publications: dict[int, _PendingPublication] = {}
         self._subscribers: list[EventSubscriber] = []
@@ -294,6 +295,17 @@ class SessionEventHub:
                 pass
 
         return unsubscribe
+
+    async def discard_reserved_sequence(self, sequence: int) -> None:
+        """Release a synchronous ingress slot that produced no runtime event."""
+
+        async with self._publish_lock:
+            with self._sequence_lock:
+                if sequence not in self._reserved_sequences:
+                    raise ValueError(f"logical sequence {sequence} is not reserved")
+                self._reserved_sequences.remove(sequence)
+            self._discarded_sequences.add(sequence)
+            await self._drain_publications()
 
     async def publish(
         self,
@@ -361,7 +373,14 @@ class SessionEventHub:
 
     async def _drain_publications(self) -> None:
         failure: BaseException | None = None
-        while publication := self._pending_publications.pop(self._next_publication_seq, None):
+        while True:
+            if self._next_publication_seq in self._discarded_sequences:
+                self._discarded_sequences.remove(self._next_publication_seq)
+                self._next_publication_seq += 1
+                continue
+            publication = self._pending_publications.pop(self._next_publication_seq, None)
+            if publication is None:
+                break
             try:
                 await self._deliver(publication)
             except BaseException as exc:

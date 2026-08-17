@@ -27,6 +27,8 @@ from axio_tools_agents.peers import background_agent_state, local_background_age
 HISTORY_PATH = Path.home() / ".axio_repl_history"
 
 SEPARATOR = " │ "
+MAX_PANEL_MESSAGE_LINES = 8
+MAX_PANEL_MESSAGE_CHARS = 4096
 
 MAIN_AGENT = "main"
 
@@ -121,13 +123,40 @@ def agent_summary(now: float | None = None) -> str:
     return SEPARATOR.join(parts)
 
 
-def status_line(model: ModelSpec | None, stats: SessionStats, action_status: str = "") -> str:
+def bounded_panel_message(text: str) -> str:
+    """Bound temporary UI feedback without moving normal output into scrollback."""
+
+    normalized = text.strip()
+    if not normalized:
+        return ""
+    lines = normalized.splitlines()
+    omitted_lines = max(0, len(lines) - MAX_PANEL_MESSAGE_LINES)
+    retained = lines[:MAX_PANEL_MESSAGE_LINES]
+    value = "\n".join(retained)
+    if len(value) > MAX_PANEL_MESSAGE_CHARS:
+        value = value[:MAX_PANEL_MESSAGE_CHARS].rstrip()
+        omitted_lines = max(1, omitted_lines)
+    if omitted_lines:
+        value += f"\n… {omitted_lines} more line(s)"
+    return value
+
+
+def status_line(
+    model: ModelSpec | None,
+    stats: SessionStats,
+    action_status: str = "",
+    *,
+    agent_status: str = "",
+    panel_message: str = "",
+) -> str:
     """The whole line: model, context, usage, applicable cost, and activity."""
     parts: list[str] = []
     if model is not None:
         parts.append(model.id)
         if model.context_window:
             parts.append(f"ctx {compact(stats.context_tokens)}/{compact(model.context_window)}")
+    if agent_status:
+        parts.append(agent_status)
     parts.append(f"{compact(stats.input_tokens)} in / {compact(stats.output_tokens)} out")
     if model is not None and model.pricing_available and stats.cost_is_complete:
         parts.append(format_cost(stats.cost))
@@ -136,7 +165,9 @@ def status_line(model: ModelSpec | None, stats: SessionStats, action_status: str
         parts.append(agents)
     if action_status:
         parts.append(action_status)
-    return SEPARATOR.join(parts)
+    status = SEPARATOR.join(parts)
+    message = bounded_panel_message(panel_message)
+    return f"{status}\n{message}" if message else status
 
 
 ESCAPE_FLUSH_SECONDS = 0.2
