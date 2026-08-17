@@ -8,11 +8,12 @@ Works with any LLM backend via pluggable transports — bring your own API key.
 axio-repl is an opinionated terminal agent that **actually verifies its work**.
 The system prompt encodes hard-won lessons from watching models cut corners:
 
-- **Stream everything, hide nothing.** Every piece of information shown to the
-  user — tool arguments, stdout/stderr, images, exit codes — must also be
-  faithfully presented to the model. The model should see exactly what the user
-  sees, so it can reason about the same reality. No summarizing, no truncating,
-  no dropping context between what's displayed and what's sent back.
+- **Keep evidence aligned.** Tool arguments, stdout/stderr, images, and exit
+  codes reach the model through the tool/context path instead of being silently
+  replaced by a more convenient story. Presentation-only suppression is marked
+  explicitly in the terminal. Background prose may be hidden from the active
+  stream, but its final report and relevant events still use the normal context
+  path.
 - **Not tested — not done.** The agent must run tests, re-read edited files,
   and observe actual results instead of assuming success from exit codes.
 - **Iterative UI review.** When building or modifying UI, the agent captures
@@ -44,12 +45,15 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   Banana / Veo models.
 - **AGENTS.md** — workspace-level instructions loaded into the system prompt from
   an `AGENTS.md` file in the working directory.
-- **Multiline paste** — pasting multi-line text into the prompt is handled
-  gracefully with continuation markers (`...`).
+- **Multiline paste** — bracketed multi-line paste remains one editor value and
+  becomes one message when Enter is pressed.
 - **Graceful interruption** — Escape cancels the captured agent turn without
   submitting the editor and preserves available partial output for context or
   recovery.
-- **Readline history** — persisted across sessions in `~/.axio_repl_history`.
+- **Prompt history** — `prompt_toolkit` history is persisted across sessions in
+  `~/.axio_repl_history` after input has been claimed by an agent.
+- **Terminal scrollback** — interactive output stays on the primary screen
+  buffer; only the editor and status line are temporary redrawable UI.
 - **Session journals** — every main, foreground, and background agent event is
   written to a private JSONL journal for later inspection.
 - **Single-prompt mode** — pass a prompt as argument for scripting and non-interactive use.
@@ -61,7 +65,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   Escape and Up, and an additional submission is restored to the editor instead
   of being dropped.
 - **Up** recalls all user messages not yet claimed by an agent and joins their
-  text in the editor with an empty line between messages.
+  text in the editor with an empty line between messages. With no pending input,
+  it falls back to normal prompt history or multi-line cursor movement.
 - **Escape** interrupts the captured turn and delivers only messages previously
   submitted with Enter. Pending messages remain separate conversation objects;
   editor text is never submitted or changed by Escape. Without pending user
@@ -70,6 +75,9 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   exits gracefully.
 - **Ctrl-C** starts graceful shutdown. It does not submit or clear the editor;
   the shutdown journal retains it for `--resume`.
+
+A lone Escape has a 200 ms disambiguation timeout. It is bound eagerly, so the
+usual escape-prefixed Alt+B/Alt+F word-motion bindings are unavailable.
 
 ## Install
 
@@ -89,6 +97,16 @@ Or within the monorepo workspace:
 ```bash
 uv run axio-repl
 ```
+
+`axio-repl` is POSIX-only. Interactive mode uses POSIX terminal input state and
+does not support Windows. It never enters the alternate screen or installs a
+scroll region: normal output remains in terminal scrollback while one serialized
+owner erases and redraws the temporary `prompt_toolkit` editor around
+asynchronous stdout, stderr, logging, and agent output. Bounded output overload
+and late writes are represented by explicit skip markers, and terminal state is
+restored during shutdown or failure handling. ANSI styles are reset and
+re-established on each physical line so reasoning or tool colours cannot leak
+into a later answer block.
 
 ## Usage
 
@@ -154,9 +172,10 @@ the session's `attachments/` directory. Directories are created with mode
 The initial `session_start` record is fsynced before the REPL starts normal
 session work. Streaming records are admitted to a bounded memory queue without
 an fsync per token. Successfully committed context mutations, completed turns,
-outcome deliveries, and stopped agents are durability boundaries: each drains
-and fsyncs every earlier accepted record. A clean shutdown also drains the queue,
-writes `session_end`, and fsyncs it.
+outcome deliveries, pending-input transitions, interruption barriers, editor
+snapshots, recovery application, and stopped agents are durability boundaries:
+each drains and fsyncs every earlier accepted record. A clean shutdown also
+drains the queue, writes `session_end`, and fsyncs it.
 
 After abrupt process termination, all records through the last successful
 durability boundary are retained. Records accepted after that
@@ -184,9 +203,15 @@ appropriate retention policy.
 | `/agent-actions on\|off` | Toggle framed actions from other agents    |
 | `/agents`            | List local background agents                    |
 | `/agent-focus <id>`  | Change the input target                         |
+| `/agent-interrupt [id]` | Interrupt a background agent's current turn |
+| `/agent-stop [id]`   | Stop a background agent                         |
 | `/model`             | Show current model and list available models    |
 | `/model <query>`     | Switch to a model matching the query            |
 | `/effort [level]`    | Show or set effort; `default` resets it          |
+| `/temperature [val]` | Show or set sampling temperature                |
+| `/max-tokens [val]`  | Show or set maximum output tokens               |
+| `/iterations [val]`  | Show or set the agent iteration limit           |
+| `/debug [on\|off]`   | Show or toggle transport debug logging          |
 | `/quit` `/exit` `/q` | Exit the REPL                                   |
 
 ## Foreground and background agents
@@ -226,6 +251,18 @@ each final report through normal incoming-outcome delivery. It does not focus a
 background agent or replay that agent's hidden prose before displaying the
 report.
 
+User input, peer messages, background outcomes, interrupts, and deferred-tool
+results share one monotonic session order. Enter reserves its sequence before
+the prompt accepts a later event, and an ordered batch remains a batch of
+distinct conversation messages.
+
+If a new arrival occurs while the active turn is blocked in a tool dispatch,
+the REPL closes the interrupted tool protocol with a placeholder and lets the
+session-owned call continue. The actual result is delivered once, later, as a
+labelled user message at the earliest safe model boundary. It is not emitted as
+a duplicate `ToolResult`. Shutdown cancels unresolved deferred calls and records
+their identities for `--resume`.
+
 ## Tools
 
 | Tool            | Description                                                    |
@@ -238,6 +275,13 @@ report.
 | `shell`         | Run shell commands with streaming output and process-group cleanup |
 | `generate_image` | Generate images via Gemini Nano Banana (Google transport only) |
 | `generate_video` | Generate videos via Veo (Google transport only)                |
+| `list_peers`     | List running local agents                                      |
+| `send_message`   | Send a message to a local agent by global id                    |
+| `run_agent`      | Run one foreground child turn and return its final answer       |
+| `spawn_agent`    | Start a persistent background child agent                      |
+| `monitor`        | Wait for agents, tasks, paths, processes, or messages           |
+| `interrupt_agent` | Interrupt a background agent's current turn                   |
+| `stop_agent`     | Stop a background agent                                         |
 
 ## Transports
 
@@ -272,21 +316,20 @@ This means switching from a text-only model to a vision model mid-session
 
 ## Architecture
 
-```
-┌─────────────┐     ┌───────────┐     ┌──────────────────┐
-│  axio-repl  │────▶│   axio    │────▶│    transport      │
-│  (terminal  │     │  (agent   │     │  (anthropic /     │
-│   UI, I/O)  │     │   loop)   │     │   google / openai │
-└─────────────┘     └───────────┘     │   / nebius / ...)  │
-                          │           └──────────────────┘
-                    ┌─────┴─────┐
-                    │ tools     │
-                    │ (local fs │
-                    │  + shell) │
-                    └───────────┘
+```mermaid
+flowchart LR
+    R[axio-repl<br/>input coordinator and terminal owner]
+    A[axio<br/>agent loop]
+    T[transport<br/>Anthropic, Google, OpenAI, ...]
+    L[local and agent tools]
+
+    R --> A
+    A --> T
+    A --> L
 ```
 
-- **axio-repl** owns the terminal UI: readline, event rendering, REPL commands.
+- **axio-repl** owns `prompt_toolkit` input, chronological coordination, the
+  serialized primary-buffer renderer, recovery, and REPL commands.
 - **axio** runs the agent loop: dispatch tools, manage conversation context,
   handle cancellation.
 - **transports** handle LLM communication — message conversion, streaming,

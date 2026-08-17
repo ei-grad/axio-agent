@@ -9,6 +9,7 @@ Guidance for AI coding agents working in this repository.
 This is a **uv workspace** monorepo. Each subdirectory is an independent Python package with its own `pyproject.toml`, `src/` layout, and `tests/`. They share a single `uv.lock` and a single `.venv`.
 
 - `axio/` - core library; start here when unsure
+- `axio-repl/` - POSIX inline REPL, chronological input coordinator, journal recovery
 - `axio-tui/` - TUI application and plugin discovery
 - `axio-transport-*/` - transport implementations
 - `axio-tools-*/` - tool providers
@@ -23,6 +24,8 @@ This is a **uv workspace** monorepo. Each subdirectory is an independent Python 
 | `axio-transport-openai` | OpenAI-compatible transport (OpenAI, Nebius, OpenRouter, custom) |
 | `axio-transport-anthropic` | Anthropic Claude transport with prompt caching |
 | `axio-transport-codex` | ChatGPT via OAuth Responses API |
+| `axio-repl` | POSIX primary-buffer REPL, renderer, input coordination, session journal and recovery |
+| `axio-tools-agents` | Local agent lifecycle, messaging, monitoring, and ordered runtime events |
 | `axio-tools-local` | File, shell, Python execution tools |
 | `axio-tools-mcp` | MCP server bridge |
 | `axio-tools-docker` | Docker sandbox tool provider |
@@ -203,7 +206,7 @@ class CompletionTransport(Protocol):
 Contract:
 - The stream **must** end with exactly one `IterationEnd` event
 - Do not suppress exceptions - let them propagate as `Error` events or raise naturally
-- `messages` contains the full conversation history except the current user input (already appended)
+- `messages` contains the full conversation history including the current user input or ordered input batch, which the `Agent` appends before calling the transport
 - `tools` is the Tool definitions from the Agent's registry
 
 ### Agent loop (`axio/agent.py`)
@@ -218,12 +221,19 @@ class Agent:
     tools: list[Tool]                        # Available tools
     selector: ToolSelector | None = None     # Optional tool selection logic
     max_iterations: int = 50                # Iteration limit
-    last_iteration_message: Message | None = None  # Set after run completes
+    last_iteration_message: Message | None = None  # Optional final-iteration hint
+    deferred_tool_sink: DeferredToolSink | None = None  # Optional host-owned continuation of cancelled tools
 ```
 
 Public API:
 - `agent.run_stream(user_message, context) -> AgentStream` - streaming entry point, returns an async iterator that yields `StreamEvent` plus `SessionEndEvent`
 - `await agent.run(user_message, context) -> str` - convenience wrapper, returns final text
+- `agent.run_stream_messages(messages, context, *, on_input_committed=None) -> AgentStream` - append an ordered batch of distinct `Message` objects and start one model operation
+- `await agent.run_messages(messages, context, *, on_input_committed=None) -> str` - convenience wrapper for the batch API
+
+The batch APIs deep-copy the input sequence and call `ContextStore.append_many()` once. Persistent stores should make
+that operation atomic. `on_input_committed`, when supplied, runs after the append succeeds and before the first
+transport request; use it to correlate durable queue transitions with the exact input IDs rather than matching text.
 
 **Loop per iteration**:
 1. Call `transport.stream(history, tools, system)` → `AsyncIterator[StreamEvent]`
@@ -238,7 +248,46 @@ Public API:
    - Emit `SessionEndEvent`
    - Return
 
-Tool dispatch happens **before** appending to context. This prevents orphaned `ToolUseBlock`s if a task is cancelled mid-loop.
+Tool dispatch happens **before** appending to context. This prevents orphaned `ToolUseBlock`s if a task is cancelled
+mid-loop. Without a `deferred_tool_sink`, cancellation stops unfinished tools and records interrupted results. A host
+may install a sink to retain an in-flight task: the agent first closes the old tool protocol with a continuation
+placeholder, then the host delivers the eventual result as a new user message. Never append a second `ToolResultBlock`
+for the closed call.
+
+### axio-repl interactive architecture
+
+`axio-repl` has contracts that are easy to break with a locally reasonable terminal or concurrency change:
+
+- It is POSIX-only and stays on the primary screen buffer. Do not enable the alternate screen or use `DECSTBM` scroll
+  regions; completed output must remain in ordinary terminal scrollback.
+- `prompt_toolkit` owns only editor/history/key handling and the temporary status lines. `_terminal.TerminalUI` is the
+  sole interactive terminal writer. Application and background code may use the wrapped stdout/stderr, but must not
+  write directly to the prompt output backend.
+- `_prompt_terminal.PromptToolkitInlineOutput` is the only compatibility boundary allowed to use private
+  `prompt_toolkit` redraw APIs. Keep the dependency upper bound and fail-fast compatibility validation; do not spread
+  those private calls through renderer or coordinator code.
+- Output ingress is serialized and bounded. Preserve explicit suppression markers, late-write fallback, startup
+  rollback, terminal-failure propagation, and restoration of cursor, autowrap, streams, logging handlers, and input
+  state.
+- `SessionEventHub` defines one monotonic order across user input, peer messages, lifecycle events, context commits,
+  and tool events. A non-empty Enter reserves its sequence synchronously before the prompt accept handler returns;
+  every exit path after accept must complete that reservation.
+- Enter is the only operation that queues editor text. Up recalls every still-pending message and joins text only in
+  the editor with `"\n\n"`; a later Enter creates one new message. Escape never submits, clears, or modifies the editor.
+- Escape claims **all** pending messages and sends them to the focused agent as distinct `Message` objects. With no
+  pending input it records an interrupt only and starts no replacement turn. Repeated Escape for the same captured
+  turn is idempotent; stale interrupts must not cancel a replacement turn.
+- Agent-visible arrivals must be exposed at the earliest safe provider boundary in hub order. If a foreground tool
+  blocks that boundary, request deferral, close its old protocol with a placeholder, and deliver its real result later
+  as a labelled user message exactly once.
+- Journal events for input transitions, interruption, editor snapshots, context mutation, recovery, and shutdown are
+  durability boundaries. Recovery must preserve available partial output plus the nature and identity of the
+  interruption; do not correlate inputs by equal text when a source input ID exists.
+- Every coloured physical line must establish and close its own SGR state. Reapply reasoning/tool styles after each
+  newline and reset before another semantic block so asynchronous redraw cannot leak colours.
+
+When changing these paths, run the focused `axio-repl` and `axio-tools-agents` suites, including PTY, repeated-Escape,
+cancellation, recovery, ordering, and renderer-boundary tests, before the normal repository-wide checks.
 
 ### Tool system (`axio/tool.py`)
 
@@ -273,7 +322,7 @@ class Tool[T]:
 
 ### ContextStore (`axio/context.py`)
 
-`ContextStore` is an ABC. Implement all methods:
+`ContextStore` is an ABC. Custom stores must implement the two abstract methods:
 
 ```python
 class ContextStore(ABC):
@@ -282,12 +331,12 @@ class ContextStore(ABC):
 
     @abstractmethod
     async def get_history(self) -> list[Message]: ...
-
-    @abstractmethod
-    async def compact(self, summary: str) -> None:
-        """Replace history with a summary message."""
-        ...
 ```
+
+The base class also provides default implementations for `append_many()`, `fork()`, `clear()`, token accounting,
+session listing, and `close()`. Override `append_many()` with one atomic transaction in persistent stores. Override
+the other optional operations when the backend supports them; `clear()` raises `NotImplementedError` by default,
+while `fork()` returns an independent `MemoryContextStore` copy.
 
 **Implementations**:
 - `MemoryContextStore` - in-process, ephemeral storage

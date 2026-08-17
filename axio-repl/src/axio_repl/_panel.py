@@ -143,10 +143,10 @@ ESCAPE_FLUSH_SECONDS = 0.2
 """How long a lone Escape byte waits to be told apart from a sequence.
 
 An arrow key arrives as three bytes beginning with the same one, so the parser
-holds an Escape until either the rest arrives or this elapses. The default is
-half a second, which for a key that sends the message reads as the key not
-working. Shortened rather than removed: over a slow link an arrow key can still
-arrive split across two reads, and the gap has to outlast that.
+holds an Escape until either the rest arrives or this elapses. Two hundred
+milliseconds keeps a lone interrupt responsive while still allowing an arrow
+sequence split across nearby reads to complete. Over a slow link the bytes can
+arrive farther apart, so this remains an explicit compatibility tradeoff.
 """
 
 
