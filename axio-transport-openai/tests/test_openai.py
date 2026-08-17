@@ -14,7 +14,13 @@ from aiohttp import web
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    InputProvenance,
+    Message,
+    input_provenance_header,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason, Usage
@@ -532,6 +538,10 @@ async def test_content_filter_raises_stream_error(
 # ---------------------------------------------------------------------------
 
 
+def _unattributed_chat_text(text: str) -> str:
+    return input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE) + text + INPUT_PROVENANCE_FOOTER
+
+
 def test_build_payload_system_prompt() -> None:
     t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     payload = t.build_payload([], [], "You are helpful.")
@@ -547,7 +557,25 @@ def test_build_payload_user_text() -> None:
     messages = [Message(role="user", content=[TextBlock(text="Hello")])]
     payload = t.build_payload(messages, [], "")
     # No system message when empty
-    assert payload["messages"][0] == {"role": "user", "content": "Hello"}
+    assert payload["messages"][0] == {"role": "user", "content": _unattributed_chat_text("Hello")}
+
+
+def test_build_payload_frames_non_human_text_and_image() -> None:
+    provenance = InputProvenance(human_authored=False, source="peer", author="agent-1")
+    image = ImageBlock(media_type="image/png", data=b"image")
+    message = Message(
+        role="user",
+        content=[TextBlock(text="report"), image],
+        provenance=provenance,
+    )
+
+    payload = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"]).build_payload([message], [], "")
+
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": input_provenance_header(provenance)}
+    assert content[1] == {"type": "text", "text": "report"}
+    assert content[2]["type"] == "image_url"
+    assert content[3] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_build_payload_assistant_with_tool_calls() -> None:
@@ -594,6 +622,7 @@ def test_build_payload_tool_result_with_image() -> None:
     """Tool results containing ImageBlocks should inject a follow-up user message with image_url parts."""
     t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     img_data = b"\x89PNG\r\n\x1a\nfake"
+    provenance = InputProvenance(human_authored=False, source="tool-result", author="read_file")
     messages = [
         Message(
             role="user",
@@ -606,6 +635,7 @@ def test_build_payload_tool_result_with_image() -> None:
                     ],
                 ),
             ],
+            provenance=provenance,
         ),
     ]
     payload = t.build_payload(messages, [], "")
@@ -617,11 +647,13 @@ def test_build_payload_tool_result_with_image() -> None:
     # Second: a user message with the injected image
     assert msgs[1]["role"] == "user"
     parts = msgs[1]["content"]
-    assert len(parts) == 2
-    assert parts[0]["type"] == "text"
-    assert "call_img" in parts[0]["text"]
-    assert parts[1]["type"] == "image_url"
-    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert len(parts) == 4
+    assert parts[0] == {"type": "text", "text": input_provenance_header(provenance)}
+    assert parts[1]["type"] == "text"
+    assert "call_img" in parts[1]["text"]
+    assert parts[2]["type"] == "image_url"
+    assert parts[2]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert parts[3] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_build_payload_tool_result_no_image_no_injection() -> None:
@@ -659,7 +691,7 @@ def test_build_payload_tool_result_mixed_with_text() -> None:
     assert msgs[0]["tool_call_id"] == "call_1"
     assert msgs[0]["content"] == "22C"
     assert msgs[1]["role"] == "user"
-    assert msgs[1]["content"] == "Thanks, what about tomorrow?"
+    assert msgs[1]["content"] == _unattributed_chat_text("Thanks, what about tomorrow?")
 
 
 def test_build_payload_tool_result_message_then_separate_user_text_message() -> None:
@@ -683,7 +715,7 @@ def test_build_payload_tool_result_message_then_separate_user_text_message() -> 
     assert msgs[1]["tool_call_id"] == "call_1"
     assert msgs[1]["content"] == "22C"
     assert msgs[2]["role"] == "user"
-    assert msgs[2]["content"] == "Notification: background task finished"
+    assert msgs[2]["content"] == _unattributed_chat_text("Notification: background task finished")
 
 
 def test_build_payload_tool_schema() -> None:
@@ -722,11 +754,16 @@ def test_build_payload_image_block() -> None:
     msg = payload["messages"][0]
     assert msg["role"] == "user"
     assert isinstance(msg["content"], list)
-    assert len(msg["content"]) == 2
-    assert msg["content"][0] == {"type": "text", "text": "What is in this image?"}
-    img_part = msg["content"][1]
+    assert len(msg["content"]) == 4
+    assert msg["content"][0] == {
+        "type": "text",
+        "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE),
+    }
+    assert msg["content"][1] == {"type": "text", "text": "What is in this image?"}
+    img_part = msg["content"][2]
     assert img_part["type"] == "image_url"
     assert img_part["image_url"]["url"].startswith("data:image/png;base64,")
+    assert msg["content"][3] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_build_payload_image_only() -> None:
@@ -738,9 +775,14 @@ def test_build_payload_image_only() -> None:
     payload = t.build_payload(messages, [], "")
     msg = payload["messages"][0]
     assert isinstance(msg["content"], list)
-    assert len(msg["content"]) == 1
-    assert msg["content"][0]["type"] == "image_url"
-    assert msg["content"][0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert len(msg["content"]) == 3
+    assert msg["content"][0] == {
+        "type": "text",
+        "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE),
+    }
+    assert msg["content"][1]["type"] == "image_url"
+    assert msg["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert msg["content"][2] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_build_payload_text_only_stays_string() -> None:
@@ -748,7 +790,7 @@ def test_build_payload_text_only_stays_string() -> None:
     t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     messages = [Message(role="user", content=[TextBlock(text="Hello")])]
     payload = t.build_payload(messages, [], "")
-    assert payload["messages"][0]["content"] == "Hello"
+    assert payload["messages"][0]["content"] == _unattributed_chat_text("Hello")
 
 
 def test_build_payload_system_message_in_history() -> None:

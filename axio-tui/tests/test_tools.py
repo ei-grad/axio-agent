@@ -11,7 +11,7 @@ import pytest
 from axio.agent import Agent
 from axio.context import MemoryContextStore
 from axio.events import StreamEvent
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
 
@@ -56,14 +56,21 @@ class TestSubAgent:
     async def test_returns_subagent_result(self) -> None:
         transport = StubTransport([make_text_response("sub-result")])
         agent = self._make_agent(transport)
+        context = MemoryContextStore()
 
         async def factory() -> tuple[Agent, MemoryContextStore]:
-            return agent, MemoryContextStore()
+            return agent, context
 
         _tools.subagent_factory = factory
         try:
             result = await subagent(task="do something")
             assert result == "sub-result"
+            history = await context.get_history()
+            assert history[0].provenance == InputProvenance(
+                human_authored=False,
+                source="delegated-task",
+                author="parent-agent",
+            )
         finally:
             _tools.subagent_factory = None
 
@@ -233,6 +240,11 @@ class TestVisionAnalyze:
             assert isinstance(msg.content[0], TextBlock)
             assert msg.content[0].text == "Describe it"
             assert isinstance(msg.content[1], ImageBlock)
+            assert msg.provenance == InputProvenance(
+                human_authored=False,
+                source="vision-tool",
+                author="vision_analyze",
+            )
             assert msg.content[1].media_type == "image/jpeg"
         finally:
             os.chdir(old_cwd)

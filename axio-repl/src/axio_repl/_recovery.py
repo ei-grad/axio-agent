@@ -19,7 +19,7 @@ from axio.blocks import (
     VideoBlock,
     VideoMediaType,
 )
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 
 from axio_repl._journal import SCHEMA_VERSION, read_journal
 
@@ -288,6 +288,11 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
                         )
                     )
                 ],
+                provenance=InputProvenance(
+                    human_authored=False,
+                    source="recovery",
+                    author="axio-repl",
+                ),
             )
         )
         recovery_ids.append(recovery_id)
@@ -311,6 +316,11 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
                         )
                     )
                 ],
+                provenance=InputProvenance(
+                    human_authored=False,
+                    source="recovery",
+                    author=agent_id,
+                ),
             )
         )
         recovery_ids.append(recovery_id)
@@ -333,6 +343,11 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
                         )
                     )
                 ],
+                provenance=InputProvenance(
+                    human_authored=False,
+                    source="recovery",
+                    author="axio-repl",
+                ),
             )
         )
         recovery_ids.append(recovery_id)
@@ -419,9 +434,21 @@ def _decode_message(data: dict[str, Any], session_dir: Path) -> Message:
     raw_content = data.get("content")
     if not isinstance(raw_content, list):
         raise RecoveryError("message content is not a list")
+    provenance: InputProvenance | None = None
+    raw_provenance = data.get("provenance")
+    if raw_provenance is not None:
+        provenance_data = _mapping(raw_provenance, "message.provenance")
+        record_type = provenance_data.get("record_type")
+        if record_type not in {None, "InputProvenance"}:
+            raise RecoveryError(f"invalid message provenance record type: {record_type!r}")
+        try:
+            provenance = InputProvenance.from_dict(provenance_data)
+        except ValueError as error:
+            raise RecoveryError(f"invalid message provenance: {error}") from error
     return Message(
         role=cast(Literal["user", "assistant", "system"], role),
         content=[_decode_block(_mapping(block, "message block"), session_dir) for block in raw_content],
+        provenance=provenance,
     )
 
 

@@ -21,7 +21,13 @@ from axio.events import (
     ToolUseStart,
 )
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    InputProvenance,
+    Message,
+    input_provenance_header,
+)
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 
@@ -420,12 +426,38 @@ def test_effort_uses_codex_advertised_native_reasoning() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _unattributed_input_text(text: str) -> list[dict[str, str]]:
+    return [
+        {"type": "input_text", "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)},
+        {"type": "input_text", "text": text},
+        {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER},
+    ]
+
+
 def test_convert_user_text() -> None:
     messages = [Message(role="user", content=[TextBlock(text="Hello")])]
     _, items = _convert_messages(messages, "")
     assert len(items) == 1
     assert items[0]["role"] == "user"
-    assert items[0]["content"] == [{"type": "input_text", "text": "Hello"}]
+    assert items[0]["content"] == _unattributed_input_text("Hello")
+
+
+def test_convert_user_provenance_precedes_text_and_image() -> None:
+    provenance = InputProvenance(human_authored=False, source="peer", author="agent-1")
+    messages = [
+        Message(
+            role="user",
+            content=[TextBlock(text="report"), ImageBlock(media_type="image/png", data=b"image")],
+            provenance=provenance,
+        )
+    ]
+
+    _, [item] = _convert_messages(messages, "")
+
+    assert item["content"][0] == {"type": "input_text", "text": input_provenance_header(provenance)}
+    assert item["content"][1] == {"type": "input_text", "text": "report"}
+    assert item["content"][2]["type"] == "input_image"
+    assert item["content"][3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_user_image() -> None:
@@ -442,10 +474,13 @@ def test_convert_user_image() -> None:
     _, items = _convert_messages(messages, "")
     assert len(items) == 1
     content = items[0]["content"]
-    assert len(content) == 2
+    assert len(content) == 4
     assert content[0]["type"] == "input_text"
-    assert content[1]["type"] == "input_image"
-    assert content[1]["image_url"].startswith("data:image/png;base64,")
+    assert content[0]["text"] == input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)
+    assert content[1] == {"type": "input_text", "text": "What is this?"}
+    assert content[2]["type"] == "input_image"
+    assert content[2]["image_url"].startswith("data:image/png;base64,")
+    assert content[3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_results() -> None:
@@ -460,6 +495,38 @@ def test_convert_tool_results() -> None:
     assert items[0]["type"] == "function_call_output"
     assert items[0]["call_id"] == "call_1"
     assert items[0]["output"] == "22C"
+
+
+def test_convert_tool_result_image_uses_framed_user_fallback() -> None:
+    provenance = InputProvenance(human_authored=False, source="tool-result", author="read_file")
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call-image", name="read_file", input={})],
+        ),
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(
+                    tool_use_id="call-image",
+                    content=[TextBlock(text="diagram"), ImageBlock(media_type="image/png", data=b"image")],
+                )
+            ],
+            provenance=provenance,
+        ),
+    ]
+
+    items = _convert_messages(messages, "")[1]
+
+    assert items[1] == {"type": "function_call_output", "call_id": "call-image", "output": "diagram"}
+    assert items[2]["role"] == "user"
+    assert items[2]["content"][0] == {
+        "type": "input_text",
+        "text": input_provenance_header(provenance),
+    }
+    assert items[2]["content"][1] == {"type": "input_text", "text": "[Image from tool call call-image]"}
+    assert items[2]["content"][2]["type"] == "input_image"
+    assert items[2]["content"][3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_result_mixed_with_text_emits_both_in_order() -> None:
@@ -478,7 +545,7 @@ def test_convert_tool_result_mixed_with_text_emits_both_in_order() -> None:
     assert items[0]["call_id"] == "call_1"
     assert items[0]["output"] == "22C"
     assert items[1]["role"] == "user"
-    assert items[1]["content"] == [{"type": "input_text", "text": "And tomorrow?"}]
+    assert items[1]["content"] == _unattributed_input_text("And tomorrow?")
 
 
 def test_convert_tool_result_message_then_separate_user_text_message() -> None:
@@ -497,7 +564,7 @@ def test_convert_tool_result_message_then_separate_user_text_message() -> None:
     assert items[0]["type"] == "function_call"
     assert items[1] == {"type": "function_call_output", "call_id": "call_1", "output": "22C"}
     assert items[2]["role"] == "user"
-    assert items[2]["content"] == [{"type": "input_text", "text": "Notification: background task finished"}]
+    assert items[2]["content"] == _unattributed_input_text("Notification: background task finished")
 
 
 def test_convert_assistant_text() -> None:

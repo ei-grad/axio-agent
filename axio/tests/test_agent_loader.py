@@ -18,6 +18,7 @@ from axio.agent_loader import (
     make_agent_tools,
 )
 from axio.context import MemoryContextStore
+from axio.messages import InputProvenance
 from axio.testing import StubTransport, make_echo_tool, make_text_response
 from axio.tool import Tool
 from axio.transport import DummyCompletionTransport
@@ -310,9 +311,22 @@ class TestMakeAgentTools:
         transport = StubTransport([make_text_response("result text")])
         proto = Agent(system="s", transport=DummyCompletionTransport())
         agents = {"bot": ("A bot", proto)}
-        tools = make_agent_tools(agents, transport=transport)
+        contexts: list[MemoryContextStore] = []
+
+        def context_factory() -> MemoryContextStore:
+            context = MemoryContextStore()
+            contexts.append(context)
+            return context
+
+        tools = make_agent_tools(agents, transport=transport, context_factory=context_factory)
         result = await tools[0](task="do something")
         assert result == "result text"
+        history = await contexts[0].get_history()
+        assert history[0].provenance == InputProvenance(
+            human_authored=False,
+            source="delegated-task",
+            author="agent-tool",
+        )
 
     async def test_tool_streams_events_to_on_event(self) -> None:
         from axio.events import TextDelta

@@ -7,7 +7,7 @@ import logging
 from .agent import Agent
 from .blocks import TextBlock, ToolResultBlock
 from .context import ContextStore, MemoryContextStore, SessionInfo
-from .messages import Message
+from .messages import InputProvenance, Message
 from .transport import CompletionTransport
 
 logger = logging.getLogger(__name__)
@@ -47,13 +47,30 @@ async def compact_context(
     summary_ctx = MemoryContextStore(old)
     agent = Agent(system=system_prompt, transport=transport, max_iterations=1)
     try:
-        summary = await agent.run("Summarize the conversation above.", summary_ctx)
+        summary = await agent.run_messages(
+            [
+                Message(
+                    role="user",
+                    content=[TextBlock(text="Summarize the conversation above.")],
+                    provenance=InputProvenance(
+                        human_authored=False,
+                        source="compaction-request",
+                        author="axio",
+                    ),
+                )
+            ],
+            summary_ctx,
+        )
     except Exception:
         logger.warning("Context compaction failed, keeping original history", exc_info=True)
         return None
 
     return [
-        Message(role="user", content=[TextBlock(text=summary)]),
+        Message(
+            role="user",
+            content=[TextBlock(text=summary)],
+            provenance=InputProvenance(human_authored=False, source="compaction-summary", author="axio"),
+        ),
         Message(role="assistant", content=[TextBlock(text="Understood, context restored.")]),
         *recent,
     ]

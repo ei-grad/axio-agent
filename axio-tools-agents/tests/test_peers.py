@@ -11,7 +11,7 @@ from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import HandlerError
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio.types import StopReason, Usage
@@ -455,6 +455,11 @@ async def test_local_agent_message_batch_stays_distinct_in_one_turn(tmp_path: Pa
     result = await spawn_agent(task="initial")
     agent_id = result.split("agent_id=", 1)[1].split(" ", 1)[0]
     await wait_local_background_agents_idle([agent_id])
+    assert transport.calls[0][-1].provenance == InputProvenance(
+        human_authored=False,
+        source="delegated-task",
+        author="host",
+    )
     committed: list[str] = []
     first = Message(role="user", content=[TextBlock(text="first")])
     second = Message(role="user", content=[TextBlock(text="second")])

@@ -7,7 +7,13 @@ from typing import Any
 
 import pytest
 from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    InputProvenance,
+    Message,
+    input_provenance_header,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 
@@ -81,11 +87,37 @@ def test_convert_user_image() -> None:
     contents = _build_contents_json(messages)
     assert len(contents) == 1
     parts = contents[0]["parts"]
-    assert len(parts) == 2
-    assert parts[0]["text"] == "What is this?"
-    idata = parts[1]["inlineData"]
+    assert len(parts) == 4
+    assert parts[0] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[1]["text"] == "What is this?"
+    idata = parts[2]["inlineData"]
     assert idata["mimeType"] == "image/png"
     assert base64.b64decode(idata["data"]) == img_data
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
+
+
+def test_mixed_user_batch_preserves_provenance_order_and_media() -> None:
+    human = InputProvenance(human_authored=True, source="interactive", author="human")
+    peer = InputProvenance(human_authored=False, source="peer", author="agent-1")
+    messages = [
+        Message(role="user", content=[TextBlock(text="question")], provenance=human),
+        Message(
+            role="user",
+            content=[TextBlock(text="report"), ImageBlock(media_type="image/png", data=b"image")],
+            provenance=peer,
+        ),
+    ]
+
+    [content] = _build_contents_json(messages)
+
+    parts = content["parts"]
+    assert parts[0] == {"text": input_provenance_header(human)}
+    assert parts[1] == {"text": "question"}
+    assert parts[2] == {"text": INPUT_PROVENANCE_FOOTER}
+    assert parts[3] == {"text": input_provenance_header(peer)}
+    assert parts[4] == {"text": "report"}
+    assert parts[5]["inlineData"]["mimeType"] == "image/png"
+    assert parts[6] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_user_audio() -> None:
@@ -101,10 +133,13 @@ def test_convert_user_audio() -> None:
     ]
     contents = _build_contents_json(messages)
     parts = contents[0]["parts"]
-    assert len(parts) == 2
-    idata = parts[1]["inlineData"]
+    assert len(parts) == 4
+    assert parts[0] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[1] == {"text": "Transcribe this"}
+    idata = parts[2]["inlineData"]
     assert idata["mimeType"] == "audio/mp3"
     assert base64.b64decode(idata["data"]) == audio_data
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_user_video() -> None:
@@ -120,10 +155,13 @@ def test_convert_user_video() -> None:
     ]
     contents = _build_contents_json(messages)
     parts = contents[0]["parts"]
-    assert len(parts) == 2
-    idata = parts[1]["inlineData"]
+    assert len(parts) == 4
+    assert parts[0] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[1] == {"text": "Describe this video"}
+    idata = parts[2]["inlineData"]
     assert idata["mimeType"] == "video/mp4"
     assert base64.b64decode(idata["data"]) == video_data
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +207,7 @@ def test_convert_tool_result_text() -> None:
 
 def test_convert_tool_result_with_image() -> None:
     img_data = b"\xff\xd8\xff\xe0fake-jpeg"
+    provenance = InputProvenance(human_authored=False, source="tool-result", author="read_file")
     messages = [
         Message(
             role="assistant",
@@ -185,15 +224,18 @@ def test_convert_tool_result_with_image() -> None:
                     ],
                 )
             ],
+            provenance=provenance,
         ),
     ]
     contents = _build_contents_json(messages)
-    fr = contents[1]["parts"][0]["functionResponse"]
+    assert contents[1]["parts"][0] == {"text": input_provenance_header(provenance)}
+    fr = contents[1]["parts"][1]["functionResponse"]
     assert fr["response"] == {"result": "Image file: photo.jpg"}
     # Media is a sibling inlineData part, not nested inside functionResponse
-    media_part = contents[1]["parts"][1]
+    media_part = contents[1]["parts"][2]
     assert media_part["inlineData"]["mimeType"] == "image/jpeg"
     assert base64.b64decode(media_part["inlineData"]["data"]) == img_data
+    assert contents[1]["parts"][3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_result_with_audio() -> None:
@@ -218,9 +260,11 @@ def test_convert_tool_result_with_audio() -> None:
     ]
     contents = _build_contents_json(messages)
     parts = contents[1]["parts"]
-    assert parts[0]["functionResponse"]["response"] == {"result": "Audio file: audio.ogg"}
-    assert parts[1]["inlineData"]["mimeType"] == "audio/ogg"
-    assert base64.b64decode(parts[1]["inlineData"]["data"]) == audio_data
+    assert parts[0] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[1]["functionResponse"]["response"] == {"result": "Audio file: audio.ogg"}
+    assert parts[2]["inlineData"]["mimeType"] == "audio/ogg"
+    assert base64.b64decode(parts[2]["inlineData"]["data"]) == audio_data
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_result_mixed_with_text() -> None:
@@ -244,7 +288,9 @@ def test_convert_tool_result_mixed_with_text() -> None:
     assert len(contents) == 2
     parts = contents[1]["parts"]
     assert parts[0]["functionResponse"]["response"]["result"] == "22°C sunny"
-    assert parts[1] == {"text": "And tomorrow?"}
+    assert parts[1] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[2] == {"text": "And tomorrow?"}
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_result_message_then_separate_user_text_message() -> None:
@@ -268,7 +314,9 @@ def test_convert_tool_result_message_then_separate_user_text_message() -> None:
     assert len(contents) == 2
     parts = contents[1]["parts"]
     assert parts[0]["functionResponse"]["response"]["result"] == "22°C sunny"
-    assert parts[1] == {"text": "Notification: background task finished"}
+    assert parts[1] == {"text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)}
+    assert parts[2] == {"text": "Notification: background task finished"}
+    assert parts[3] == {"text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_convert_tool_result_error() -> None:

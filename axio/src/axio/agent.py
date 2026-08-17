@@ -32,7 +32,7 @@ from .events import (
     VideoOutput,
 )
 from .exceptions import GuardCrash, HandlerCrash, ToolError
-from .messages import Message
+from .messages import InputProvenance, Message
 from .models import Capability
 from .selector import ToolSelector
 from .stream import AgentStream
@@ -185,13 +185,29 @@ class Agent:
         """Return a new Agent with *overrides* applied."""
         return dataclasses.replace(self, **overrides)
 
-    def run_stream(self, user_message: str, context: ContextStore) -> AgentStream:
+    def run_stream(
+        self,
+        user_message: str,
+        context: ContextStore,
+        *,
+        provenance: InputProvenance | None = None,
+    ) -> AgentStream:
         ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        message = Message(role="user", content=[TextBlock(text=f"[{ts}] {user_message}")])
+        message = Message(
+            role="user",
+            content=[TextBlock(text=f"[{ts}] {user_message}")],
+            provenance=provenance or InputProvenance(human_authored=True, source="direct", author="human"),
+        )
         return self.run_stream_messages((message,), context)
 
-    async def run(self, user_message: str, context: ContextStore) -> str:
-        return await self.run_stream(user_message, context).get_final_text()
+    async def run(
+        self,
+        user_message: str,
+        context: ContextStore,
+        *,
+        provenance: InputProvenance | None = None,
+    ) -> str:
+        return await self.run_stream(user_message, context, provenance=provenance).get_final_text()
 
     def run_stream_messages(
         self,
@@ -429,7 +445,15 @@ class Agent:
                     if notifications := notify.drain(owner):
                         await self._append(
                             context,
-                            Message(role="user", content=[TextBlock(text="\n\n".join(notifications))]),
+                            Message(
+                                role="user",
+                                content=[TextBlock(text="\n\n".join(notifications))],
+                                provenance=InputProvenance(
+                                    human_authored=False,
+                                    source="notification",
+                                    author="axio",
+                                ),
+                            ),
                         )
                     history = await context.get_history()
                     logger.info("Iteration %d, history length=%d", iteration, len(history))
@@ -630,7 +654,15 @@ class Agent:
                             await context.append_many(
                                 [
                                     Message(role="assistant", content=list(content)),
-                                    Message(role="user", content=list(interrupted_results)),
+                                    Message(
+                                        role="user",
+                                        content=list(interrupted_results),
+                                        provenance=InputProvenance(
+                                            human_authored=False,
+                                            source="tool-result",
+                                            author="axio",
+                                        ),
+                                    ),
                                 ]
                             )
                             if deferred and dispatch is not None and self.deferred_tool_sink is not None:
@@ -650,7 +682,15 @@ class Agent:
                         await context.append_many(
                             [
                                 Message(role="assistant", content=list(content)),
-                                Message(role="user", content=list(results)),
+                                Message(
+                                    role="user",
+                                    content=list(results),
+                                    provenance=InputProvenance(
+                                        human_authored=False,
+                                        source="tool-result",
+                                        author="axio",
+                                    ),
+                                ),
                             ]
                         )
 
@@ -671,6 +711,11 @@ class Agent:
                                             text="You now have the media file above in your context. Proceed.",
                                         )
                                     ],
+                                    provenance=InputProvenance(
+                                        human_authored=False,
+                                        source="transport-nudge",
+                                        author="axio",
+                                    ),
                                 ),
                             )
 

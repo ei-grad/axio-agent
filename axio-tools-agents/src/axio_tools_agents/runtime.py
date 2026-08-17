@@ -16,7 +16,7 @@ from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import ContextStore, SessionInfo
 from axio.events import Error, SessionEndEvent, StreamEvent, TextDelta, ToolResult
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.types import StopReason
 
 logger = logging.getLogger(__name__)
@@ -514,6 +514,7 @@ async def observe_agent_turn(
     prompt: str,
     identity: TurnIdentity,
     hub: SessionEventHub,
+    provenance: InputProvenance | None = None,
 ) -> TurnOutcome:
     """Consume a complete turn and derive its outcome after the iterator closes."""
 
@@ -528,6 +529,7 @@ async def observe_agent_turn(
             messages=None,
             identity=identity,
             hub=hub,
+            provenance=provenance,
         )
     finally:
         _current_turn_identity.reset(identity_token)
@@ -591,11 +593,12 @@ async def _observe_agent_turn_current(
     identity: TurnIdentity,
     hub: SessionEventHub,
     on_input_committed: Callable[[], Awaitable[None]] | None = None,
+    provenance: InputProvenance | None = None,
 ) -> TurnOutcome:
     history_boundary = len(await context.get_history())
     await hub.publish_for(identity, TurnStarted(prompt=prompt))
     stream = (
-        agent.run_stream(prompt, context)
+        agent.run_stream(prompt, context, provenance=provenance)
         if messages is None
         else agent.run_stream_messages(
             messages,

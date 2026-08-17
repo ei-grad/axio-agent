@@ -11,7 +11,7 @@ from axio.agent import Agent
 from axio.blocks import TextBlock, ToolUseBlock
 from axio.context import ContextStore
 from axio.exceptions import GuardError
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.permission import PermissionGuard
 
 if TYPE_CHECKING:
@@ -103,7 +103,15 @@ class LLMGuard(PermissionGuard):
 
         # Fork so tool-call noise is discarded; user answers persist in the original
         forked = await self.context.fork()
-        async for _ in self.agent.run_stream(description, forked):
+        async for _ in self.agent.run_stream(
+            description,
+            forked,
+            provenance=InputProvenance(
+                human_authored=False,
+                source="permission-guard",
+                author=tool.name,
+            ),
+        ):
             pass
 
         confirm = await self.extract_confirm(forked)
@@ -130,10 +138,25 @@ class LLMGuard(PermissionGuard):
             self.allowed.add(confirm.category)
         elif answer.lower() != "y":
             # Feed user answer back and let it run more turns
-            async for _ in self.agent.run_stream(answer, forked):
+            answer_provenance = InputProvenance(
+                human_authored=True,
+                source="permission-prompt",
+                author="human",
+            )
+            async for _ in self.agent.run_stream(
+                answer,
+                forked,
+                provenance=answer_provenance,
+            ):
                 pass
             # Persist the user note in original context for future checks
-            await self.context.append(Message(role="user", content=[TextBlock(text=answer)]))
+            await self.context.append(
+                Message(
+                    role="user",
+                    content=[TextBlock(text=answer)],
+                    provenance=answer_provenance,
+                )
+            )
 
         return kwargs
 

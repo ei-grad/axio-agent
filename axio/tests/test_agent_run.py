@@ -20,7 +20,7 @@ from axio.events import (
     TextDelta,
     ToolResult,
 )
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio.types import StopReason, Usage
@@ -99,6 +99,15 @@ class TestRun:
         agent = Agent(system="test", tools=[], transport=transport)
         result = await agent.run("hi", MemoryContextStore())
         assert result == "Hello world"
+
+    async def test_direct_prompt_is_explicitly_human_authored(self) -> None:
+        agent = Agent(system="test", tools=[], transport=StubTransport([make_text_response("done")]))
+        context = MemoryContextStore()
+
+        await agent.run("hi", context)
+
+        [prompt, _response] = await context.get_history()
+        assert prompt.provenance == InputProvenance(human_authored=True, source="direct", author="human")
 
 
 class TestMessageBatchRun:

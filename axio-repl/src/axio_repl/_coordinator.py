@@ -9,7 +9,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from axio.blocks import TextBlock
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     InputBuffered,
@@ -460,7 +460,15 @@ def claim_batch_arrivals(batch: ClaimBatch) -> tuple[ContextArrival, ...]:
         ContextArrival(
             seq=entry.arrival_seq,
             target_agent_id=batch.target_agent_id,
-            message=Message(role="user", content=[TextBlock(text=entry.text)]),
+            message=Message(
+                role="user",
+                content=[TextBlock(text=entry.text)],
+                provenance=InputProvenance(
+                    human_authored=True,
+                    source="interactive",
+                    author="human",
+                ),
+            ),
             source="interactive",
             source_input_id=entry.id,
         )

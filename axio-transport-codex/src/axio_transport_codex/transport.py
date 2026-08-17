@@ -13,11 +13,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    Message,
+    effective_input_provenance,
+    input_provenance_header,
+    model_visible_content,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport
@@ -95,8 +101,18 @@ def _convert_messages(messages: list[Message], system: str) -> tuple[str, list[d
         if msg.role == "user":
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
             if tool_results:
+                tool_image_parts: list[dict[str, Any]] = []
                 for tr in tool_results:
-                    content = tr.content if isinstance(tr.content, str) else json.dumps(tr.content)
+                    if isinstance(tr.content, str):
+                        content = tr.content
+                        images: list[ImageBlock] = []
+                    else:
+                        unsupported = [block for block in tr.content if isinstance(block, (AudioBlock, VideoBlock))]
+                        if unsupported:
+                            media = ", ".join(sorted({block.media_type for block in unsupported}))
+                            raise ValueError(f"Codex Responses does not support tool-result media: {media}")
+                        content = "\n".join(block.text for block in tr.content if isinstance(block, TextBlock))
+                        images = [block for block in tr.content if isinstance(block, ImageBlock)]
                     items.append(
                         {
                             "type": "function_call_output",
@@ -104,9 +120,26 @@ def _convert_messages(messages: list[Message], system: str) -> tuple[str, list[d
                             "output": content,
                         }
                     )
-                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
+                    if images:
+                        tool_image_parts.append(
+                            {"type": "input_text", "text": f"[Image from tool call {tr.tool_use_id}]"}
+                        )
+                        for image in images:
+                            encoded = base64.b64encode(image.data).decode("ascii")
+                            tool_image_parts.append(
+                                {"type": "input_image", "image_url": f"data:{image.media_type};base64,{encoded}"}
+                            )
+                if tool_image_parts:
+                    provenance = effective_input_provenance(msg)
+                    tool_image_parts.insert(
+                        0,
+                        {"type": "input_text", "text": input_provenance_header(provenance)},
+                    )
+                    tool_image_parts.append({"type": "input_text", "text": INPUT_PROVENANCE_FOOTER})
+                    items.append({"role": "user", "content": tool_image_parts})
+                remaining_blocks = [b for b in model_visible_content(msg) if not isinstance(b, ToolResultBlock)]
             else:
-                remaining_blocks = msg.content
+                remaining_blocks = model_visible_content(msg)
             content_parts: list[dict[str, Any]] = []
             for b in remaining_blocks:
                 if isinstance(b, TextBlock):

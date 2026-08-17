@@ -14,7 +14,12 @@ from aiohttp import web
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    Message,
+    input_provenance_header,
+)
 from axio.tool import Tool
 from axio.types import StopReason
 
@@ -360,17 +365,31 @@ class TestMessageConversion:
     def test_user_text_block(self) -> None:
         msgs = [Message(role="user", content=[TextBlock(text="hello")])]
         result = _convert_messages(msgs)
-        assert result == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)},
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": INPUT_PROVENANCE_FOOTER},
+                ],
+            }
+        ]
 
     def test_user_image_block(self) -> None:
         raw = b"\x89PNG\r\n"
         msgs = [Message(role="user", content=[ImageBlock(media_type="image/png", data=raw)])]
         result = _convert_messages(msgs)
-        block = result[0]["content"][0]
+        assert result[0]["content"][0] == {
+            "type": "text",
+            "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE),
+        }
+        block = result[0]["content"][1]
         assert block["type"] == "image"
         assert block["source"]["type"] == "base64"
         assert block["source"]["media_type"] == "image/png"
         assert block["source"]["data"] == base64.b64encode(raw).decode("ascii")
+        assert result[0]["content"][2] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
 
     def test_user_tool_result_string(self) -> None:
         msgs = [Message(role="user", content=[ToolResultBlock(tool_use_id="id1", content="done")])]

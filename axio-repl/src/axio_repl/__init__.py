@@ -55,7 +55,7 @@ from axio.events import (
 )
 from axio.exceptions import StreamError
 from axio.field import StrictStr
-from axio.messages import Message
+from axio.messages import INPUT_PROVENANCE_SYSTEM_INSTRUCTION, InputProvenance, Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 from axio.tool_args import ToolArgStream
@@ -344,6 +344,7 @@ def build_system_prompt(
     if has_tools:
         lines.append(f"Tools: {tool_names}")
     lines.append("")
+    lines += ["Input provenance:", f"- {INPUT_PROVENANCE_SYSTEM_INSTRUCTION}", ""]
     if sandbox_note:
         lines += [sandbox_note, ""]
 
@@ -578,6 +579,8 @@ class _ForegroundResult:
 class _IncomingPrompt:
     text: str
     arrival_seq: int | None = None
+    source: str | None = None
+    author: str | None = None
     display_text: str | None = None
     agent_id: str | None = None
     agent_name: str | None = None
@@ -1689,7 +1692,14 @@ async def run_prompt(
         context_id=ctx.session_id,
     )
     await event_hub.publish_for(identity, InputReceived(text=prompt, source=source))
-    return await observe_agent_turn(agent=agent, context=ctx, prompt=prompt, identity=identity, hub=event_hub)
+    return await observe_agent_turn(
+        agent=agent,
+        context=ctx,
+        prompt=prompt,
+        identity=identity,
+        hub=event_hub,
+        provenance=InputProvenance(human_authored=True, source=source, author="human"),
+    )
 
 
 async def run_prompt_messages(
@@ -1715,7 +1725,8 @@ async def run_prompt_messages(
     )
     for message in messages:
         text = "".join(block.text for block in message.content if isinstance(block, TextBlock))
-        await event_hub.publish_for(turn_identity, InputReceived(text=text, source=source))
+        message_source = message.provenance.source if message.provenance is not None else source
+        await event_hub.publish_for(turn_identity, InputReceived(text=text, source=message_source))
     return await observe_agent_turn_messages(
         agent=agent,
         context=ctx,
@@ -2818,10 +2829,13 @@ async def main() -> None:
         pending_peer_prompts: deque[_IncomingPrompt] = deque()
 
         async def _sequence_incoming(prompt: _IncomingPrompt, *, source: str) -> _IncomingPrompt:
+            if prompt.source is not None and prompt.source != source:
+                raise ValueError("incoming prompt source cannot change")
+            author = prompt.author or prompt.agent_id or "axio-repl"
             if prompt.arrival_seq is not None:
-                return prompt
+                return dataclasses.replace(prompt, source=source, author=author)
             envelope = await _publish_main_event(InputReceived(text=prompt.text, source=source))
-            return dataclasses.replace(prompt, arrival_seq=envelope.seq)
+            return dataclasses.replace(prompt, arrival_seq=envelope.seq, source=source, author=author)
 
         async def _admit_incoming(prompt: _IncomingPrompt, *, source: str) -> None:
             await peer_queue.put(await _sequence_incoming(prompt, source=source))
@@ -2840,13 +2854,23 @@ async def main() -> None:
                 )
                 delivered = await enqueue_local_agent_messages(
                     notification.agent_id,
-                    (Message(role="user", content=[TextBlock(text=text)]),),
+                    (
+                        Message(
+                            role="user",
+                            content=[TextBlock(text=text)],
+                            provenance=InputProvenance(
+                                human_authored=False,
+                                source="deferred-tool",
+                                author=notification.tool_name,
+                            ),
+                        ),
+                    ),
                 )
                 if delivered:
                     return
                 text = f"[Deferred result from stopped agent {notification.agent_id}]\n\n{text}"
             await _admit_incoming(
-                _IncomingPrompt(text=text, display_text=text),
+                _IncomingPrompt(text=text, display_text=text, author=notification.tool_name),
                 source="deferred-tool",
             )
 
@@ -2877,6 +2901,7 @@ async def main() -> None:
                     display_text=display_text,
                     agent_id=agent_id,
                     agent_name=agent_name,
+                    author=agent_id,
                     suppress_display=suppress_display,
                 ),
                 source="background-outcome",
@@ -3027,7 +3052,7 @@ async def main() -> None:
 
         def _queue_notification(text: str) -> None:
             task = asyncio.create_task(
-                _admit_incoming(_IncomingPrompt(text=text), source="notification"),
+                _admit_incoming(_IncomingPrompt(text=text, author="axio"), source="notification"),
                 name="axio-repl-notification-admission",
             )
             incoming_admission_tasks.add(task)
@@ -3066,6 +3091,7 @@ async def main() -> None:
                     prompt=prompt,
                     identity=identity,
                     hub=event_hub,
+                    provenance=InputProvenance(human_authored=True, source=source, author="human"),
                 )
             else:
                 turn = run_prompt_messages(
@@ -3156,8 +3182,22 @@ async def main() -> None:
                     agent_name=prompt.agent_name,
                     suppress_display=prompt.suppress_display,
                 )
-            messages = tuple(Message(role="user", content=[TextBlock(text=prompt.text)]) for prompt in prompts)
-            await _run_turn(messages=messages, source="peer")
+            messages: list[Message] = []
+            for prompt in prompts:
+                if prompt.source is None:
+                    raise RuntimeError("incoming prompt reached delivery without a source")
+                messages.append(
+                    Message(
+                        role="user",
+                        content=[TextBlock(text=prompt.text)],
+                        provenance=InputProvenance(
+                            human_authored=False,
+                            source=prompt.source,
+                            author=prompt.author or "axio-repl",
+                        ),
+                    )
+                )
+            await _run_turn(messages=tuple(messages), source="internal")
 
         async def _run_peer_turn(first: _IncomingPrompt) -> None:
             await _run_peer_prompts(_collect_queued(first))
@@ -3496,6 +3536,11 @@ async def main() -> None:
                 notice = Message(
                     role="user",
                     content=[TextBlock(text=f"[Turn {turn_label} was interrupted by Escape.]")],
+                    provenance=InputProvenance(
+                        human_authored=False,
+                        source="interrupt",
+                        author="axio-repl",
+                    ),
                 )
                 arrivals = list(claim_batch_arrivals(transaction.claimed)) if transaction.claimed is not None else []
                 if request.target_agent_id == "main":
@@ -3513,8 +3558,16 @@ async def main() -> None:
                                 ContextArrival(
                                     seq=prompt.arrival_seq,
                                     target_agent_id="main",
-                                    message=Message(role="user", content=[TextBlock(text=prompt.text)]),
-                                    source="peer",
+                                    message=Message(
+                                        role="user",
+                                        content=[TextBlock(text=prompt.text)],
+                                        provenance=InputProvenance(
+                                            human_authored=False,
+                                            source=prompt.source or "peer",
+                                            author=prompt.author or "axio-repl",
+                                        ),
+                                    ),
+                                    source=prompt.source or "peer",
                                 )
                             )
                         else:

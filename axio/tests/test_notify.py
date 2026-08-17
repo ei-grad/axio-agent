@@ -12,7 +12,7 @@ from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
 from axio.events import StreamEvent, ToolResult
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_ephemeral_context, make_text_response, make_tool_use_response
 from axio.tool import Tool
 
@@ -178,6 +178,16 @@ async def test_a_notification_posted_mid_turn_joins_the_next_iteration() -> None
 
     history = await context.get_history()
     assert "news about hi" in _user_texts(history)
+    notification = next(
+        message
+        for message in history
+        if any(isinstance(block, TextBlock) and "news about hi" in block.text for block in message.content)
+    )
+    assert notification.provenance == InputProvenance(
+        human_authored=False,
+        source="notification",
+        author="axio",
+    )
     assert notify.drain("agent-1") == []
 
 

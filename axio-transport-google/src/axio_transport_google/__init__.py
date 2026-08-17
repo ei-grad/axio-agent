@@ -26,7 +26,13 @@ from axio.events import (
     VideoOutput,
 )
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    Message,
+    effective_input_provenance,
+    input_provenance_header,
+    model_visible_content,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport, ImageGenTransport, VideoGenTransport
@@ -304,6 +310,13 @@ def _build_contents_json(
             tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
             if tool_results:
                 tool_result_parts: list[Part] = []
+                has_tool_result_media = any(
+                    isinstance(result.content, list)
+                    and any(isinstance(block, (ImageBlock, AudioBlock, VideoBlock)) for block in result.content)
+                    for result in tool_results
+                )
+                if has_tool_result_media:
+                    tool_result_parts.append({"text": input_provenance_header(effective_input_provenance(msg))})
                 for tr in tool_results:
                     if isinstance(tr.content, str):
                         response_dict: dict[str, Any] = {"result": tr.content}
@@ -326,10 +339,12 @@ def _build_contents_json(
                         for content_block in tr.content:
                             if isinstance(content_block, (ImageBlock, AudioBlock, VideoBlock)):
                                 tool_result_parts.append(_inline_data_part(content_block))
+                if has_tool_result_media:
+                    tool_result_parts.append({"text": INPUT_PROVENANCE_FOOTER})
                 contents.append({"role": "user", "parts": tool_result_parts})
-                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
+                remaining_blocks = [b for b in model_visible_content(msg) if not isinstance(b, ToolResultBlock)]
             else:
-                remaining_blocks = msg.content
+                remaining_blocks = model_visible_content(msg)
 
             user_parts: list[Part] = []
             for message_block in remaining_blocks:

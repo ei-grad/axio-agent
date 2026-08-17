@@ -72,6 +72,7 @@ from .agent import Agent
 from .context import ContextStore, MemoryContextStore
 from .events import StreamEvent, TextDelta
 from .field import Field
+from .messages import InputProvenance
 from .tool import CONTEXT, Tool
 from .transport import CompletionTransport, DummyCompletionTransport
 
@@ -304,10 +305,11 @@ async def agent_tool(task: Annotated[str, Field(description="Full task instructi
     context: AgentContext = CONTEXT.get()
     agent = context["proto"].copy(transport=context["transport"])
     ctx = context["context_factory"]()
+    provenance = InputProvenance(human_authored=False, source="delegated-task", author="agent-tool")
     if context["on_event"] is None:
-        return await agent.run(task, ctx)
+        return await agent.run(task, ctx, provenance=provenance)
     parts: list[str] = []
-    async for event in agent.run_stream(task, ctx):
+    async for event in agent.run_stream(task, ctx, provenance=provenance):
         context["on_event"](context["agent_name"], event)
         if isinstance(event, TextDelta):
             parts.append(event.delta)

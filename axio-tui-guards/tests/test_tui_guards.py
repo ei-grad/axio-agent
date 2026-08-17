@@ -8,7 +8,7 @@ import pytest
 from axio.blocks import TextBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.exceptions import GuardError
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio_tui.tools import confirm, status_line
@@ -185,6 +185,30 @@ class TestLLMGuard:
         guard = LLMGuard(agent, MemoryContextStore(), prompt_fn=deny)
         with pytest.raises(GuardError, match="denied"):
             await guard.check(_shell_tool, command="sudo reboot")
+
+    async def test_free_form_user_answer_retains_human_provenance(self) -> None:
+        confirm_input = {"verdict": "RISKY", "reason": "needs context", "category": "write"}
+        transport = StubTransport(
+            [
+                make_tool_use_response("confirm", "call_1", confirm_input),
+                make_text_response("review needed"),
+            ]
+        )
+        context = MemoryContextStore()
+
+        async def explain(_msg: str) -> str:
+            return "This file is a disposable fixture."
+
+        guard = LLMGuard(_make_guard_agent(transport), context, prompt_fn=explain)
+
+        await guard.check(_write_tool, file_path="fixture.txt", content="data")
+
+        [answer] = await context.get_history()
+        assert answer.provenance == InputProvenance(
+            human_authored=True,
+            source="permission-prompt",
+            author="human",
+        )
 
     async def test_always_allows_category(self) -> None:
         confirm_input = {"verdict": "RISKY", "reason": "writes", "category": "write_file"}

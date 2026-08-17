@@ -18,7 +18,14 @@ from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    InputProvenance,
+    Message,
+    effective_input_provenance,
+    input_provenance_header,
+    model_visible_content,
+)
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport, EmbeddingTransport
@@ -286,7 +293,10 @@ def _extract_tool_result_text(tr: ToolResultBlock) -> str:
     return "\n".join(b.text for b in tr.content if isinstance(b, TextBlock))
 
 
-def _collect_tool_result_images(tool_results: list[ToolResultBlock]) -> list[dict[str, Any]]:
+def _collect_tool_result_images(
+    tool_results: list[ToolResultBlock],
+    provenance: InputProvenance | None,
+) -> list[dict[str, Any]]:
     """Collect image parts from tool results to inject as a follow-up user message."""
     parts: list[dict[str, Any]] = []
     for tr in tool_results:
@@ -298,6 +308,9 @@ def _collect_tool_result_images(tool_results: list[ToolResultBlock]) -> list[dic
                     encoded = base64.b64encode(img.data).decode("ascii")
                     data_uri = f"data:{img.media_type};base64,{encoded}"
                     parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+    if parts and provenance is not None:
+        parts.insert(0, {"type": "text", "text": input_provenance_header(provenance)})
+        parts.append({"type": "text", "text": INPUT_PROVENANCE_FOOTER})
     return parts
 
 
@@ -321,12 +334,12 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
                     )
                 # Chat Completions API doesn't support images in tool messages,
                 # so inject them as a follow-up user message.
-                image_parts = _collect_tool_result_images(tool_results)
+                image_parts = _collect_tool_result_images(tool_results, effective_input_provenance(msg))
                 if image_parts:
                     result.append({"role": "user", "content": image_parts})
-                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
+                remaining_blocks = [b for b in model_visible_content(msg) if not isinstance(b, ToolResultBlock)]
             else:
-                remaining_blocks = msg.content
+                remaining_blocks = model_visible_content(msg)
 
             if remaining_blocks:
                 has_images = any(isinstance(b, ImageBlock) for b in remaining_blocks)

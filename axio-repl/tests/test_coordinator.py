@@ -5,7 +5,7 @@ from dataclasses import fields, replace
 
 import pytest
 from axio.blocks import TextBlock
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     ExecutionMode,
@@ -165,6 +165,10 @@ def test_interrupt_claims_all_pending_inputs_for_current_agent_without_joining()
     messages = tuple(arrival.message for arrival in claim_batch_arrivals(batch))
     assert [_text(message) for message in messages] == ["first", "second"]
     assert messages[0] is not messages[1]
+    assert [message.provenance for message in messages] == [
+        InputProvenance(human_authored=True, source="interactive", author="human"),
+        InputProvenance(human_authored=True, source="interactive", author="human"),
+    ]
 
 
 def test_normal_claim_does_not_take_another_agents_pending_input() -> None:
@@ -197,9 +201,21 @@ def test_claimed_inputs_can_be_marked_delivered_exactly_once() -> None:
 
 
 def test_ordered_messages_merge_sources_by_sequence_without_joining() -> None:
-    interactive = Message(role="user", content=[TextBlock(text="interactive")])
-    peer = Message(role="user", content=[TextBlock(text="peer")])
-    interrupted = Message(role="user", content=[TextBlock(text="interrupted")])
+    interactive = Message(
+        role="user",
+        content=[TextBlock(text="interactive")],
+        provenance=InputProvenance(human_authored=True, source="interactive", author="human"),
+    )
+    peer = Message(
+        role="user",
+        content=[TextBlock(text="peer")],
+        provenance=InputProvenance(human_authored=False, source="peer", author="child-1"),
+    )
+    interrupted = Message(
+        role="user",
+        content=[TextBlock(text="interrupted")],
+        provenance=InputProvenance(human_authored=False, source="interrupt", author="axio-repl"),
+    )
     arrivals = (
         ContextArrival(3, "main", interrupted, "interrupt"),
         ContextArrival(1, "main", interactive, "interactive"),

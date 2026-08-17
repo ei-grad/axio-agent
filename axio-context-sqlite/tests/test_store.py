@@ -1,6 +1,7 @@
 """Tests for SQLiteContextStore."""
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 from axio.blocks import TextBlock
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 
 from axio_context_sqlite import SQLiteContextStore, connect
 from axio_context_sqlite.store import COMPRESS_THRESHOLD, compress_payload, decompress_payload
@@ -42,6 +43,42 @@ async def test_append_and_get_history(store: SQLiteContextStore) -> None:
     assert len(history) == 2
     assert history[0].role == "user"
     assert history[1].role == "assistant"
+
+
+async def test_provenance_roundtrips_through_append_many_and_fork(store: SQLiteContextStore) -> None:
+    provenance = InputProvenance(human_authored=False, source="peer", author="agent-1")
+    message = Message(role="user", content=[TextBlock(text="report")], provenance=provenance)
+
+    await store.append_many([message])
+    forked = await store.fork()
+
+    assert await store.get_history() == [message]
+    assert await forked.get_history() == [message]
+
+
+async def test_connect_migrates_legacy_schema_without_losing_messages(db_path: Path) -> None:
+    legacy = await aiosqlite.connect(str(db_path))
+    await legacy.execute(
+        "CREATE TABLE axio_context_messages ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, project TEXT NOT NULL, "
+        "position INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, "
+        "created_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(session_id, position))"
+    )
+    await legacy.execute(
+        "INSERT INTO axio_context_messages (session_id, project, position, role, content) VALUES (?, ?, ?, ?, ?)",
+        ("legacy", "proj", 0, "user", json.dumps([{"type": "text", "text": "old"}])),
+    )
+    await legacy.commit()
+    await legacy.close()
+
+    migrated = await connect(db_path)
+    try:
+        history = await SQLiteContextStore(migrated, "legacy", "proj").get_history()
+    finally:
+        await migrated.close()
+
+    assert history == [Message(role="user", content=[TextBlock(text="old")])]
+    assert history[0].provenance is None
 
 
 async def test_append_many_commits_ordered_batch(store: SQLiteContextStore) -> None:

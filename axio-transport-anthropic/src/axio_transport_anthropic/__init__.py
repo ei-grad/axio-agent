@@ -16,7 +16,7 @@ from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, Vi
 from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import Message, model_visible_content
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport
@@ -193,7 +193,7 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
         content_parts: list[dict[str, Any]] = []
 
         if msg.role == "user":
-            for b in msg.content:
+            for b in model_visible_content(msg):
                 if isinstance(b, TextBlock):
                     content_parts.append({"type": "text", "text": b.text})
                 elif isinstance(b, (ImageBlock, VideoBlock)):

@@ -10,7 +10,7 @@ from axio.agent import Agent
 from axio.blocks import ImageBlock, TextBlock
 from axio.context import ContextStore
 from axio.events import TextDelta
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.transport import CompletionTransport
 
 
@@ -78,7 +78,11 @@ async def subagent(task: str) -> str:
     if subagent_factory is None:
         return "SubAgent is not configured"
     agent, store = await subagent_factory()
-    return await agent.run(task, store)
+    return await agent.run(
+        task,
+        store,
+        provenance=InputProvenance(human_authored=False, source="delegated-task", author="parent-agent"),
+    )
 
 
 subagent._tool_concurrency = 3  # type: ignore[attr-defined]
@@ -124,6 +128,7 @@ async def vision_analyze(
                 TextBlock(text=prompt),
                 ImageBlock(media_type=media_type, data=data),  # type: ignore[arg-type]
             ],
+            provenance=InputProvenance(human_authored=False, source="vision-tool", author="vision_analyze"),
         ),
     ]
 

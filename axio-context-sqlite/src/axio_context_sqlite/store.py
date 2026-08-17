@@ -119,10 +119,15 @@ async def connect(db_path: str | Path) -> aiosqlite.Connection:
         "  position INTEGER NOT NULL,"
         "  role TEXT NOT NULL,"
         "  content TEXT NOT NULL,"
+        "  provenance TEXT,"
         "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
         "  UNIQUE(session_id, position)"
         ")"
     )
+    async with conn.execute("PRAGMA table_info(axio_context_messages)") as cursor:
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+    if "provenance" not in columns:
+        await conn.execute("ALTER TABLE axio_context_messages ADD COLUMN provenance TEXT")
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_axio_context_messages_session ON axio_context_messages(session_id)"
     )
@@ -191,12 +196,13 @@ class SQLiteContextStore(ContextStore):
 
     async def append(self, message: Message) -> None:
         content_json = json.dumps(message.to_dict()["content"])
+        provenance_json = json.dumps(message.provenance.to_dict()) if message.provenance is not None else None
         async with self._transaction():
             await self._conn.execute(
-                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content, provenance)"
                 "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, "
-                "compress_payload(?))",
-                (self._session_id, self._project, self._session_id, message.role, content_json),
+                "compress_payload(?), ?)",
+                (self._session_id, self._project, self._session_id, message.role, content_json, provenance_json),
             )
             await self._conn.commit()
 
@@ -210,26 +216,33 @@ class SQLiteContextStore(ContextStore):
                 self._session_id,
                 message.role,
                 json.dumps(message.to_dict()["content"]),
+                json.dumps(message.provenance.to_dict()) if message.provenance is not None else None,
             )
             for message in messages
         ]
         async with self._transaction():
             await self._conn.executemany(
-                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content, provenance)"
                 "VALUES (?, ?, (SELECT COUNT(*) FROM axio_context_messages WHERE session_id = ?), ?, "
-                "compress_payload(?))",
+                "compress_payload(?), ?)",
                 rows,
             )
             await self._conn.commit()
 
     async def get_history(self) -> list[Message]:
         async with self._conn.execute(
-            "SELECT role, decompress_payload(content) FROM axio_context_messages"
+            "SELECT role, decompress_payload(content), provenance FROM axio_context_messages"
             " WHERE session_id = ? ORDER BY position",
             (self._session_id,),
         ) as cursor:
             rows = await cursor.fetchall()
-        return [Message.from_dict({"role": role, "content": json.loads(content)}) for role, content in rows]
+        history: list[Message] = []
+        for role, content, provenance in rows:
+            data = {"role": role, "content": json.loads(content)}
+            if provenance is not None:
+                data["provenance"] = json.loads(provenance)
+            history.append(Message.from_dict(data))
+        return history
 
     async def clear(self) -> None:
         async with self._transaction():
@@ -244,8 +257,9 @@ class SQLiteContextStore(ContextStore):
         new_id = uuid4().hex
         async with self._transaction():
             await self._conn.execute(
-                "INSERT INTO axio_context_messages (session_id, project, position, role, content)"
-                "SELECT ?, project, position, role, content FROM axio_context_messages WHERE session_id = ?",
+                "INSERT INTO axio_context_messages (session_id, project, position, role, content, provenance)"
+                "SELECT ?, project, position, role, content, provenance "
+                "FROM axio_context_messages WHERE session_id = ?",
                 (new_id, self._session_id),
             )
             await self._conn.execute(

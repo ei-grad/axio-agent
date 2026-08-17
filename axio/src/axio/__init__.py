@@ -19,7 +19,7 @@ from .events import (
 )
 from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from .field import Field, FieldInfo, StrictStr
-from .messages import Message
+from .messages import InputProvenance, Message
 from .permission import ConcurrentGuard, PermissionGuard
 from .realtime import RealtimeAgent
 from .selector import ToolSelector
@@ -62,6 +62,7 @@ __all__ = [
     "TurnComplete",
     # messages & blocks
     "Message",
+    "InputProvenance",
     "TextBlock",
     "ToolUseBlock",
     "ToolResultBlock",

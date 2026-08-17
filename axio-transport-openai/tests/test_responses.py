@@ -7,7 +7,13 @@ from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, Tool
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    InputProvenance,
+    Message,
+    input_provenance_header,
+)
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason
@@ -31,6 +37,14 @@ def _transport(**kwargs: Any) -> OpenAITransport:
     return OpenAITransport(model=_REASONING, **kwargs)
 
 
+def _unattributed_input_text(text: str) -> list[dict[str, str]]:
+    return [
+        {"type": "input_text", "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)},
+        {"type": "input_text", "text": text},
+        {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER},
+    ]
+
+
 def test_streams_from_the_responses_endpoint() -> None:
     assert OpenAITransport.stream_path == "responses"
 
@@ -39,13 +53,29 @@ def test_system_prompt_moves_to_instructions() -> None:
     payload = _transport().build_payload([Message(role="user", content=[TextBlock(text="hi")])], [], "be terse")
     assert payload["instructions"] == "be terse"
     assert payload["store"] is False
-    assert payload["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    assert payload["input"] == [{"role": "user", "content": _unattributed_input_text("hi")}]
 
 
 def test_system_messages_in_history_are_preserved() -> None:
     items = _convert_messages([Message(role="system", content=[TextBlock(text="historical policy")])])
 
     assert items == [{"role": "system", "content": [{"type": "input_text", "text": "historical policy"}]}]
+
+
+def test_provenance_precedes_responses_text_and_image_parts() -> None:
+    provenance = InputProvenance(human_authored=False, source="peer", author="agent-1")
+    message = Message(
+        role="user",
+        content=[TextBlock(text="report"), ImageBlock(media_type="image/png", data=b"image")],
+        provenance=provenance,
+    )
+
+    [item] = _convert_messages([message])
+
+    assert item["content"][0] == {"type": "input_text", "text": input_provenance_header(provenance)}
+    assert item["content"][1] == {"type": "input_text", "text": "report"}
+    assert item["content"][2]["type"] == "input_image"
+    assert item["content"][3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_tools_are_flat_not_nested() -> None:
@@ -112,10 +142,11 @@ def test_tool_result_mixed_with_text_emits_both_in_order() -> None:
     assert items[0]["type"] == "function_call"
     assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "x"}
     assert items[2]["role"] == "user"
-    assert items[2]["content"] == [{"type": "input_text", "text": "and then?"}]
+    assert items[2]["content"] == _unattributed_input_text("and then?")
 
 
 def test_tool_result_images_are_forwarded_as_user_input() -> None:
+    provenance = InputProvenance(human_authored=False, source="tool-result", author="image")
     messages = [
         Message(role="assistant", content=[ToolUseBlock(id="call-1", name="image", input={})]),
         Message(
@@ -126,6 +157,7 @@ def test_tool_result_images_are_forwarded_as_user_input() -> None:
                     content=[TextBlock(text="diagram"), ImageBlock(media_type="image/png", data=b"png")],
                 )
             ],
+            provenance=provenance,
         ),
     ]
 
@@ -133,7 +165,12 @@ def test_tool_result_images_are_forwarded_as_user_input() -> None:
 
     assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "diagram"}
     assert items[2]["role"] == "user"
-    assert items[2]["content"][1]["image_url"].startswith("data:image/png;base64,")
+    assert items[2]["content"][0] == {
+        "type": "input_text",
+        "text": input_provenance_header(provenance),
+    }
+    assert items[2]["content"][2]["image_url"].startswith("data:image/png;base64,")
+    assert items[2]["content"][3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
 
 
 def test_unsupported_media_is_rejected_explicitly() -> None:
@@ -163,7 +200,7 @@ def test_tool_result_message_then_separate_user_text_message() -> None:
     assert items[0]["type"] == "function_call"
     assert items[1] == {"type": "function_call_output", "call_id": "call-1", "output": "x"}
     assert items[2]["role"] == "user"
-    assert items[2]["content"] == [{"type": "input_text", "text": "Notification: background task finished"}]
+    assert items[2]["content"] == _unattributed_input_text("Notification: background task finished")
 
 
 def test_unanswered_call_gets_a_placeholder_output() -> None:

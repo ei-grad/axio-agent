@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
-from axio.messages import Message
+from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    UNATTRIBUTED_INPUT_PROVENANCE,
+    InputProvenance,
+    Message,
+    input_provenance_header,
+)
 from axio.models import ModelRegistry
 
 from axio_transport_anthropic import (
@@ -30,6 +36,22 @@ def test_convert_messages_basic() -> None:
     assert result[1]["role"] == "assistant"
 
 
+def test_convert_messages_frames_non_human_text_and_image() -> None:
+    provenance = InputProvenance(human_authored=False, source="background-outcome", author="child-1")
+    message = Message(
+        role="user",
+        content=[TextBlock(text="done"), ImageBlock(media_type="image/png", data=b"image")],
+        provenance=provenance,
+    )
+
+    [converted] = _convert_messages([message])
+
+    assert converted["content"][0] == {"type": "text", "text": input_provenance_header(provenance)}
+    assert converted["content"][1] == {"type": "text", "text": "done"}
+    assert converted["content"][2]["type"] == "image"
+    assert converted["content"][3] == {"type": "text", "text": INPUT_PROVENANCE_FOOTER}
+
+
 def test_convert_messages_adjacent_user_messages_stay_separate() -> None:
     """The agent loop can inject a follow-up user message (e.g. a notification) as its
     own Message right after a tool-results message. The Messages API accepts
@@ -47,7 +69,34 @@ def test_convert_messages_adjacent_user_messages_stay_separate() -> None:
     assert result[1]["content"][0]["type"] == "tool_result"
     assert result[1]["content"][0]["tool_use_id"] == "call_1"
     assert result[2]["role"] == "user"
-    assert result[2]["content"] == [{"type": "text", "text": "Notification: background task finished"}]
+    assert result[2]["content"] == [
+        {"type": "text", "text": input_provenance_header(UNATTRIBUTED_INPUT_PROVENANCE)},
+        {"type": "text", "text": "Notification: background task finished"},
+        {"type": "text", "text": INPUT_PROVENANCE_FOOTER},
+    ]
+
+
+def test_adjacent_human_and_internal_inputs_have_closed_independent_envelopes() -> None:
+    human = InputProvenance(human_authored=True, source="interactive", author="human")
+    peer = InputProvenance(human_authored=False, source="peer", author="child-1")
+
+    converted = _convert_messages(
+        [
+            Message(role="user", content=[TextBlock(text="question")], provenance=human),
+            Message(role="user", content=[TextBlock(text="report")], provenance=peer),
+        ]
+    )
+
+    assert converted[0]["content"] == [
+        {"type": "text", "text": input_provenance_header(human)},
+        {"type": "text", "text": "question"},
+        {"type": "text", "text": INPUT_PROVENANCE_FOOTER},
+    ]
+    assert converted[1]["content"] == [
+        {"type": "text", "text": input_provenance_header(peer)},
+        {"type": "text", "text": "report"},
+        {"type": "text", "text": INPUT_PROVENANCE_FOOTER},
+    ]
 
 
 # ---------------------------------------------------------------------------

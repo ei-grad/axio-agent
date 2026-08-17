@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from axio.blocks import TextBlock
 from axio.events import ReasoningDelta, TextDelta, ToolInputDelta, ToolOutputDelta, ToolUseStart
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio_tools_agents.runtime import (
     EditorSnapshot,
     InputBuffered,
@@ -70,7 +70,15 @@ async def test_recovery_restores_messages_pending_editor_and_partial_turn(tmp_pa
         {
             "hub_seq": 1,
             "run_id": "run",
-            "message": Message(role="user", content=[TextBlock(text="committed")]),
+            "message": Message(
+                role="user",
+                content=[TextBlock(text="committed")],
+                provenance=InputProvenance(
+                    human_authored=True,
+                    source="interactive",
+                    author="human",
+                ),
+            ),
         },
         agent_id="main",
         turn_id="complete-turn",
@@ -115,9 +123,19 @@ async def test_recovery_restores_messages_pending_editor_and_partial_turn(tmp_pa
     assert recovered.recovery_ids == ("source:unfinished",)
     assert [message.role for message in recovered.messages] == ["user", "assistant", "user"]
     assert recovered.messages[0].content == [TextBlock(text="committed")]
+    assert recovered.messages[0].provenance == InputProvenance(
+        human_authored=True,
+        source="interactive",
+        author="human",
+    )
     assert recovered.messages[1].content == [TextBlock(text="partial answer")]
     notice = recovered.messages[2].content[0]
     assert isinstance(notice, TextBlock)
+    assert recovered.messages[2].provenance == InputProvenance(
+        human_authored=False,
+        source="recovery",
+        author="axio-repl",
+    )
     assert "Available reasoning fragment:\nchecking" in notice.text
     assert "name=shell, call_id=call" in notice.text
     assert "still running" in notice.text

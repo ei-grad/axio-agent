@@ -26,7 +26,13 @@ from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, Tool
 from axio.effort import EFFORT_LEVELS, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
 from axio.exceptions import StreamError
-from axio.messages import Message
+from axio.messages import (
+    INPUT_PROVENANCE_FOOTER,
+    Message,
+    effective_input_provenance,
+    input_provenance_header,
+    model_visible_content,
+)
 from axio.models import Capability
 from axio.tool import Tool
 from axio.types import StopReason, Usage
@@ -95,10 +101,16 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
                                 {"type": "input_image", "image_url": f"data:{image.media_type};base64,{encoded}"}
                             )
                 if tool_image_parts:
+                    provenance = effective_input_provenance(msg)
+                    tool_image_parts.insert(
+                        0,
+                        {"type": "input_text", "text": input_provenance_header(provenance)},
+                    )
+                    tool_image_parts.append({"type": "input_text", "text": INPUT_PROVENANCE_FOOTER})
                     items.append({"role": "user", "content": tool_image_parts})
-                remaining_blocks = [b for b in msg.content if not isinstance(b, ToolResultBlock)]
+                remaining_blocks = [b for b in model_visible_content(msg) if not isinstance(b, ToolResultBlock)]
             else:
-                remaining_blocks = msg.content
+                remaining_blocks = model_visible_content(msg)
             parts: list[dict[str, Any]] = []
             for b in remaining_blocks:
                 if isinstance(b, TextBlock):

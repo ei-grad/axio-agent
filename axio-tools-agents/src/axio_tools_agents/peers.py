@@ -21,7 +21,7 @@ from axio.context import ContextStore
 from axio.events import StreamEvent
 from axio.exceptions import HandlerError
 from axio.field import StrictStr
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.tool import CURRENT_TOOL_CALL
 
 from axio_tools_agents.names import generate_name
@@ -144,6 +144,7 @@ _legacy_event_unsubscribe: Callable[[], None] | None = None
 @dataclass(slots=True)
 class _QueuedPrompt:
     prompt: str | None
+    provenance: InputProvenance | None = None
     messages: tuple[Message, ...] = ()
     source_input_ids: tuple[str | None, ...] | None = None
     done: asyncio.Future[None] | None = None
@@ -842,6 +843,7 @@ async def _run_agent_turn(
             prompt=queued.prompt,
             identity=identity,
             hub=_session_event_hub,
+            provenance=queued.provenance,
         )
 
 
@@ -955,7 +957,17 @@ async def _start_background_agent(
         async with accept_lock:
             if background.stopping:
                 raise RuntimeError("agent is no longer accepting messages")
-            _enqueue_background_input(background, _QueuedPrompt(format_message_for_dialog(message)))
+            _enqueue_background_input(
+                background,
+                _QueuedPrompt(
+                    format_message_for_dialog(message),
+                    provenance=InputProvenance(
+                        human_authored=False,
+                        source="peer",
+                        author=message.from_id,
+                    ),
+                ),
+            )
 
     async def _on_stop(_from_id: str, _reason: str) -> None:
         async with accept_lock:
@@ -991,7 +1003,20 @@ async def _start_background_agent(
     # Between turns the agent is not draining anything, so its own notifications
     # — a detached call finishing, a child of its own going idle — arrive as the
     # prompt that starts the next turn.
-    notify.add_listener(peer.id, lambda text: _enqueue_background_input(background, _QueuedPrompt(text)))
+    notify.add_listener(
+        peer.id,
+        lambda text: _enqueue_background_input(
+            background,
+            _QueuedPrompt(
+                text,
+                provenance=InputProvenance(
+                    human_authored=False,
+                    source="notification",
+                    author="axio",
+                ),
+            ),
+        ),
+    )
     # A subscriber failure or task cancellation happens after registration;
     # both must unwind every resource allocated above.
     try:
@@ -1013,7 +1038,17 @@ async def _start_background_agent(
         finally:
             await peer.close()
         raise
-    background.inbox.put_nowait(_QueuedPrompt(initial_task, parent_tool_use_id=parent_tool_use_id))
+    background.inbox.put_nowait(
+        _QueuedPrompt(
+            initial_task,
+            provenance=InputProvenance(
+                human_authored=False,
+                source="delegated-task",
+                author=parent_agent_id or "host",
+            ),
+            parent_tool_use_id=parent_tool_use_id,
+        )
+    )
     background.runner = asyncio.create_task(_run_background_agent(background))
     return background
 
@@ -1065,7 +1100,18 @@ async def enqueue_local_agent_prompt(agent_id: str, prompt: str, *, wait: bool =
     done: asyncio.Future[None] | None = None
     if wait:
         done = asyncio.get_running_loop().create_future()
-    _enqueue_background_input(background, _QueuedPrompt(prompt, done=done))
+    _enqueue_background_input(
+        background,
+        _QueuedPrompt(
+            prompt,
+            provenance=InputProvenance(
+                human_authored=False,
+                source="local-agent-prompt",
+                author="host",
+            ),
+            done=done,
+        ),
+    )
     if done is not None:
         await done
     return True
@@ -1259,6 +1305,11 @@ async def run_agent(
                 prompt=task,
                 identity=identity,
                 hub=_session_event_hub,
+                provenance=InputProvenance(
+                    human_authored=False,
+                    source="delegated-task",
+                    author=parent_agent_id or "host",
+                ),
             )
         status = outcome.status
     except asyncio.CancelledError:
