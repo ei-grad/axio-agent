@@ -234,6 +234,11 @@ axio-repl --sandbox docker \
   --sandbox-datasets /srv/axio-datasets
 ```
 
+For repeated use, put the same values in a named REPL agent bundle and run
+`axio-repl --agent <name>`. The full manifest schema, environment overrides,
+and precedence rules are in
+[Persistent configuration and agent bundles](axio-repl.md#persistent-configuration-and-agent-bundles).
+
 `axio-repl` verifies that the named Docker network has `Internal=true` before
 creating the container, then creates it against that verified network ID rather
 than looking it up again by name. Missing, malformed, replaced, and routed

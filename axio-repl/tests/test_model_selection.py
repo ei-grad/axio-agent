@@ -103,6 +103,14 @@ def test_naming_a_transport_with_its_key_is_allowed(monkeypatch: pytest.MonkeyPa
     assert cls is not None
 
 
+def test_explicit_credential_reference_satisfies_transport_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NEBIUS_API_KEY", raising=False)
+
+    cls, _ = _select_transport("nebius", credential_override=True)
+
+    assert cls is not None
+
+
 def test_zero_iterations_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
     # It reads as "no limit" and does the opposite: an agent that never calls
     # the model and then reports that it ran out of iterations.

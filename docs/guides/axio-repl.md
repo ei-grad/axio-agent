@@ -83,6 +83,172 @@ axio-repl --transport anthropic --model claude-sonnet-4-20250514
 axio-repl --transport google --model gemini-3.1-pro-preview
 ```
 
+## Persistent configuration and agent bundles
+
+The REPL reads optional global defaults from
+`${AXIO_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/axio}/config.yaml`. Named
+agents are self-contained directories below `agents/` and are selected with
+`--agent`. A minimal layout uses these three paths:
+
+```text
+~/.config/axio/config.yaml
+~/.config/axio/agents/local/agent.yaml
+~/.config/axio/agents/local/instructions.md
+```
+
+List bundles without initializing a transport or Docker:
+
+```bash
+axio-repl --list-agents
+```
+
+The global file is optional. It supplies defaults shared by every invocation:
+
+```yaml
+version: 1
+defaults:
+  runtime:
+    max_iterations: 100
+    session_log: true
+  sandbox:
+    backend: docker
+    image: axio-agent-sandbox:standard
+    memory: 4g
+    cpus: "2"
+```
+
+An agent manifest overlays those defaults. This bundle replaces the long
+llama.cpp plus devpi command with `axio-repl --agent local`:
+
+```yaml
+# ~/.config/axio/agents/local/agent.yaml
+version: 1
+description: Local llama.cpp coding agent
+instructions:
+  - instructions.md
+
+transport:
+  name: llama-cpp
+  base_url: http://127.0.0.1:18080/v1
+
+runtime:
+  temperature: 0.2
+  effort: high
+  max_tokens: 16384
+  max_iterations: 1000
+  debug: false
+  agent_actions: "off"
+  session_log: true
+
+sandbox:
+  backend: docker
+  image: axio-agent-sandbox:standard
+  network: axio-agent-egress
+  memory: 4g
+  cpus: "2"
+  no_proxy: devpi
+  registries:
+    pypi: http://devpi:3141/root/pypi/+simple/
+
+tools:
+  - read_file
+  - write_file
+  - patch_file
+  - list_files
+  - search_files
+  - shell
+  - run_agent
+  - spawn_agent
+  - interrupt_agent
+  - stop_agent
+  - list_peers
+  - send_message
+  - monitor
+```
+
+`model` is optional; omit it to retain the transport default. The same applies
+to every nested setting. `tools: [all]` enables the complete built-in set and
+`tools: [none]` disables it. A named list preserves the REPL's canonical tool
+order. Docker-only `run_python` and environment-dependent `ast_grep` can be
+named when that backend actually provides them. Unknown or unavailable names,
+duplicates, and mixing `all` or `none` with named tools are errors.
+
+For an authenticated LLM endpoint, store only the environment-variable name:
+
+```yaml
+transport:
+  name: openai
+  base_url: https://llm.internal.example/v1
+  api_key_env: AXIO_INTERNAL_LLM_TOKEN
+```
+
+Set `AXIO_INTERNAL_LLM_TOKEN` in the process environment or a service-manager
+secret store. A missing reference is a startup error. The secret is passed to
+the transport constructor; it is not retained in the resolved profile or
+emitted as a configuration event. PyPI and Cargo URLs containing credentials
+are rejected. No registry field is a secret channel; use an internal
+download-only frontend when registry authentication is required.
+
+The complete sandbox form is:
+
+```yaml
+sandbox:
+  backend: docker              # auto, docker, or none
+  image: axio-agent-sandbox:standard
+  network: axio-agent-egress   # must be a user-defined Internal=true network
+  memory: 4g
+  cpus: "2"
+  proxy: http://mitmania:3128
+  no_proxy: nexus.internal,artifactory.internal
+  registries:
+    pypi: https://nexus.internal/repository/pypi-all/simple
+    npm: https://nexus.internal/repository/npm-all/
+    cargo: sparse+https://nexus.internal/repository/cargo-all/
+    go: https://nexus.internal/repository/go-all/
+    go_sumdb: sum.golang.org https://nexus.internal/repository/go-sumdb/
+  datasets: /srv/axio-datasets
+  ca_certificate: /srv/axio-pki/egress-ca-bundle.pem
+```
+
+The network/cache architecture and concrete devpi, Nexus, and Artifactory
+recipes are documented in [Docker sandbox](docker-sandbox.md#restricted-packages-and-datasets).
+
+### Resolution and validation
+
+Configuration resolves in this order, from lowest to highest precedence:
+
+1. built-in defaults;
+2. global `config.yaml` defaults;
+3. the selected `agents/<name>/agent.yaml`;
+4. `AXIO_REPL_*` environment overrides;
+5. explicitly supplied CLI flags.
+
+Transport-native variables such as `LLAMA_CPP_BASE_URL` remain constructor
+fallbacks only when no resolved `transport.base_url` is present. Select a bundle
+with `AXIO_REPL_AGENT` instead of `--agent`, or relocate the whole configuration
+root with `AXIO_CONFIG_DIR`/`--config-dir`.
+
+The environment layer maps directly to manifest fields:
+
+| Area | Variables |
+|---|---|
+| Agent/transport | `AXIO_REPL_AGENT`, `AXIO_REPL_TRANSPORT`, `AXIO_REPL_TRANSPORT_BASE_URL`, `AXIO_REPL_TRANSPORT_API_KEY_ENV`, `AXIO_REPL_MODEL` |
+| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
+| Sandbox | `AXIO_REPL_SANDBOX`, `AXIO_REPL_SANDBOX_IMAGE`, `AXIO_REPL_SANDBOX_NETWORK`, `AXIO_REPL_SANDBOX_MEMORY`, `AXIO_REPL_SANDBOX_CPUS`, `AXIO_REPL_SANDBOX_PROXY`, `AXIO_REPL_SANDBOX_NO_PROXY`, `AXIO_REPL_SANDBOX_DATASETS`, `AXIO_REPL_SANDBOX_CA_CERT` |
+| Registries | `AXIO_REPL_SANDBOX_PYPI_INDEX`, `AXIO_REPL_SANDBOX_NPM_REGISTRY`, `AXIO_REPL_SANDBOX_CARGO_INDEX`, `AXIO_REPL_SANDBOX_GO_PROXY`, `AXIO_REPL_SANDBOX_GO_SUMDB` |
+| Tools | `AXIO_REPL_TOOLS` as a comma-separated list, `all`, or `none` |
+
+Both files require integer `version: 1`. Unknown or duplicate YAML keys are
+errors. Instruction files must be relative paths confined to their bundle and
+must exist; their combined UTF-8 content is limited to 1 MiB. Relative dataset,
+CA, and session-log paths are confined to the file that declares them; absolute
+paths are allowed. `agent.yaml` instructions are loaded before project
+`AGENTS.md` instructions, and both are included in the system prompt. Mutable
+session state and secrets are never written into an agent bundle.
+
+Long CLI options must be written in full. Abbreviations such as `--temp` are
+rejected so an abbreviated option cannot bypass CLI-over-config precedence.
+
 ## Single-prompt mode
 
 Pass a prompt as an argument for non-interactive use:
@@ -96,16 +262,23 @@ axio-repl --transport openai "write tests for src/auth.py"
 
 | Flag | Default | Description |
 |---|---|---|
+| `--agent` | `AXIO_REPL_AGENT` or none | Named bundle below `CONFIG_DIR/agents` |
+| `--config-dir` | XDG config directory | Configuration root; overrides `AXIO_CONFIG_DIR` |
+| `--list-agents` | off | List named bundles and exit without starting a transport |
 | `--transport` | auto | Transport name (see table above) |
+| `--transport-base-url` | transport default | Transport API base URL |
+| `--transport-api-key-env` | none | Environment variable containing the transport API key |
 | `--model` | transport default | Model name |
 | `--temperature` | transport default | Sampling temperature |
 | `--effort` | `default` | Effort: `none`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `--max-tokens` | transport default | Max output tokens |
 | `--max-iterations` | 1000 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
+| `--no-debug` | off | Explicitly disable debug logging after config resolution |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
+| `--session-log` | on | Explicitly enable the journal after config resolution |
 | `--resume EVENTS_JSONL` | none | Resume a stopped interactive session into a new journal |
 | `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
 | `--sandbox-image` | `axio-agent-sandbox:standard` | Locally built image for `--sandbox docker` |
@@ -121,6 +294,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--sandbox-go-sumdb` | Go default | Explicit `GOSUMDB` setting for an internal checksum database/proxy |
 | `--sandbox-datasets` | none | Host directory mounted read-only at `/datasets` |
 | `--sandbox-ca-cert` | none | Full CA bundle (system roots plus interception CA) mounted read-only for common clients |
+| `--tools` | all | `all`, `none`, or a comma-separated tool whitelist |
 
 ## Session journals
 

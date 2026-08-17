@@ -147,6 +147,39 @@ axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.json
 axio-repl --agent-actions on
 ```
 
+## Agent configuration
+
+Persistent defaults live in `~/.config/axio/config.yaml` (or
+`$XDG_CONFIG_HOME/axio/config.yaml`). Named bundles live under
+`~/.config/axio/agents/<name>/agent.yaml` and run with `--agent <name>`.
+`AXIO_CONFIG_DIR` or `--config-dir` selects another root.
+
+```yaml
+# ~/.config/axio/agents/local/agent.yaml
+version: 1
+transport:
+  name: llama-cpp
+  base_url: http://127.0.0.1:18080/v1
+sandbox:
+  backend: docker
+  network: axio-agent-egress
+  registries:
+    pypi: http://devpi:3141/root/pypi/+simple/
+```
+
+```bash
+axio-repl --list-agents
+axio-repl --agent local
+```
+
+Resolution is built-ins, global defaults, agent bundle, `AXIO_REPL_*`
+environment, then explicit CLI flags. YAML is versioned and strict: unknown or
+duplicate fields, escaping relative paths, missing instruction files, and
+missing secret references stop startup. LLM credentials use
+`transport.api_key_env`; secret values do not belong in YAML. See the
+[REPL guide](../docs/guides/axio-repl.md#persistent-configuration-and-agent-bundles)
+for the complete schema and sandbox registry mapping.
+
 ## Session journals and privacy
 
 Session journaling is enabled by default. Each invocation creates one journal at:

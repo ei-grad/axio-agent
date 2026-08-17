@@ -269,7 +269,7 @@ class TestForegroundAgentGuidance:
 class TestAgentsText:
     def test_agents_text_appended(self) -> None:
         model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
-        prompt = build_system_prompt(_ROOT, model, [], agents_text="Custom agent rules here")
+        prompt = build_system_prompt(_ROOT, model, [], agents_text="AGENTS.md instructions:\nCustom agent rules here")
         assert "Custom agent rules here" in prompt
         assert "AGENTS.md instructions:" in prompt
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import inspect
 import logging
 import os
 import shutil
@@ -124,7 +125,7 @@ from axio_tools_local.read_file import read_file
 from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
-from axio_repl import _journal, _panel, _sandbox, _search
+from axio_repl import _agent_config, _journal, _panel, _sandbox, _search
 from axio_repl._coordinator import (
     ClaimBatch,
     ContextArrival,
@@ -251,7 +252,7 @@ def _transport_has_credentials(name: str) -> bool:
     return any(os.environ.get(v, "") for v in env_vars)
 
 
-def _select_transport(name: str | None) -> tuple[Callable[..., Any], str]:
+def _select_transport(name: str | None, credential_override: bool = False) -> tuple[Callable[..., Any], str]:
     available = _discover_transports()
     if name:
         if name not in available:
@@ -264,7 +265,7 @@ def _select_transport(name: str | None) -> tuple[Callable[..., Any], str]:
         # skipped the question entirely, and an unset key surfaced as a stack
         # trace from the first API call instead of the answer "set this".
         env_vars = _TRANSPORT_ENV_VARS.get(name, [])
-        if env_vars and not _transport_has_credentials(name):
+        if env_vars and not credential_override and not _transport_has_credentials(name):
             print(f"No API key for {name}. Set {' or '.join(env_vars)}.", file=sys.stderr)
             sys.exit(1)
         return available[name], ""
@@ -279,6 +280,32 @@ def _select_transport(name: str | None) -> tuple[Callable[..., Any], str]:
         if env_vars:
             print(f"  {', '.join(env_vars)}  ({transport_name})", file=sys.stderr)
     sys.exit(1)
+
+
+def _select_configured_tools(
+    selection: str | tuple[str, ...] | None,
+    available_tools: list[Tool[Any]] | None = None,
+) -> list[Tool[Any]]:
+    tools = TOOLS if available_tools is None else available_tools
+    if selection is None:
+        return list(tools)
+    names = tuple(part.strip() for part in selection.split(",")) if isinstance(selection, str) else selection
+    if any(not name for name in names):
+        raise ValueError("--tools must be 'all', 'none', or a comma-separated list of tool names")
+    if names == ("all",):
+        return list(tools)
+    if names == ("none",) or not names:
+        return []
+    if "all" in names or "none" in names:
+        raise ValueError("'all' and 'none' cannot be combined with named tools")
+    if len(set(names)) != len(names):
+        raise ValueError("tool selection must not contain duplicate names")
+    available = {tool.name: tool for tool in tools}
+    unknown = sorted(set(names) - set(available))
+    if unknown:
+        raise ValueError(f"unknown tool(s): {', '.join(unknown)}")
+    requested = set(names)
+    return [tool for tool in tools if tool.name in requested]
 
 
 # ── AGENTS.md & system prompt ────────────────────────────────────────
@@ -443,7 +470,7 @@ def build_system_prompt(
     lines.append("")
 
     if agents_text:
-        lines += ["AGENTS.md instructions:", agents_text, ""]
+        lines += [agents_text, ""]
 
     return "\n".join(lines)
 
@@ -2402,22 +2429,42 @@ async def _session_journal(
 def _build_argument_parser() -> Any:
     import argparse
 
-    parser = argparse.ArgumentParser(description="REPL coding assistant (axio)")
+    parser = argparse.ArgumentParser(description="REPL coding assistant (axio)", allow_abbrev=False)
     parser.add_argument("prompt", nargs="?", default=None, help="Single prompt (non-interactive)")
+    parser.add_argument("--agent", default=None, help="Named agent bundle from CONFIG_DIR/agents/NAME")
+    parser.add_argument("--config-dir", type=Path, default=None, help="Configuration root (default: XDG config/axio)")
+    parser.add_argument("--list-agents", action="store_true", help="List available named agent bundles and exit")
     parser.add_argument("--transport", default=None, help="Transport name (auto-detected if omitted)")
+    parser.add_argument("--transport-base-url", default=None, help="Override the transport API base URL")
+    parser.add_argument(
+        "--transport-api-key-env",
+        default=None,
+        metavar="ENV_VAR",
+        help="Read the transport API key from this environment variable",
+    )
     parser.add_argument("--model", default=None, help="Model name")
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--effort", default=None, help=f"Effort level: default, {', '.join(EFFORT_LEVELS)}")
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
-    parser.add_argument("--debug", action="store_true", help="Log request/response bodies to stderr")
+    debug_group = parser.add_mutually_exclusive_group()
+    debug_group.add_argument("--debug", dest="debug", action="store_true", help="Log request/response bodies")
+    debug_group.add_argument("--no-debug", dest="debug", action="store_false", help="Disable request/response logging")
+    parser.set_defaults(debug=False)
     parser.add_argument(
         "--agent-actions",
         choices=(DisplayMode.ACTIVE_ONLY.value, DisplayMode.ALL_ACTIONS.value),
         default=DisplayMode.ACTIVE_ONLY.value,
         help="Show framed actions from non-active agents (default: off)",
     )
-    parser.add_argument("--no-session-log", action="store_true", help="Do not write the session JSONL journal")
+    session_log_group = parser.add_mutually_exclusive_group()
+    session_log_group.add_argument(
+        "--session-log", dest="no_session_log", action="store_false", help="Write the session JSONL journal"
+    )
+    session_log_group.add_argument(
+        "--no-session-log", dest="no_session_log", action="store_true", help="Do not write the session JSONL journal"
+    )
+    parser.set_defaults(no_session_log=False)
     parser.add_argument(
         "--resume",
         type=Path,
@@ -2480,18 +2527,45 @@ def _build_argument_parser() -> Any:
         default=None,
         help="Full CA bundle (system roots plus interception CA) mounted read-only for common clients",
     )
+    parser.add_argument(
+        "--tools",
+        default=None,
+        help="Enabled tools: 'all', 'none', or a comma-separated list (default: all)",
+    )
     return parser
 
 
 async def main() -> None:
     parser = _build_argument_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    args = parser.parse_args(argv)
+    root = Path.cwd().resolve()
+    config_dir = (
+        args.config_dir.expanduser().resolve() if args.config_dir is not None else _agent_config.default_config_dir()
+    )
+    if args.list_agents:
+        try:
+            agent_names = _agent_config.list_agent_names(config_dir)
+        except _agent_config.AgentConfigError as error:
+            parser.error(str(error))
+        print("\n".join(agent_names))
+        return
+    try:
+        agent_name = _agent_config.resolve_agent_name(args.agent)
+        profile = _agent_config.load_agent_profile(config_dir, agent_name, cwd=root)
+        _agent_config.apply_profile_to_args(args, profile, _agent_config.explicit_cli_destinations(argv))
+        profile_instructions = profile.instructions_text()
+        api_key = _agent_config.resolve_api_key(args.transport_api_key_env)
+    except _agent_config.AgentConfigError as error:
+        parser.error(str(error))
+    if (args.transport_base_url is not None or args.transport_api_key_env is not None) and args.transport is None:
+        parser.error("transport connection settings require an explicit transport name")
     recovery: RecoveryMaterialization | None = None
     if args.resume is not None:
         if args.prompt is not None:
             parser.error("--resume is interactive-only and cannot be combined with a one-shot prompt")
         if args.no_session_log:
-            parser.error("--resume requires a new session journal; remove --no-session-log")
+            parser.error("--resume requires session journaling; enable runtime.session_log or pass --session-log")
         try:
             recovery = materialize_recovery(args.resume.expanduser().resolve())
         except (OSError, RecoveryError) as error:
@@ -2520,7 +2594,6 @@ async def main() -> None:
         parser.error("restricted sandbox settings require Docker, but sandbox execution is unavailable")
 
     setup_logging(args.debug)
-    root = Path.cwd().resolve()
     event_hub = SessionEventHub()
     main_run_id = uuid4().hex
     journal_root = args.session_log_dir.expanduser().resolve() if args.session_log_dir is not None else None
@@ -2538,9 +2611,35 @@ async def main() -> None:
     ):
         if recovery is not None and session_journal is None:
             parser.error("recovery stopped because the new session journal could not be opened")
-        transport_cls, _ = _select_transport(args.transport)
-        agents_text = load_agents_instructions(root)
-        transport = transport_cls(session=session)
+        transport_cls, _ = (
+            _select_transport(args.transport, credential_override=True)
+            if api_key is not None
+            else _select_transport(args.transport)
+        )
+        project_instructions = load_agents_instructions(root)
+        agents_text = "\n\n".join(
+            part
+            for part in (
+                f"Agent profile instructions:\n{profile_instructions}" if profile_instructions else "",
+                f"AGENTS.md instructions:\n{project_instructions}" if project_instructions else "",
+            )
+            if part
+        )
+        transport_kwargs: dict[str, object] = {"session": session}
+        if args.transport_base_url is not None:
+            transport_kwargs["base_url"] = args.transport_base_url
+        if api_key is not None:
+            transport_kwargs["api_key"] = api_key
+        try:
+            transport_signature = inspect.signature(transport_cls)
+        except (TypeError, ValueError):
+            transport_signature = None
+        if transport_signature is not None:
+            try:
+                transport_signature.bind(**transport_kwargs)
+            except TypeError:
+                parser.error(f"transport {args.transport!r} does not accept the configured connection settings")
+        transport = transport_cls(**transport_kwargs)
         try:
             await transport.fetch_models()
         except StreamError as exc:
@@ -2574,6 +2673,10 @@ async def main() -> None:
             )
         except RuntimeError as exc:
             parser.error(str(exc))
+        try:
+            tools = _select_configured_tools(args.tools, tools)
+        except ValueError as error:
+            parser.error(str(error))
         if args.prompt is not None:
             print(f"Tools: {sandbox_desc}", file=sys.stderr)
         system = effort.system_prompt(
@@ -2608,6 +2711,7 @@ async def main() -> None:
 
         await _publish_main_event(AgentStarted(name=AGENT_NAME, kind="repl-agent"))
         for config_name, config_value in (
+            ("agent", profile.name),
             ("transport", getattr(transport, "name", type(transport).__name__)),
             ("model", transport.model.id),
             ("sandbox", sandbox_desc),

@@ -17,12 +17,14 @@ from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import ConfigurationChanged, EditorSnapshot, RuntimeEvent
 
 from axio_repl import (
+    TOOLS,
     ReplRenderer,
     _build_argument_parser,
     _cancel_and_settle_tasks,
     _handle_agent_actions,
     _IncomingPrompt,
     _pending_prompt_count,
+    _select_configured_tools,
     main,
 )
 from axio_repl._journal import SessionJournal, read_journal
@@ -76,6 +78,47 @@ def test_sandbox_restricted_network_flags_are_parsed() -> None:
     assert args.sandbox_proxy == "http://mitmania:8080"
     assert args.sandbox_pypi_index.endswith("/simple")
     assert args.sandbox_datasets.as_posix() == "/srv/datasets"
+
+
+def test_agent_configuration_flags_are_parsed_without_abbreviations(tmp_path: Path) -> None:
+    args = _build_argument_parser().parse_args(
+        [
+            "--agent",
+            "local",
+            "--config-dir",
+            str(tmp_path),
+            "--transport-base-url",
+            "http://127.0.0.1:18080/v1",
+            "--transport-api-key-env",
+            "LOCAL_TOKEN",
+            "--tools",
+            "read_file,shell",
+            "--no-debug",
+            "--session-log",
+        ]
+    )
+
+    assert args.agent == "local"
+    assert args.config_dir == tmp_path
+    assert args.transport_base_url == "http://127.0.0.1:18080/v1"
+    assert args.transport_api_key_env == "LOCAL_TOKEN"
+    assert args.tools == "read_file,shell"
+    assert args.debug is False
+    assert args.no_session_log is False
+    with pytest.raises(SystemExit):
+        _build_argument_parser().parse_args(["--transp", "llama-cpp"])
+
+
+def test_configured_tools_support_all_none_and_named_subsets() -> None:
+    assert _select_configured_tools(None) == TOOLS
+    assert _select_configured_tools("all") == TOOLS
+    assert _select_configured_tools("none") == []
+    assert [tool.name for tool in _select_configured_tools(("shell", "read_file"))] == ["read_file", "shell"]
+
+    with pytest.raises(ValueError, match="unknown tool"):
+        _select_configured_tools("missing")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _select_configured_tools("all,shell")
 
 
 async def test_sandbox_none_reports_restricted_options_as_cli_error(
