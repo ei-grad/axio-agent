@@ -224,12 +224,12 @@ axio-repl --sandbox docker \
   --sandbox-cpus 2 \
   --sandbox-network axio-agent-egress \
   --sandbox-proxy http://mitmania:3128 \
-  --sandbox-no-proxy nexus \
-  --sandbox-pypi-index https://nexus:8081/repository/pypi/simple \
-  --sandbox-npm-registry https://nexus:8081/repository/npm/ \
-  --sandbox-cargo-index sparse+https://nexus:8081/repository/cargo/ \
-  --sandbox-go-proxy https://nexus:8081/repository/go/ \
-  --sandbox-go-sumdb 'sum.golang.org https://nexus:8081/repository/sumdb/sum.golang.org' \
+  --sandbox-no-proxy nexus.internal \
+  --sandbox-pypi-index https://nexus.internal/repository/pypi-all/simple \
+  --sandbox-npm-registry https://nexus.internal/repository/npm-all/ \
+  --sandbox-cargo-index sparse+https://nexus.internal/repository/cargo-all/ \
+  --sandbox-go-proxy https://nexus.internal/repository/go-all/ \
+  --sandbox-go-sumdb 'sum.golang.org https://nexus.internal/repository/go-sumdb/' \
   --sandbox-ca-cert /srv/axio-pki/egress-ca-bundle.pem \
   --sandbox-datasets /srv/axio-datasets
 ```
@@ -241,6 +241,235 @@ networks fail closed. Proxy and registry flags, read-only data mounts, CA
 configuration, and non-default resource limits are rejected instead of silently
 falling back to the host when `--sandbox none` is selected or `--sandbox auto`
 cannot use Docker.
+
+#### Cache service recipes
+
+The examples below assume two Docker networks:
+
+```bash
+docker network create --internal axio-agent-egress
+docker network create axio-registry-upstream
+```
+
+The sandbox joins only `axio-agent-egress`. A cache service needs a controlled
+route to its public upstream, either by joining `axio-registry-upstream` or by
+using an organization egress proxy. For a local evaluation, the cache container
+can also join `axio-agent-egress` directly. In production, expose a separate
+download-only TLS frontend to the sandbox network and keep the cache's
+administration UI and API on a management network.
+
+The examples use `VERSION` as an image-tag placeholder. Replace it with a
+reviewed, pinned release; do not use a floating `latest` tag. Give the sandbox
+anonymous read access only to the dedicated proxy or group endpoints. If
+authentication is mandatory, let the download-only frontend inject a narrowly
+scoped token. Axio rejects credentials in the PyPI URL and does not provide a
+dedicated secret channel for package-manager credentials.
+
+##### devpi
+
+[devpi](https://devpi.net/docs/devpi/devpi/stable/+doc/index.html) is the
+smallest option when only Python packages need caching. Its default `root/pypi`
+index is an on-demand PyPI mirror; devpi does not proxy npm, Cargo, or Go.
+
+Install a pinned release on a dedicated service host, initialize persistent
+storage once, and then run the server under the same unprivileged service
+account:
+
+```bash
+DEVPI_VERSION=6.20.3
+uv tool install "devpi-server==$DEVPI_VERSION"
+: "${DEVPI_ROOT_PASSWORD:?set from a secret manager before initialization}"
+devpi-init --serverdir /srv/devpi --root-passwd "$DEVPI_ROOT_PASSWORD"
+unset DEVPI_ROOT_PASSWORD
+devpi-server --serverdir /srv/devpi --host 0.0.0.0 --port 3141 \
+  --restrict-modify root
+```
+
+Supply `DEVPI_ROOT_PASSWORD` from a secret manager before initialization; do
+not store it in this file or shell history. Initialize before exposing the
+service. `--restrict-modify root` prevents anonymous clients from creating
+users and indexes, while the `root/pypi` mirror remains readable.
+
+For a permanent deployment, use a devpi YAML configuration and a service
+manager instead of leaving the foreground process in a shell. Put the HTTP
+service behind an internal TLS reverse proxy if traffic can leave a single
+trusted host or Docker network. The
+[mirror quickstart](https://devpi.net/docs/devpi/devpi/stable/+doc/quickstart-pypimirror.html)
+and
+[permanent-install guide](https://devpi.net/docs/devpi/devpi/stable/+doc/quickstart-server.html)
+describe initialization, generated service configurations, and reverse-proxy
+settings.
+
+The following command assumes that the service is reachable from
+`axio-agent-egress` as `devpi`. That can be a container joined to the network,
+or an internal DNS name on a frontend that routes to the dedicated service
+host. Point Axio at the Simple API endpoint:
+
+```bash
+axio-repl --sandbox docker \
+  --sandbox-network axio-agent-egress \
+  --sandbox-pypi-index http://devpi:3141/root/pypi/+simple/
+```
+
+An HTTP endpoint is acceptable only on the isolated internal network. Axio
+derives `PIP_TRUSTED_HOST` and `UV_INSECURE_HOST` for this case. Prefer HTTPS
+and `--sandbox-ca-cert` when a TLS frontend is available.
+
+devpi caches packages on demand. A network outage does not make uncached
+packages available, so prefetch every locked artifact required for an offline
+run. If private packages are needed, create a stage index based on `root/pypi`
+and expose only that index; devpi index inheritance prevents public packages
+from silently replacing a private package of the same name by default.
+
+##### Nexus Repository
+
+For a local single-node evaluation, start the official image with persistent
+storage and a pinned `VERSION`:
+
+```bash
+docker volume create nexus-data
+docker run -d --name nexus \
+  --network axio-registry-upstream \
+  -p 127.0.0.1:8081:8081 \
+  -v nexus-data:/nexus-data \
+  sonatype/nexus3:VERSION
+docker network connect axio-agent-egress nexus
+```
+
+The direct connection in this example exposes the Nexus application port to
+the sandbox network and is therefore for evaluation only. For production, put
+a path- and method-restricted TLS frontend on `axio-agent-egress` and keep
+`/service/rest/`, the UI, and administrative endpoints inaccessible from the
+sandbox.
+
+After completing the initial administrator setup, open
+`Settings → Repository → Repositories → Create repository` and create these
+proxy repositories:
+
+| Recipe | Name | Remote storage |
+|---|---|---|
+| `pypi (proxy)` | `pypi-proxy` | `https://pypi.org/` |
+| `npm (proxy)` | `npm-proxy` | `https://registry.npmjs.org/` |
+| `cargo (proxy)` | `cargo-proxy` | `https://index.crates.io/` |
+| `go (proxy)` | `go-proxy` | `https://proxy.golang.org` |
+| `raw (proxy)` | `go-sumdb` | `https://sum.golang.org` |
+
+The Cargo remote URL must end in `/`. For `go-sumdb`, disable Strict Content
+Type Validation as required by the Nexus Go setup. The Go proxy stores module
+content but not checksum-database responses; the raw proxy supplies the
+separate checksum endpoint.
+
+If internal packages are also served, create corresponding hosted repositories
+and group repositories named `pypi-all`, `npm-all`, `cargo-all`, and `go-all`.
+Put the hosted repository before the public proxy in each group and grant the
+sandbox principal read access only to the group. Otherwise use the proxy
+repository names directly in the URLs below.
+
+The command below assumes the production TLS frontend is reachable as
+`nexus.internal` and presents a certificate signed by the supplied CA bundle:
+
+```bash
+axio-repl --sandbox docker \
+  --sandbox-network axio-agent-egress \
+  --sandbox-proxy http://mitmania:3128 \
+  --sandbox-no-proxy nexus.internal \
+  --sandbox-pypi-index https://nexus.internal/repository/pypi-all/simple \
+  --sandbox-npm-registry https://nexus.internal/repository/npm-all/ \
+  --sandbox-cargo-index sparse+https://nexus.internal/repository/cargo-all/ \
+  --sandbox-go-proxy https://nexus.internal/repository/go-all/ \
+  --sandbox-go-sumdb 'sum.golang.org https://nexus.internal/repository/go-sumdb/' \
+  --sandbox-ca-cert /srv/axio-pki/egress-ca-bundle.pem
+```
+
+Use a current maintained Nexus release. Cargo repositories require Nexus
+3.73 or newer. Self-hosted PEP 658/691 metadata support and the hosted Go
+repository recipe require 3.93 or newer. Apply routing rules, blob-store
+quotas, cleanup policies, and cache-age policy before production use. If Nexus
+itself must use an outbound HTTP proxy, configure it under
+`Settings → System → HTTP`; the sandbox proxy variables do not configure
+Nexus's own upstream connection.
+
+See the official
+[container deployment](https://help.sonatype.com/en/cloud-deployments.html),
+[PyPI](https://help.sonatype.com/en/create-a-pypi-repository.html),
+[npm](https://help.sonatype.com/en/npm-registry.html),
+[Cargo](https://help.sonatype.com/en/rust-cargo.html), and
+[Go](https://help.sonatype.com/en/create-a-go-repository.html) documentation
+for release-specific fields.
+
+##### JFrog Artifactory
+
+Confirm first that the selected Artifactory edition and subscription support
+PyPI, npm, Cargo, and Go remote repositories. The multi-format setup below
+targets a Pro-capable deployment; the `artifactory-oss` image is not a drop-in
+replacement for every repository type.
+
+For a local single-node evaluation, start a pinned official Pro image:
+
+```bash
+docker volume create artifactory-data
+docker run -d --name artifactory \
+  --network axio-registry-upstream \
+  -p 127.0.0.1:8081:8081 \
+  -p 127.0.0.1:8082:8082 \
+  -v artifactory-data:/var/opt/jfrog/artifactory \
+  releases-docker.jfrog.io/jfrog/artifactory-pro:VERSION
+docker network connect axio-agent-egress artifactory
+```
+
+This is a local bootstrap, not a production topology. Follow JFrog's
+[Docker installation guide](https://docs.jfrog.com/installation/docs/docker)
+for database, sizing, backup, upgrade, and high-availability requirements.
+Expose only a download frontend such as `https://artifactory.internal` to the
+sandbox network.
+
+In `Administration → Repositories → Create a Repository`, configure:
+
+| Package type | Remote repository | Required upstream settings | Client repository |
+|---|---|---|---|
+| PyPI | `pypi-remote` | URL `https://files.pythonhosted.org`; registry URL `https://pypi.org` | virtual `pypi-virtual` |
+| npm | `npm-remote` | URL `https://registry.npmjs.org` | virtual `npm-virtual` |
+| Cargo | `cargo-remote` | URL and registry URL `https://index.crates.io`; enable sparse index | use `cargo-remote` directly |
+| Go | `go-remote` | URL `https://proxy.golang.org/`; Git provider `Artifactory` | virtual `go-virtual` |
+
+Add local repositories to the PyPI, npm, and Go virtual repositories only when
+internal packages are required. Artifactory resolves Go modules only through a
+local or virtual repository, so `go-remote` must be a member of
+`go-virtual`. Artifactory does not support Cargo virtual repositories; point
+Axio at the remote repository's sparse index. Cargo also requires Artifactory's
+custom base URL to be configured.
+
+The command below assumes that frontend presents a certificate signed by the
+supplied CA bundle:
+
+```bash
+axio-repl --sandbox docker \
+  --sandbox-network axio-agent-egress \
+  --sandbox-proxy http://mitmania:3128 \
+  --sandbox-no-proxy artifactory.internal \
+  --sandbox-pypi-index https://artifactory.internal/artifactory/api/pypi/pypi-virtual/simple \
+  --sandbox-npm-registry https://artifactory.internal/artifactory/api/npm/npm-virtual/ \
+  --sandbox-cargo-index sparse+https://artifactory.internal/artifactory/api/cargo/cargo-remote/index/ \
+  --sandbox-go-proxy https://artifactory.internal/artifactory/api/go/go-virtual \
+  --sandbox-ca-cert /srv/axio-pki/egress-ca-bundle.pem
+```
+
+Leave `GOSUMDB` at its default for this configuration. Artifactory proxies and
+caches `sum.golang.org` requests for clients using it as their Go proxy. If the
+feature is disabled or its upstream is overridden through Artifactory system
+properties, document that decision and test checksum resolution before
+restricting direct egress.
+
+Sparse Cargo indexes require Artifactory 7.46.3 or newer and a stable sparse
+client such as Cargo 1.68 or newer.
+
+The exact URL prefixes are part of Artifactory's package protocols:
+`api/pypi/<repo>/simple`, `api/npm/<repo>/`,
+`api/cargo/<repo>/index/`, and `api/go/<repo>`. See the official
+[PyPI](https://docs.jfrog.com/artifactory/docs/pypi-repositories),
+[npm](https://docs.jfrog.com/artifactory/docs/npm-repositories),
+[Cargo](https://docs.jfrog.com/artifactory/docs/cargo-repositories), and
+[Go](https://docs.jfrog.com/artifactory/docs/go-modules) guides.
 
 #### Configuration mapping
 
@@ -305,7 +534,7 @@ configuration is equivalent to:
 replace-with = "axio-mirror"
 
 [source.axio-mirror]
-registry = "sparse+https://nexus:8081/repository/cargo/"
+registry = "sparse+https://nexus.internal/repository/cargo-all/"
 ```
 
 Axio mounts the file read-only at
