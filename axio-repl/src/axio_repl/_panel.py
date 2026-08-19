@@ -23,6 +23,7 @@ from axio import background
 from axio.models import ModelSpec
 from axio.types import Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
+from prompt_toolkit.formatted_text import FormattedText
 
 HISTORY_PATH = Path.home() / ".axio_repl_history"
 
@@ -31,6 +32,7 @@ MAX_PANEL_MESSAGE_LINES = 8
 MAX_PANEL_MESSAGE_CHARS = 4096
 
 MAIN_AGENT = "main"
+PROMPT_MESSAGE = FormattedText([("class:repl-prompt", "axio-repl> ")])
 
 
 @dataclass
@@ -310,7 +312,12 @@ def make_session(
     session: Any = PromptSession(
         history=history,
         bottom_toolbar=status or (lambda: agent_summary() or None),
-        style=Style.from_dict({"bottom-toolbar": "noreverse bg:default fg:#808080"}),
+        style=Style.from_dict(
+            {
+                "bottom-toolbar": "noreverse bg:default fg:#808080",
+                "repl-prompt": "bold ansicyan",
+            }
+        ),
         key_bindings=input_bindings(
             on_interrupt or (lambda: None),
             on_shutdown or (lambda: None),

@@ -291,8 +291,8 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
             self._capture_target = capture_target
             self._reserve_sequence = reserve_sequence
 
-        async def prompt_async(self, prompt: str) -> str:
-            assert prompt == "repl> "
+        async def prompt_async(self, prompt: object) -> str:
+            assert prompt == axio_repl._panel.PROMPT_MESSAGE
             if self.previous == "queued request 2":
                 waiting_after_queued.set()
             result = await inputs.get()
@@ -480,8 +480,8 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
             )
 
     class PromptSession:
-        async def prompt_async(self, prompt: str) -> str:
-            assert prompt == "repl> "
+        async def prompt_async(self, prompt: object) -> str:
+            assert prompt == axio_repl._panel.PROMPT_MESSAGE
             return await inputs.get()
 
     class InertTerminal:
@@ -638,9 +638,9 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
     class PromptSession:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: str, **kwargs: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
             nonlocal prompt_calls
-            assert prompt == "repl> "
+            assert prompt == axio_repl._panel.PROMPT_MESSAGE
             prompt_calls += 1
             if default := kwargs.get("default"):
                 self.default_buffer.text = str(default)
@@ -769,8 +769,8 @@ async def test_resume_copies_context_and_restores_editor_before_input(
     class PromptSession:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: str, **kwargs: object) -> str:
-            assert prompt == "repl> "
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert prompt == axio_repl._panel.PROMPT_MESSAGE
             assert kwargs == {"default": "restored editor"}
             self.default_buffer.text = "restored editor"
             raise EOFError

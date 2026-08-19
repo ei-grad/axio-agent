@@ -180,6 +180,7 @@ CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+MUTED_AMBER = "\033[2;33m"
 RESET = "\033[0m"
 
 
@@ -1342,7 +1343,7 @@ class ReplRenderer:
                 if tid not in state.streamed_tool_ids:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
-                color = RED if key == "stderr" else DIM
+                color = MUTED_AMBER if key == "stderr" else DIM
                 sys.stdout.write(_styled(color, delta))
                 self._flush()
 
@@ -1840,10 +1841,10 @@ async def _read_input_async(
         while True:
             try:
                 if initial_text:
-                    value = await session.prompt_async("repl> ", default=initial_text)
+                    value = await session.prompt_async(_panel.PROMPT_MESSAGE, default=initial_text)
                     initial_text = ""
                 else:
-                    value = await session.prompt_async("repl> ")
+                    value = await session.prompt_async(_panel.PROMPT_MESSAGE)
                 editor_value = str(value)
                 text = editor_value.strip()
                 if text:

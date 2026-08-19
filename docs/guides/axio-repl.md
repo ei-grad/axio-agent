@@ -519,12 +519,14 @@ with `/model` recalculates capabilities and rewrites the prompt automatically:
 Bracketed multi-line paste is preserved in one `prompt_toolkit` editor value.
 Pressing Enter submits the complete value as one user message; the REPL does not
 split or rejoin it through a separate continuation-line protocol. Displayed
-continuation and wrapping are controlled by the terminal and `prompt_toolkit`:
+continuation and wrapping are controlled by the terminal and `prompt_toolkit`.
+There is no continuation prefix, so each explicit continuation starts at column
+zero; any indentation shown is part of the editor content:
 
 ```
-repl> Refactor this function:
-      def old(x):
-          return x + 1
+axio-repl> Refactor this function:
+def old(x):
+    return x + 1
 ```
 
 ## Interactive input and interruption

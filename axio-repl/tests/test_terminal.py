@@ -425,7 +425,7 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
             session: Any = _panel.make_session(lambda: "temporary status")
             terminal = TerminalUI(session)
             await terminal.start()
-            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
             try:
                 await asyncio.sleep(0.05)
                 assert session.app.is_running
@@ -455,6 +455,7 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
         rendered = b"".join(chunks).decode("utf-8", errors="replace")
 
         assert "asynchronous output" in rendered
+        assert "axio-repl> " in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
         assert after[1] == before[1]
@@ -513,7 +514,7 @@ async def test_escape_during_redraw_stays_raw_without_submitting_editor(
             session: Any = _panel.make_session(lambda: "temporary status", on_interrupt=lambda: interrupts.append(1))
             terminal = TerminalUI(session)
             await terminal.start()
-            prompt = asyncio.create_task(session.prompt_async("repl> "))
+            prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
             sender = threading.Thread(target=send_escape_during_write)
             sender.start()
             turn: asyncio.Task[None] | None = None

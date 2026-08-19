@@ -41,7 +41,7 @@ from axio_tools_agents.runtime import (
     TurnStatus,
 )
 
-from axio_repl import DIM, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
+from axio_repl import DIM, RED, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
@@ -342,6 +342,29 @@ async def test_multiline_tool_output_reapplies_its_style_after_newlines(
 
     output = capsys.readouterr().out
     assert f"{DIM}one{RESET}\n{DIM}two{RESET}\n{DIM}three{RESET}" in output
+
+
+async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(show_main_turn_headers=False)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="warning one\nwarning two"),
+    )
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="call", name="shell", is_error=True, content="command failed"),
+    )
+
+    output = capsys.readouterr().out
+    muted_amber = "\033[2;33m"
+    red = "\033[31m"
+    assert f"{muted_amber}warning one{RESET}\n{muted_amber}warning two{RESET}" in output
+    assert f"{red}command failed{RESET}" in output
+    assert f"{red}warning one" not in output
 
 
 async def test_agent_switch_closes_reasoning_style_before_other_agent_output(
@@ -1139,7 +1162,7 @@ async def test_error_only_turn_is_self_labelled_on_stderr_without_a_stdout_heade
         )
 
     assert stdout.getvalue() == ""
-    assert "Error from agent axio-repl (main): boom" in stderr.getvalue()
+    assert f"{RED}Error from agent axio-repl (main): boom{RESET}" in stderr.getvalue()
 
 
 async def test_error_after_stdout_keeps_both_source_attributions() -> None:
