@@ -41,6 +41,20 @@ class TestWriteFileBasic:
         await write("f.txt", "new content")
         assert (tmp_cwd / "f.txt").read_text() == "new content"
 
+    async def test_overwrite_reports_diff(self, tmp_cwd: Path) -> None:
+        """Overwriting must show what changed - the model needs it to stay oriented."""
+        (tmp_cwd / "f.txt").write_text("old content\n")
+        result = await write("f.txt", "new content\n")
+        assert "-old content" in result
+        assert "+new content" in result
+        assert "a/f.txt" in result
+
+    async def test_new_file_no_diff(self, tmp_cwd: Path) -> None:
+        """Creating a fresh file has nothing to diff against."""
+        result = await write("fresh.txt", "hello")
+        assert "Wrote 5 bytes" in result
+        assert "diff" not in result
+
     async def test_overwrite_shorter_content(self, tmp_cwd: Path) -> None:
         """Overwriting with shorter content must not leave old tail."""
         (tmp_cwd / "f.txt").write_text("long content here")

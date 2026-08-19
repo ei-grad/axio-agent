@@ -4,6 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 
+from axio.diff import render_diff
 from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
@@ -31,21 +32,23 @@ async def patch_file(
 
         try:
             with resolved.open("r") as f:
-                lines = f.readlines()
+                before = f.read()
 
             content_lines = content.splitlines(keepends=True)
             if content_lines and not content_lines[-1].endswith("\n"):
                 content_lines[-1] += "\n"
 
+            lines = before.splitlines(keepends=True)
             new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
+            after = "".join(new_lines)
             with resolved.open("w") as f:
-                f.writelines(new_lines)
-                result = f"{f.tell()} bytes written to {path}"
+                f.write(after)
+                result = f"{f.tell()} bytes"
             os.chmod(resolved, mode)
         except UnicodeDecodeError as exc:
             raise HandlerError(f"File is not valid UTF-8: {path}") from exc
         except OSError as exc:
             raise HandlerError(f"{exc.strerror or exc}: {path}") from exc
-        return result
+        return f"{result} written to {path}\n{render_diff(path, before, after)}"
 
     return await asyncio.to_thread(_blocking)

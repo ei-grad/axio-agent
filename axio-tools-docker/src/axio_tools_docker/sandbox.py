@@ -18,6 +18,7 @@ from typing import Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
+from axio.diff import render_diff
 from axio.exceptions import HandlerError
 from axio.tool import CONTEXT, Tool
 
@@ -123,7 +124,18 @@ async def write_file(path: str, content: str, mode: int = 0o644) -> str:
     For partial edits prefer patch_file instead."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    return await sandbox.write_file(resolved, content, mode=mode)
+    before = ""
+    existed = False
+    if await sandbox.path_exists(resolved):
+        existed = True
+        try:
+            before = (await sandbox.read_file_bytes(resolved)).decode()
+        except UnicodeDecodeError as exc:
+            raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
+    written = await sandbox.write_file(resolved, content, mode=mode)
+    if existed:
+        return f"{written} {render_diff(path, before, content)}"
+    return written
 
 
 async def read_file(
@@ -295,15 +307,17 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     except FileNotFoundError as exc:
         raise HandlerError(str(exc)) from exc
     try:
-        lines = raw.decode().splitlines(keepends=True)
+        before = raw.decode()
+        lines = before.splitlines(keepends=True)
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n"):
         content_lines[-1] += "\n"
     new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
-    await sandbox.write_file(resolved, "".join(new_lines), mode=mode)
-    return f"{len(new_lines)} lines written to {path}"
+    after = "".join(new_lines)
+    written = await sandbox.write_file(resolved, after, mode=mode)
+    return f"{written}\n{render_diff(path, before, after)}"
 
 
 # ---------------------------------------------------------------------------
@@ -747,3 +761,11 @@ class DockerSandbox:
             return b""
         f = tar.extractfile(member)
         return f.read() if f else b""
+
+    async def path_exists(self, path: str) -> bool:
+        """Return True when the container path exists (file or directory)."""
+        try:
+            await self.get_archive(path)
+        except FileNotFoundError:
+            return False
+        return True

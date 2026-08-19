@@ -189,6 +189,17 @@ class TestEdgeCases:
         assert "bytes written" in result
         assert "f.txt" in result
 
+    async def test_reports_diff_of_edit(self, tmp_cwd: Path) -> None:
+        """patch_file must render what changed, not just a byte count."""
+        f = tmp_cwd / "f.txt"
+        f.write_text("line1\nline2\nline3\n")
+        result = await patch(f, 2, 2, "CHANGED")
+        assert "line2" in result
+        assert "+CHANGED" in result
+        assert "-line2" in result
+        assert "a/f.txt" in result
+        assert "b/f.txt" in result
+
     async def test_empty_file_append(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("")
