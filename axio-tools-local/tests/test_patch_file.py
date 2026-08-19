@@ -182,23 +182,17 @@ class TestEdgeCases:
         finally:
             f.chmod(0o644)
 
-    async def test_returns_bytes_written_message(self, tmp_cwd: Path) -> None:
-        f = tmp_cwd / "f.txt"
-        f.write_text("a\nb\n")
-        result = await patch(f, 1, 1, "x\n")
-        assert "bytes written" in result
-        assert "f.txt" in result
-
-    async def test_reports_diff_of_edit(self, tmp_cwd: Path) -> None:
-        """patch_file must render what changed, not just a byte count."""
+    async def test_reports_bytes_and_diff_of_edit(self, tmp_cwd: Path) -> None:
+        """The result must say how much was written and show what changed."""
         f = tmp_cwd / "f.txt"
         f.write_text("line1\nline2\nline3\n")
         result = await patch(f, 2, 2, "CHANGED")
-        assert "line2" in result
-        assert "+CHANGED" in result
-        assert "-line2" in result
-        assert "a/f.txt" in result
-        assert "b/f.txt" in result
+        assert result.startswith("Wrote 20 bytes to ")
+        assert "f.txt" in result
+        assert "-line2\n" in result
+        assert "+CHANGED\n" in result
+        assert " line1\n" in result
+        assert " line3\n" in result
 
     async def test_empty_file_append(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"

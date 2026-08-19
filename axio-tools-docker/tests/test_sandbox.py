@@ -717,8 +717,8 @@ async def test_patch_file_handler_non_utf8_target_raises_handler_error() -> None
                 CONTEXT.reset(token)
 
 
-async def test_patch_file_handler_reports_digest_and_diff() -> None:
-    """The result message must report written bytes plus a unified diff of the edit."""
+async def test_patch_file_handler_reports_bytes_and_diff() -> None:
+    """The result must say how much was written and show what changed."""
     cls, client, container = mock_docker_factory(
         archive_content=make_tar_file("patch_me.txt", b"line1\nline2\nline3\n")
     )
@@ -731,59 +731,49 @@ async def test_patch_file_handler_reports_digest_and_diff() -> None:
                 )
             finally:
                 CONTEXT.reset(token)
-    assert "Wrote 21 bytes" in result
-    assert "patch_me.txt" in result
-    assert "-line2" in result
-    assert "+REPLACED" in result
-    # 3 original source lines replaced by 1: "line1\nREPLACED\nline3\n" is 21 bytes.
+
+    # "line1\nREPLACED\nline3\n" is 21 bytes.
+    assert result.startswith("Wrote 21 bytes to /workspace/patch_me.txt\n")
+    assert "-line2\n" in result
+    assert "+REPLACED\n" in result
+    assert " line1\n" in result
     written = container.put_archive.call_args.kwargs["data"]
     member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
     assert member is not None
-    written_bytes = member.read()
-    assert len(written_bytes) == 21
+    assert member.read() == b"line1\nREPLACED\nline3\n"
 
 
-async def test_write_file_handler_reports_diff_on_overwrite() -> None:
-    """Overwriting an existing file must render a diff of what changed."""
-    cls, client, container = mock_docker_factory(
-        archive_content=make_tar_file("data.txt", b"old line\n")
-    )
+async def test_write_file_handler_diffs_only_when_replacing_text() -> None:
+    """Replacing text shows a diff; a new or binary target still gets written.
+
+    The container round-trip that answers "what did it hold" is also the one
+    that answers "does it exist", so all three cases share a single fetch.
+    """
+    cls, client, container = mock_docker_factory(archive_content=make_tar_file("data.txt", b"old line\n"))
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                result = await sandbox_module.write_file(path="/workspace/data.txt", content="new line\n")
+                replaced = await sandbox_module.write_file(path="/workspace/data.txt", content="new line\n")
+
+                container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
+                created = await sandbox_module.write_file(path="/workspace/fresh.txt", content="brand new\n")
+
+                container.get_archive = AsyncMock(return_value=make_tar_file("bin.dat", b"\xff\xfe\x00binary"))
+                overwritten_binary = await sandbox_module.write_file(path="/workspace/bin.dat", content="text\n")
             finally:
                 CONTEXT.reset(token)
-    assert "Wrote 9 bytes" in result
-    assert "-old line" in result
-    assert "+new line" in result
 
-
-async def test_write_file_handler_no_diff_for_new_file() -> None:
-    """Creating a brand-new file has nothing to diff against - no diff shown."""
-    cls, client, container = mock_docker_factory(
-        archive_content=make_tar_file("fresh.txt", b"something")
-    )
-    container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
-    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
-        async with DockerSandbox() as sb:
-            token = _bind_context(sb)
-            try:
-                result = await sandbox_module.write_file(path="/workspace/fresh.txt", content="brand new\n")
-            finally:
-                CONTEXT.reset(token)
-    assert result.startswith("Wrote 10 bytes")
-    assert "diff" not in result
+    assert replaced.startswith("Wrote 9 bytes to /workspace/data.txt\nChanged /workspace/data.txt:\n")
+    assert "-old line\n" in replaced
+    assert "+new line\n" in replaced
+    assert created == "Wrote 10 bytes to /workspace/fresh.txt"
+    assert overwritten_binary == "Wrote 5 bytes to /workspace/bin.dat"
 
 
 # ---------------------------------------------------------------------------
 # Container config
 # ---------------------------------------------------------------------------
-
-
-
-
 
 
 async def test_volumes_binds() -> None:

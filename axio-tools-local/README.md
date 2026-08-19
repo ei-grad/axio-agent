@@ -15,8 +15,8 @@ Gives your agent the ability to read, write, and patch files, run shell commands
 | `shell` | `shell` | Run any shell command with configurable timeout, cwd, and stdin |
 | `run_python` | `run_python` | Execute a Python snippet in a subprocess |
 | `read_file` | `read_file` | Read a file, optionally with line range |
-| `write_file` | `write_file` | Write or overwrite a file |
-| `patch_file` | `patch_file` | Replace a range of lines in an existing file (1-indexed, both ends inclusive) |
+| `write_file` | `write_file` | Write or overwrite a file with UTF-8 text |
+| `patch_file` | `patch_file` | Replace a range of lines in an existing UTF-8 text file (1-indexed, both ends inclusive) |
 | `list_files` | `list_files` | List files in a directory |
 
 ## Installation
@@ -104,6 +104,33 @@ os.unlink(name)
 ```
 
 Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`
+
+### Text encoding and edit reports
+
+`write_file` and `patch_file` are text tools: `content` is written as UTF-8, and
+the previous content is read back as UTF-8 so the result can report a unified
+diff of the change instead of a bare byte count.
+
+- `patch_file` needs to split the target into lines, so a non-UTF-8 file is an
+  error (`File is not valid UTF-8`).
+- `write_file` only needs the old content for the diff, so replacing a binary,
+  unreadable, or very large file still succeeds - the result just reports the
+  size with no diff. Creating a new file reports no diff either.
+- Neither tool writes binary content. Use `shell` for that, and `read_file` with
+  `binary_as_hex` to inspect it.
+
+```text
+Wrote 64 bytes to app.py
+Changed app.py:
+--- a/app.py
++++ b/app.py
+@@ -1,4 +1,4 @@
+ def greet(name):
+-    return f'Hello {name}'
++    return f'Hi {name}'
+ 
+ print(greet('World'))
+```
 
 ### list_files
 

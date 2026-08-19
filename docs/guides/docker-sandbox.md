@@ -51,14 +51,21 @@ requires changing only the tool list passed to `Agent`.
 | Tool | Description |
 |------|-------------|
 | `shell` | Run a shell command with streaming stdout/stderr. Supports `timeout`, `cwd`, and `stdin`. |
-| `write_file` | Create or overwrite a file. Parent directories are created automatically. Accepts `file_path`, `content`, and optional `mode`. |
+| `write_file` | Create or overwrite a file with UTF-8 text. Parent directories are created automatically. Accepts `file_path`, `content`, and optional `mode`. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, and `max_chars` truncation. Binary files return hex. |
 | `list_files` | List immediate directory entries without reading descendant contents. Directories appear first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess inside the container. Supports `timeout`, `cwd`, and `stdin`. |
-| `patch_file` | Replace lines `from_line`..`to_line` (1-indexed, inclusive). Set `to_line = from_line - 1` to insert without deleting. Always read the file first with `line_numbers=True`. |
+| `patch_file` | Replace lines `from_line`..`to_line` in a UTF-8 text file (1-indexed, inclusive). Set `to_line = from_line - 1` to insert without deleting. Always read the file first with `line_numbers=True`. |
 
 The `tools` property is only valid inside the `async with` block. Accessing it
 outside raises `RuntimeError`.
+
+`write_file` and `patch_file` are text tools with the same UTF-8 contract as
+their `axio-tools-local` counterparts: both write UTF-8 and report a unified
+diff of the change. `patch_file` rejects a non-UTF-8 target; `write_file` can
+replace one but reports no diff for it, and none for a new file either. The
+container round-trip that reads the previous content is also what detects
+whether the file exists, so an overwrite costs one archive fetch, not two.
 
 ## From axio-repl
 

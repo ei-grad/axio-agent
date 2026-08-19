@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
-from axio.diff import render_diff
+from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_write
 from axio.exceptions import HandlerError
 from axio.tool import CONTEXT, Tool
 
@@ -119,23 +119,37 @@ shell.format_stream_result = staticmethod(_format_shell_records)  # type: ignore
 
 
 async def write_file(path: str, content: str, mode: int = 0o644) -> str:
-    """Create or overwrite a file with the given content. Parent directories
-    are created automatically. Use this for new files or full rewrites.
-    For partial edits prefer patch_file instead."""
+    """Create or overwrite a file with UTF-8 text. Parent directories are
+    created automatically. Use this for new files or full rewrites; for partial
+    edits prefer patch_file instead. Overwriting an existing text file reports a
+    unified diff of the change. Binary files can be replaced but not written
+    with this tool, and their replacement reports no diff."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    before = ""
-    existed = False
-    if await sandbox.path_exists(resolved):
-        existed = True
-        try:
-            before = (await sandbox.read_file_bytes(resolved)).decode()
-        except UnicodeDecodeError as exc:
-            raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
-    written = await sandbox.write_file(resolved, content, mode=mode)
-    if existed:
-        return f"{written} {render_diff(path, before, content)}"
-    return written
+    before = await _previous_content(sandbox, resolved)
+    await sandbox.write_file(resolved, content, mode=mode)
+    return describe_write(path, len(content.encode()), before, content)
+
+
+async def _previous_content(sandbox: DockerSandbox, resolved: str) -> str | None:
+    """Return the text to diff the write against, or None when there is none.
+
+    A missing file has no previous version, a binary one cannot be diffed, and
+    pulling a huge file back out of the container costs more than the diff is
+    worth. None of those may block the write itself, so every one of them
+    degrades to "no diff" instead of raising. One archive fetch answers both
+    "does it exist" and "what did it hold".
+    """
+    try:
+        raw = await sandbox.read_file_bytes(resolved)
+    except FileNotFoundError:
+        return None
+    if len(raw) > MAX_DIFF_SOURCE_BYTES:
+        return None
+    try:
+        return raw.decode()
+    except UnicodeDecodeError:
+        return None
 
 
 async def read_file(
@@ -294,12 +308,13 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
 
 
 async def patch_file(path: str, from_line: int, to_line: int, content: str, mode: int = 0o644) -> str:
-    """Replace a range of lines in an existing file. Lines are 1-indexed:
-    from_line and to_line are both inclusive (from_line=2, to_line=4 replaces
-    lines 2, 3, 4). To insert without deleting, set to_line = from_line - 1.
-    Always read the file first with line_numbers=True to get correct line numbers.
-    Use this for surgical edits instead of rewriting the whole file with
-    write_file."""
+    """Replace a range of lines in an existing UTF-8 text file. Lines are
+    1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
+    replaces lines 2, 3, 4). To insert without deleting, set
+    to_line = from_line - 1. Always read the file first with line_numbers=True
+    to get correct line numbers. Use this for surgical edits instead of
+    rewriting the whole file with write_file. The result reports a unified diff
+    of the change. Binary files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:
@@ -314,10 +329,9 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n"):
         content_lines[-1] += "\n"
-    new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
-    after = "".join(new_lines)
-    written = await sandbox.write_file(resolved, after, mode=mode)
-    return f"{written}\n{render_diff(path, before, after)}"
+    after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
+    await sandbox.write_file(resolved, after, mode=mode)
+    return describe_write(path, len(after.encode()), before, after)
 
 
 # ---------------------------------------------------------------------------
@@ -761,11 +775,3 @@ class DockerSandbox:
             return b""
         f = tar.extractfile(member)
         return f.read() if f else b""
-
-    async def path_exists(self, path: str) -> bool:
-        """Return True when the container path exists (file or directory)."""
-        try:
-            await self.get_archive(path)
-        except FileNotFoundError:
-            return False
-        return True

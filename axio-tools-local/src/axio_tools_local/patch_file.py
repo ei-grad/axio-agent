@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from axio.diff import render_diff
+from axio.diff import describe_write
 from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
@@ -16,12 +16,13 @@ async def patch_file(
     content: str,
     mode: int = 0o644,
 ) -> str:
-    """Replace a range of lines in an existing file. Lines are 1-indexed:
-    from_line and to_line are both inclusive (from_line=2, to_line=4 replaces
-    lines 2, 3, 4). To insert without deleting, set to_line = from_line - 1.
-    Always read the file first with line_numbers=True to get correct line numbers.
-    Use this for surgical edits instead of rewriting the whole file with
-    write_file."""
+    """Replace a range of lines in an existing UTF-8 text file. Lines are
+    1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
+    replaces lines 2, 3, 4). To insert without deleting, set
+    to_line = from_line - 1. Always read the file first with line_numbers=True
+    to get correct line numbers. Use this for surgical edits instead of
+    rewriting the whole file with write_file. The result reports a unified diff
+    of the change. Binary files cannot be patched."""
 
     def _blocking() -> str:
         resolved = Path(os.getcwd()) / path
@@ -39,16 +40,14 @@ async def patch_file(
                 content_lines[-1] += "\n"
 
             lines = before.splitlines(keepends=True)
-            new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
-            after = "".join(new_lines)
+            after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
             with resolved.open("w") as f:
                 f.write(after)
-                result = f"{f.tell()} bytes"
             os.chmod(resolved, mode)
         except UnicodeDecodeError as exc:
             raise HandlerError(f"File is not valid UTF-8: {path}") from exc
         except OSError as exc:
             raise HandlerError(f"{exc.strerror or exc}: {path}") from exc
-        return f"{result} written to {path}\n{render_diff(path, before, after)}"
+        return describe_write(path, len(after.encode()), before, after)
 
     return await asyncio.to_thread(_blocking)

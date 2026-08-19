@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from axio.diff import MAX_DIFF_SOURCE_BYTES
 from axio.exceptions import HandlerError
 
 from axio_tools_local.write_file import write_file
@@ -45,15 +46,23 @@ class TestWriteFileBasic:
         """Overwriting must show what changed - the model needs it to stay oriented."""
         (tmp_cwd / "f.txt").write_text("old content\n")
         result = await write("f.txt", "new content\n")
-        assert "-old content" in result
-        assert "+new content" in result
-        assert "a/f.txt" in result
+        assert result.startswith("Wrote 12 bytes to f.txt\nChanged f.txt:\n")
+        assert "-old content\n" in result
+        assert "+new content\n" in result
 
-    async def test_new_file_no_diff(self, tmp_cwd: Path) -> None:
-        """Creating a fresh file has nothing to diff against."""
-        result = await write("fresh.txt", "hello")
-        assert "Wrote 5 bytes" in result
-        assert "diff" not in result
+    async def test_no_diff_when_there_is_nothing_to_diff_against(self, tmp_cwd: Path) -> None:
+        """A new, a binary, and an oversized target all still have to be written.
+
+        None of them can produce a useful diff, so each degrades to the plain
+        size message instead of failing the write.
+        """
+        assert await write("fresh.txt", "hello") == "Wrote 5 bytes to fresh.txt"
+
+        (tmp_cwd / "bin.dat").write_bytes(b"\xff\xfe\x00binary")
+        assert await write("bin.dat", "text\n") == "Wrote 5 bytes to bin.dat"
+
+        (tmp_cwd / "huge.txt").write_text("x" * (MAX_DIFF_SOURCE_BYTES + 1))
+        assert await write("huge.txt", "small\n") == "Wrote 6 bytes to huge.txt"
 
     async def test_overwrite_shorter_content(self, tmp_cwd: Path) -> None:
         """Overwriting with shorter content must not leave old tail."""

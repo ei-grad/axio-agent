@@ -312,8 +312,8 @@ their identities for `--resume`.
 | Tool            | Description                                                    |
 |-----------------|----------------------------------------------------------------|
 | `read_file`     | Read file contents; images and videos returned as vision blocks |
-| `write_file`    | Create or overwrite files                                       |
-| `patch_file`    | Replace line ranges in files (1-indexed, inclusive)              |
+| `write_file`    | Create or overwrite files with UTF-8 text                       |
+| `patch_file`    | Replace line ranges in UTF-8 text files (1-indexed, inclusive)   |
 | `list_files`    | List directory contents                                         |
 | `search_files`  | Text/regex search across files                                  |
 | `shell`         | Run shell commands with streaming output and process-group cleanup |
