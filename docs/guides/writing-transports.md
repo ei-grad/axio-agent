@@ -109,6 +109,18 @@ NaN, and infinities rather than treating them as money. Leave both fields as
 `None` when the response does not contain a trustworthy monetary value; a host
 can then present a clearly labelled estimate from its model registry.
 
+Provider contracts differ. OpenRouter documents
+[automatic terminal usage with `usage.cost`](https://openrouter.ai/docs/cookbook/administration/usage-accounting),
+marks `usage: {"include": true}` and
+`stream_options: {"include_usage": true}` as deprecated no-ops, and says its
+[API prices are denominated in US dollars](https://openrouter.ai/docs/faq).
+By contrast, the documented Chat Completions usage schemas for
+[OpenAI](https://developers.openai.com/api/reference/resources/chat) and
+[Nebius](https://docs.tokenfactory.nebius.com/api-reference/inference/create-chat-completion)
+list token counts but no monetary total. Treat the configured transport and its
+documented response contract as the authority; do not infer cost currency from
+a model name.
+
 Do not add a local token-price estimate to a provider-reported total. Usage
 chunks generally contain totals for the operation, so repeated chunks replace
 the previous reported total rather than being summed. An interrupted stream
