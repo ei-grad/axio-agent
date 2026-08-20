@@ -24,10 +24,19 @@ def test_unknown_theme_fails_with_available_names() -> None:
 
 
 def test_default_and_monochrome_are_semantically_distinct() -> None:
-    assert DEFAULT_THEME.prompt.ansi == "\033[1;97m"
+    assert DEFAULT_THEME.prompt.ansi == "\033[1;30;107m"
+    assert DEFAULT_THEME.prompt.prompt_toolkit == "bold fg:ansiblack bg:ansiwhite"
     assert DEFAULT_THEME.stderr.ansi == "\033[2;33m"
     assert DEFAULT_THEME.error.ansi == "\033[31m"
-    assert DEFAULT_THEME.prompt_badge.foreground.prompt_toolkit == "ansiwhite"
+    assert DEFAULT_THEME.prompt_badge.foreground.prompt_toolkit == "ansiblack"
+    assert DEFAULT_THEME.prompt_badge.background.prompt_toolkit == "ansiwhite"
+    assert DEFAULT_THEME.tool_badge.foreground.prompt_toolkit == "ansiblack"
+    assert DEFAULT_THEME.tool_badge.background.prompt_toolkit == "ansicyan"
+    assert DEFAULT_THEME.agent_badge.background.prompt_toolkit == "ansimagenta"
+    assert DEFAULT_THEME.action_badge.background.prompt_toolkit == "ansiyellow"
+    assert MONOCHROME_THEME.prompt.ansi == "\033[1;97m"
+    assert MONOCHROME_THEME.prompt.prompt_toolkit == "bold ansiwhite"
+    assert MONOCHROME_THEME.prompt_badge.foreground.prompt_toolkit == "ansiblack"
     assert MONOCHROME_THEME.stderr.ansi == "\033[1;97m"
     assert MONOCHROME_THEME.error.ansi == "\033[1;7m"
     assert MONOCHROME_THEME.prompt_badge.background.prompt_toolkit == "ansiwhite"

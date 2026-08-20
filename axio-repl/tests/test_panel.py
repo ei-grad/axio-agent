@@ -216,7 +216,8 @@ def test_prompt_is_named_and_visually_distinct_from_agent_text() -> None:
     assert to_formatted_text(_panel.PROMPT_MESSAGE) == [("class:repl-prompt", "axio-repl> ")]
     prompt_attrs = merged.get_attrs_for_style_str("class:repl-prompt")
     default_attrs = merged.get_attrs_for_style_str("")
-    assert prompt_attrs.color == "ansiwhite"
+    assert prompt_attrs.color == "ansiblack"
+    assert prompt_attrs.bgcolor == "ansiwhite"
     assert prompt_attrs.bold is True
     assert prompt_attrs != default_attrs
 
@@ -225,8 +226,8 @@ def test_powerline_prompt_uses_a_coloured_segment_and_separator() -> None:
     from prompt_toolkit.formatted_text import to_formatted_text
 
     assert to_formatted_text(_panel.prompt_message(powerline=True)) == [
-        ("bold fg:ansiwhite bg:ansicyan", " axio-repl "),
-        ("fg:ansicyan bg:default", "\ue0b0"),
+        ("bold fg:ansiblack bg:ansiwhite", " axio-repl "),
+        ("fg:ansiwhite bg:default", "\ue0b0"),
         ("", " "),
     ]
 
@@ -244,8 +245,8 @@ def test_prompt_factory_uses_only_the_stable_effective_username() -> None:
         powerline=True,
     )
     assert to_formatted_text(powerline()) == [
-        ("bold fg:ansiwhite bg:ansicyan", " alice "),
-        ("fg:ansicyan bg:default", "\ue0b0"),
+        ("bold fg:ansiblack bg:ansiwhite", " alice "),
+        ("fg:ansiwhite bg:default", "\ue0b0"),
         ("", " "),
     ]
 
@@ -265,10 +266,23 @@ def test_submitted_message_uses_accept_time_without_changing_message_text() -> N
     submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
 
     assert _panel.submitted_message("first\nsecond", "alice", submitted_at) == (
-        "\x1b[1;97m12:41 alice>\x1b[0m first\nsecond"
+        "\x1b[1;30;107m12:41 alice>\x1b[0m first\nsecond"
     )
     assert _panel.submitted_message("ping", "alice", submitted_at, powerline=True) == (
-        "\x1b[1;97;46m 12:41 alice \x1b[22;36;49m\ue0b0\x1b[0m ping"
+        "\x1b[1;30;107m 12:41 alice \x1b[22;97;49m\ue0b0\x1b[0m ping"
+    )
+    assert _panel.submitted_message("ping", "alice", submitted_at, theme=MONOCHROME_THEME) == (
+        "\x1b[1;97m12:41 alice>\x1b[0m ping"
+    )
+    assert (
+        _panel.submitted_message(
+            "ping",
+            "alice",
+            submitted_at,
+            powerline=True,
+            theme=MONOCHROME_THEME,
+        )
+        == "\x1b[1;30;107m 12:41 alice \x1b[22;97;49m\ue0b0\x1b[0m ping"
     )
     assert _panel.submitted_message("ping", "alice", submitted_at, theme=NO_COLOR_THEME) == "12:41 alice> ping"
 

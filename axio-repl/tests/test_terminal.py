@@ -542,9 +542,13 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
             assert "tester>" not in rendered
             assert "ordinary main response" in rendered
             assert "agent axio-repl (main)" not in rendered
+            if theme is DEFAULT_THEME:
+                assert "\x1b[0;30;107;1m tester \x1b[0;97m\ue0b0\x1b[0m par" in rendered
         else:
             assert "asynchronous output" in rendered
             assert "tester> " in rendered
+            if theme is DEFAULT_THEME:
+                assert "\x1b[0;30;107;1mtester> \x1b[0mpar" in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
         assert after[1] == before[1]
@@ -658,7 +662,7 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
         assert rendered.count("12:41 tester") == 1
         assert rendered.index("partial model output") < rendered.index("12:41 tester")
         assert rendered.index("12:41 tester") < rendered.index("remaining model output")
-        assert "\x1b[1;97;46m 12:41 tester \x1b[22;36;49m\ue0b0\x1b[0m ping\r\n" in rendered
+        assert "\x1b[1;30;107m 12:41 tester \x1b[22;97;49m\ue0b0\x1b[0m ping\r\n" in rendered
         assert "\x1b[?1049h" not in rendered
     finally:
         terminal_input.close()

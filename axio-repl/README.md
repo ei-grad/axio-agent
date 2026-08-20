@@ -161,10 +161,12 @@ axio-repl --theme monochrome
 
 Powerline mode requires a terminal font that provides the `U+E0B0` (``) separator glyph.
 The active editor prompt shows only the effective-UID username (`username>` in plain mode or a
-filled ` username ` Powerline segment). When Enter accepts a user message, its persistent
-scrollback line is stamped with the local `HH:MM` captured at that keypress. Queueing and model
-startup delays do not change it. Terminal recordings therefore expose the local username and
-submission times. Built-in themes are `default` and `monochrome`; unknown names stop startup.
+filled ` username ` Powerline segment). The default theme renders that label as black text on a
+white background; editor and submitted-message text after the label return to the terminal's normal
+foreground and background. When Enter accepts a user message, its persistent scrollback line is
+stamped with the local `HH:MM` captured at that keypress. Queueing and model startup delays do not
+change it. Terminal recordings therefore expose the local username and submission times. Built-in
+themes are `default` and `monochrome`; unknown names stop startup.
 
 Set `NO_COLOR` to disable application-owned ANSI styling. It takes precedence
 over `--theme` and also disables Powerline. One-shot output automatically uses

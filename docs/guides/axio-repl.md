@@ -329,12 +329,14 @@ presentation styling, not those required input-control sequences.
 
 The active editor prompt contains only the effective-UID username: plain mode
 renders `username>`, while Powerline mode renders a filled ` username ` segment
-followed by ``. After Enter accepts a user message, the persistent scrollback
-line gains a local `HH:MM` timestamp captured synchronously at that keypress.
-Queueing, admission, and model-start delays do not change it; recalled text gets
-a new timestamp when resubmitted. The username comes from the system account
-database, not `USER`; terminal recordings and provider-visible runtime metadata
-expose it, while recordings also expose submission times.
+followed by ``. In the default theme the label is black on a white background;
+the editor and persistent message body after it use the terminal's normal
+foreground and background. After Enter accepts a user message, the persistent
+scrollback line gains a local `HH:MM` timestamp captured synchronously at that
+keypress. Queueing, admission, and model-start delays do not change it; recalled
+text gets a new timestamp when resubmitted. The username comes from the system
+account database, not `USER`; terminal recordings and provider-visible runtime
+metadata expose it, while recordings also expose submission times.
 
 `axio-repl --version` exits before agent configuration, sandbox, or provider
 initialization. Its local-only report identifies the distribution version,
