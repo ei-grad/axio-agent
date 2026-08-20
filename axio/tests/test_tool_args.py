@@ -271,18 +271,64 @@ class TestBroken:
         assert "q" in text  # \q → 'q' (passthrough)
 
     def test_lone_low_surrogate(self) -> None:
-        r"""\\uDC00 with no preceding high surrogate: no crash."""
-        s = ToolArgStream("c")
-        events = s.feed(r'{"s": "\uDC00x"}')
-        text = "".join(e.text for e in events if isinstance(e, ToolFieldDelta))
-        assert "x" in text
+        r"""\\uDC00 with no preceding high surrogate becomes valid Unicode."""
+        assert collect(r'{"s": "\uDC00x"}')["s"] == "\ufffdx"
 
     def test_double_high_surrogate(self) -> None:
-        r"""\\uD800\\uD800: second high replaces first (no low between them)."""
-        s = ToolArgStream("c")
-        events = s.feed(r'{"s": "\uD800\uD800x"}')
-        text = "".join(e.text for e in events if isinstance(e, ToolFieldDelta))
-        assert "x" in text
+        r"""A second high replaces the first but remains available to pair."""
+        assert collect(r'{"s": "\uD800\uD83D\uDE00"}')["s"] == "\ufffd😀"
+
+    @pytest.mark.parametrize(
+        "payload,expected",
+        [
+            (r'{"s":"\uZZZZtail"}', "\ufffdZZZZtail"),
+            (r'{"s":"\u12"}', "\ufffd"),
+            (r'{"s":"\uD800"}', "\ufffd"),
+            (r'{"s":"\uD800A"}', "\ufffdA"),
+            (r'{"s":"\uD800\n"}', "\ufffd\n"),
+            (r'{"s":"\uD800\u0041"}', "\ufffdA"),
+            (r'{"s":"\uD800\uZZZZ"}', "\ufffd\ufffdZZZZ"),
+            (r'{"s":"\uD800\uD800x"}', "\ufffd\ufffdx"),
+            (r'{"s":"\uDC00"}', "\ufffd"),
+        ],
+    )
+    def test_malformed_unicode_recovery_is_chunk_invariant(self, payload: str, expected: str) -> None:
+        batch = collect(payload)["s"]
+        chunked = collect(payload, chunk_size=1)["s"]
+        assert batch == chunked == expected
+        assert expected.encode("utf-8").decode("utf-8") == expected
+
+    def test_interrupted_high_surrogate_finishes_exactly_once(self) -> None:
+        stream = ToolArgStream("c")
+        events = stream.feed(r'{"s":"\uD800')
+        events.extend(stream.finish())
+        events.extend(stream.finish())
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert text == "\ufffd"
+        assert not any(isinstance(event, ToolFieldEnd) for event in events)
+        text.encode("utf-8", errors="strict")
+
+    def test_interrupted_unicode_escape_finishes_with_replacement(self) -> None:
+        stream = ToolArgStream("c")
+        events = stream.feed(r'{"s":"before\u12')
+        events.extend(stream.finish())
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert text == "before\ufffd"
+
+    def test_unicode_recovery_applies_to_keys_and_literal_surrogates(self) -> None:
+        escaped_key = ToolArgStream("c").feed(r'{"\uDC00":"value"}')
+        key = next(event.key for event in escaped_key if isinstance(event, ToolFieldStart))
+        assert key == "\ufffd"
+
+        literal = '{"s":"' + "\ud800\udc00\udfff" + '"}'
+        assert collect(literal)["s"] == "𐀀\ufffd"
+        collect(literal)["s"].encode("utf-8", errors="strict")
+
+        nested_raw = '{"x":{"s":"' + "\ud800" + '"}}'
+        assert collect(nested_raw)["x"] == '{"s":"\ufffd"}'
+        collect(nested_raw)["x"].encode("utf-8", errors="strict")
 
     def test_truncated_unicode_escape(self) -> None:
         r"""\\u with fewer than 4 hex digits at end of stream: no crash."""

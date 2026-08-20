@@ -4,7 +4,9 @@ Feeds partial JSON chunks (from ``ToolInputDelta.partial_json``) and emits
 structured ``ToolField*`` events as top-level object fields are discovered.
 
 Top-level *string* values are decoded (escape sequences resolved, quotes
-stripped).  All other top-level values are emitted as raw JSON fragments.
+stripped). All other top-level values are emitted as raw JSON fragments. This
+is a best-effort presentation parser: agent execution separately retains every
+raw ``ToolInputDelta`` fragment for strict final JSON validation.
 """
 
 from __future__ import annotations
@@ -43,6 +45,9 @@ ESCAPES: Mapping[str, str] = MappingProxyType(
         "/": "/",
     }
 )
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_REPLACEMENT = "\ufffd"
 
 
 class ToolArgStream:
@@ -110,6 +115,23 @@ class ToolArgStream:
         self._flush()
         return self._events
 
+    def finish(self) -> list[ToolFieldEvent]:
+        """Finish an interrupted preview without emitting invalid Unicode."""
+
+        self._events = []
+        if self._st is State.UESC:
+            self._flush_high_surrogate()
+            self._append_decoded(_REPLACEMENT)
+            self._u.clear()
+            self._st = self._esc_ret
+        elif self._st is State.ESC:
+            self._flush_high_surrogate()
+            self._st = self._esc_ret
+        else:
+            self._flush_high_surrogate()
+        self._flush()
+        return self._events
+
     def _flush(self) -> None:
         if self._buf:
             self._events.append(ToolFieldDelta(self._idx, self._id, self._key, "".join(self._buf)))
@@ -120,8 +142,47 @@ class ToolArgStream:
         self._events.append(ToolFieldStart(self._idx, self._id, self._key))
 
     def _end(self) -> None:
+        self._flush_high_surrogate()
         self._flush()
         self._events.append(ToolFieldEnd(self._idx, self._id, self._key))
+
+    def _append_decoded(self, text: str) -> None:
+        target = self._key_chars if self._esc_key else self._buf
+        target.append(text)
+
+    def _flush_high_surrogate(self) -> None:
+        if self._high:
+            self._append_decoded(_REPLACEMENT)
+            self._high = 0
+
+    def _append_unicode_code_unit(self, code: int) -> None:
+        if self._high:
+            if 0xDC00 <= code <= 0xDFFF:
+                full = 0x10000 + (self._high - 0xD800) * 0x400 + (code - 0xDC00)
+                self._append_decoded(chr(full))
+                self._high = 0
+                return
+            self._append_decoded(_REPLACEMENT)
+            self._high = 0
+
+        if 0xD800 <= code <= 0xDBFF:
+            self._high = code
+        elif 0xDC00 <= code <= 0xDFFF:
+            self._append_decoded(_REPLACEMENT)
+        else:
+            self._append_decoded(chr(code))
+
+    def _append_literal_character(self, ch: str) -> None:
+        code = ord(ch)
+        if 0xD800 <= code <= 0xDFFF:
+            self._append_unicode_code_unit(code)
+            return
+        self._flush_high_surrogate()
+        self._append_decoded(ch)
+
+    @staticmethod
+    def _safe_raw_character(ch: str) -> str:
+        return _REPLACEMENT if 0xD800 <= ord(ch) <= 0xDFFF else ch
 
     def _step(self, ch: str) -> None:  # noqa: PLR0912
         match self._st:
@@ -132,6 +193,7 @@ class ToolArgStream:
             case State.OBJ:
                 if ch == '"':
                     self._key_chars.clear()
+                    self._esc_key = True
                     self._st = State.KEY
                 elif ch == "}":
                     self._done = True
@@ -143,10 +205,11 @@ class ToolArgStream:
                     self._esc_ret = State.KEY
                     self._st = State.ESC
                 elif ch == '"':
+                    self._flush_high_surrogate()
                     self._key = "".join(self._key_chars)
                     self._st = State.COLON
                 else:
-                    self._key_chars.append(ch)
+                    self._append_literal_character(ch)
 
             case State.COLON:
                 if ch == ":":
@@ -157,9 +220,10 @@ class ToolArgStream:
                 if ch in " \t\r\n":
                     pass
                 elif ch == '"':
+                    self._esc_key = False
                     self._st = State.STR
                 else:
-                    self._buf.append(ch)
+                    self._buf.append(self._safe_raw_character(ch))
                     self._depth = 1 if ch in "{[" else 0
                     self._raw_str = False
                     self._raw_esc = False
@@ -171,20 +235,14 @@ class ToolArgStream:
                     self._esc_ret = State.STR
                     self._st = State.ESC
                 elif ch == '"':
-                    if self._high:
-                        self._buf.append("\ufffd")
-                        self._high = 0
                     self._end()
                     self._st = State.AFTER
                 else:
-                    if self._high:
-                        self._buf.append("\ufffd")
-                        self._high = 0
-                    self._buf.append(ch)
+                    self._append_literal_character(ch)
 
             case State.RAW:
                 if self._raw_str:
-                    self._buf.append(ch)
+                    self._buf.append(self._safe_raw_character(ch))
                     if self._raw_esc:
                         self._raw_esc = False
                     elif ch == "\\":
@@ -210,7 +268,7 @@ class ToolArgStream:
                         self._end()
                         self._st = State.AFTER
                 else:
-                    self._buf.append(ch)
+                    self._buf.append(self._safe_raw_character(ch))
 
             case State.AFTER:
                 if ch == ",":
@@ -224,29 +282,21 @@ class ToolArgStream:
                     self._u.clear()
                     self._st = State.UESC
                 else:
+                    self._flush_high_surrogate()
                     dec = ESCAPES.get(ch, ch)
-                    if self._esc_key:
-                        self._key_chars.append(dec)
-                    else:
-                        self._buf.append(dec)
+                    self._append_decoded(self._safe_raw_character(dec))
                     self._st = self._esc_ret
 
             case State.UESC:
+                if ch not in _HEX_DIGITS:
+                    self._flush_high_surrogate()
+                    self._append_decoded(_REPLACEMENT)
+                    self._u.clear()
+                    self._st = self._esc_ret
+                    self._step(ch)
+                    return
                 self._u.append(ch)
                 if len(self._u) == 4:
                     code = int("".join(self._u), 16)
-                    if self._esc_key:
-                        self._key_chars.append(chr(code))
-                    elif self._high:
-                        if 0xDC00 <= code <= 0xDFFF:
-                            full = 0x10000 + (self._high - 0xD800) * 0x400 + (code - 0xDC00)
-                            self._buf.append(chr(full))
-                        else:
-                            self._buf.append("\ufffd")
-                            self._buf.append(chr(code))
-                        self._high = 0
-                    elif 0xD800 <= code <= 0xDBFF:
-                        self._high = code
-                    else:
-                        self._buf.append(chr(code))
+                    self._append_unicode_code_unit(code)
                     self._st = self._esc_ret
