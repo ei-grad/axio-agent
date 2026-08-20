@@ -12,7 +12,7 @@ from io import TextIOWrapper
 from typing import Any, cast
 
 import pytest
-from axio.events import SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
+from axio.events import Error, SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import ExecutionMode, TurnStarted
 from prompt_toolkit.application import create_app_session
@@ -801,12 +801,39 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
                 )
                 await terminal.drain()
                 result_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolUseStart(index=1, tool_use_id="error-call", name="write_file"),
+                )
+                await terminal.drain()
+                await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(
+                        index=1,
+                        tool_use_id="error-call",
+                        partial_json='{"content":"visible-before-error',
+                    ),
+                )
+                await terminal.drain()
+                error_visible_stage = await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=1, tool_use_id="error-call", partial_json="\x1b[3"),
+                )
+                await terminal.drain()
+                swallowed_stage = await read_stage()
+                await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
+                await terminal.drain()
+                error_stage = await read_stage()
             finally:
                 renderer.set_input_active(False)
                 if not prompt.done():
                     prompt.cancel()
                     await asyncio.gather(prompt, return_exceptions=True)
                 await terminal.close()
+                late_stage = await read_stage()
 
         assert "path" in stages[0] and "/tmp/stream-" in stages[0]
         assert "demo.txt" in stages[1] and "content" in stages[1]
@@ -816,6 +843,11 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
         assert "peer body" in stages[4]
         assert 'three" and \\ delta-four' in stages[5]
         assert "wrote stream demo" in result_stage
+        assert "content" in error_visible_stage and "visible-before-error" in error_visible_stage
+        assert "(continued)" not in swallowed_stage
+        assert "provider stream failed" in error_stage
+        assert "(continued)" not in error_stage
+        assert "(continued)" not in late_stage
 
         combined = "".join(stages)
         for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", long_middle, "gamma-", "delta-four"):
