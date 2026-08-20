@@ -14,8 +14,10 @@ from typing import Any, cast
 
 import pytest
 from axio.exceptions import HandlerError
+from axio.tool import Tool
 
-from axio_tools_local.shell import _format_records, shell
+from axio_tools_local import shell as shell_module
+from axio_tools_local.shell import _discover_shells, _format_records, _select_shell, _ShellExecutable, shell
 
 
 async def sh(command: str, **kwargs: Any) -> str:
@@ -35,6 +37,89 @@ def large_output_command(line_chars: int = 300, lines: int = 20) -> str:
 def failing_large_output_command() -> str:
     code = "import sys\nfor i in range(20): print(f'line{i:02d}-' + 'x' * 300)\nsys.exit(7)"
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def make_fake_shell(directory: Path, name: str, log_path: Path) -> Path:
+    executable = directory / name
+    executable.write_text(
+        f'#!/bin/sh\nprintf \'%s\\n\' "$#" "$1" "$2" > {shlex.quote(str(log_path))}\nexec /bin/sh "$@"\n'
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+class TestShellSelection:
+    def test_discovers_fake_executables_in_preference_order(self, tmp_path: Path) -> None:
+        make_fake_shell(tmp_path, "sh", tmp_path / "sh.log")
+        make_fake_shell(tmp_path, "bash", tmp_path / "bash.log")
+        make_fake_shell(tmp_path, "dash", tmp_path / "dash.log")
+
+        available = _discover_shells(str(tmp_path))
+
+        assert [item.name for item in available] == ["bash", "sh", "dash"]
+        assert all(Path(item.path).is_absolute() for item in available)
+        assert _select_shell(None, available).name == "bash"
+
+    def test_falls_back_to_sh(self, tmp_path: Path) -> None:
+        expected = make_fake_shell(tmp_path, "sh", tmp_path / "sh.log")
+
+        available = _discover_shells(str(tmp_path))
+
+        assert available == (_ShellExecutable(name="sh", path=str(expected)),)
+        assert _select_shell(None, available).name == "sh"
+
+    async def test_explicit_selection_uses_discovered_argv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bash_log = tmp_path / "bash.log"
+        sh_log = tmp_path / "sh.log"
+        make_fake_shell(tmp_path, "bash", bash_log)
+        make_fake_shell(tmp_path, "sh", sh_log)
+        monkeypatch.setattr(shell_module, "_AVAILABLE_SHELLS", _discover_shells(str(tmp_path)))
+        command = "printf selected"
+
+        result = await shell(command=command, shell="sh")
+
+        assert "selected" in result
+        assert not bash_log.exists()
+        assert sh_log.read_text().splitlines() == ["2", "-lc", command]
+
+    async def test_default_uses_preferred_discovered_shell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bash_log = tmp_path / "bash.log"
+        make_fake_shell(tmp_path, "sh", tmp_path / "sh.log")
+        make_fake_shell(tmp_path, "bash", bash_log)
+        monkeypatch.setattr(shell_module, "_AVAILABLE_SHELLS", _discover_shells(str(tmp_path)))
+
+        await shell(command="true")
+
+        assert bash_log.read_text().splitlines() == ["2", "-lc", "true"]
+
+    async def test_invalid_selection_lists_choices_and_cannot_inject(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        make_fake_shell(tmp_path, "bash", tmp_path / "bash.log")
+        monkeypatch.setattr(shell_module, "_AVAILABLE_SHELLS", _discover_shells(str(tmp_path)))
+        marker = tmp_path / "injected"
+
+        with pytest.raises(HandlerError, match=r"available shells: bash"):
+            await shell(command="true", shell=f"bash; touch {marker}")
+
+        assert not marker.exists()
+
+    async def test_no_shell_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(shell_module, "_AVAILABLE_SHELLS", ())
+
+        with pytest.raises(HandlerError, match="No supported shell found on PATH"):
+            await shell(command="true")
+
+    def test_tool_schema_describes_cached_choices(self) -> None:
+        tool: Tool[Any] = Tool(name="shell", handler=shell)
+
+        description = tool.input_schema["properties"]["shell"]["description"]
+        assert "Available shells:" in description
+        assert "Omit shell to use" in description
 
 
 class TestShellBasic:

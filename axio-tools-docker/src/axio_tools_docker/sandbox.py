@@ -8,25 +8,59 @@ import contextlib
 import io
 import logging
 import os
+import posixpath
 import shlex
 import stat as stat_module
 import tarfile
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
 from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_write
 from axio.exceptions import HandlerError
+from axio.schema import build_tool_schema
 from axio.tool import CONTEXT, Tool
 
 logger = logging.getLogger(__name__)
 
+_SHELL_PREFERENCE = ("bash", "sh", "zsh", "dash")
+_DEFAULT_CONTAINER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SHELL_PROBE_TIMEOUT = 2.0
+
 
 class ImageNotAvailableError(RuntimeError):
     """Raised when a local-only sandbox image is absent from the daemon."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ShellExecutable:
+    name: str
+    path: str
+
+
+def _shell_choices_text(available: tuple[_ShellExecutable, ...]) -> str:
+    if not available:
+        return "No supported shells were found in the container PATH."
+    names = ", ".join(item.name for item in available)
+    return f"Available shells: {names}. Omit shell to use {available[0].name}."
+
+
+def _select_shell(requested: str | None, available: tuple[_ShellExecutable, ...]) -> _ShellExecutable:
+    if not available:
+        tried = ", ".join(_SHELL_PREFERENCE)
+        raise HandlerError(f"No supported shell found in the container PATH (tried: {tried})")
+    if requested is None:
+        return available[0]
+    for item in available:
+        if requested == item.name:
+            return item
+    choices = ", ".join(item.name for item in available)
+    raise HandlerError(f"Unknown shell {requested!r}; available shells: {choices}")
 
 
 def parse_memory(s: str) -> int:
@@ -111,23 +145,32 @@ async def _shell_stream(
     timeout: float = 5,
     cwd: str = ".",
     stdin: str | None = None,
+    shell: str | None = None,
 ) -> AsyncGenerator[tuple[str, str], None]:
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, cwd)
     cmd = f"cd {shlex.quote(resolved)} && {command}"
-    async for chunk in sandbox.exec_stream(cmd, timeout=timeout, stdin=stdin):
+    async for chunk in sandbox.exec_stream(cmd, timeout=timeout, stdin=stdin, shell=shell):
         yield chunk
 
 
-async def shell(command: str, timeout: float = 5, cwd: str = ".", stdin: str | None = None) -> str:
+async def shell(
+    command: str,
+    timeout: float = 5,
+    cwd: str = ".",
+    stdin: str | None = None,
+    shell: str | None = None,
+) -> str:
     """Run a shell command and return combined stdout/stderr. Use for git,
     build tools, grep, tests, or any CLI operation. Non-zero exit codes
     are reported. Optionally pass stdin data for commands that read from
     standard input. Live and final output preserve Docker-observed
     stdout/stderr order; this does not imply a global syscall order across the
-    two descriptors. Prefer short timeouts and avoid interactive commands."""
+    two descriptors. Commands default to the first shell discovered in the
+    container (bash is preferred); pass shell to select another advertised
+    shell. Prefer short timeouts and avoid interactive commands."""
     records: list[_ShellRecord] = []
-    async for key, text in _shell_stream(command, timeout, cwd, stdin):
+    async for key, text in _shell_stream(command, timeout, cwd, stdin, shell):
         records.append((0.0, key, text))
     return _format_shell_records(records)
 
@@ -489,6 +532,7 @@ class DockerSandbox:
         self._client: aiodocker.Docker | None = None
         self._container: aiodocker.containers.DockerContainer | None = None
         self._attached: bool = False  # True when we reused an existing container
+        self._shells: tuple[_ShellExecutable, ...] | None = None
         self._tools: list[Tool[Any]] | None = None
 
     async def __aenter__(self) -> DockerSandbox:
@@ -616,14 +660,19 @@ class DockerSandbox:
                 raise
             logger.info("Started sandbox container (image=%s)", self.image)
 
-        self._tools = [
-            Tool(name="shell", handler=shell, context=self),
-            Tool(name="write_file", handler=write_file, context=self),
-            Tool(name="read_file", handler=read_file, context=self),
-            Tool(name="list_files", handler=list_files, context=self),
-            Tool(name="run_python", handler=run_python, context=self),
-            Tool(name="patch_file", handler=patch_file, context=self),
-        ]
+        try:
+            self._shells = await self._discover_shells()
+            self._tools = [
+                self._make_shell_tool(),
+                Tool(name="write_file", handler=write_file, context=self),
+                Tool(name="read_file", handler=read_file, context=self),
+                Tool(name="list_files", handler=list_files, context=self),
+                Tool(name="run_python", handler=run_python, context=self),
+                Tool(name="patch_file", handler=patch_file, context=self),
+            ]
+        except Exception:
+            await self.__aexit__()
+            raise
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -647,6 +696,7 @@ class DockerSandbox:
                 logger.info("Removed %d named volume(s)", len(self.named_volumes))
             await self._client.close()
             self._client = None
+        self._shells = None
         self._tools = None
 
     @property
@@ -662,6 +712,78 @@ class DockerSandbox:
         if self._container is None:
             raise RuntimeError("DockerSandbox must be used as an async context manager")
         return str(self._container.id)
+
+    @property
+    def available_shells(self) -> tuple[str, ...]:
+        """Shell names cached for the running container, in default preference order."""
+        if self._shells is None:
+            raise RuntimeError("DockerSandbox must be used as an async context manager")
+        return tuple(item.name for item in self._shells)
+
+    def _make_shell_tool(self) -> Tool[Any]:
+        assert self._shells is not None
+        schema = build_tool_schema(shell)
+        shell_schema = cast(dict[str, Any], schema["properties"]["shell"])
+        shell_schema["description"] = f"Shell name to execute. {_shell_choices_text(self._shells)}"
+        if self._shells:
+            string_schema = cast(dict[str, Any], shell_schema["anyOf"][0])
+            string_schema["enum"] = [item.name for item in self._shells]
+        description = f"{shell.__doc__ or ''}\n{_shell_choices_text(self._shells)}"
+        return Tool(
+            name="shell",
+            handler=shell,
+            context=self,
+            description=description,
+            schema=MappingProxyType(schema),
+        )
+
+    async def _probe_shell(self, executable: str) -> bool:
+        assert self._container is not None
+        stream: Any | None = None
+        try:
+            exec_obj = await self._container.exec(
+                cmd=[executable, "-c", "exit 0"],
+                stdout=True,
+                stderr=True,
+                tty=False,
+            )
+            stream = exec_obj.start(detach=False)
+            while await asyncio.wait_for(stream.read_out(), timeout=_SHELL_PROBE_TIMEOUT) is not None:
+                pass
+            info = await exec_obj.inspect()
+            exit_code = info.get("ExitCode")
+            return isinstance(exit_code, int) and exit_code == 0
+        except (DockerError, TimeoutError):
+            return False
+        finally:
+            if stream is not None:
+                await stream.close()
+
+    async def _discover_shells(self) -> tuple[_ShellExecutable, ...]:
+        assert self._container is not None
+        info = await self._container.show()
+        config = info.get("Config") if isinstance(info, dict) else None
+        env = config.get("Env") if isinstance(config, dict) else None
+        search_path: str | None = None
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and item.startswith("PATH="):
+                    search_path = item.removeprefix("PATH=")
+        if search_path is None:
+            search_path = _DEFAULT_CONTAINER_PATH
+
+        directories = search_path.split(":")
+        available: list[_ShellExecutable] = []
+        for name in _SHELL_PREFERENCE:
+            for directory in directories:
+                base = directory or self.workdir
+                if not posixpath.isabs(base):
+                    base = posixpath.join(self.workdir, base)
+                candidate = posixpath.normpath(posixpath.join(base, name))
+                if await self._probe_shell(candidate):
+                    available.append(_ShellExecutable(name=name, path=candidate))
+                    break
+        return tuple(available)
 
     async def _ensure_image(self) -> None:
         """Pull the image if it is not present locally."""
@@ -694,13 +816,17 @@ class DockerSandbox:
         command: str,
         timeout: float = 30,
         stdin: str | None = None,
+        shell: str | None = None,
     ) -> AsyncGenerator[tuple[str, str], None]:
         """Yield tagged chunks in Docker's observed multiplex-frame order."""
         assert self._container is not None
         command = await self._prepare_exec_command(command, stdin)
+        if self._shells is None:
+            raise RuntimeError("DockerSandbox must be used as an async context manager")
+        executable = _select_shell(shell, self._shells)
 
         exec_obj = await self._container.exec(
-            cmd=["sh", "-c", command],
+            cmd=[executable.path, "-lc", command],
             stdout=True,
             stderr=True,
             tty=False,
@@ -743,10 +869,16 @@ class DockerSandbox:
         if exit_code != 0:
             yield "stderr", _ShellControl(f"[exit code: {exit_code}]")
 
-    async def exec(self, command: str, timeout: float = 30, stdin: str | None = None) -> str:
+    async def exec(
+        self,
+        command: str,
+        timeout: float = 30,
+        stdin: str | None = None,
+        shell: str | None = None,
+    ) -> str:
         """Execute a shell command inside the container and return its output."""
         records: list[_ShellRecord] = []
-        async for key, text in self.exec_stream(command, timeout=timeout, stdin=stdin):
+        async for key, text in self.exec_stream(command, timeout=timeout, stdin=stdin, shell=shell):
             records.append((0.0, key, text))
         return _format_shell_records(records)
 

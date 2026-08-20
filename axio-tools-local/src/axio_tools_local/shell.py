@@ -5,16 +5,17 @@ import codecs
 import contextlib
 import os
 import re
+import shutil
 import signal
 import tempfile
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Annotated, TextIO
 
 from axio.exceptions import HandlerError
-from axio.field import StrictStr
+from axio.field import Field, StrictStr
 
 type OutputRecord = tuple[float, str, str]
 
@@ -26,6 +27,7 @@ _SUFFIX_TRUNCATION_MARKER = "[truncated]...\n"
 _LIMIT_RE = re.compile(r"within (?P<limit>\d+) chars")
 _PIPE_READ_BYTES = 4096
 _PIPE_QUEUE_ITEMS = 32
+_SHELL_PREFERENCE = ("bash", "sh", "zsh", "dash")
 
 
 class _LargeOutputNotice(str):
@@ -39,6 +41,48 @@ class _ShellControl(str):
 @dataclass(frozen=True, slots=True)
 class _ReaderDone:
     error: Exception | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ShellExecutable:
+    name: str
+    path: str
+
+
+def _discover_shells(search_path: str | None) -> tuple[_ShellExecutable, ...]:
+    available: list[_ShellExecutable] = []
+    for name in _SHELL_PREFERENCE:
+        executable = shutil.which(name, path=search_path)
+        if executable is not None:
+            available.append(_ShellExecutable(name=name, path=os.path.abspath(executable)))
+    return tuple(available)
+
+
+def _shell_choices_text(available: tuple[_ShellExecutable, ...]) -> str:
+    if not available:
+        return "No supported shells were found on PATH."
+    names = ", ".join(item.name for item in available)
+    return f"Available shells: {names}. Omit shell to use {available[0].name}."
+
+
+def _select_shell(requested: str | None, available: tuple[_ShellExecutable, ...]) -> _ShellExecutable:
+    if not available:
+        tried = ", ".join(_SHELL_PREFERENCE)
+        raise HandlerError(f"No supported shell found on PATH (tried: {tried})")
+    if requested is None:
+        return available[0]
+    for item in available:
+        if requested == item.name:
+            return item
+    choices = ", ".join(item.name for item in available)
+    raise HandlerError(f"Unknown shell {requested!r}; available shells: {choices}")
+
+
+_AVAILABLE_SHELLS = _discover_shells(os.environ.get("PATH"))
+_ShellName = Annotated[
+    str | None,
+    Field(description=f"Shell name to execute. {_shell_choices_text(_AVAILABLE_SHELLS)}"),
+]
 
 
 def _kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -253,6 +297,7 @@ async def _shell_stream(
     cwd: str = ".",
     stdin: str | None = None,
     max_output_chars: int = _MAX_INLINE_OUTPUT_CHARS,
+    shell: _ShellName = None,
 ) -> AsyncGenerator[tuple[str, str], None]:
     """Yield tagged chunks in the order accepted from the two pipe readers.
 
@@ -262,8 +307,11 @@ async def _shell_stream(
     if max_output_chars < 0:
         raise HandlerError("max_output_chars must be >= 0")
 
+    executable = _select_shell(shell, _AVAILABLE_SHELLS)
     try:
-        proc = await asyncio.create_subprocess_shell(
+        proc = await asyncio.create_subprocess_exec(
+            executable.path,
+            "-lc",
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -487,6 +535,7 @@ async def shell(
     cwd: StrictStr = ".",
     stdin: str | None = None,
     max_output_chars: int = _MAX_INLINE_OUTPUT_CHARS,
+    shell: _ShellName = None,
 ) -> str:
     """Run a shell command and return combined stdout/stderr. Use for git,
     build tools, grep, tests, or any CLI operation. Non-zero exit codes
@@ -497,10 +546,11 @@ async def shell(
     summarized to the first 5 and last 5 lines.
     Live and final output preserve executor-observed stdout/stderr order; this
     does not imply a global syscall order across the two descriptors. Avoid
-    interactive commands."""
+    interactive commands. Commands default to the first shell discovered on
+    PATH (bash is preferred); pass shell to select another advertised shell."""
     records: list[OutputRecord] = []
     t0 = time.monotonic()
-    async for key, text in _shell_stream(command, timeout, cwd, stdin, max_output_chars):
+    async for key, text in _shell_stream(command, timeout, cwd, stdin, max_output_chars, shell):
         records.append((time.monotonic() - t0, key, text))
     return _format_records(records)
 

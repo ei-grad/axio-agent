@@ -74,7 +74,16 @@ asyncio.run(shell(command="echo hello", cwd=".", timeout=30))
 asyncio.run(shell(command="cat", stdin="hello"))
 ```
 
-Parameters: `command: str`, `timeout: int = 5`, `cwd: str = "."`, `stdin: str | None = None`, `max_output_chars: int = 4096`
+Parameters: `command: str`, `timeout: int = 5`, `cwd: str = "."`,
+`stdin: str | None = None`, `max_output_chars: int = 4096`,
+`shell: str | None = None`
+
+At module import, the tool takes an immutable snapshot of supported executables
+on the process `PATH`. It prefers `bash`, then `sh`, `zsh`, and `dash`. The
+generated tool schema lists the names found in that snapshot. Omit `shell` to
+use the first one, or pass one of those names explicitly; paths and shell flags
+are not accepted. Each command is passed as one argument to
+`[discovered_shell_path, "-lc", command]`.
 
 Streaming emits bounded, UTF-8-decoded chunks without waiting for a newline.
 The live stream and final result retain stdout/stderr tags in the order observed

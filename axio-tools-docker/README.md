@@ -61,7 +61,7 @@ These mirror `axio-tools-local` exactly - same names and field schemas:
 
 | Tool | Description |
 |---|---|
-| `shell` | Run a shell command with streaming stdout/stderr in Docker-observed order. Supports `timeout`, `cwd`, `stdin`. |
+| `shell` | Run a shell command with streaming stdout/stderr in Docker-observed order. Supports `timeout`, `cwd`, `stdin`, and discovered-shell selection. |
 | `write_file` | Create or overwrite a file with UTF-8 text. Parent directories are created automatically. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, `max_chars`. |
 | `list_files` | List immediate directory entries without reading descendant contents; directories first with a trailing `/`. |
@@ -73,6 +73,15 @@ transitions in the final string are labelled `[stdout]` or `[stderr]`; an
 initial stdout segment stays unlabelled for compatibility. This observed order
 is not a global ordering of writes to the container's independent file
 descriptors.
+
+After a container starts, `DockerSandbox` searches its effective `PATH` once
+and caches the supported executables. It prefers `bash`, then `sh`, `zsh`, and
+`dash`; minimal images without Bash therefore use `sh`. The runtime-generated
+tool schema lists the container's choices. Pass `shell="sh"` (or another listed
+name) to select explicitly. Arbitrary paths and flags are rejected, and the
+command is executed as `[cached_shell_path, "-lc", command]`. Discovery cannot
+happen at Python module import because the host `PATH` says nothing about an
+image that has not been created yet.
 
 ## Container lifecycle
 

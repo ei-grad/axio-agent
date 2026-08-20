@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG BASE_IMAGE=mcr.microsoft.com/devcontainers/base:3-noble
+ARG BASE_IMAGE=mcr.microsoft.com/devcontainers/base:trixie
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG GO_IMAGE=golang:1.25-bookworm
 ARG RUST_IMAGE=rust:1-bookworm
@@ -23,6 +23,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GOROOT=/usr/local/go \
     GOPATH=/opt/go \
     JAVA_HOME=/usr/local/openjdk \
+    CHROME_BIN=/usr/bin/chromium \
+    CHROMIUM_PATH=/usr/bin/chromium \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PUPPETEER_SKIP_DOWNLOAD=true \
     HF_HUB_DISABLE_TELEMETRY=1 \
     HF_HUB_DISABLE_UPDATE_CHECK=1 \
     DO_NOT_TRACK=1 \
@@ -40,12 +44,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         clang \
         cmake \
+        chromium \
+        chromium-driver \
+        chromium-sandbox \
         curl \
         diffutils \
         dnsutils \
         fd-find \
         ffmpeg \
         file \
+        fonts-liberation \
+        fonts-noto-color-emoji \
         gdb \
         git \
         git-lfs \
@@ -150,12 +159,16 @@ RUN --mount=type=bind,from=ghcr.io/astral-sh/uv:latest,source=/uv,target=/bin/uv
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 COPY python-data /usr/local/bin/python-data
+COPY browser-smoke /usr/local/bin/browser-smoke
 
-RUN chmod 0755 /usr/local/bin/python-data \
+RUN chmod 0755 /usr/local/bin/browser-smoke /usr/local/bin/python-data \
     && ln -sf /opt/agent-python/.venv/bin/ipython /usr/local/bin/ipython \
     && ln -sf /opt/agent-python/.venv/bin/jupyter /usr/local/bin/jupyter \
     && command -v git gh glab python3 python-data uv node npm go rustc cargo java javac mvn \
-        pdftotext qpdf tesseract jq rg ast-grep kaggle hf >/dev/null \
+        chromium chromedriver pdftotext qpdf tesseract jq rg ast-grep kaggle hf >/dev/null \
+    && test -u /usr/lib/chromium/chrome-sandbox \
+    && chromium --version \
+    && chromedriver --version \
     && python-data -c "import duckdb, pandas, pdfplumber, polars, pyarrow, pymupdf, pypdf, sklearn"
 
 WORKDIR /workspace

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import aiodocker
 import pytest
+from axio.exceptions import HandlerError
 
 from axio_tools_docker.sandbox import DockerSandbox
 
@@ -88,6 +89,37 @@ async def test_shell_tool_streams_output(sandbox: DockerSandbox) -> None:
     assert ("stdout", "first") in chunks
     assert ("stderr", "second") in chunks
     assert ("stderr", "[exit code: 3]") in chunks
+
+
+async def test_generic_image_discovers_sh_fallback_and_explicit_selection(sandbox: DockerSandbox) -> None:
+    assert sandbox.available_shells == ("sh",)
+    tool = next(item for item in sandbox.tools if item.name == "shell")
+
+    result = await tool(command='printf "%s" "$0"', shell="sh")
+
+    assert result == "/bin/sh"
+    with pytest.raises(HandlerError, match="available shells: sh"):
+        await tool(command="true", shell="bash")
+
+
+async def test_standard_image_defaults_to_bash(docker: str) -> None:
+    standard_image = os.environ.get("AXIO_STANDARD_SANDBOX_IMAGE")
+    if standard_image is None:
+        pytest.skip("set AXIO_STANDARD_SANDBOX_IMAGE to run the standard-image shell smoke test")
+
+    async with DockerSandbox(
+        docker,
+        image=standard_image,
+        workdir="/tmp",
+        env={"HOME": "/tmp"},
+        user="1000:1000",
+        pull_missing=False,
+    ) as sandbox:
+        assert sandbox.available_shells[0] == "bash"
+        tool = next(item for item in sandbox.tools if item.name == "shell")
+        result = await tool(command='test -n "$BASH_VERSION" && printf bash')
+
+    assert result == "bash"
 
 
 async def test_write_and_read_file(sandbox: DockerSandbox) -> None:

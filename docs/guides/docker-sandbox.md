@@ -115,10 +115,11 @@ whole tree.
 
 ### Standard agent image
 
-The repository contains a moderately sized universal image based on
-`mcr.microsoft.com/devcontainers/base:3-noble`. It includes Python/uv, Node.js,
-Go, Rust, OpenJDK, Git, `gh`, `glab`, PDF/OCR utilities, a Python data-analysis
-environment, and Kaggle/Hugging Face CLIs.
+The repository contains a moderately sized universal image based on the Debian
+Trixie variant of `mcr.microsoft.com/devcontainers/base`. It includes
+Python/uv, Node.js, Go, Rust, OpenJDK, Git, `gh`, `glab`, PDF/OCR utilities, a
+Python data-analysis environment, Kaggle/Hugging Face CLIs, and Debian Chromium
+with its matching ChromeDriver.
 
 ```bash
 make sandbox-image
@@ -134,6 +135,29 @@ to run `make sandbox-image`. An explicit alternative such as
 pulled when missing. See `docker/agent-sandbox/README.md` for the exact inventory
 and build arguments. Keep `python3` in derivative images:
 `search_files` and `run_python` both need it.
+
+The standard image exports `CHROME_BIN=/usr/bin/chromium` and
+`CHROMIUM_PATH=/usr/bin/chromium`. Playwright can launch that path with
+`executable_path`/`executablePath`, Selenium finds the baked `chromedriver` on
+`PATH` after setting `ChromeOptions.binary_location`, and Cypress accepts
+`--browser "$CHROME_BIN"`. Browser-download skipping is enabled for Playwright
+and Puppeteer. Run `make sandbox-image-smoke` to exercise the installed browser,
+driver, installed setuid sandbox, and a real headless render. Docker's default
+seccomp profile blocks the namespace transition required by Chromium's nested
+sandbox, so the smoke browser process uses `--no-sandbox` inside a no-network,
+capability-free container with `no-new-privileges`. Do not use that browser flag
+for untrusted pages: provide a container security profile that supports the
+installed sandbox instead. `--disable-dev-shm-usage` handles Docker's small
+default `/dev/shm`; browser-heavy runs should use a larger `shm_size` and omit
+that performance tradeoff.
+
+The Docker shell tool discovers supported names from the running container's
+`PATH` once, because the host `PATH` is not evidence about an image. It prefers
+`bash`, then `sh`, `zsh`, and `dash`. The standard image therefore defaults to
+Bash, while minimal images without Bash fall back to `sh`. The tool schema
+lists the cached choices; pass `shell="sh"` (for example) to select one. Shell
+paths and flags are rejected, and tagged stdout/stderr remains in Docker's
+observed multiplex-frame order.
 
 Dependencies must be baked in for the same reason — with networking off, a
 `uv sync` inside the container cannot reach an index. The next section describes

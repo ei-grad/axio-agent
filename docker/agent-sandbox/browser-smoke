@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+chromium --version
+chromedriver --version
+
+rendered="$({
+    chromium \
+        --headless \
+        --no-sandbox \
+        --disable-dev-shm-usage \
+        --no-first-run \
+        --user-data-dir=/tmp/axio-chromium-smoke \
+        --dump-dom \
+        'data:text/html,%3Cmain%20id%3D%22ready%22%3Eaxio-browser-ready%3C%2Fmain%3E'
+} 2>/dev/null)"
+
+grep -F '<main id="ready">axio-browser-ready</main>' <<<"$rendered"

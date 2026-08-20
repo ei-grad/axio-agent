@@ -6,7 +6,7 @@ import asyncio
 import io
 import tarfile
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiodocker
@@ -47,6 +47,7 @@ def mock_docker_factory(
     exec_messages: list[tuple[int, bytes]] | None = None,
     exec_exit_code: int = 0,
     archive_content: tarfile.TarFile | None = None,
+    shell_paths: tuple[str, ...] = ("/bin/sh",),
 ) -> tuple[MagicMock, MagicMock, MagicMock]:
     """Return (mock_docker_class, mock_client, mock_container)."""
     if exec_messages is None:
@@ -74,8 +75,26 @@ def mock_docker_factory(
     mock_container = MagicMock()
     mock_container.start = AsyncMock()
     mock_container.delete = AsyncMock()
-    mock_container.exec = AsyncMock(return_value=mock_exec)
-    mock_container.show = AsyncMock(return_value={"State": {"Running": True}})
+    mock_container.command_exec = mock_exec
+
+    async def exec_command(*, cmd: list[str], **_: Any) -> MagicMock:
+        if cmd[1:] == ["-c", "exit 0"]:
+            probe_stream = MagicMock()
+            probe_stream.read_out = AsyncMock(return_value=None)
+            probe_stream.close = AsyncMock()
+            probe_exec = MagicMock()
+            probe_exec.start = MagicMock(return_value=probe_stream)
+            probe_exec.inspect = AsyncMock(return_value={"ExitCode": 0 if cmd[0] in shell_paths else 127})
+            return probe_exec
+        return cast(MagicMock, mock_container.command_exec)
+
+    mock_container.exec = AsyncMock(side_effect=exec_command, return_value=mock_exec)
+    mock_container.show = AsyncMock(
+        return_value={
+            "State": {"Running": True},
+            "Config": {"Env": [f"PATH={sandbox_module._DEFAULT_CONTAINER_PATH}"]},
+        }
+    )
     mock_container.put_archive = AsyncMock()
     mock_container.get_archive = AsyncMock(
         return_value=archive_content if archive_content is not None else make_tar_file("file.txt", b"content")
@@ -271,6 +290,66 @@ async def test_tools_names_match_axio_tools_local() -> None:
     assert names == EXPECTED_TOOL_NAMES
 
 
+async def test_shell_discovery_prefers_bash_and_builds_runtime_schema() -> None:
+    cls, client, container = mock_docker_factory(
+        shell_paths=("/usr/bin/bash", "/bin/sh", "/usr/local/bin/zsh", "/usr/bin/dash")
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            assert sb.available_shells == ("bash", "sh", "zsh", "dash")
+            tool = next(item for item in sb.tools if item.name == "shell")
+
+    shell_schema = tool.input_schema["properties"]["shell"]
+    assert shell_schema["anyOf"][0]["enum"] == ["bash", "sh", "zsh", "dash"]
+    assert "Omit shell to use bash" in shell_schema["description"]
+    assert "Docker-observed" in tool.description
+
+
+async def test_shell_discovery_falls_back_to_sh_and_is_cached() -> None:
+    cls, client, container = mock_docker_factory(shell_paths=("/bin/sh",))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            assert sb.available_shells == ("sh",)
+            probe_count = sum(call.kwargs["cmd"][1:] == ["-c", "exit 0"] for call in container.exec.await_args_list)
+            await sb.exec("true")
+            await sb.exec("true")
+            assert (
+                sum(call.kwargs["cmd"][1:] == ["-c", "exit 0"] for call in container.exec.await_args_list)
+                == probe_count
+            )
+
+    command_calls = [call.kwargs["cmd"] for call in container.exec.await_args_list if call.kwargs["cmd"][1] == "-lc"]
+    assert command_calls == [["/bin/sh", "-lc", "true"], ["/bin/sh", "-lc", "true"]]
+
+
+async def test_shell_explicit_selection_uses_cached_path() -> None:
+    cls, client, container = mock_docker_factory(shell_paths=("/usr/bin/bash", "/bin/sh"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            await sb.exec("printf selected", shell="sh")
+
+    assert container.exec.await_args.kwargs["cmd"] == ["/bin/sh", "-lc", "printf selected"]
+
+
+async def test_shell_invalid_selection_cannot_become_argv() -> None:
+    cls, client, container = mock_docker_factory(shell_paths=("/usr/bin/bash",))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            command_count = len(container.exec.await_args_list)
+            with pytest.raises(HandlerError, match=r"available shells: bash"):
+                await sb.exec("true", shell="bash; touch /tmp/injected")
+            assert len(container.exec.await_args_list) == command_count
+
+
+async def test_shell_no_discovered_shell_is_expected_failure() -> None:
+    cls, client, container = mock_docker_factory(shell_paths=())
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            assert sb.available_shells == ()
+            with pytest.raises(HandlerError, match="No supported shell found in the container PATH"):
+                await sb.exec("true")
+
+
 async def test_tools_raises_outside_context() -> None:
     sb = DockerSandbox()
     with pytest.raises(RuntimeError, match="async context manager"):
@@ -350,7 +429,7 @@ async def test_exec_timeout() -> None:
     mock_exec_slow = MagicMock()
     mock_exec_slow.start = MagicMock(return_value=mock_stream_slow)
     mock_exec_slow.inspect = AsyncMock(return_value={"ExitCode": 0})
-    container.exec = AsyncMock(return_value=mock_exec_slow)
+    container.command_exec = mock_exec_slow
 
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
@@ -653,6 +732,7 @@ async def test_list_files_reports_timeout_instead_of_parsing_partial_output() ->
                 command: str,
                 timeout: float = 30,
                 stdin: str | None = None,
+                shell: str | None = None,
             ) -> AsyncGenerator[tuple[str, str], None]:
                 yield "stdout", make_listing_output(("81a4", 3, 1_700_000_000, "/workspace/project/partial")).decode()
                 yield "stderr", sandbox_module._ShellControl("[timeout after 30s]")
