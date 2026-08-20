@@ -6,6 +6,7 @@ import io
 import re
 from collections.abc import AsyncIterator
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -51,7 +52,7 @@ from axio_repl import (
     render_runtime_event,
     run_prompt,
 )
-from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
+from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
 from axio_repl._powerline import agent_header
 from axio_repl._theme import MONOCHROME_THEME, NO_COLOR_THEME
 
@@ -507,6 +508,94 @@ async def test_multiline_reasoning_reapplies_dim_after_every_terminal_line(
     assert f"{DIM}> first{RESET}\n{DIM}> second{RESET}" in output
     assert f"{DIM} continues{RESET}\n{DIM}> third{RESET}" in output
     assert output.endswith("\nanswer")
+
+
+async def test_submitted_input_closes_an_open_text_line_before_persistent_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(effective_username="alice")
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+
+    await renderer.render("main", TextDelta(index=0, delta="partial model text"))
+    await renderer.submitted("queued input", submitted_at)
+    await renderer.render("main", TextDelta(index=0, delta="remaining model text"))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output == "partial model text\n12:41 alice> queued input\nremaining model text"
+    assert output.count("12:41 alice>") == 1
+
+
+async def test_submitted_input_reopens_reasoning_with_prefix_and_owned_style(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(effective_username="alice")
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+
+    await renderer.render("main", ReasoningDelta(index=0, delta="thinking before input"))
+    await renderer.submitted("queued input", submitted_at)
+    await renderer.render("main", ReasoningDelta(index=0, delta="thinking after input"))
+
+    raw_output = capsys.readouterr().out
+    output = sanitize_terminal_text(raw_output)
+    assert output == "> thinking before input\n12:41 alice> queued input\n> thinking after input"
+    assert f"{DIM}> thinking before input{RESET}" in raw_output
+    assert f"{DIM}> thinking after input{RESET}" in raw_output
+
+
+async def test_submitted_input_preserves_a_streaming_tool_field_continuation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(effective_username="alice")
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"before'))
+    await renderer.submitted("queued input", submitted_at)
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=' after"}'))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert "content: before\n12:41 alice> queued input\n  content (continued):  after" in output
+    assert output.index("before") < output.index("12:41 alice>") < output.index(" after")
+
+
+@pytest.mark.parametrize("mode", ["text", "reasoning", "tool-field"])
+async def test_peer_incoming_closes_and_resumes_every_open_structural_mode(
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    renderer = ReplRenderer()
+
+    if mode == "text":
+        await renderer.render("main", TextDelta(index=0, delta="before text"))
+    elif mode == "reasoning":
+        await renderer.render("main", ReasoningDelta(index=0, delta="before reasoning"))
+    else:
+        await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"before'))
+
+    await renderer.incoming("peer body", agent_id="child", agent_name="peer")
+
+    if mode == "text":
+        await renderer.render("main", TextDelta(index=0, delta="after text"))
+    elif mode == "reasoning":
+        await renderer.render("main", ReasoningDelta(index=0, delta="after reasoning"))
+    else:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=' after"}'))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    header = "─── incoming from agent peer (child) ───"
+    assert f"\n{header}\npeer body\n" in output
+    assert output.count(header) == 1
+    if mode == "text":
+        assert output.index("before text") < output.index(header) < output.index("after text")
+    elif mode == "reasoning":
+        assert "> before reasoning" in output
+        assert "> after reasoning" in output
+        assert output.index("before reasoning") < output.index(header) < output.index("after reasoning")
+    else:
+        assert "content: before" in output
+        assert "content (continued):  after" in output
+        assert output.index("content: before") < output.index(header) < output.index(" after")
 
 
 async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(

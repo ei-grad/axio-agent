@@ -456,6 +456,46 @@ async def test_enter_time_is_captured_before_delayed_admission_and_rendered_once
     assert _panel.accepted_at(session) is None
 
 
+async def test_admission_failure_clears_accept_metadata_without_retrying() -> None:
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._input import InputSubmitted
+
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+    calls = 0
+
+    class Buffer:
+        def __init__(self) -> None:
+            self.text = "accepted text"
+            self._axio_accepted_target = "main"
+            self._axio_accepted_seq = 1
+            self._axio_accepted_at = submitted_at
+
+        def reset(self) -> None:
+            self.text = ""
+
+    class Session:
+        default_buffer = Buffer()
+
+        async def prompt_async(self, prompt: object) -> str:
+            del prompt
+            return self.default_buffer.text
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        nonlocal calls
+        del text, target_agent_id, reserved_seq
+        calls += 1
+        raise RuntimeError("admission failed")
+
+    session = Session()
+    with pytest.raises(RuntimeError, match="admission failed"):
+        await _read_input_async(session, ReplRenderer(), lambda: None, admit)
+
+    assert calls == 1
+    assert session.default_buffer.text == "accepted text"
+    assert _panel.accepted_sequence(session) is None
+    assert _panel.accepted_at(session) is None
+
+
 async def test_enter_admission_completes_before_editor_clear_even_when_reader_is_cancelled() -> None:
     from axio_tools_agents.runtime import AgentEventEnvelope, ExecutionMode, RuntimeEvent
 

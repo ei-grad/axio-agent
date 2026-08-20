@@ -625,6 +625,7 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
             )
             try:
                 await asyncio.sleep(0.05)
+                await renderer.render("main", TextDelta(index=0, delta="partial model output"))
                 os.write(master_fd, b"ping\r")
                 await asyncio.wait_for(admission_started.wait(), timeout=1)
                 assert clock_calls == [accepted_time]
@@ -632,6 +633,7 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
 
                 release_admission.set()
                 submitted = await asyncio.wait_for(input_task, timeout=1)
+                await renderer.render("main", TextDelta(index=0, delta="remaining model output"))
                 await terminal.drain()
                 assert submitted.text == "ping"
             finally:
@@ -654,6 +656,8 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
         rendered = b"".join(chunks).decode("utf-8", errors="replace")
 
         assert rendered.count("12:41 tester") == 1
+        assert rendered.index("partial model output") < rendered.index("12:41 tester")
+        assert rendered.index("12:41 tester") < rendered.index("remaining model output")
         assert "\x1b[1;97;46m 12:41 tester \x1b[22;36;49m\ue0b0\x1b[0m ping\r\n" in rendered
         assert "\x1b[?1049h" not in rendered
     finally:

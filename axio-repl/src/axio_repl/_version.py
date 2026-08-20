@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import tomllib
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -49,9 +50,11 @@ def resolved_source(source: str | None) -> str:
 def _git_directories(marker: Path) -> tuple[Path, Path] | None:
     if marker.is_dir():
         return marker, marker
+    if not marker.is_file():
+        return None
     try:
         marker_value = marker.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     prefix = "gitdir:"
     if not marker_value.lower().startswith(prefix):
@@ -73,7 +76,7 @@ def _git_directories(marker: Path) -> tuple[Path, Path] | None:
             common_dir = common_dir.resolve(strict=False)
         else:
             common_dir = git_dir
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     return git_dir, common_dir
 
@@ -82,13 +85,13 @@ def _read_git_ref(git_dir: Path, common_dir: Path, ref: str) -> str | None:
     for root in (git_dir, common_dir):
         try:
             value = (root / ref).read_text(encoding="ascii").strip()
-        except OSError:
+        except (OSError, UnicodeError):
             continue
         if value:
             return value
     try:
         packed_refs = (common_dir / "packed-refs").read_text(encoding="ascii").splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     suffix = f" {ref}"
     for line in packed_refs:
@@ -96,6 +99,49 @@ def _read_git_ref(git_dir: Path, common_dir: Path, ref: str) -> str | None:
             continue
         return line.split(" ", 1)[0]
     return None
+
+
+def _nearest_git_marker(current: Path) -> Path | None:
+    """Return the nearest lexical marker, including broken symlinks."""
+
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return marker
+        return marker
+    return None
+
+
+def _is_axio_repl_checkout(source: Path, checkout_root: Path) -> bool:
+    try:
+        source.relative_to(checkout_root)
+    except ValueError:
+        return False
+    current = source if source.is_dir() else source.parent
+    while True:
+        manifest = current / "pyproject.toml"
+        try:
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            pass
+        else:
+            project = data.get("project")
+            if isinstance(project, dict) and project.get("name") == "axio-repl":
+                try:
+                    relative_source = source.relative_to(current)
+                except ValueError:
+                    pass
+                else:
+                    source_parts = relative_source.parts
+                    if source_parts[:2] == ("src", "axio_repl") or source_parts[:1] == ("axio_repl",):
+                        return True
+        if current == checkout_root:
+            return False
+        current = current.parent
 
 
 def git_revision(module_source: str | None) -> str:
@@ -108,11 +154,10 @@ def git_revision(module_source: str | None) -> str:
     except OSError:
         return "unavailable"
     current = source if source.is_dir() else source.parent
-    marker = next(
-        (candidate / ".git" for candidate in (current, *current.parents) if (candidate / ".git").exists()),
-        None,
-    )
+    marker = _nearest_git_marker(current)
     if marker is None:
+        return "unavailable"
+    if not _is_axio_repl_checkout(source, marker.parent):
         return "unavailable"
     directories = _git_directories(marker)
     if directories is None:
@@ -120,7 +165,7 @@ def git_revision(module_source: str | None) -> str:
     git_dir, common_dir = directories
     try:
         head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
-    except OSError:
+    except (OSError, UnicodeError):
         return "unavailable"
     revision = _read_git_ref(git_dir, common_dir, head.removeprefix("ref: ")) if head.startswith("ref: ") else head
     if revision is None or len(revision) < 7:

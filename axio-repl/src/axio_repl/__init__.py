@@ -1102,15 +1102,16 @@ class ReplRenderer:
         """Persist one accepted editor value after coordinator admission."""
 
         async with self._lock:
-            print(
-                _panel.submitted_message(
-                    text,
-                    self._effective_username,
-                    submitted_at,
-                    powerline=self._powerline,
-                    theme=self._theme,
+            with self._persistent_insertion_locked():
+                print(
+                    _panel.submitted_message(
+                        text,
+                        self._effective_username,
+                        submitted_at,
+                        powerline=self._powerline,
+                        theme=self._theme,
+                    )
                 )
-            )
 
     async def incoming(
         self,
@@ -1130,21 +1131,19 @@ class ReplRenderer:
             if suppress_display:
                 return
             text = sanitize_terminal_text(text)
-            if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
-                print()
-                self._state(self._active_agent).mode = _BoundaryMode()
-            if self._powerline and agent_id is not None:
-                identity = format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))
-                print(f"\n{agent_header(identity, self._theme)}\n{text}\n")
+            with self._persistent_insertion_locked():
+                if self._powerline and agent_id is not None:
+                    identity = format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))
+                    print(f"\n{agent_header(identity, self._theme)}\n{text}\n")
+                    self._drain_safe_boundary_locked()
+                    return
+                source = (
+                    f" from agent {format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))}"
+                    if agent_id is not None
+                    else ""
+                )
+                print(f"\n{self._theme.agent.ansi}{'─' * 3} incoming{source} {'─' * 3}{self._theme.reset}\n{text}\n")
                 self._drain_safe_boundary_locked()
-                return
-            source = (
-                f" from agent {format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))}"
-                if agent_id is not None
-                else ""
-            )
-            print(f"\n{self._theme.agent.ansi}{'─' * 3} incoming{source} {'─' * 3}{self._theme.reset}\n{text}\n")
-            self._drain_safe_boundary_locked()
 
     async def notice(self, text: str) -> None:
         async with self._lock:
@@ -1152,6 +1151,30 @@ class ReplRenderer:
 
     def _state(self, agent_id: str) -> _AgentRenderState:
         return self._states.setdefault(agent_id, _AgentRenderState())
+
+    @contextmanager
+    def _persistent_insertion_locked(self) -> Iterator[None]:
+        """Bracket an out-of-band scrollback line without tearing stream structure."""
+
+        continuation: tuple[_AgentRenderState, _ToolFieldMode] | None = None
+        if self._active_agent is not None:
+            state = self._state(self._active_agent)
+            mode = state.mode
+            if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
+                sys.stdout.write(self._theme.reset)
+                state.mode = _BoundaryMode()
+            elif not isinstance(mode, _BoundaryMode):
+                sys.stdout.write(f"{self._theme.reset}\n")
+                self._flush()
+                state.mode = _BoundaryMode()
+            if isinstance(mode, _ToolFieldMode):
+                continuation = (state, mode)
+        yield
+        if continuation is not None:
+            state, mode = continuation
+            sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
+            state.mode = dataclasses.replace(mode, first_delta=True)
+            self._flush()
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
         state.mode = _BoundaryMode()
@@ -1954,21 +1977,23 @@ async def _read_input_async(
         submitted_at: datetime | None,
         prior_failure: BaseException | None = None,
     ) -> InputSubmitted:
-        admission: asyncio.Future[InputSubmitted] = asyncio.ensure_future(
-            admit_submission(editor_value.strip(), target_agent_id, reserved_seq)
-        )
         failure = prior_failure
-        while True:
-            try:
-                submitted = await asyncio.shield(admission)
-                break
-            except asyncio.CancelledError as exc:
-                if admission.done():
-                    submitted = admission.result()
-                    failure = failure or exc
-                    break
-                failure = failure or exc
+        clear_editor = False
         try:
+            admission: asyncio.Future[InputSubmitted] = asyncio.ensure_future(
+                admit_submission(editor_value.strip(), target_agent_id, reserved_seq)
+            )
+            while True:
+                try:
+                    submitted = await asyncio.shield(admission)
+                    break
+                except asyncio.CancelledError as exc:
+                    if admission.done():
+                        submitted = admission.result()
+                        failure = failure or exc
+                        break
+                    failure = failure or exc
+            clear_editor = submitted.disposition is SubmissionDisposition.PENDING
             if submitted.disposition is SubmissionDisposition.PENDING and submitted_at is not None:
                 rendering = asyncio.ensure_future(renderer.submitted(submitted.text, submitted_at))
                 while True:
@@ -1985,7 +2010,7 @@ async def _read_input_async(
             _panel.complete_submission(
                 session,
                 editor_value,
-                clear_editor=submitted.disposition is SubmissionDisposition.PENDING,
+                clear_editor=clear_editor,
             )
         if failure is not None:
             raise failure
