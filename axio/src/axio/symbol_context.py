@@ -90,10 +90,9 @@ class _JavaScriptLineState:
     pending_condition: bool = False
 
     def start_line(self) -> None:
+        self.finish_word()
         self.expression_start = True
         self.last_significant_category = "line-start"
-        self.word.clear()
-        self.pending_condition = False
 
     def can_start_regex(self) -> bool:
         self.finish_word()

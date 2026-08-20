@@ -184,6 +184,38 @@ def test_ambiguous_javascript_regex_position_omits_context_instead_of_guessing()
     assert "one.two" not in result
 
 
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "if /* note\n  */ (ready) /\\{/.test(value);",
+        "if // note\n  (ready) /\\{/.test(value);",
+    ],
+)
+def test_control_keyword_survives_comments_before_ambiguous_regex(condition: str) -> None:
+    before = f"function one(value, ready) {{\n  {condition}\n}}\nfunction two() {{ return 2; }}\n"
+
+    result = _replace("commented-condition.js", before, "return 2", "return 3")
+
+    assert "one.two" not in result
+    assert result.splitlines()[1].endswith("@@")
+
+
+def test_contradictory_syntax_clears_pending_control_keyword() -> None:
+    before = (
+        "function one(ready, divisor) {\n"
+        "  if // note\n"
+        "  +ready;\n"
+        "  (ready) / divisor;\n"
+        "}\n"
+        "function two() { return 2; }\n"
+    )
+
+    result = _replace("contradiction.js", before, "return 2", "return 3")
+
+    assert result.splitlines()[1].endswith("@@ two")
+    assert "one.two" not in result
+
+
 def test_javascript_slash_masking_has_linear_deterministic_work() -> None:
     measurements: list[tuple[int, int]] = []
     for target_size in (4_000, 8_000, 16_000, 32_000):
@@ -218,6 +250,25 @@ def test_nested_array_divisions_have_linear_deterministic_work() -> None:
         assert reliable
         assert len(masked) == len(source)
         assert expression in masked
+        assert metrics.lexical_steps <= 2 * len(source)
+        measurements.append((len(source), metrics.lexical_steps))
+
+    for (previous_size, previous_steps), (size, steps) in zip(measurements, measurements[1:]):
+        assert size <= 2 * previous_size + 64
+        assert steps <= 2 * previous_steps + 64
+
+
+def test_commented_control_conditions_have_linear_deterministic_work() -> None:
+    measurements: list[tuple[int, int]] = []
+    statement = "if /* note\ncontinued */ (ready) value++;\n"
+    for repetitions in (100, 200, 400, 800):
+        source = f"function run() {{\n{statement * repetitions}}}\n"
+        metrics = _MaskMetrics()
+
+        masked, reliable = _mask_brace_source(source.splitlines(keepends=True), ".js", metrics=metrics)
+
+        assert reliable
+        assert len("".join(masked)) == len(source)
         assert metrics.lexical_steps <= 2 * len(source)
         measurements.append((len(source), metrics.lexical_steps))
 
