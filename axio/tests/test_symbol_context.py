@@ -166,6 +166,15 @@ def test_javascript_division_is_not_misread_as_a_regex() -> None:
     assert "@@ -3,5 +3,5 @@ two\n" in _replace("division.js", before, "return 2", "return 3")
 
 
+def test_javascript_division_after_call_keeps_source_reliable() -> None:
+    before = (
+        "function one() {\n  const value = read() / [a / [1]];\n  return value;\n}\n\n"
+        "function two() {\n  return 2;\n}\n"
+    )
+
+    assert "@@ -4,5 +4,5 @@ two\n" in _replace("call-division.js", before, "return 2", "return 3")
+
+
 def test_ambiguous_javascript_regex_position_omits_context_instead_of_guessing() -> None:
     before = "function one(value, ready) {\n  if (ready) /\\{/.test(value);\n}\n\nfunction two() {\n  return 2;\n}\n"
 
@@ -189,6 +198,27 @@ def test_javascript_slash_masking_has_linear_deterministic_work() -> None:
         assert "a/b;" in masked
         assert "/\\{/" not in masked
         assert metrics.lexical_steps <= 6 * len(source)
+        measurements.append((len(source), metrics.lexical_steps))
+
+    for (previous_size, previous_steps), (size, steps) in zip(measurements, measurements[1:]):
+        assert size <= 2 * previous_size + 64
+        assert steps <= 2 * previous_steps + 64
+
+
+def test_nested_array_divisions_have_linear_deterministic_work() -> None:
+    measurements: list[tuple[int, int]] = []
+    for target_size in (4_000, 8_000, 16_000, 32_000):
+        depth = target_size // 6
+        expression = "a / [" * depth + "1" + "]" * depth
+        source = f"function run() {{ const value = {expression}; return value; }}\n"
+        metrics = _MaskMetrics()
+
+        [masked], reliable = _mask_brace_source([source], ".js", metrics=metrics)
+
+        assert reliable
+        assert len(masked) == len(source)
+        assert expression in masked
+        assert metrics.lexical_steps <= 2 * len(source)
         measurements.append((len(source), metrics.lexical_steps))
 
     for (previous_size, previous_steps), (size, steps) in zip(measurements, measurements[1:]):

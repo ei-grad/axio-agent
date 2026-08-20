@@ -56,6 +56,7 @@ _CONTROL_NAMES = frozenset({"catch", "do", "else", "for", "if", "lock", "match",
 _JS_REGEX_PREFIX_WORDS = frozenset(
     {"await", "case", "delete", "do", "else", "in", "instanceof", "of", "return", "throw", "typeof", "void", "yield"}
 )
+_JS_CONDITION_WORDS = frozenset({"catch", "for", "if", "switch", "while", "with"})
 _JS_REGEX_PREFIX_CHARS = frozenset("=([{,:;!?&|+-*%^~<>")
 _MAX_SIGNATURE_LINES = 8
 _MAX_SIGNATURE_CHARS = 1200
@@ -85,6 +86,14 @@ class _JavaScriptLineState:
     expression_start: bool = True
     last_significant_category: str = "line-start"
     word: list[str] = field(default_factory=list)
+    parentheses: list[bool] = field(default_factory=list)
+    pending_condition: bool = False
+
+    def start_line(self) -> None:
+        self.expression_start = True
+        self.last_significant_category = "line-start"
+        self.word.clear()
+        self.pending_condition = False
 
     def can_start_regex(self) -> bool:
         self.finish_word()
@@ -94,26 +103,43 @@ class _JavaScriptLineState:
             "keyword",
         }
 
+    def slash_is_ambiguous(self) -> bool:
+        self.finish_word()
+        return self.last_significant_category == "condition-close"
+
     def consume(self, character: str) -> None:
         if character.isascii() and (character.isalnum() or character in "_$"):
             self.word.append(character)
             self.last_significant_category = "word"
             return
         self.finish_word()
-        if not character.isspace():
-            self.expression_start = character == "/" or character in _JS_REGEX_PREFIX_CHARS
-            self.last_significant_category = "operator" if self.expression_start else "value"
+        if character.isspace():
+            return
+        if character == "(":
+            self.parentheses.append(self.pending_condition)
+        elif character == ")":
+            closes_condition = self.parentheses.pop() if self.parentheses else False
+            self.pending_condition = False
+            self.expression_start = False
+            self.last_significant_category = "condition-close" if closes_condition else "value"
+            return
+        self.pending_condition = False
+        self.expression_start = character == "/" or character in _JS_REGEX_PREFIX_CHARS
+        self.last_significant_category = "operator" if self.expression_start else "value"
 
     def consume_value(self) -> None:
         self.word.clear()
+        self.pending_condition = False
         self.expression_start = False
         self.last_significant_category = "value"
 
     def finish_word(self) -> None:
         if not self.word:
             return
-        self.expression_start = "".join(self.word) in _JS_REGEX_PREFIX_WORDS
+        word = "".join(self.word)
+        self.expression_start = word in _JS_REGEX_PREFIX_WORDS
         self.last_significant_category = "keyword" if self.expression_start else "value"
+        self.pending_condition = word in _JS_CONDITION_WORDS
         self.word.clear()
 
 
@@ -363,9 +389,10 @@ def _mask_brace_source(
     quote: str | None = None
     escaped = False
     preprocessor_continuation = False
+    javascript = _JavaScriptLineState()
 
     for raw_line in lines:
-        javascript = _JavaScriptLineState()
+        javascript.start_line()
         if extension in _C_FAMILY_EXTENSIONS and (preprocessor_continuation or raw_line.lstrip().startswith("#")):
             preprocessor_continuation = raw_line.rstrip().endswith("\\")
             masked.append(" " * len(raw_line))
@@ -420,8 +447,7 @@ def _mask_brace_source(
                 javascript.consume_value()
                 continue
             if extension in _JAVASCRIPT_EXTENSIONS and character == "/":
-                possible_end, closed = _javascript_regex_end(raw_line, index, metrics=metrics)
-                if closed and any(item in "{}" for item in raw_line[index:possible_end]):
+                if javascript.slash_is_ambiguous():
                     reliable = False
             if character in {'"', "'", "`"} and _starts_quote(raw_line, index, character, extension):
                 quote = character
