@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from axio import background
 from axio.models import ModelSpec
-from axio.types import Usage
+from axio.types import CostSource, Usage
 
 from axio_repl import _panel
 from axio_repl._theme import MONOCHROME_THEME, NO_COLOR_THEME
@@ -88,7 +88,7 @@ def test_a_fresh_session_still_says_which_model() -> None:
 
     assert "MiniMaxAI/MiniMax-M3" in line
     assert "ctx 0/1M" in line
-    assert "$0" in line
+    assert "est. $0" in line
 
 
 def test_tokens_of_every_agent_are_counted() -> None:
@@ -131,6 +131,7 @@ def test_cost_follows_the_model_that_was_charged() -> None:
     stats.record("child", Usage(1_000_000, 1_000_000), cheap)
 
     assert stats.cost == pytest.approx(0.3 + 1.2 + 0.1 + 0.2)
+    assert stats.cost_source is CostSource.estimated
     assert stats.cost_is_complete is True
     assert stats.per_model["cheap"] == Usage(1_000_000, 1_000_000)
 
@@ -164,7 +165,40 @@ def test_known_free_model_still_displays_zero_cost() -> None:
     line = _panel.status_line(known_free, stats)
 
     assert stats.cost_is_complete is True
-    assert "$0" in line
+    assert "est. $0" in line
+
+
+def test_provider_reported_cost_overrides_the_model_estimate() -> None:
+    stats = _panel.SessionStats()
+    usage = Usage(1_000_000, 1_000_000, cost_usd=0.42, cost_source=CostSource.provider)
+
+    stats.record("main", usage, _M3)
+    line = _panel.status_line(_M3, stats)
+
+    assert stats.cost == pytest.approx(0.42)
+    assert stats.cost_source is CostSource.provider
+    assert "reported $0.420" in line
+    assert "est." not in line
+
+
+def test_reported_and_estimated_iterations_are_labelled_mixed() -> None:
+    stats = _panel.SessionStats()
+    stats.record("main", Usage(1, 1, cost_usd=0.1, cost_source=CostSource.provider), _M3)
+    stats.record("main", Usage(1_000_000, 1_000_000), _M3)
+
+    assert stats.cost == pytest.approx(1.6)
+    assert stats.cost_source is CostSource.mixed
+    assert "mixed $1.600" in _panel.status_line(_M3, stats)
+
+
+def test_reported_cost_does_not_require_local_model_pricing() -> None:
+    unpriced = ModelSpec(id="remote", pricing_available=False)
+    stats = _panel.SessionStats()
+
+    stats.record("main", Usage(10, 20, cost_usd=0.01, cost_source=CostSource.provider), unpriced)
+
+    assert stats.cost_is_complete is True
+    assert "reported $0.010" in _panel.status_line(unpriced, stats)
 
 
 def test_usage_without_a_model_still_counts_tokens() -> None:

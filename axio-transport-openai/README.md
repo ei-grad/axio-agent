@@ -113,6 +113,26 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+### Cost accounting
+
+`IterationEnd.usage.cost_usd` is populated only when the configured provider
+reports a validated, non-negative USD cost for that operation. OpenRouter's
+terminal `usage.cost` is such a value, so `OpenRouterTransport` exposes it with
+`cost_source == CostSource.provider`. It is not recomputed from catalogue token
+prices and is recorded only once even if a compatible endpoint sends more than
+one usage chunk.
+
+OpenAI and Nebius currently return token usage, not a monetary total, in their
+Chat Completions streaming responses. Their `cost_usd` and `cost_source` fields
+therefore remain `None`. Hosts may estimate from `ModelSpec.input_cost` and
+`ModelSpec.output_cost`; `axio-repl` labels that fallback as `est.` and labels
+provider totals as `reported`. The estimate is not a billing statement and may
+differ when cached tokens, long-context or service tiers, request fees, images,
+or hosted tools have separate prices.
+
+Usage normally arrives in the terminal SSE chunk. If a stream is interrupted
+before that chunk, the transport does not fabricate token usage or cost.
+
 ## Configuration reference
 
 `OpenAITransport` and `ChatCompletionsTransport` share the following configuration fields:
@@ -213,6 +233,9 @@ transport = OpenRouterTransport(
 | `model` | `google/gemini-2.5-pro-preview` |
 
 `fetch_models()` queries `/v1/models` and populates `transport.models` with all models returned by the API, including their context windows, output limits, capabilities (text, vision, tool use, reasoning, embedding), and pricing.
+
+OpenRouter's response-level `usage.cost` takes precedence over those catalogue
+prices because it includes the actual route and applicable non-token charges.
 
 Model ids follow `[<lab>/]<model>[:tier][@<provider>]`:
 

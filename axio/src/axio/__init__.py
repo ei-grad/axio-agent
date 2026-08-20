@@ -26,7 +26,7 @@ from .selector import ToolSelector
 from .stream import AgentStream
 from .tool import CONTEXT, CURRENT_TOOL_CALL, Tool, ToolCallContext
 from .transport import CompletionTransport, RealtimeSession, RealtimeTransport
-from .types import StopReason, Usage
+from .types import CostSource, StopReason, Usage
 
 __all__ = [
     # core
@@ -67,6 +67,7 @@ __all__ = [
     "ToolUseBlock",
     "ToolResultBlock",
     # types & errors
+    "CostSource",
     "StopReason",
     "Usage",
     "GuardError",

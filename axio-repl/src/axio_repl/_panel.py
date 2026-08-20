@@ -22,7 +22,7 @@ from typing import Any
 
 from axio import background
 from axio.models import ModelSpec
-from axio.types import Usage
+from axio.types import CostSource, Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
 from prompt_toolkit.formatted_text import FormattedText
 
@@ -107,6 +107,7 @@ class SessionStats:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    cost_source: CostSource | None = None
     cost_is_complete: bool = True
     context_tokens: int = 0
     per_model: dict[str, Usage] = field(default_factory=dict)
@@ -118,14 +119,26 @@ class SessionStats:
             # The prompt of the latest iteration is what occupies the window
             # now: it grows with the conversation and drops when it is compacted.
             self.context_tokens = usage.input_tokens
-        if model is None:
-            self.cost_is_complete = False
+        if model is not None:
+            self.per_model[model.id] = self.per_model.get(model.id, Usage(0, 0)) + usage
+        if usage.cost_usd is not None:
+            assert usage.cost_source is not None
+            self.cost += usage.cost_usd
+            self.cost_source = _combine_cost_sources(self.cost_source, usage.cost_source)
             return
-        self.per_model[model.id] = self.per_model.get(model.id, Usage(0, 0)) + usage
-        if not model.pricing_available:
+        if model is None or not model.pricing_available:
             self.cost_is_complete = False
             return
         self.cost += (usage.input_tokens * model.input_cost + usage.output_tokens * model.output_cost) / 1_000_000
+        self.cost_source = _combine_cost_sources(self.cost_source, CostSource.estimated)
+
+
+def _combine_cost_sources(current: CostSource | None, added: CostSource) -> CostSource:
+    if current is None:
+        return added
+    if current == added and current is not CostSource.mixed:
+        return current
+    return CostSource.mixed
 
 
 def compact(value: int) -> str:
@@ -145,6 +158,15 @@ def format_cost(cost: float) -> str:
     if cost < 10:
         return f"${cost:.3f}"
     return f"${cost:.2f}"
+
+
+def format_cost_with_source(cost: float, source: CostSource) -> str:
+    prefix = {
+        CostSource.provider: "reported",
+        CostSource.estimated: "est.",
+        CostSource.mixed: "mixed",
+    }[source]
+    return f"{prefix} {format_cost(cost)}"
 
 
 def agent_summary(now: float | None = None) -> str:
@@ -214,8 +236,11 @@ def status_line(
     if agent_status:
         parts.append(agent_status)
     parts.append(f"{compact(stats.input_tokens)} in / {compact(stats.output_tokens)} out")
-    if model is not None and model.pricing_available and stats.cost_is_complete:
-        parts.append(format_cost(stats.cost))
+    if stats.cost_is_complete:
+        if stats.cost_source is not None:
+            parts.append(format_cost_with_source(stats.cost, stats.cost_source))
+        elif model is not None and model.pricing_available:
+            parts.append(format_cost_with_source(stats.cost, CostSource.estimated))
     agents = agent_summary()
     if agents:
         parts.append(agents)

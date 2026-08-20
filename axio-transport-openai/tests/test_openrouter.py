@@ -13,7 +13,7 @@ from aiohttp import web
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta
 from axio.exceptions import StreamError
 from axio.models import Capability, ModelRegistry, ModelSpec
-from axio.types import StopReason, Usage
+from axio.types import CostSource, StopReason, Usage
 
 from axio_transport_openai.openrouter import OpenRouterTransport
 
@@ -625,6 +625,84 @@ async def test_text_streaming(
     ends = [e for e in events if isinstance(e, IterationEnd)]
     assert ends[0].stop_reason == StopReason.end_turn
     assert ends[0].usage == Usage(10, 5)
+
+
+async def test_reported_cost_is_preserved(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+) -> None:
+    server, _ = fake_server
+    sse = _sse_chunk({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    sse += _sse_chunk(
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cost": 0.000123,
+                "cost_details": {"upstream_inference_cost": 0.0001},
+            },
+        }
+    )
+    sse += _sse_done()
+    server.sse_responses.append(sse)
+
+    events = await _collect(transport.stream([], [], ""))
+
+    usage = [event.usage for event in events if isinstance(event, IterationEnd)][0]
+    assert usage == Usage(10, 5, cost_usd=0.000123, cost_source=CostSource.provider)
+
+
+async def test_multiple_usage_chunks_use_the_latest_reported_total_once(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+) -> None:
+    server, _ = fake_server
+    sse = _sse_chunk({"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 1, "cost": 0.01}})
+    sse += _sse_chunk({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    sse += _sse_chunk({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.02}})
+    sse += _sse_done()
+    server.sse_responses.append(sse)
+
+    events = await _collect(transport.stream([], [], ""))
+
+    usage = [event.usage for event in events if isinstance(event, IterationEnd)][0]
+    assert usage == Usage(10, 5, cost_usd=0.02, cost_source=CostSource.provider)
+
+
+async def test_earlier_reported_cost_survives_a_later_token_only_usage_chunk(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+) -> None:
+    server, _ = fake_server
+    sse = _sse_chunk({"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 1, "cost": 0.01}})
+    sse += _sse_chunk({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    sse += _sse_chunk({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+    sse += _sse_done()
+    server.sse_responses.append(sse)
+
+    events = await _collect(transport.stream([], [], ""))
+
+    usage = [event.usage for event in events if isinstance(event, IterationEnd)][0]
+    assert usage == Usage(10, 5, cost_usd=0.01, cost_source=CostSource.provider)
+
+
+@pytest.mark.parametrize("invalid_cost", [-0.1, True, "0.1", float("nan")])
+async def test_malformed_reported_cost_is_ignored(
+    fake_server: tuple[FakeOpenRouterServer, str],
+    transport: OpenRouterTransport,
+    invalid_cost: object,
+) -> None:
+    server, _ = fake_server
+    sse = _sse_chunk({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    sse += _sse_chunk({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": invalid_cost}})
+    sse += _sse_done()
+    server.sse_responses.append(sse)
+
+    events = await _collect(transport.stream([], [], ""))
+
+    usage = [event.usage for event in events if isinstance(event, IterationEnd)][0]
+    assert usage == Usage(10, 5)
 
 
 async def test_reasoning_deltas_are_read(
