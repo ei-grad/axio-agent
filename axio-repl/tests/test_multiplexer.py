@@ -63,6 +63,61 @@ def test_streaming_output_is_grouped_by_lines_and_flushed_at_result() -> None:
     assert "ignored duplicate" not in result
 
 
+def test_background_patch_result_is_compact_plain_and_reuses_argument_path() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    mux.observe(
+        "child",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="patch",
+            partial_json='{"path":"src/app.py","from_line":1,"to_line":1,"content":"new\\n"}',
+        ),
+    )
+    mux.observe(
+        "child",
+        ToolResult(
+            tool_use_id="patch",
+            name="patch_file",
+            is_error=False,
+            content="+1 -1\n@@ -1 +1 @@ run\n-old\n+new\n",
+        ),
+    )
+
+    call, result = mux.drain(max_frames=2)
+    combined = call + result
+    assert combined.count("src/app.py") == 1
+    assert "+1 -1\n@@ -1 +1 @@ run\n-old\n+new" in result
+    assert "Wrote" not in result and "Changed" not in result
+    assert "---" not in result and "+++" not in result
+    assert "\x1b[" not in result
+
+
+def test_background_write_ack_suppression_is_structural_and_errors_remain_visible() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="write", name="write_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="write", partial_json='{"path":"app.py"}'))
+    assert "tool call" in mux.drain()[0]
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="write", name="write_file", is_error=False, content="Wrote 5 bytes to app.py"),
+    )
+    assert mux.drain() == []
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="error", name="write_file", is_error=True, content="provider failed"),
+    )
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="read", name="read_file", is_error=False, content="Wrote 5 bytes to app.py"),
+    )
+    error, unrelated = mux.drain(max_frames=2)
+    assert "provider failed" in error
+    assert "Wrote 5 bytes to app.py" in unrelated
+
+
 def test_partial_output_segments_flush_in_executor_observed_order() -> None:
     mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, output_chunk_chars=64)
     mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))

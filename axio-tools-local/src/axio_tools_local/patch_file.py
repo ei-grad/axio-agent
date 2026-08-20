@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from axio.diff import describe_write
+from axio.diff import describe_patch
 from axio.exceptions import HandlerError
 from axio.field import StrictStr
 
@@ -21,8 +21,9 @@ async def patch_file(
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
     to get correct line numbers. Use this for surgical edits instead of
-    rewriting the whole file with write_file. The result reports a unified diff
-    of the change. Binary files cannot be patched."""
+    rewriting the whole file with write_file. The result reports a compact diff
+    fragment with function context when it can be inferred. Binary files cannot
+    be patched."""
 
     def _blocking() -> str:
         resolved = Path(os.getcwd()) / path
@@ -48,6 +49,6 @@ async def patch_file(
             raise HandlerError(f"File is not valid UTF-8: {path}") from exc
         except OSError as exc:
             raise HandlerError(f"{exc.strerror or exc}: {path}") from exc
-        return describe_write(path, len(after.encode()), before, after)
+        return describe_patch(path, before, after)
 
     return await asyncio.to_thread(_blocking)

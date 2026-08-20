@@ -162,6 +162,7 @@ from axio_repl._theme import (
     theme_names,
 )
 from axio_repl._theme import RESET as RESET
+from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
 
 LAST_ITERATION_HINT = Message(
     role="system",
@@ -1501,6 +1502,13 @@ class ReplRenderer:
                 if isinstance(state.mode, _ToolFieldMode):
                     self._close_tool_field_locked(state)
                 content = sanitize_terminal_text(content)
+                known_call = tid in state.active_tool_ids
+                name_matches_call = not known_call or state.tool_names.get(tid) == name
+                patch_display = (
+                    parse_patch_result(content, include_legacy_path=not known_call)
+                    if name == "patch_file" and name_matches_call and not is_error
+                    else None
+                )
                 parent_key = self._parent_tool_key(agent_id, tid, presentation)
                 foreground_result = self._streamed_foreground_calls.pop(parent_key, None)
                 if foreground_result is not None:
@@ -1527,6 +1535,10 @@ class ReplRenderer:
                     sys.stdout.write(f"{self._theme.reset}\n{_styled(self._theme.error.ansi, content)}\n")
                 elif name in {"run_agent", "spawn_agent"}:
                     sys.stdout.write(f"{self._theme.reset}\n{_styled(self._theme.success.ansi, content)}\n")
+                elif patch_display is not None:
+                    sys.stdout.write(f"{self._theme.reset}\n{patch_display.styled_text(self._theme)}\n")
+                elif name == "write_file" and name_matches_call and known_call and is_write_file_result(content):
+                    sys.stdout.write(f"{self._theme.reset}\n")
                 elif tid in state.streamed_tool_ids:
                     sys.stdout.write(f"{self._theme.reset}\n")
                 else:

@@ -182,17 +182,28 @@ class TestEdgeCases:
         finally:
             f.chmod(0o644)
 
-    async def test_reports_bytes_and_diff_of_edit(self, tmp_cwd: Path) -> None:
-        """The result must say how much was written and show what changed."""
+    async def test_reports_compact_path_free_diff_of_edit(self, tmp_cwd: Path) -> None:
+        """The result keeps exact changes without repeating the tool input path."""
         f = tmp_cwd / "f.txt"
         f.write_text("line1\nline2\nline3\n")
         result = await patch(f, 2, 2, "CHANGED")
-        assert result.startswith("Wrote 20 bytes to ")
-        assert "f.txt" in result
+        assert result.startswith("+1 -1\n@@ -1,3 +1,3 @@\n")
+        assert "f.txt" not in result
+        assert "Wrote" not in result
+        assert "---" not in result
+        assert "+++" not in result
         assert "-line2\n" in result
         assert "+CHANGED\n" in result
         assert " line1\n" in result
         assert " line3\n" in result
+
+    async def test_python_patch_reports_function_context(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "service.py"
+        f.write_text("class Service:\n    def run(self):\n        return 1\n")
+
+        result = await patch(f, 3, 3, "        return 2\n")
+
+        assert "@@ -1,3 +1,3 @@ Service.run\n" in result
 
     async def test_empty_file_append(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"

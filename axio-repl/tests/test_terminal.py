@@ -843,7 +843,7 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
                         tool_use_id="call",
                         name="write_file",
                         is_error=False,
-                        content="wrote stream demo",
+                        content="Wrote 14719 bytes to /tmp/stream-demo.txt",
                     ),
                 )
                 await terminal.drain()
@@ -851,14 +851,44 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
 
                 await renderer.render(
                     "main",
-                    ToolUseStart(index=1, tool_use_id="tool-result-close", name="list_files"),
+                    ToolUseStart(index=1, tool_use_id="patch-call", name="patch_file"),
+                )
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(
+                        index=1,
+                        tool_use_id="patch-call",
+                        partial_json=(
+                            '{"path":"src/service.py","from_line":3,"to_line":3,"content":"        return 2\\n"}'
+                        ),
+                    ),
+                )
+                await terminal.drain()
+                patch_argument_stage = await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolResult(
+                        tool_use_id="patch-call",
+                        name="patch_file",
+                        is_error=False,
+                        content=(
+                            "+1 -1\n@@ -1,3 +1,3 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
+                        ),
+                    ),
+                )
+                await terminal.drain()
+                patch_result_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolUseStart(index=2, tool_use_id="tool-result-close", name="list_files"),
                 )
                 await terminal.drain()
                 await read_stage()
                 await renderer.render(
                     "main",
                     ToolInputDelta(
-                        index=1,
+                        index=2,
                         tool_use_id="tool-result-close",
                         partial_json='{"path":"partial-before-result',
                     ),
@@ -879,29 +909,29 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
 
                 await renderer.render(
                     "main",
-                    ToolUseStart(index=2, tool_use_id="error-call", name="list_files"),
+                    ToolUseStart(index=3, tool_use_id="error-call", name="list_files"),
                 )
                 await terminal.drain()
                 await read_stage()
                 await renderer.render(
                     "main",
-                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json='{"path":"'),
+                    ToolInputDelta(index=3, tool_use_id="error-call", partial_json='{"path":"'),
                 )
                 dsml_value = "<|DSML|>\nsecond natural line\nunterminated-tail"
                 for character in dsml_value.replace("\n", "\\n"):
                     await renderer.render(
                         "main",
-                        ToolInputDelta(index=2, tool_use_id="error-call", partial_json=character),
+                        ToolInputDelta(index=3, tool_use_id="error-call", partial_json=character),
                     )
                 await terminal.drain()
                 dsml_streaming_stage = await read_stage()
                 await renderer.render(
                     "main",
-                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json="\x1b[3"),
+                    ToolInputDelta(index=3, tool_use_id="error-call", partial_json="\x1b[3"),
                 )
                 await renderer.render(
                     "main",
-                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json="1m"),
+                    ToolInputDelta(index=3, tool_use_id="error-call", partial_json="1m"),
                 )
                 await terminal.drain()
                 sanitizer_only_stage = await read_stage()
@@ -930,7 +960,12 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
         assert incoming.index(" after") < incoming.index("peer body")
         assert long_partial_stage == ""
         assert long_value in sanitize_terminal_text(long_complete_stage)
-        assert "wrote stream demo" in result_stage
+        assert "Wrote 14719 bytes" not in result_stage
+        assert patch_argument_stage.count("src/service.py") == 1
+        assert "src/service.py" not in patch_result_stage
+        assert "+1 -1" in patch_result_stage
+        assert "Service.run" in patch_result_stage
+        assert "return 1" in patch_result_stage and "return 2" in patch_result_stage
         assert result_partial_stage == ""
         forced_result = sanitize_terminal_text(forced_result_stage)
         assert forced_result.index("path: partial-before-result") < forced_result.index("partial result")
@@ -954,6 +989,8 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
                 incoming_stage,
                 long_complete_stage,
                 result_stage,
+                patch_argument_stage,
+                patch_result_stage,
                 forced_result_stage,
                 dsml_streaming_stage,
                 error_stage,
@@ -961,10 +998,11 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
             )
         )
         sanitized = sanitize_terminal_text(combined)
-        assert sanitized.count("content:") == 1
+        assert sanitized.count("content:") == 2
         assert sanitized.count("long:") == 1
         assert sanitized.count("partial-before-result") == 1
         assert sanitized.count("<|DSML|>") == 1
+        assert sanitized.count("src/service.py") == 1
         assert "(continued)" not in sanitized
         assert sanitized.index("/tmp/stream-demo.txt") < sanitized.index("alpha-one")
         assert sanitized.index("alpha-one") < sanitized.index("beta-two") < sanitized.index("gamma")

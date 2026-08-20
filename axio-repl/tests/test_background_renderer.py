@@ -353,6 +353,122 @@ async def test_no_color_interactive_renderer_emits_no_ansi_or_powerline(
     assert "\ue0b0" not in captured.out + captured.err
 
 
+@pytest.mark.parametrize("powerline", [False, True])
+async def test_patch_file_result_is_compact_colored_and_keeps_tool_event_unchanged(
+    capsys: pytest.CaptureFixture[str],
+    powerline: bool,
+) -> None:
+    renderer = ReplRenderer(powerline=powerline)
+    content = "+1 -1\n@@ -1,3 +1,3 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
+    event = ToolResult(tool_use_id="patch", name="patch_file", is_error=False, content=content)
+    event_before = dataclasses.asdict(event)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="patch",
+            partial_json='{"path":"src/service.py","from_line":3,"to_line":3,"content":"        return 2\\n"}',
+        ),
+    )
+    await renderer.render("main", event)
+
+    raw = capsys.readouterr().out
+    visible = sanitize_terminal_text(raw)
+    assert visible.count("src/service.py") == 1
+    assert "Wrote" not in visible
+    assert "Changed src/service.py" not in visible
+    assert "---" not in visible
+    assert "+++" not in visible
+    assert "+1 -1\n@@ -1,3 +1,3 @@ Service.run" in visible
+    assert f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}\n" in raw
+    assert f"{DEFAULT_THEME.tool.ansi}@@ -1,3 +1,3 @@ Service.run{DEFAULT_THEME.reset}\n" in raw
+    assert f"{DEFAULT_THEME.reasoning.ansi} class Service:{DEFAULT_THEME.reset}\n" in raw
+    assert f"{DEFAULT_THEME.error.ansi}-    return 1{DEFAULT_THEME.reset}\n" in raw
+    assert f"{DEFAULT_THEME.success.ansi}+    return 2{DEFAULT_THEME.reset}\n" in raw
+    assert raw.count(DEFAULT_THEME.error.ansi) == 1
+    assert dataclasses.asdict(event) == event_before
+
+
+async def test_patch_file_result_respects_no_color_and_sanitizes_terminal_injection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolResult(
+            tool_use_id="patch",
+            name="patch_file",
+            is_error=False,
+            content="+1 -1\n@@ -1 +1 @@ run\n-old\n+\x1b[2Jnew\n",
+        ),
+    )
+
+    raw = capsys.readouterr().out
+    assert "+1 -1\n@@ -1 +1 @@ run\n-old\n+new" in raw
+    assert "\x1b[" not in raw
+
+
+async def test_malformed_patch_result_fails_open_to_existing_sanitized_display(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    await renderer.render(
+        "main",
+        ToolResult(
+            tool_use_id="orphan",
+            name="patch_file",
+            is_error=False,
+            content="+1 -0\nnot-a-hunk\n+visible\x1b[2J",
+        ),
+    )
+
+    raw = capsys.readouterr().out
+    assert "not-a-hunk" in raw and "+visible" in raw
+    assert "\x1b[2J" not in raw
+    assert f"{DEFAULT_THEME.success.ansi}+1 -0" in raw
+
+
+async def test_successful_write_ack_is_suppressed_only_for_a_known_write_call(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="write", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="write", partial_json='{"path":"app.py","content":"value\\n"}'),
+    )
+    capsys.readouterr()
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="write", name="write_file", is_error=False, content="Wrote 6 bytes to app.py"),
+    )
+    assert "Wrote" not in sanitize_terminal_text(capsys.readouterr().out)
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="error", name="write_file", is_error=True, content="Wrote failed: read-only"),
+    )
+    assert "Wrote failed: read-only" in sanitize_terminal_text(capsys.readouterr().out)
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="read", name="read_file", is_error=False, content="Wrote 6 bytes to app.py"),
+    )
+    assert "Wrote 6 bytes to app.py" in sanitize_terminal_text(capsys.readouterr().out)
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="orphan", name="write_file", is_error=False, content="Wrote 6 bytes to app.py"),
+    )
+    assert "Wrote 6 bytes to app.py" in sanitize_terminal_text(capsys.readouterr().out)
+
+
 async def test_powerline_labels_foreground_child_but_not_ordinary_main_output(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

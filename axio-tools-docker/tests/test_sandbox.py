@@ -922,8 +922,8 @@ async def test_patch_file_handler_non_utf8_target_raises_handler_error() -> None
                 CONTEXT.reset(token)
 
 
-async def test_patch_file_handler_reports_bytes_and_diff() -> None:
-    """The result must say how much was written and show what changed."""
+async def test_patch_file_handler_reports_compact_path_free_diff() -> None:
+    """The result keeps exact changes without repeating the tool input path."""
     cls, client, container = mock_docker_factory(
         archive_content=make_tar_file("patch_me.txt", b"line1\nline2\nline3\n")
     )
@@ -937,8 +937,11 @@ async def test_patch_file_handler_reports_bytes_and_diff() -> None:
             finally:
                 CONTEXT.reset(token)
 
-    # "line1\nREPLACED\nline3\n" is 21 bytes.
-    assert result.startswith("Wrote 21 bytes to /workspace/patch_me.txt\n")
+    assert result.startswith("+1 -1\n@@ -1,3 +1,3 @@\n")
+    assert "/workspace/patch_me.txt" not in result
+    assert "Wrote" not in result
+    assert "---" not in result
+    assert "+++" not in result
     assert "-line2\n" in result
     assert "+REPLACED\n" in result
     assert " line1\n" in result

@@ -122,8 +122,8 @@ Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode
 ### Text encoding and edit reports
 
 `write_file` and `patch_file` are text tools: `content` is written as UTF-8, and
-the previous content is read back as UTF-8 so the result can report a unified
-diff of the change instead of a bare byte count.
+the previous content is read back as UTF-8 so the result can report a diff of
+the change instead of a bare byte count.
 
 - `patch_file` needs to split the target into lines, so a non-UTF-8 file is an
   error (`File is not valid UTF-8`).
@@ -134,17 +134,21 @@ diff of the change instead of a bare byte count.
   `binary_as_hex` to inspect it.
 
 ```text
-Wrote 64 bytes to app.py
-Changed app.py:
---- a/app.py
-+++ b/app.py
-@@ -1,4 +1,4 @@
++1 -1
+@@ -1,4 +1,4 @@ greet
  def greet(name):
 -    return f'Hello {name}'
 +    return f'Hi {name}'
  
  print(greet('World'))
 ```
+
+This is the compact `patch_file` result. The path remains in the immediately
+preceding tool arguments instead of being repeated in the result. Each hunk
+header gets best-effort function context for Python and common brace-delimited
+languages. `write_file` retains its byte acknowledgement and full file headers
+in the model-visible result because it also covers whole-file creation and
+replacement; the interactive REPL omits its redundant successful acknowledgement.
 
 ### list_files
 

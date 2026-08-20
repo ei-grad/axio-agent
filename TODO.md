@@ -52,17 +52,3 @@ Points to settle: whether the semantic log is derived from the replay log or
 written independently; the schema and its versioning; retention, given that the
 replay log records keystrokes and therefore anything typed, including secrets
 the redactor cannot recognize.
-
-## Detect tool-call markup that leaks into the content stream
-
-Transports read tool calls from the provider's structured field only. When a
-model emits its native tool-call markup as ordinary content - DeepSeek `DSML`,
-Qwen `<tool_call>`, Llama `<|python_tag|>` - because the provider's chat
-template or parser does not match the model build, the markup is committed to
-context as assistant prose. The turn ends having executed nothing, and neither
-the user nor the model is told why.
-
-Points to settle: whether a transport should parse known markup into a real tool
-call, or only detect it and surface a protocol error; and whether detection
-belongs in each transport or in the agent loop, which is where "the model said it
-would call a tool and did not" is actually observable.
