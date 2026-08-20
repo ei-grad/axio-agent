@@ -173,7 +173,9 @@ def _python_contexts(lines: Sequence[str]) -> list[str | None]:
 
 
 def _brace_contexts(lines: Sequence[str], extension: str) -> list[str | None]:
-    masked_lines = _mask_brace_source(lines, extension)
+    masked_lines, reliable = _mask_brace_source(lines, extension)
+    if not reliable:
+        return [None] * len(lines)
     contexts: list[str | None] = [None] * len(lines)
     active: list[_BraceSymbol] = []
     depth = 0
@@ -307,8 +309,9 @@ def _parenthesis_depth(text: str, end: int) -> int:
     return depth
 
 
-def _mask_brace_source(lines: Sequence[str], extension: str) -> list[str]:
+def _mask_brace_source(lines: Sequence[str], extension: str) -> tuple[list[str], bool]:
     masked: list[str] = []
+    reliable = True
     block_depth = 0
     quote: str | None = None
     escaped = False
@@ -356,10 +359,14 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> list[str]:
                 index += 2
                 continue
             if extension in _JAVASCRIPT_EXTENSIONS and character == "/" and _starts_javascript_regex(output):
-                end = _javascript_regex_end(raw_line, index)
+                end, _ = _javascript_regex_end(raw_line, index)
                 output.extend("\n" if item == "\n" else " " for item in raw_line[index:end])
                 index = end
                 continue
+            if extension in _JAVASCRIPT_EXTENSIONS and character == "/":
+                possible_end, closed = _javascript_regex_end(raw_line, index)
+                if closed and any(item in "{}" for item in raw_line[index:possible_end]):
+                    reliable = False
             if character in {'"', "'", "`"} and _starts_quote(raw_line, index, character, extension):
                 quote = character
                 output.append(" ")
@@ -371,7 +378,7 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> list[str]:
             quote = None
             escaped = False
         masked.append("".join(output))
-    return masked
+    return masked, reliable
 
 
 def _starts_quote(line: str, index: int, quote: str, extension: str) -> bool:
@@ -389,14 +396,14 @@ def _starts_javascript_regex(output: list[str]) -> bool:
     return word_match is not None and word_match.group() in _JS_REGEX_PREFIX_WORDS
 
 
-def _javascript_regex_end(line: str, start: int) -> int:
+def _javascript_regex_end(line: str, start: int) -> tuple[int, bool]:
     escaped = False
     in_character_class = False
     index = start + 1
     while index < len(line):
         character = line[index]
         if character == "\n":
-            return index
+            return index, False
         if escaped:
             escaped = False
         elif character == "\\":
@@ -409,6 +416,6 @@ def _javascript_regex_end(line: str, start: int) -> int:
             index += 1
             while index < len(line) and line[index].isalpha():
                 index += 1
-            return index
+            return index, True
         index += 1
-    return index
+    return index, False

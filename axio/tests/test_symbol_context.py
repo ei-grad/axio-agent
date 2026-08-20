@@ -165,6 +165,15 @@ def test_javascript_division_is_not_misread_as_a_regex() -> None:
     assert "@@ -3,5 +3,5 @@ two\n" in _replace("division.js", before, "return 2", "return 3")
 
 
+def test_ambiguous_javascript_regex_position_omits_context_instead_of_guessing() -> None:
+    before = "function one(value, ready) {\n  if (ready) /\\{/.test(value);\n}\n\nfunction two() {\n  return 2;\n}\n"
+
+    result = _replace("ambiguous.js", before, "return 2", "return 3")
+
+    assert "@@ -3,5 +3,5 @@\n" in result
+    assert "one.two" not in result
+
+
 def test_valid_nested_javascript_function_keeps_nearest_context() -> None:
     before = "function outer() {\n  function inner() {\n    return 1;\n  }\n}\n"
 
