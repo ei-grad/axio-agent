@@ -34,8 +34,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
 - **Runtime model switching** — `/model <query>` to switch models mid-session
   without restarting. Capabilities (vision, reasoning, image generation) are
   re-evaluated and the system prompt adapts automatically.
-- **Streaming tool arguments** — tool call fields appear incrementally as the
-  model generates them, so you see what's happening before execution starts.
+- **Streaming tool arguments** — tool call fields appear before execution at
+  decoded newlines, field completion, or bounded 256-character preview chunks.
 - **Streaming tool output** — tagged shell stdout/stderr chunks appear as soon
   as the executor observes them instead of waiting for completion or a newline.
 - **Vision** — `read_file` on images (PNG, JPG, GIF, WebP) and videos returns
@@ -110,6 +110,15 @@ output, and results are incrementally stripped of terminal control sequences,
 including controls split across streaming chunks. Application-owned ANSI styles
 are reset and re-established on each physical line so reasoning or tool colours
 cannot leak into a later answer block.
+
+With an interactive prompt open, tool argument previews are grouped by decoded
+field lines rather than provider transport deltas. A newline-free value is
+flushed every 256 sanitized characters, and any remaining tail is flushed when
+the field completes or another persistent output line must be inserted. This
+keeps progress visible and preview memory bounded without turning token-sized
+provider chunks into one scrollback line each. The exact incremental JSON stream
+still goes to the tool argument parser; this grouping changes only its terminal
+projection.
 
 The bottom panel shows whether the active agent is idle, waiting for the model,
 reasoning, responding, or running named tools. Startup details, command output,
