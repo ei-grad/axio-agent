@@ -380,6 +380,32 @@ async def test_tools_unavailable_after_exit() -> None:
         _ = sb.tools
 
 
+async def test_shell_discovery_cancellation_cleans_up_container_and_client() -> None:
+    cls, client, container = mock_docker_factory()
+    discovery_started = asyncio.Event()
+
+    async def blocked_discovery(self: DockerSandbox) -> tuple[sandbox_module._ShellExecutable, ...]:
+        discovery_started.set()
+        await asyncio.Event().wait()
+        return ()
+
+    with (
+        patch("axio_tools_docker.sandbox.aiodocker.Docker", cls),
+        patch.object(DockerSandbox, "_discover_shells", blocked_discovery),
+    ):
+        sandbox = DockerSandbox()
+        enter_task = asyncio.create_task(sandbox.__aenter__())
+        await discovery_started.wait()
+        enter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await enter_task
+
+    container.delete.assert_awaited_once_with(force=True)
+    client.close.assert_awaited_once()
+    assert sandbox._container is None
+    assert sandbox._client is None
+
+
 # ---------------------------------------------------------------------------
 # exec
 # ---------------------------------------------------------------------------

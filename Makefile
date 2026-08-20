@@ -4,7 +4,7 @@ PACKAGES := axio axio-audio axio-context-sqlite axio-repl axio-tools-docker \
             axio-tui axio-tui-guards examples/gas_town examples/agent_swarm \
             examples/realtime_smoke examples/realtime_chat
 SANDBOX_IMAGE ?= axio-agent-sandbox:standard
-SANDBOX_RUNTIME_USER ?= $(shell id -u):$(shell id -g)
+SANDBOX_RUNTIME_USER ?= 1000:1000
 
 .PHONY: $(PACKAGES) all pytest linter typing test tests test-docs sandbox-image sandbox-image-smoke
 

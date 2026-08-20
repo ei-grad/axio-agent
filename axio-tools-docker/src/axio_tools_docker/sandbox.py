@@ -21,6 +21,7 @@ from typing import Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
+from axio._asyncio import shield_until_done
 from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_write
 from axio.exceptions import HandlerError
 from axio.schema import build_tool_schema
@@ -670,6 +671,9 @@ class DockerSandbox:
                 Tool(name="run_python", handler=run_python, context=self),
                 Tool(name="patch_file", handler=patch_file, context=self),
             ]
+        except asyncio.CancelledError:
+            await shield_until_done(self.__aexit__())
+            raise
         except Exception:
             await self.__aexit__()
             raise

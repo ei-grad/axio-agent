@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+runtime_uid="$(id -u)"
+if [[ "$runtime_uid" == 0 ]]; then
+    echo "browser-smoke must run as a non-root user" >&2
+    exit 1
+fi
+
+printf 'Browser smoke UID: %s\n' "$runtime_uid"
 chromium --version
 chromedriver --version
 

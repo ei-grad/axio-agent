@@ -82,7 +82,7 @@ driver = webdriver.Chrome(options=options)  # finds /usr/bin/chromedriver on PAT
 For Cypress, select it with `npx cypress run --browser "$CHROME_BIN"`.
 
 `make sandbox-image-smoke` builds the image, prints both installed versions,
-renders a local `data:` page headlessly as a non-root runtime UID, and verifies
+renders a local `data:` page headlessly as fixed non-root UID 1000, and verifies
 that the Docker shell tool defaults to Bash. Docker's default seccomp profile
 blocks the namespace transition required by Chromium's nested sandbox, so the
 smoke browser process uses `--no-sandbox`; the surrounding test container still
