@@ -60,6 +60,14 @@ those styles are applied. CSI, OSC, DCS, APC, cursor, screen, scrollback, and
 clipboard controls are removed even when a sequence spans multiple chunks;
 ordinary text, newlines, and tabs remain.
 
+While the interactive editor is open, decoded tool argument fields are written
+to scrollback at natural newlines, field completion, persistent insertion
+boundaries, or every 256 sanitized characters for a long newline-free value.
+The renderer therefore provides bounded incremental progress without creating a
+new `field (continued)` line for every provider token. This is a display-only
+projection: the parser still receives every `ToolInputDelta` exactly and does
+not interpret or rewrite malformed provider content.
+
 The bottom panel continuously reports the active agent phase: idle, waiting for
 the model, reasoning, responding, or the names and counts of active tools. REPL
 startup details, slash-command help/results, queue warnings, and interruption

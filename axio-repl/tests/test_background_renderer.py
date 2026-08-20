@@ -787,7 +787,7 @@ async def test_incomplete_active_tool_argument_line_closes_before_error(
         ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/visible'),
     )
     visible = sanitize_terminal_text(capsys.readouterr().out)
-    assert visible.endswith("path: /tmp/visible\n")
+    assert visible.endswith("▶ write_file")
 
     await renderer.render(
         "main",
@@ -798,6 +798,7 @@ async def test_incomplete_active_tool_argument_line_closes_before_error(
     await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
 
     captured = capsys.readouterr()
+    assert sanitize_terminal_text(captured.out).endswith("path: /tmp/visible\n")
     assert "(continued)" not in captured.out
     assert sanitize_terminal_text(captured.err).startswith("\nError from agent main: provider stream failed")
 
@@ -850,6 +851,8 @@ async def test_control_only_fragment_defers_exactly_one_label_until_printable_te
         "main",
         ToolInputDelta(index=0, tool_use_id="call", partial_json="1mprintable"),
     )
+    assert capsys.readouterr().out == ""
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
     output = sanitize_terminal_text(capsys.readouterr().out)
     assert output == "\n  content: printable\n"
     assert output.count("content:") == 1
@@ -893,16 +896,76 @@ async def test_swallowed_continuation_fragment_waits_for_printable_text_before_l
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
     await renderer.render(
         "main",
-        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"visible'),
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"visible\\n'),
     )
-    capsys.readouterr()
+    visible = sanitize_terminal_text(capsys.readouterr().out)
+    assert visible.endswith("content: visible\n")
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="\x1b[3"))
     assert capsys.readouterr().out == ""
 
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="1mprintable"))
+    assert capsys.readouterr().out == ""
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
     output = sanitize_terminal_text(capsys.readouterr().out)
     assert output == "  content (continued): printable\n"
     assert output.count("content (continued):") == 1
+
+
+async def test_prompt_active_token_sized_malformed_path_uses_bounded_visual_chunks(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+    value = "<|DSML|>" + ("malformed-provider-token" * 30)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="list_files"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"'))
+    capsys.readouterr()
+    for character in value:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+
+    streaming_output = sanitize_terminal_text(capsys.readouterr().out)
+    assert streaming_output.count("path:") == 1
+    assert streaming_output.count("path (continued):") == 1
+    await renderer.render("main", Error(exception=RuntimeError("malformed arguments")))
+    output = streaming_output + sanitize_terminal_text(capsys.readouterr().out)
+    value_lines = [line.split(": ", 1)[1] for line in output.splitlines() if line.startswith("  path")]
+    assert "".join(value_lines) == value
+    assert len(value_lines) == 3
+    assert output.count("path (continued):") == 2
+
+
+async def test_prompt_active_character_chunks_flush_on_newline_threshold_and_completion(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    for character in '{"path":"/tmp/demo.py","content":"':
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+    first_stage = sanitize_terminal_text(capsys.readouterr().out)
+    assert "path: /tmp/demo.py" in first_stage
+    assert "content:" not in first_stage
+
+    content = "first line\n" + ("x" * 300) + ' quote: " slash: \\ snow: ☃'
+    encoded = content.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("☃", "\\u2603")
+    for character in encoded:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+    streaming_stage = sanitize_terminal_text(capsys.readouterr().out)
+    assert "content: first line" in streaming_stage
+    assert streaming_stage.count("content (continued):") == 1
+
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
+    completion_stage = sanitize_terminal_text(capsys.readouterr().out)
+    rendered_lines = [
+        line.split(": ", 1)[1]
+        for line in (streaming_stage + completion_stage).splitlines()
+        if line.startswith("  content")
+    ]
+    assert "".join(rendered_lines) == content.replace("\n", "")
+    assert len(rendered_lines) == 3
+    assert completion_stage.count("content (continued):") == 1
 
 
 async def test_multiline_tool_output_reapplies_its_style_after_newlines(

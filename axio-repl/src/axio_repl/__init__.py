@@ -185,6 +185,7 @@ it gets silence where the report should be.
 AGENT_NAME = "axio-repl"
 MAX_PENDING_INPUTS = 32
 AGENT_VERSION = "0.2.3"
+TOOL_ARG_PREVIEW_CHARS = 256
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
@@ -554,8 +555,10 @@ class _ReasoningMode:
 class _ToolFieldMode:
     tool_use_id: str
     key: str
+    bounded_preview: bool = False
     first_delta: bool = True
     chunk_line_closed: bool = False
+    preview_buffer: str = ""
 
 
 type _StructuralMode = _BoundaryMode | _TextMode | _ReasoningMode | _ToolFieldMode
@@ -1162,6 +1165,8 @@ class ReplRenderer:
         continuation: tuple[_AgentRenderState, _ToolFieldMode] | None = None
         if self._active_agent is not None:
             state = self._state(self._active_agent)
+            if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
+                self._drain_prompt_tool_field_preview_locked(state, force=True)
             mode = state.mode
             if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
                 sys.stdout.write(self._theme.reset)
@@ -1177,7 +1182,7 @@ class ReplRenderer:
         yield
         if continuation is not None:
             state, mode = continuation
-            if self._input_active:
+            if mode.bounded_preview:
                 state.tool_arg_at_line_start = True
                 state.mode = dataclasses.replace(mode, chunk_line_closed=not mode.first_delta)
             else:
@@ -1372,6 +1377,8 @@ class ReplRenderer:
         if switched:
             if self._active_agent is not None:
                 active_state = self._state(self._active_agent)
+                if isinstance(active_state.mode, _ToolFieldMode) and active_state.mode.bounded_preview:
+                    self._drain_prompt_tool_field_preview_locked(active_state, force=True)
                 if isinstance(active_state.mode, _ReasoningMode):
                     sys.stdout.write("\n")
                     active_state.mode = _BoundaryMode()
@@ -1399,7 +1406,7 @@ class ReplRenderer:
         if not isinstance(event, ReasoningDelta):
             state.reasoning_sanitizer.reset()
         if switched and isinstance(state.mode, _ToolFieldMode):
-            if self._input_active:
+            if state.mode.bounded_preview:
                 state.tool_arg_at_line_start = True
                 state.mode = dataclasses.replace(
                     state.mode,
@@ -1507,6 +1514,10 @@ class ReplRenderer:
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
+                if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
+                    if state.mode.tool_use_id == tid:
+                        self._drain_prompt_tool_field_preview_locked(state, force=True)
+                        state.mode = _BoundaryMode()
                 content = sanitize_terminal_text(content)
                 known_call = tid in state.active_tool_ids
                 name_matches_call = not known_call or state.tool_names.get(tid) == name
@@ -1572,7 +1583,8 @@ class ReplRenderer:
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
-                if self._input_active and isinstance(state.mode, _ToolFieldMode):
+                if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
+                    self._drain_prompt_tool_field_preview_locked(state, force=True)
                     if not state.mode.chunk_line_closed:
                         sys.stdout.write(f"{self._theme.reset}\n")
                         self._flush()
@@ -1788,9 +1800,13 @@ class ReplRenderer:
         match event:
             case ToolFieldStart(key=key):
                 key = sanitize_terminal_text(key).replace("\n", " ")
-                state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
+                state.mode = _ToolFieldMode(
+                    tool_use_id=tool_use_id,
+                    key=key,
+                    bounded_preview=self._input_active,
+                )
                 state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
-                if not self._input_active:
+                if not state.mode.bounded_preview:
                     leading = "" if state.tool_arg_at_line_start else "\n"
                     sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
                     self._flush()
@@ -1805,37 +1821,69 @@ class ReplRenderer:
                 text = sanitizer.feed(text)
                 if not text:
                     return
+                if mode.bounded_preview:
+                    state.mode = dataclasses.replace(mode, preview_buffer=mode.preview_buffer + text)
+                    self._drain_prompt_tool_field_preview_locked(state, force=False)
+                    return
                 if mode.chunk_line_closed:
                     sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
                     state.tool_arg_at_line_start = False
                     mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
-                elif self._input_active and mode.first_delta:
-                    leading = "" if state.tool_arg_at_line_start else "\n"
-                    sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{mode.key}{self._theme.reset}: ")
-                    state.tool_arg_at_line_start = False
                 if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.mode = dataclasses.replace(mode, first_delta=False)
-                styled = _styled(self._theme.reasoning.ansi, text)
-                if self._input_active and text.endswith("\n") and self._theme.reasoning.ansi:
-                    styled = styled[: -len(self._theme.reasoning.ansi + self._theme.reset)]
-                sys.stdout.write(styled)
-                if self._input_active and text:
-                    # A partial terminal frame would share a row with prompt_toolkit's
-                    # redraw. Complete one visual line per received value fragment;
-                    # the next fragment is labelled as a continuation of this field.
-                    if not text.endswith("\n"):
-                        sys.stdout.write(f"{self._theme.reset}\n")
-                    state.tool_arg_at_line_start = True
-                    state.mode = dataclasses.replace(state.mode, chunk_line_closed=True)
+                sys.stdout.write(_styled(self._theme.reasoning.ansi, text))
                 self._flush()
             case ToolFieldEnd():
                 if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
-                    if not state.mode.chunk_line_closed and not (self._input_active and state.mode.first_delta):
+                    if state.mode.bounded_preview:
+                        self._drain_prompt_tool_field_preview_locked(state, force=True)
+                    if not state.mode.chunk_line_closed and not (
+                        state.mode.bounded_preview and state.mode.first_delta
+                    ):
                         sys.stdout.write(self._theme.reset)
                         self._flush()
                     state.tool_field_sanitizers.pop((tool_use_id, state.mode.key), None)
                     state.mode = _BoundaryMode()
+
+    def _drain_prompt_tool_field_preview_locked(
+        self,
+        state: _AgentRenderState,
+        *,
+        force: bool,
+    ) -> None:
+        mode = state.mode
+        if not isinstance(mode, _ToolFieldMode):
+            return
+        emitted = False
+        while mode.preview_buffer:
+            newline = mode.preview_buffer.find("\n")
+            if 0 <= newline <= TOOL_ARG_PREVIEW_CHARS:
+                end = newline + 1
+            elif len(mode.preview_buffer) >= TOOL_ARG_PREVIEW_CHARS:
+                end = TOOL_ARG_PREVIEW_CHARS
+            elif force:
+                end = len(mode.preview_buffer)
+            else:
+                break
+
+            text = mode.preview_buffer[:end]
+            mode = dataclasses.replace(mode, preview_buffer=mode.preview_buffer[end:])
+            leading = "" if state.tool_arg_at_line_start else "\n"
+            label = mode.key if mode.first_delta else f"{mode.key} (continued)"
+            sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{label}{self._theme.reset}: ")
+            styled = _styled(self._theme.reasoning.ansi, text)
+            if text.endswith("\n") and self._theme.reasoning.ansi:
+                styled = styled[: -len(self._theme.reasoning.ansi + self._theme.reset)]
+            sys.stdout.write(styled)
+            if not text.endswith("\n"):
+                sys.stdout.write(f"{self._theme.reset}\n")
+            state.tool_arg_at_line_start = True
+            mode = dataclasses.replace(mode, first_delta=False, chunk_line_closed=True)
+            state.mode = mode
+            emitted = True
+        if emitted:
+            self._flush()
 
 
 async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvelope) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import termios
 import threading
@@ -24,6 +25,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from axio_repl import ReplRenderer, _panel, _read_input_async
 from axio_repl._input import InputSubmitted, SubmissionDisposition
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
+from axio_repl._terminal_sanitizer import sanitize_terminal_text
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, TerminalTheme
 
 
@@ -161,13 +163,19 @@ async def test_no_color_active_tool_argument_frames_have_no_sgr() -> None:
             ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/stream-'),
         )
         await terminal.drain()
+        assert not any("/tmp/stream-" in chunk for chunk in output.raw)
+        await renderer.render(
+            "main",
+            ToolInputDelta(index=0, tool_use_id="call", partial_json='demo"'),
+        )
+        await terminal.drain()
         first_frame = next(chunk for chunk in output.raw if "/tmp/stream-" in chunk)
         assert "\x1b[" not in first_frame
 
         output.raw.clear()
         await renderer.render(
             "main",
-            ToolInputDelta(index=0, tool_use_id="call", partial_json='demo","content":"value"}'),
+            ToolInputDelta(index=0, tool_use_id="call", partial_json=',"content":"value"}'),
         )
         await terminal.drain()
         second_frame = next(chunk for chunk in output.raw if "content" in chunk and "value" in chunk)
@@ -709,7 +717,7 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal argument streaming test")
 @pytest.mark.parametrize("powerline", [False, True])
-async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with_prompt_open(
+async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_with_prompt_open(
     monkeypatch: pytest.MonkeyPatch,
     powerline: bool,
 ) -> None:
@@ -865,11 +873,12 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
                 await terminal.close()
                 late_stage = await read_stage()
 
-        assert "path" in stages[0] and "/tmp/stream-" in stages[0]
-        assert "demo.txt" in stages[1] and "content" in stages[1]
-        assert "alpha-one" in stages[1] and "bet" in stages[1]
-        assert "12:41 tester" in stages[2] and "queued input" in stages[2]
-        assert 'a-two with "gamma-' in stages[3] and long_middle in stages[3]
+        assert stages[0] == ""
+        assert "path" in stages[1] and "/tmp/stream-demo.txt" in stages[1]
+        assert "content" in stages[1] and "alpha-one" in stages[1]
+        assert "bet" not in stages[1]
+        assert "bet" in stages[2] and "12:41 tester" in stages[2] and "queued input" in stages[2]
+        assert 'a-two with "gamma-' in stages[3]
         assert "peer body" in stages[4]
         assert 'three" and \\ delta-four' in stages[5]
         assert "Wrote 14719 bytes" not in result_stage
@@ -878,20 +887,29 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
         assert "+1 -1" in patch_result_stage
         assert "Service.run" in patch_result_stage
         assert "return 1" in patch_result_stage and "return 2" in patch_result_stage
-        assert "content" in error_visible_stage and "visible-before-error" in error_visible_stage
+        assert error_visible_stage == ""
         assert "(continued)" not in swallowed_stage
+        assert "content" in error_stage and "visible-before-error" in error_stage
         assert "provider stream failed" in error_stage
         assert "(continued)" not in error_stage
         assert "(continued)" not in late_stage
 
+        argument_output = sanitize_terminal_text("".join(stages))
+        content_lines = [
+            match.group(1)
+            for line in argument_output.splitlines()
+            if (match := re.search(r"  content(?: \(continued\))?: (.*)$", line))
+        ]
+        assert "".join(content_lines) == ('alpha-onebeta-two with "gamma-' + long_middle + 'three" and \\ delta-four')
+        assert argument_output.count("content:") == 1
+        assert argument_output.count("content (continued):") == 4
+        assert argument_output.index("/tmp/stream-demo.txt") < argument_output.index("alpha-one")
+        assert (
+            argument_output.index("alpha-one") < argument_output.index("gamma-") < argument_output.index("delta-four")
+        )
+
         combined = "".join((*stages, result_stage, patch_argument_stage, patch_result_stage))
-        for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", long_middle, "gamma-", "delta-four"):
-            assert combined.count(fragment) == 1
-        assert combined.index("/tmp/stream-") < combined.index("demo.txt") < combined.index("alpha-one")
-        assert combined.index("alpha-one") < combined.index("gamma-") < combined.index("delta-four")
-        assert f"{DEFAULT_THEME.reasoning.ansi}/tmp/stream-{DEFAULT_THEME.reset}" in combined
-        assert f"{DEFAULT_THEME.reset}\r\n{DEFAULT_THEME.reasoning.ansi}bet" in combined
-        assert combined.count("src/service.py") == 1
+        assert sanitize_terminal_text(combined).count("src/service.py") == 1
         assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()
