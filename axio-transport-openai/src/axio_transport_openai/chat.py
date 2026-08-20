@@ -29,7 +29,7 @@ from axio.messages import (
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport, EmbeddingTransport
-from axio.types import StopReason, Usage
+from axio.types import CostSource, StopReason, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -740,6 +740,23 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
 
         return payload
 
+    def _provider_cost_usd(self, usage: Mapping[str, Any]) -> float | None:
+        return None
+
+    def _parse_usage(self, raw_usage: object, previous: Usage) -> Usage:
+        if not isinstance(raw_usage, Mapping):
+            logger.warning("Ignoring non-object usage payload from %s", self.name)
+            return previous
+        provider_cost = self._provider_cost_usd(raw_usage)
+        cost_usd = previous.cost_usd if provider_cost is None else provider_cost
+        cost_source = previous.cost_source if provider_cost is None else CostSource.provider
+        return Usage(
+            input_tokens=raw_usage.get("prompt_tokens", 0),
+            output_tokens=raw_usage.get("completion_tokens", 0),
+            cost_usd=cost_usd,
+            cost_source=cost_source,
+        )
+
     async def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
         tool_index_to_id: dict[int, str] = {}
         usage = Usage(0, 0)
@@ -763,11 +780,7 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
                     error_message = err.get("message") or str(err) if isinstance(err, dict) else str(err)
 
                 if "usage" in data and data["usage"] is not None:
-                    u: dict[str, int] = data["usage"]
-                    usage = Usage(
-                        input_tokens=u.get("prompt_tokens", 0),
-                        output_tokens=u.get("completion_tokens", 0),
-                    )
+                    usage = self._parse_usage(data["usage"], usage)
 
                 choices: list[dict[str, Any]] = data.get("choices", [])
                 if not choices:
@@ -815,11 +828,7 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
                 data = json.loads(line[6:])
 
                 if "usage" in data and data["usage"] is not None:
-                    u = data["usage"]
-                    usage = Usage(
-                        input_tokens=u.get("prompt_tokens", 0),
-                        output_tokens=u.get("completion_tokens", 0),
-                    )
+                    usage = self._parse_usage(data["usage"], usage)
 
                 choices = data.get("choices", [])
                 if choices:

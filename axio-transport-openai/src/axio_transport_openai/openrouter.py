@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -94,6 +96,19 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
             payload["model"] = model_id
             payload.setdefault("provider", {"only": [provider]})
         return payload
+
+    def _provider_cost_usd(self, usage: Mapping[str, Any]) -> float | None:
+        if "cost" not in usage:
+            return None
+        value = usage["cost"]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            logger.warning("Ignoring OpenRouter usage.cost with non-numeric type %s", type(value).__name__)
+            return None
+        cost = float(value)
+        if not math.isfinite(cost) or cost < 0:
+            logger.warning("Ignoring non-finite or negative OpenRouter usage.cost")
+            return None
+        return cost
 
     def resolve_model(self, model_id: str) -> ModelSpec:
         """Resolve ``[<lab>/]<model>[:tier][@<provider>]``.

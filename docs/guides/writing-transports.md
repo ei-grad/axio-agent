@@ -100,6 +100,31 @@ Your transport should yield these events in order:
    - `stop_reason`: `end_turn`, `tool_use`, `max_tokens`, or `error`
    - `usage`: token counts for this call
 
+### Provider-reported cost
+
+If a provider includes the operation's monetary cost in a known USD field, put
+the validated value in `Usage.cost_usd` and set
+`cost_source=CostSource.provider`. Reject booleans, strings, negative values,
+NaN, and infinities rather than treating them as money. Leave both fields as
+`None` when the response does not contain a trustworthy monetary value; a host
+can then present a clearly labelled estimate from its model registry.
+
+Do not add a local token-price estimate to a provider-reported total. Usage
+chunks generally contain totals for the operation, so repeated chunks replace
+the previous reported total rather than being summed. An interrupted stream
+that never receives terminal usage must not invent a cost.
+
+```python
+from axio import CostSource, Usage
+
+usage = Usage(
+    input_tokens=100,
+    output_tokens=20,
+    cost_usd=0.0012,
+    cost_source=CostSource.provider,
+)
+```
+
 ### Tool calls
 
 When the LLM wants to call a tool, yield:

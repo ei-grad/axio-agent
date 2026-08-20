@@ -23,7 +23,7 @@ from axio.events import (
 from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
 from axio.tool import Tool
-from axio.types import StopReason, Usage
+from axio.types import CostSource, StopReason, Usage
 
 
 class CapturingTransport:
@@ -292,6 +292,24 @@ class TestMultiIteration:
         agent = Agent(system="test", tools=[tool], transport=transport)
         end = await agent.run_stream("go", MemoryContextStore()).get_session_end()
         assert end.total_usage == Usage(13, 12)
+
+    async def test_total_provider_cost_across_iterations(self) -> None:
+        tool = make_echo_tool()
+        first = Usage(10, 5, cost_usd=0.1, cost_source=CostSource.provider)
+        second = Usage(3, 7, cost_usd=0.2, cost_source=CostSource.provider)
+        transport = StubTransport(
+            [
+                make_tool_use_response("echo", "c1", {"msg": "hi"}, 1, first),
+                make_text_response("Done", 2, second),
+            ]
+        )
+        agent = Agent(system="test", tools=[tool], transport=transport)
+
+        end = await agent.run_stream("go", MemoryContextStore()).get_session_end()
+
+        assert (end.total_usage.input_tokens, end.total_usage.output_tokens) == (13, 12)
+        assert end.total_usage.cost_usd == pytest.approx(0.3)
+        assert end.total_usage.cost_source is CostSource.provider
 
 
 class TestContextTokenTracking:

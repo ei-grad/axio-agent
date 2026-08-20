@@ -2,7 +2,7 @@
 
 import pytest
 
-from axio.types import StopReason, Usage
+from axio.types import CostSource, StopReason, Usage
 
 
 class TestUsage:
@@ -29,6 +29,43 @@ class TestUsage:
         zero = Usage(0, 0)
         a = Usage(10, 5)
         assert a + zero == a
+
+    def test_provider_cost_is_accumulated(self) -> None:
+        first = Usage(10, 2, cost_usd=0.1, cost_source=CostSource.provider)
+        second = Usage(20, 3, cost_usd=0.2, cost_source=CostSource.provider)
+
+        total = first + second
+        assert (total.input_tokens, total.output_tokens, total.cost_source) == (30, 5, CostSource.provider)
+        assert total.cost_usd == pytest.approx(0.3)
+
+    def test_mixed_cost_sources_remain_distinguishable(self) -> None:
+        reported = Usage(10, 2, cost_usd=0.1, cost_source=CostSource.provider)
+        estimated = Usage(20, 3, cost_usd=0.2, cost_source=CostSource.estimated)
+
+        total = reported + estimated
+        assert (total.input_tokens, total.output_tokens, total.cost_source) == (30, 5, CostSource.mixed)
+        assert total.cost_usd == pytest.approx(0.3)
+
+    def test_unknown_cost_makes_a_nonempty_total_unknown(self) -> None:
+        reported = Usage(10, 2, cost_usd=0.1, cost_source=CostSource.provider)
+
+        assert (reported + Usage(1, 1)).cost_usd is None
+        assert (Usage(1, 1) + reported).cost_usd is None
+
+    def test_empty_accumulator_is_a_cost_identity(self) -> None:
+        reported = Usage(10, 2, cost_usd=0.1, cost_source=CostSource.provider)
+
+        assert Usage(0, 0) + reported == reported
+        assert reported + Usage(0, 0) == reported
+
+    @pytest.mark.parametrize("cost", [-0.1, float("inf"), float("nan")])
+    def test_rejects_invalid_cost(self, cost: float) -> None:
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            Usage(1, 1, cost_usd=cost, cost_source=CostSource.provider)
+
+    def test_rejects_cost_without_source(self) -> None:
+        with pytest.raises(ValueError, match="provided together"):
+            Usage(1, 1, cost_usd=0.1)
 
 
 class TestStopReason:

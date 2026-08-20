@@ -30,7 +30,7 @@ from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.testing import make_text_response, make_tool_use_response
 from axio.tool import Tool
-from axio.types import StopReason, Usage
+from axio.types import CostSource, StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     EditorSnapshot,
@@ -1046,7 +1046,7 @@ class _Envelope:
 async def test_serializer_handles_events_dataclasses_enums_usage_and_exceptions(tmp_path: Path) -> None:
     journal = await SessionJournal.open(session_id="types", root=tmp_path)
     payload = _Envelope(
-        usage=Usage(input_tokens=7, output_tokens=3),
+        usage=Usage(input_tokens=7, output_tokens=3, cost_usd=0.001, cost_source=CostSource.provider),
         reason=StopReason.end_turn,
         event=IterationEnd(iteration=2, stop_reason=StopReason.tool_use, usage=Usage(5, 1)),
         failure=RuntimeError("failed with password=hunter2"),
@@ -1059,13 +1059,25 @@ async def test_serializer_handles_events_dataclasses_enums_usage_and_exceptions(
     records = _read_records(journal.events_path)
     serialized = records[1]["payload"]
     assert serialized["record_type"] == "_Envelope"
-    assert serialized["usage"] == {"record_type": "Usage", "input_tokens": 7, "output_tokens": 3}
+    assert serialized["usage"] == {
+        "record_type": "Usage",
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "cost_usd": 0.001,
+        "cost_source": "provider",
+    }
     assert serialized["reason"] == "end_turn"
     assert serialized["event"] == {
         "record_type": "IterationEnd",
         "iteration": 2,
         "stop_reason": "tool_use",
-        "usage": {"record_type": "Usage", "input_tokens": 5, "output_tokens": 1},
+        "usage": {
+            "record_type": "Usage",
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "cost_usd": None,
+            "cost_source": None,
+        },
     }
     assert serialized["failure"] == {
         "exception_type": "RuntimeError",

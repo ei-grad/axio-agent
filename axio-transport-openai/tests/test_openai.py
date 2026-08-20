@@ -290,6 +290,18 @@ async def test_text_streaming(
     assert any("Stream complete" in r.message for r in caplog.records)
 
 
+async def test_generic_transport_does_not_assume_cost_currency(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
+    server, _ = fake_server
+    server.responses.append(_text_chunks("x", usage={"prompt_tokens": 10, "completion_tokens": 5, "cost": 1}))
+
+    events = await _collect(transport.stream([], [], ""))
+
+    usage = [event.usage for event in events if isinstance(event, IterationEnd)][0]
+    assert usage == Usage(10, 5)
+
+
 # ---------------------------------------------------------------------------
 # Tool call streaming
 # ---------------------------------------------------------------------------
