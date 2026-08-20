@@ -136,6 +136,7 @@ from axio_repl._coordinator import (
     ordered_arrivals,
 )
 from axio_repl._deferred_tools import DeferredToolNotification, DeferredToolRegistry
+from axio_repl._identity import append_runtime_identity_metadata, resolve_effective_username
 from axio_repl._input import ExitArmingState, InputSubmitted, SubmissionDisposition
 from axio_repl._input import InterruptRequested as PromptInterruptRequested
 from axio_repl._multiplexer import (
@@ -149,6 +150,8 @@ from axio_repl._multiplexer import (
 from axio_repl._powerline import agent_header, tool_title
 from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
 from axio_repl._terminal import TerminalUI
+from axio_repl._theme import DEFAULT_THEME, TerminalTheme, resolve_theme, theme_names
+from axio_repl._theme import RESET as RESET
 
 LAST_ITERATION_HINT = Message(
     role="system",
@@ -175,14 +178,12 @@ AGENT_VERSION = "0.2.3"
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
-DIM = "\033[2m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-MUTED_AMBER = "\033[2;33m"
-RESET = "\033[0m"
+DIM = DEFAULT_THEME.reasoning.ansi
+BOLD = DEFAULT_THEME.emphasis.ansi
+GREEN = DEFAULT_THEME.success.ansi
+YELLOW = DEFAULT_THEME.warning.ansi
+RED = DEFAULT_THEME.error.ansi
+MUTED_AMBER = DEFAULT_THEME.stderr.ansi
 
 
 def _styled(style: str, text: str) -> str:
@@ -330,6 +331,7 @@ def build_system_prompt(
     agents_text: str = "",
     parent_peer_id: str | None = None,
     sandbox_note: str = "",
+    model_context: str = "",
 ) -> str:
     caps = model.capabilities
     ctx_k = model.context_window // 1000
@@ -349,6 +351,12 @@ def build_system_prompt(
     lines += ["Input provenance:", f"- {INPUT_PROVENANCE_SYSTEM_INSTRUCTION}", ""]
     if sandbox_note:
         lines += [sandbox_note, ""]
+    if model_context:
+        lines += [
+            "Operator model context (trusted local profile data; descriptive, not an enforcement mechanism):",
+            model_context,
+            "",
+        ]
 
     # Capability-aware guidance
     cap_notes: list[str] = []
@@ -476,6 +484,36 @@ def build_system_prompt(
         lines += [agents_text, ""]
 
     return "\n".join(lines)
+
+
+def _build_runtime_system_prompt(
+    root: Path,
+    model: ModelSpec,
+    tools: list[Tool[Any]],
+    agents_text: str,
+    *,
+    effective_username: str | None = None,
+    effort: EffortRuntime | None = None,
+    parent_peer_id: str | None = None,
+    sandbox_note: str = "",
+    model_context: str = "",
+) -> str:
+    """Compose the stable provider system prompt and append runtime identity once."""
+
+    system = build_system_prompt(
+        root,
+        model,
+        tools,
+        agents_text,
+        parent_peer_id=parent_peer_id,
+        sandbox_note=sandbox_note,
+        model_context=model_context,
+    )
+    if effort is not None:
+        system = effort.system_prompt(system)
+    if effective_username is not None:
+        system = append_runtime_identity_metadata(system, effective_username)
+    return system
 
 
 # ── Readline history ─────────────────────────────────────────────────
@@ -654,6 +692,7 @@ class ReplRenderer:
         action_boundary_bytes: int = 16 * 1024,
         max_identity_cache: int = 256,
         powerline: bool = False,
+        theme: TerminalTheme = DEFAULT_THEME,
     ) -> None:
         if max_identity_cache < 2:
             raise ValueError("max_identity_cache must be at least 2")
@@ -666,6 +705,7 @@ class ReplRenderer:
         self._agent_names: OrderedDict[str, str] = OrderedDict()
         self._max_identity_cache = max_identity_cache
         self._powerline = powerline
+        self._theme = theme
         if normalized_main_name := normalize_agent_name(main_agent_name):
             self._agent_names["main"] = normalized_main_name
         self._turns: dict[_TurnKey, _TurnPresentation] = {}
@@ -680,12 +720,13 @@ class ReplRenderer:
         self._background_summaries: OrderedDict[_TurnKey, _BackgroundSummary] = OrderedDict()
         self._input_active = False
         self._panel_message = ""
-        self._actions = action_multiplexer or ActionMultiplexer(display_mode, powerline=powerline)
+        self._actions = action_multiplexer or ActionMultiplexer(display_mode, powerline=powerline, theme=theme)
         # A parent's sibling tool still belongs to the active turn while a child
         # owns the terminal, so it has an always-on queue separate from background actions.
         self._suspended_actions = suspended_action_multiplexer or ActionMultiplexer(
             DisplayMode.ALL_ACTIONS,
             powerline=powerline,
+            theme=theme,
         )
         self._suspended_tool_calls: set[tuple[str, str]] = set()
         self._action_boundary_frames = action_boundary_frames
@@ -1049,7 +1090,7 @@ class ReplRenderer:
                 self._state(self._active_agent).mode = _BoundaryMode()
             if self._powerline and agent_id is not None:
                 identity = format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))
-                print(f"\n{agent_header(identity)}\n{text}\n")
+                print(f"\n{agent_header(identity, self._theme)}\n{text}\n")
                 self._drain_safe_boundary_locked()
                 return
             source = (
@@ -1057,7 +1098,7 @@ class ReplRenderer:
                 if agent_id is not None
                 else ""
             )
-            print(f"\n{DIM}{'─' * 3} incoming{source} {'─' * 3}{RESET}\n{text}\n")
+            print(f"\n{self._theme.agent.ansi}{'─' * 3} incoming{source} {'─' * 3}{RESET}\n{text}\n")
             self._drain_safe_boundary_locked()
 
     async def notice(self, text: str) -> None:
@@ -1169,9 +1210,9 @@ class ReplRenderer:
             return
         identity = format_agent_identity(agent_id, presentation.agent_name)
         if self._powerline:
-            print(f"\n{agent_header(identity)}")
+            print(f"\n{agent_header(identity, self._theme)}")
         else:
-            print(f"\n{DIM}── agent {identity} ──{RESET}")
+            print(f"\n{self._theme.agent.ansi}── agent {identity} ──{RESET}")
 
     def _parent_tool_key(
         self,
@@ -1270,7 +1311,7 @@ class ReplRenderer:
         if self._event_starts_stdout(event, presentation):
             self._ensure_stdout_header_locked(agent_id, presentation)
         if switched and isinstance(state.mode, _ToolFieldMode):
-            sys.stdout.write(f"  {YELLOW}{state.mode.key} (continued){RESET}: ")
+            sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){RESET}: ")
             self._flush()
             state.mode = dataclasses.replace(state.mode, first_delta=True)
         if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
@@ -1291,7 +1332,7 @@ class ReplRenderer:
                         return
                     delta = f"> {delta}"
                     state.mode = _ReasoningMode()
-                sys.stdout.write(_styled(DIM, delta.replace("\n", "\n> ")))
+                sys.stdout.write(_styled(self._theme.reasoning.ansi, delta.replace("\n", "\n> ")))
                 self._flush()
 
             case TextDelta(delta=delta):
@@ -1299,7 +1340,7 @@ class ReplRenderer:
                     state.mode = _TextMode()
                 state.pending_text.append(delta)
                 if "[Output truncated:" in delta:
-                    sys.stdout.write(f"\n{_styled(RED, delta.strip())}\n")
+                    sys.stdout.write(f"\n{_styled(self._theme.error.ansi, delta.strip())}\n")
                     state.mode = _BoundaryMode()
                     self._drain_safe_boundary_locked()
                 else:
@@ -1310,7 +1351,7 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{GREEN}[image saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[image saved: {path}]{RESET}")
                 self._drain_safe_boundary_locked()
 
             case AudioOutput(data=data, media_type=mt):
@@ -1318,7 +1359,7 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{GREEN}[audio saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[audio saved: {path}]{RESET}")
                 self._drain_safe_boundary_locked()
 
             case VideoOutput(data=data, media_type=mt):
@@ -1326,7 +1367,7 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{GREEN}[video saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[video saved: {path}]{RESET}")
                 self._drain_safe_boundary_locked()
 
             case ToolUseStart(index=index, tool_use_id=tid, name=name):
@@ -1334,9 +1375,9 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 if self._powerline:
-                    sys.stdout.write(f"\n{tool_title(name)}")
+                    sys.stdout.write(f"\n{tool_title(name, self._theme)}")
                 else:
-                    sys.stdout.write(f"\n{BOLD}{CYAN}▶ {name}{RESET}")
+                    sys.stdout.write(f"\n{self._theme.tool.ansi}▶ {name}{RESET}")
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tid)
@@ -1358,7 +1399,7 @@ class ReplRenderer:
                 if tid not in state.streamed_tool_ids:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
-                color = MUTED_AMBER if key == "stderr" else DIM
+                color = self._theme.stderr.ansi if key == "stderr" else self._theme.stdout.ansi
                 sys.stdout.write(_styled(color, delta))
                 self._flush()
 
@@ -1379,16 +1420,20 @@ class ReplRenderer:
                         )
                     else:
                         content = f"[foreground agent {identity} failed; the outcome was returned to the parent]"
-                    color = GREEN if foreground_status is TurnStatus.SUCCEEDED else RED
+                    color = (
+                        self._theme.success.ansi
+                        if foreground_status is TurnStatus.SUCCEEDED
+                        else self._theme.error.ansi
+                    )
                     sys.stdout.write(f"{RESET}\n{_styled(color, content)}\n")
                 elif is_error:
-                    sys.stdout.write(f"{RESET}\n{_styled(RED, content)}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.error.ansi, content)}\n")
                 elif name in {"run_agent", "spawn_agent"}:
-                    sys.stdout.write(f"{RESET}\n{_styled(GREEN, content)}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.success.ansi, content)}\n")
                 elif tid in state.streamed_tool_ids:
                     sys.stdout.write(f"{RESET}\n")
                 else:
-                    sys.stdout.write(f"{RESET}\n{_styled(GREEN, content)}\n")
+                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.success.ansi, content)}\n")
                 self._flush()
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
@@ -1411,7 +1456,11 @@ class ReplRenderer:
                     agent_id,
                     presentation.agent_name if presentation is not None else self._agent_name(agent_id),
                 )
-                print(f"\n{_styled(RED, f'Error from agent {identity}: {exc}')}", file=sys.stderr, flush=True)
+                print(
+                    f"\n{_styled(self._theme.error.ansi, f'Error from agent {identity}: {exc}')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._drain_safe_boundary_locked()
 
             case SessionEndEvent():
@@ -1607,7 +1656,7 @@ class ReplRenderer:
     ) -> None:
         match event:
             case ToolFieldStart(key=key):
-                sys.stdout.write(f"\n  {YELLOW}{key}{RESET}: ")
+                sys.stdout.write(f"\n  {self._theme.warning.ansi}{key}{RESET}: ")
                 self._flush()
                 state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
             case ToolFieldDelta(text=text):
@@ -1617,7 +1666,7 @@ class ReplRenderer:
                 if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.mode = dataclasses.replace(mode, first_delta=False)
-                sys.stdout.write(_styled(DIM, text))
+                sys.stdout.write(_styled(self._theme.reasoning.ansi, text))
                 self._flush()
             case ToolFieldEnd():
                 sys.stdout.write(RESET)
@@ -1822,7 +1871,7 @@ async def _read_input_async(
     admit_submission: Callable[[str, str, int | None], Awaitable[InputSubmitted]],
     initial_text: str = "",
     *,
-    prompt_message: object = _panel.PROMPT_MESSAGE,
+    prompt_factory: Callable[[], object] = _panel.prompt_message,
 ) -> InputSubmitted:
     async def finish_submission(
         editor_value: str,
@@ -1858,10 +1907,10 @@ async def _read_input_async(
         while True:
             try:
                 if initial_text:
-                    value = await session.prompt_async(prompt_message, default=initial_text)
+                    value = await session.prompt_async(prompt_factory(), default=initial_text)
                     initial_text = ""
                 else:
-                    value = await session.prompt_async(prompt_message)
+                    value = await session.prompt_async(prompt_factory())
                 editor_value = str(value)
                 text = editor_value.strip()
                 if text:
@@ -2123,19 +2172,13 @@ def _apply_model(
     parent_peer_id: str | None = None,
     sandbox_note: str = "",
     effort: EffortRuntime | None = None,
+    effective_username: str | None = None,
+    model_context: str = "",
 ) -> None:
     chosen = _choose_model(transport, arg)
     if chosen is None:
         return
     transport.model = chosen
-    base_system = build_system_prompt(
-        root,
-        transport.model,
-        tools,
-        agents_text,
-        parent_peer_id=parent_peer_id,
-        sandbox_note=sandbox_note,
-    )
     if effort is not None:
         requested = effort.state.requested
         try:
@@ -2144,12 +2187,21 @@ def _apply_model(
         except ValueError as exc:
             state = effort.configure("default")
             reset_reason = str(exc)
-        agent.system = effort.system_prompt(base_system)
     else:
         requested = None
         state = None
         reset_reason = None
-        agent.system = base_system
+    agent.system = _build_runtime_system_prompt(
+        root,
+        transport.model,
+        tools,
+        agents_text,
+        effective_username=effective_username,
+        effort=effort,
+        parent_peer_id=parent_peer_id,
+        sandbox_note=sandbox_note,
+        model_context=model_context,
+    )
     _command_print(f"Switched to {BOLD}{transport.model.id}{RESET}")
     if reset_reason is not None:
         _command_print(
@@ -2203,19 +2255,23 @@ def _apply_agent_effort(
     parent_peer_id: str | None,
     sandbox_note: str,
     arg: str,
+    effective_username: str | None = None,
+    model_context: str = "",
 ) -> EffortState | None:
     state = _apply_effort(effort, arg)
     if state is None:
         return None
-    base_system = build_system_prompt(
+    agent.system = _build_runtime_system_prompt(
         root,
         cast(Any, agent.transport).model,
         tools,
         agents_text,
+        effective_username=effective_username,
+        effort=effort,
         parent_peer_id=parent_peer_id,
         sandbox_note=sandbox_note,
+        model_context=model_context,
     )
-    agent.system = effort.system_prompt(base_system)
     return state
 
 
@@ -2486,6 +2542,12 @@ def _build_argument_parser() -> Any:
         default=DisplayMode.ACTIVE_ONLY.value,
         help="Show framed actions from non-active agents (default: off)",
     )
+    parser.add_argument(
+        "--theme",
+        choices=theme_names(),
+        default=DEFAULT_THEME.name,
+        help="Terminal theme (default: default)",
+    )
     powerline_group = parser.add_mutually_exclusive_group()
     powerline_group.add_argument(
         "--powerline",
@@ -2599,8 +2661,11 @@ async def main() -> None:
         _agent_config.apply_profile_to_args(args, profile, _agent_config.explicit_cli_destinations(argv))
         profile_instructions = profile.instructions_text()
         api_key = _agent_config.resolve_api_key(args.transport_api_key_env)
+        theme = resolve_theme(args.theme)
     except _agent_config.AgentConfigError as error:
         parser.error(str(error))
+    effective_username = resolve_effective_username()
+    model_context = profile.model_context or ""
     if (args.transport_base_url is not None or args.transport_api_key_env is not None) and args.transport is None:
         parser.error("transport connection settings require an explicit transport name")
     recovery: RecoveryMaterialization | None = None
@@ -2722,8 +2787,15 @@ async def main() -> None:
             parser.error(str(error))
         if args.prompt is not None:
             print(f"Tools: {sandbox_desc}", file=sys.stderr)
-        system = effort.system_prompt(
-            build_system_prompt(tool_root, transport.model, tools, agents_text, sandbox_note=sandbox_note)
+        system = _build_runtime_system_prompt(
+            tool_root,
+            transport.model,
+            tools,
+            agents_text,
+            effective_username=effective_username,
+            effort=effort,
+            sandbox_note=sandbox_note,
+            model_context=model_context,
         )
         agent = Agent(
             system=system,
@@ -2763,6 +2835,7 @@ async def main() -> None:
             ("temperature", getattr(transport, "temperature", None)),
             ("effort", effort.state.to_dict()),
             ("agent_actions", args.agent_actions),
+            ("theme", theme.name),
             ("powerline", args.powerline),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
@@ -2803,15 +2876,16 @@ async def main() -> None:
             child_ctx = await ctx.fork() if inherit_context else ObservedContextStore(MemoryContextStore(), event_hub)
             child_transport = _clone_transport_for_spawn(agent.transport)
             child_tools = _clone_tools_for_child(agent.tools, foreground=foreground)
-            child_system = effort.system_prompt(
-                build_system_prompt(
-                    tool_root,
-                    child_transport.model,
-                    child_tools,
-                    agents_text,
-                    parent_peer_id=None if foreground else parent_peer_id,
-                    sandbox_note=sandbox_note,
-                )
+            child_system = _build_runtime_system_prompt(
+                tool_root,
+                child_transport.model,
+                child_tools,
+                agents_text,
+                effective_username=effective_username,
+                effort=effort,
+                parent_peer_id=None if foreground else parent_peer_id,
+                sandbox_note=sandbox_note,
+                model_context=model_context,
             )
             return agent.copy(
                 transport=child_transport,
@@ -2844,12 +2918,23 @@ async def main() -> None:
                 parent_peer_id,
                 sandbox_note=sandbox_note,
                 effort=effort,
+                effective_username=effective_username,
+                model_context=model_context,
             ),
         )
         commands["/effort"] = Command(
             lambda: _show_effort(effort),
             lambda a: _apply_agent_effort(
-                effort, agent, tool_root, tools, agents_text, parent_peer_id, sandbox_note, a
+                effort,
+                agent,
+                tool_root,
+                tools,
+                agents_text,
+                parent_peer_id,
+                sandbox_note,
+                a,
+                effective_username,
+                model_context,
             ),
         )
         commands["/iterations"] = Command(
@@ -2949,6 +3034,7 @@ async def main() -> None:
             current_model=lambda: transport.model,
             display_mode=DisplayMode.parse(args.agent_actions),
             powerline=args.powerline,
+            theme=theme,
         )
         startup_notices: list[str] = []
 
@@ -3047,8 +3133,13 @@ async def main() -> None:
             on_empty_eof=_handle_empty_eof,
             capture_target=lambda: renderer.focused_agent,
             reserve_sequence=event_hub.reserve_sequence,
+            theme=theme,
         )
-        input_prompt = _panel.prompt_message(powerline=args.powerline)
+        input_prompt_factory = _panel.make_prompt_factory(
+            effective_username,
+            powerline=args.powerline,
+            theme=theme,
+        )
         terminal = TerminalUI(prompt_session)
         terminal_started = False
         shutdown_reason = "complete"
@@ -3298,15 +3389,16 @@ async def main() -> None:
                     cwd=str(root),
                 ).start()
                 parent_peer_id = peer_server.id
-                agent.system = effort.system_prompt(
-                    build_system_prompt(
-                        tool_root,
-                        transport.model,
-                        tools,
-                        agents_text,
-                        parent_peer_id=parent_peer_id,
-                        sandbox_note=sandbox_note,
-                    )
+                agent.system = _build_runtime_system_prompt(
+                    tool_root,
+                    transport.model,
+                    tools,
+                    agents_text,
+                    effective_username=effective_username,
+                    effort=effort,
+                    parent_peer_id=parent_peer_id,
+                    sandbox_note=sandbox_note,
+                    model_context=model_context,
                 )
                 notify.add_listener(
                     peer_server.id,
@@ -3779,7 +3871,7 @@ async def main() -> None:
                             _on_sigint,
                             _admit_editor_submission,
                             initial_editor_text,
-                            prompt_message=input_prompt,
+                            prompt_factory=input_prompt_factory,
                         )
                     )
                     initial_editor_text = ""

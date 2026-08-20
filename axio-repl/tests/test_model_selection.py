@@ -60,6 +60,27 @@ def test_apply_model_accepts_resolved_variant(capsys: pytest.CaptureFixture[str]
     assert "Switched to" in captured.out
 
 
+def test_model_rebuild_keeps_runtime_identity_and_model_context_exactly_once() -> None:
+    transport = _VariantTransport()
+    agent: Any = SimpleNamespace(system="old")
+
+    for _ in range(2):
+        _apply_model(
+            transport,
+            agent,
+            [],
+            Path("/tmp/test-workspace"),
+            "",
+            "z-ai/glm-4.7:nitro",
+            effective_username="alice",
+            model_context="Network policy context.",
+        )
+
+        assert agent.system.count('"effective_username":"alice"') == 1
+        assert agent.system.count("axio_runtime_metadata") == 1
+        assert agent.system.count("Network policy context.") == 1
+
+
 def test_default_placeholder_adopts_catalogue_metadata() -> None:
     # What a transport ships as its default: an id, and nothing behind it.
     transport = _VariantTransport()

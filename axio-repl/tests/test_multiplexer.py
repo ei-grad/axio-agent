@@ -316,7 +316,7 @@ def test_powerline_suppression_frame_honours_drain_and_retained_byte_budgets() -
     assert len(frames) == 1
     assert len(frames[0].encode()) <= 512
     assert "4 action frames suppressed" in frames[0]
-    assert "\ue0b2" in frames[0]
+    assert "\ue0b2" not in frames[0]
     assert "\ue0b0" in frames[0]
     assert mux.queued_count == 2
 

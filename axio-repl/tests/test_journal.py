@@ -119,6 +119,7 @@ async def _run_agent_tool_one_shot(
     tool_name: str,
     extra_args: tuple[str, ...] = (),
     observed_systems: list[str] | None = None,
+    observed_histories: list[list[dict[str, Any]]] | None = None,
 ) -> None:
     import axio_repl
 
@@ -133,9 +134,10 @@ async def _run_agent_tool_one_shot(
             tools: list[Tool[object]],
             system: str,
         ) -> AsyncIterator[StreamEvent]:
-            del messages
             if observed_systems is not None:
                 observed_systems.append(system)
+            if observed_histories is not None:
+                observed_histories.append([message.to_dict() for message in messages])
             self.calls += 1
             events = (
                 make_tool_use_response(
@@ -182,6 +184,73 @@ async def test_spawned_child_inherits_prompt_fallback_effort(
 
     assert len(systems) >= 2
     assert all("Effort guidance (high)" in system for system in systems)
+
+
+@pytest.mark.parametrize("tool_name", ["run_agent", "spawn_agent"])
+async def test_main_and_local_child_share_one_runtime_identity_without_history_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    import axio_repl
+
+    systems: list[str] = []
+    histories: list[list[dict[str, Any]]] = []
+    resolver_calls = 0
+
+    def resolve_username() -> str:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return "nss-user"
+
+    monkeypatch.setattr(axio_repl, "resolve_effective_username", resolve_username)
+
+    await _run_agent_tool_one_shot(
+        monkeypatch,
+        tmp_path,
+        tool_name=tool_name,
+        observed_systems=systems,
+        observed_histories=histories,
+    )
+
+    assert resolver_calls == 1
+    assert len(systems) >= 2
+    assert all(system.count('"effective_username":"nss-user"') == 1 for system in systems)
+    assert all(system.count("axio_runtime_metadata") == 1 for system in systems)
+    serialized_history = json.dumps(histories, ensure_ascii=False)
+    assert "nss-user" not in serialized_history
+    assert "axio_runtime_metadata" not in serialized_history
+
+
+async def test_selected_agent_model_context_reaches_main_and_child_but_description_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "config"
+    bundle = config_dir / "agents" / "local"
+    bundle.mkdir(parents=True)
+    (bundle / "agent.yaml").write_text(
+        """\
+version: 1
+description: Catalog-only description
+model_context: Trusted operator policy description.
+""",
+        encoding="utf-8",
+    )
+    systems: list[str] = []
+
+    await _run_agent_tool_one_shot(
+        monkeypatch,
+        tmp_path,
+        tool_name="spawn_agent",
+        extra_args=("--config-dir", str(config_dir), "--agent", "local"),
+        observed_systems=systems,
+    )
+
+    assert len(systems) >= 2
+    assert all(system.count("Trusted operator policy description.") == 1 for system in systems)
+    assert all(system.count("Operator model context") == 1 for system in systems)
+    assert all("Catalog-only description" not in system for system in systems)
 
 
 @pytest.mark.parametrize("agent_actions", ["off", "on"])

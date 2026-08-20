@@ -13,9 +13,12 @@ from urllib.parse import urlsplit
 import yaml
 from axio.effort import EFFORT_LEVELS
 
+from axio_repl._theme import theme_names
+
 SCHEMA_VERSION = 1
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_INSTRUCTIONS_BYTES = 1024 * 1024
+MAX_MODEL_CONTEXT_BYTES = 4096
 AGENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})\Z")
 ENV_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -29,6 +32,7 @@ _RUNTIME_KEYS = frozenset(
         "max_iterations",
         "debug",
         "agent_actions",
+        "theme",
         "powerline",
         "session_log",
         "session_log_dir",
@@ -50,6 +54,7 @@ _SANDBOX_KEYS = frozenset(
 )
 _REGISTRY_KEYS = frozenset({"pypi", "npm", "cargo", "go", "go_sumdb"})
 _EFFORT_VALUES = frozenset({"default", *EFFORT_LEVELS})
+_THEME_VALUES = frozenset(theme_names())
 _CLI_OPTION_DESTINATIONS = {
     "--transport": "transport",
     "--transport-base-url": "transport_base_url",
@@ -62,6 +67,7 @@ _CLI_OPTION_DESTINATIONS = {
     "--debug": "debug",
     "--no-debug": "debug",
     "--agent-actions": "agent_actions",
+    "--theme": "theme",
     "--powerline": "powerline",
     "--no-powerline": "powerline",
     "--session-log": "no_session_log",
@@ -152,6 +158,7 @@ class RuntimeSettings:
     max_iterations: int | None = None
     debug: bool | None = None
     agent_actions: str | None = None
+    theme: str | None = None
     powerline: bool | None = None
     session_log: bool | None = None
     session_log_dir: Path | None = None
@@ -164,6 +171,7 @@ class RuntimeSettings:
             max_iterations=other.max_iterations if other.max_iterations is not None else self.max_iterations,
             debug=other.debug if other.debug is not None else self.debug,
             agent_actions=other.agent_actions if other.agent_actions is not None else self.agent_actions,
+            theme=other.theme if other.theme is not None else self.theme,
             powerline=other.powerline if other.powerline is not None else self.powerline,
             session_log=other.session_log if other.session_log is not None else self.session_log,
             session_log_dir=(other.session_log_dir if other.session_log_dir is not None else self.session_log_dir),
@@ -229,6 +237,7 @@ class ResolvedAgentProfile:
     config_dir: Path
     name: str | None
     description: str | None
+    model_context: str | None
     instructions: tuple[Path, ...]
     settings: ProfileSettings
     sources: tuple[Path, ...]
@@ -300,6 +309,7 @@ def apply_profile_to_args(args: Any, profile: ResolvedAgentProfile, explicit: fr
         "max_iterations": settings.runtime.max_iterations,
         "debug": settings.runtime.debug,
         "agent_actions": settings.runtime.agent_actions,
+        "theme": settings.runtime.theme,
         "powerline": settings.runtime.powerline,
         "session_log_dir": settings.runtime.session_log_dir,
         "sandbox": settings.sandbox.backend,
@@ -397,6 +407,7 @@ def load_agent_profile(
         sources.append(global_file)
 
     description: str | None = None
+    model_context: str | None = None
     instructions: tuple[Path, ...] = ()
     if agent_name is not None:
         if not AGENT_NAME_PATTERN.fullmatch(agent_name):
@@ -408,12 +419,13 @@ def load_agent_profile(
         data = _load_yaml_mapping(manifest_file)
         _check_keys(
             data,
-            {"version", "description", "instructions", *_SETTINGS_KEYS},
+            {"version", "description", "model_context", "instructions", *_SETTINGS_KEYS},
             manifest_file,
             "root",
         )
         _require_version(data, manifest_file)
         description = _optional_string(data, "description", manifest_file, "description")
+        model_context = _parse_model_context(data, manifest_file)
         instructions = _parse_instruction_paths(data.get("instructions"), manifest_file, bundle_dir)
         settings = settings.overlay(_parse_settings(data, manifest_file, bundle_dir))
         sources.append(manifest_file)
@@ -424,6 +436,7 @@ def load_agent_profile(
         config_dir=root,
         name=agent_name,
         description=description,
+        model_context=model_context,
         instructions=instructions,
         settings=settings,
         sources=tuple(sources),
@@ -507,6 +520,9 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
     agent_actions = _optional_string(data, "agent_actions", source, "runtime.agent_actions")
     if agent_actions is not None and agent_actions not in {"off", "on"}:
         raise AgentConfigError(f"{source}: runtime.agent_actions must be 'off' or 'on'")
+    theme = _optional_string(data, "theme", source, "runtime.theme")
+    if theme is not None and theme not in _THEME_VALUES:
+        raise AgentConfigError(f"{source}: runtime.theme must be one of: {', '.join(sorted(_THEME_VALUES))}")
     return RuntimeSettings(
         temperature=temperature,
         effort=effort,
@@ -514,6 +530,7 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
         max_iterations=max_iterations,
         debug=_optional_bool(data, "debug", source, "runtime.debug"),
         agent_actions=agent_actions,
+        theme=theme,
         powerline=_optional_bool(data, "powerline", source, "runtime.powerline"),
         session_log=_optional_bool(data, "session_log", source, "runtime.session_log"),
         session_log_dir=_optional_path(data, "session_log_dir", source, "runtime.session_log_dir", base_dir),
@@ -574,6 +591,22 @@ def _optional_string(data: Mapping[str, object], key: str, source: Path, locatio
     value = data[key]
     if not isinstance(value, str) or not value or value != value.strip():
         raise AgentConfigError(f"{source}: {location} must be a non-empty string without surrounding whitespace")
+    return value
+
+
+def _parse_model_context(data: Mapping[str, object], source: Path) -> str | None:
+    if "model_context" not in data or data["model_context"] is None:
+        return None
+    value = data["model_context"]
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise AgentConfigError(f"{source}: model_context must be a non-empty string without surrounding whitespace")
+    if len(value.encode("utf-8")) > MAX_MODEL_CONTEXT_BYTES:
+        raise AgentConfigError(f"{source}: model_context exceeds the {MAX_MODEL_CONTEXT_BYTES}-byte limit")
+    if any(
+        (ord(character) < 0x20 and character not in {"\n", "\t"}) or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    ):
+        raise AgentConfigError(f"{source}: model_context contains a forbidden control character")
     return value
 
 
@@ -710,6 +743,9 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
     agent_actions = text("AXIO_REPL_AGENT_ACTIONS")
     if agent_actions is not None and agent_actions not in {"off", "on"}:
         raise AgentConfigError("AXIO_REPL_AGENT_ACTIONS must be 'off' or 'on'")
+    theme = text("AXIO_REPL_THEME")
+    if theme is not None and theme not in _THEME_VALUES:
+        raise AgentConfigError(f"AXIO_REPL_THEME must be one of: {', '.join(sorted(_THEME_VALUES))}")
     runtime = RuntimeSettings(
         temperature=temperature,
         effort=text("AXIO_REPL_EFFORT"),
@@ -717,6 +753,7 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
         max_iterations=positive_int("AXIO_REPL_MAX_ITERATIONS"),
         debug=boolean("AXIO_REPL_DEBUG"),
         agent_actions=agent_actions,
+        theme=theme,
         powerline=boolean("AXIO_REPL_POWERLINE"),
         session_log=boolean("AXIO_REPL_SESSION_LOG"),
         session_log_dir=external_path("AXIO_REPL_SESSION_LOG_DIR"),

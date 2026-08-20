@@ -6,18 +6,10 @@ from dataclasses import dataclass
 
 from prompt_toolkit.formatted_text import FormattedText
 
-RESET = "\033[0m"
+from axio_repl._theme import DEFAULT_THEME, TerminalColor, TerminalTheme
+from axio_repl._theme import RESET as RESET
+
 POWERLINE_RIGHT = "\ue0b0"
-POWERLINE_LEFT = "\ue0b2"
-
-
-@dataclass(frozen=True, slots=True)
-class PowerlineColor:
-    """One colour expressed for ANSI SGR and prompt-toolkit."""
-
-    ansi_foreground: int
-    ansi_background: int
-    prompt_toolkit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,13 +17,13 @@ class PowerlineSegment:
     """Text and colours for one filled segment."""
 
     text: str
-    foreground: PowerlineColor
-    background: PowerlineColor
+    foreground: TerminalColor
+    background: TerminalColor
 
 
 @dataclass(frozen=True, slots=True)
 class PowerlineBadge:
-    """A filled badge with hard separators at both outer edges."""
+    """A filled badge with a straight left edge and hard right separators."""
 
     segments: tuple[PowerlineSegment, ...]
 
@@ -42,8 +34,7 @@ class PowerlineBadge:
     def ansi(self) -> str:
         """Render a reset-safe ANSI badge on the terminal's default background."""
 
-        first = self.segments[0]
-        parts = [f"\033[22;{first.background.ansi_foreground};49m{POWERLINE_LEFT}"]
+        parts: list[str] = []
         for index, segment in enumerate(self.segments):
             parts.append(
                 f"\033[1;{segment.foreground.ansi_foreground};{segment.background.ansi_background}m{segment.text}"
@@ -57,8 +48,7 @@ class PowerlineBadge:
     def formatted_text(self, *, trailing: str = "") -> FormattedText:
         """Render prompt-toolkit fragments with the same fills and separators."""
 
-        first = self.segments[0]
-        parts: list[tuple[str, str]] = [(f"fg:{first.background.prompt_toolkit} bg:default", POWERLINE_LEFT)]
+        parts: list[tuple[str, str]] = []
         for index, segment in enumerate(self.segments):
             parts.append(
                 (
@@ -75,44 +65,43 @@ class PowerlineBadge:
         return FormattedText(parts)
 
 
-_DARK = PowerlineColor(ansi_foreground=30, ansi_background=40, prompt_toolkit="ansiblack")
-_WHITE = PowerlineColor(ansi_foreground=97, ansi_background=107, prompt_toolkit="ansiwhite")
-_CYAN = PowerlineColor(ansi_foreground=36, ansi_background=46, prompt_toolkit="ansicyan")
-_MAGENTA = PowerlineColor(ansi_foreground=35, ansi_background=45, prompt_toolkit="ansimagenta")
-_YELLOW = PowerlineColor(ansi_foreground=33, ansi_background=43, prompt_toolkit="ansiyellow")
-
-
-def prompt_badge() -> FormattedText:
+def prompt_badge(label: str, theme: TerminalTheme = DEFAULT_THEME) -> FormattedText:
     """Return the complete input badge followed by one editor-space."""
 
-    badge = PowerlineBadge((PowerlineSegment(" axio-repl ", _DARK, _CYAN),))
+    style = theme.prompt_badge
+    badge = PowerlineBadge((PowerlineSegment(f" {label} ", style.foreground, style.background),))
     return badge.formatted_text(trailing=" ")
 
 
-def tool_title(name: str) -> str:
+def tool_title(name: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
     """Return a reset-safe Powerline badge for a live tool call."""
 
-    return PowerlineBadge((PowerlineSegment(f" ▶ {name} ", _DARK, _CYAN),)).ansi()
+    style = theme.tool_badge
+    return PowerlineBadge((PowerlineSegment(f" ▶ {name} ", style.foreground, style.background),)).ansi()
 
 
-def agent_header(identity: str) -> str:
+def agent_header(identity: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
     """Return a reset-safe Powerline badge for a live agent turn."""
 
-    return PowerlineBadge((PowerlineSegment(f" agent {identity} ", _WHITE, _MAGENTA),)).ansi()
+    style = theme.agent_badge
+    return PowerlineBadge((PowerlineSegment(f" agent {identity} ", style.foreground, style.background),)).ansi()
 
 
-def action_frame_header(identity: str, kind: str) -> str:
+def action_frame_header(identity: str, kind: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
     """Return the reset-safe two-segment badge of a background action."""
 
+    agent_style = theme.agent_badge
+    action_style = theme.action_badge
     return PowerlineBadge(
         (
-            PowerlineSegment(f" agent {identity} ", _WHITE, _MAGENTA),
-            PowerlineSegment(f" {kind} ", _DARK, _YELLOW),
+            PowerlineSegment(f" agent {identity} ", agent_style.foreground, agent_style.background),
+            PowerlineSegment(f" {kind} ", action_style.foreground, action_style.background),
         )
     ).ansi()
 
 
-def action_frame_footer(identity: str) -> str:
+def action_frame_footer(identity: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
     """Return the reset-safe closing badge of a background action."""
 
-    return PowerlineBadge((PowerlineSegment(f" /agent {identity} ", _WHITE, _MAGENTA),)).ansi()
+    style = theme.agent_badge
+    return PowerlineBadge((PowerlineSegment(f" /agent {identity} ", style.foreground, style.background),)).ansi()

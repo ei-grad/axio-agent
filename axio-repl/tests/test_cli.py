@@ -5,7 +5,7 @@ import sys
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
@@ -15,6 +15,7 @@ from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import ConfigurationChanged, EditorSnapshot, RuntimeEvent
+from prompt_toolkit.formatted_text import to_plain_text
 
 from axio_repl import (
     TOOLS,
@@ -44,6 +45,49 @@ def test_powerline_defaults_to_off_and_can_be_enabled() -> None:
     assert parser.parse_args([]).powerline is False
     assert parser.parse_args(["--powerline", "inspect"]).powerline is True
     assert parser.parse_args(["--no-powerline"]).powerline is False
+
+
+def test_theme_defaults_and_builtin_selection() -> None:
+    parser = _build_argument_parser()
+
+    assert parser.parse_args([]).theme == "default"
+    assert parser.parse_args(["--theme", "monochrome"]).theme == "monochrome"
+
+
+def test_theme_rejects_unknown_name_with_available_choices(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        _build_argument_parser().parse_args(["--theme", "unknown"])
+
+    error = capsys.readouterr().err
+    assert "invalid choice: 'unknown'" in error
+    assert "default" in error
+    assert "monochrome" in error
+
+
+async def test_invalid_config_theme_fails_before_transport_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import axio_repl
+
+    (tmp_path / "config.yaml").write_text(
+        "version: 1\ndefaults:\n  runtime:\n    theme: unknown\n",
+        encoding="utf-8",
+    )
+    transport_selected = False
+
+    def select_transport(_name: str | None) -> object:
+        nonlocal transport_selected
+        transport_selected = True
+        raise AssertionError("transport must not be selected")
+
+    monkeypatch.setattr(axio_repl, "_select_transport", select_transport)
+    monkeypatch.setattr(sys, "argv", ["axio-repl", "--config-dir", str(tmp_path)])
+
+    with pytest.raises(SystemExit):
+        await main()
+
+    assert transport_selected is False
 
 
 def test_agent_actions_can_be_enabled() -> None:
@@ -300,7 +344,7 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
             self._reserve_sequence = reserve_sequence
 
         async def prompt_async(self, prompt: object) -> str:
-            assert prompt == axio_repl._panel.PROMPT_MESSAGE
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
             if self.previous == "queued request 2":
                 waiting_after_queued.set()
             result = await inputs.get()
@@ -333,8 +377,9 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        theme: object,
     ) -> PromptSession:
-        del on_empty_eof, on_shutdown, recall_pending
+        del on_empty_eof, on_shutdown, recall_pending, theme
         status_callbacks.append(cast(Callable[[], str], status))
         interrupt_callbacks.append(on_interrupt)
         return PromptSession(capture_target, reserve_sequence)
@@ -489,7 +534,7 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
 
     class PromptSession:
         async def prompt_async(self, prompt: object) -> str:
-            assert prompt == axio_repl._panel.PROMPT_MESSAGE
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
             return await inputs.get()
 
     class InertTerminal:
@@ -514,8 +559,9 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, theme
         status_callbacks.append(cast(Callable[[], str], status))
         return PromptSession()
 
@@ -648,7 +694,7 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
 
         async def prompt_async(self, prompt: object, **kwargs: object) -> str:
             nonlocal prompt_calls
-            assert prompt == axio_repl._panel.PROMPT_MESSAGE
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
             prompt_calls += 1
             if default := kwargs.get("default"):
                 self.default_buffer.text = str(default)
@@ -682,9 +728,10 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        theme: object,
     ) -> PromptSession:
         del capture_target, on_empty_eof, on_interrupt, on_shutdown
-        del recall_pending, reserve_sequence, status
+        del recall_pending, reserve_sequence, status, theme
         return prompt_session
 
     journal_root = tmp_path / "journals"
@@ -779,7 +826,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
         default_buffer = Buffer()
 
         async def prompt_async(self, prompt: object, **kwargs: object) -> str:
-            assert prompt == axio_repl._panel.PROMPT_MESSAGE
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
             assert kwargs == {"default": "restored editor"}
             self.default_buffer.text = "restored editor"
             raise EOFError
@@ -808,9 +855,10 @@ async def test_resume_copies_context_and_restores_editor_before_input(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        theme: object,
     ) -> PromptSession:
         del capture_target, on_empty_eof, on_interrupt, on_shutdown
-        del recall_pending, reserve_sequence, status
+        del recall_pending, reserve_sequence, status, theme
         return prompt_session
 
     resumed_root = tmp_path / "resumed"

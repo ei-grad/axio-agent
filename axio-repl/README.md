@@ -148,9 +148,15 @@ axio-repl --agent-actions on
 
 # Use Powerline segments for the prompt, tool names, and agent frames
 axio-repl --powerline
+
+# Use the high-contrast monochrome terminal palette
+axio-repl --theme monochrome
 ```
 
-Powerline mode requires a terminal font that provides the `U+E0B2` (``) and `U+E0B0` (``) separator glyphs.
+Powerline mode requires a terminal font that provides the `U+E0B0` (``) separator glyph.
+The interactive prompt shows local time and the effective-UID username as `HH:MM username`.
+Terminal recordings therefore expose that local username. Built-in themes are `default` and
+`monochrome`; unknown names stop startup.
 
 ## Agent configuration
 
@@ -162,6 +168,8 @@ Persistent defaults live in `~/.config/axio/config.yaml` (or
 ```yaml
 # ~/.config/axio/agents/local/agent.yaml
 version: 1
+model_context: |-
+  Network access is routed through the configured local policy proxy.
 transport:
   name: llama-cpp
   base_url: http://127.0.0.1:18080/v1
@@ -170,6 +178,8 @@ sandbox:
   network: axio-agent-egress
   registries:
     pypi: http://devpi:3141/root/pypi/+simple/
+runtime:
+  theme: default
 ```
 
 ```bash
@@ -184,6 +194,11 @@ missing secret references stop startup. LLM credentials use
 `transport.api_key_env`; secret values do not belong in YAML. See the
 [REPL guide](../docs/guides/axio-repl.md#persistent-configuration-and-agent-bundles)
 for the complete schema and sandbox registry mapping.
+
+`model_context` is optional trusted operator text from the selected agent
+manifest only. It is passed unchanged to the main and local child agents as
+descriptive context; it does not enforce the policy it describes. Do not place
+credentials or untrusted external content there.
 
 ## Session journals and privacy
 

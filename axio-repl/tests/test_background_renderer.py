@@ -44,6 +44,7 @@ from axio_tools_agents.runtime import (
 from axio_repl import DIM, RED, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._powerline import agent_header
+from axio_repl._theme import MONOCHROME_THEME
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
 
@@ -221,11 +222,42 @@ async def test_powerline_styles_live_tool_and_subagent_frames(capsys: pytest.Cap
 
     output = capsys.readouterr().out
     assert "\ue0b0" in output
-    assert "\ue0b2" in output
+    assert "\ue0b2" not in output
     assert "agent main" not in output
     assert "▶ shell" in output
     assert "agent child" in output
     assert "\033[0m\n" in output
+
+
+async def test_monochrome_theme_reaches_plain_and_powerline_renderers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plain = ReplRenderer(theme=MONOCHROME_THEME)
+    await plain.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await plain.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="warning"),
+    )
+    await plain.render("main", Error(exception=RuntimeError("failure")))
+
+    captured = capsys.readouterr()
+    assert "\033[1;97m▶ shell\033[0m" in captured.out
+    assert "\033[1;97mwarning\033[0m" in captured.out
+    assert "\033[1;7mError from agent main: failure\033[0m" in captured.err
+
+    powerline = ReplRenderer(
+        display_mode=DisplayMode.ALL_ACTIONS,
+        powerline=True,
+        theme=MONOCHROME_THEME,
+    )
+    await powerline.render("main", ToolUseStart(index=0, tool_use_id="main-tool", name="shell"))
+    await _queue_background_tool_action(powerline)
+    await powerline.mark_idle()
+
+    output = capsys.readouterr().out
+    assert "\033[1;30;107m ▶ shell " in output
+    assert "\033[1;97;100m agent child " in output
+    assert "\033[1;30;47m tool call " in output
 
 
 async def test_powerline_labels_foreground_child_but_not_ordinary_main_output(

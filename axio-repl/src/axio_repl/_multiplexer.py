@@ -11,8 +11,8 @@ from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta,
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, TurnFinished, TurnStarted
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
+from axio_repl._theme import DEFAULT_THEME, RESET, TerminalTheme
 
-RESET = "\033[0m"
 _MAX_DISPLAY_COUNT = 999_999_999
 
 
@@ -54,6 +54,7 @@ class ActionFrame:
     critical: bool = False
     agent_name: str | None = None
     powerline: bool = False
+    theme: TerminalTheme = DEFAULT_THEME
 
     def render(self) -> str:
         identity = format_agent_identity(self.agent_id, self.agent_name)
@@ -61,7 +62,14 @@ class ActionFrame:
         body = sanitize_terminal_text(self.body).rstrip("\n")
         if self.powerline:
             return (
-                f"{RESET}\n{action_frame_header(identity, kind)}\n{body}\n{action_frame_footer(identity)}\n{RESET}\n"
+                f"{RESET}\n{action_frame_header(identity, kind, self.theme)}\n{body}\n"
+                f"{action_frame_footer(identity, self.theme)}\n{RESET}\n"
+            )
+        style = self.theme.action.ansi
+        if style:
+            return (
+                f"{RESET}\n{style}── agent {identity} · {kind} ──{RESET}\n{body}\n"
+                f"{style}── /agent {identity} ──{RESET}\n{RESET}\n"
             )
         return f"{RESET}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{RESET}\n"
 
@@ -203,6 +211,7 @@ class ActionMultiplexer:
         mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
         *,
         powerline: bool = False,
+        theme: TerminalTheme = DEFAULT_THEME,
         max_queued_frames: int = 256,
         max_queued_bytes: int = 256 * 1024,
         max_frames_per_agent: int = 64,
@@ -235,11 +244,13 @@ class ActionMultiplexer:
             sequence=0,
             critical=True,
             powerline=powerline,
+            theme=theme,
         )
         if max_retained_bytes < len(largest_suppression.render().encode("utf-8")):
             raise ValueError("max_retained_bytes is too small for the suppression marker")
         self._mode = mode
         self._powerline = powerline
+        self._theme = theme
         self._max_queued_frames = max_queued_frames
         self._max_queued_bytes = max_queued_bytes
         self._max_frames_per_agent = max_frames_per_agent
@@ -583,6 +594,7 @@ class ActionMultiplexer:
             critical=critical,
             agent_name=agent_name,
             powerline=self._powerline,
+            theme=self._theme,
         )
         overhead = len(frame.render().encode("utf-8"))
         if overhead >= self._max_frame_bytes:
@@ -611,6 +623,7 @@ class ActionMultiplexer:
                     critical=critical,
                     agent_name=agent_name,
                     powerline=self._powerline,
+                    theme=self._theme,
                 )
                 overhead = len(frame.render().encode("utf-8"))
         clean_body = _fit_utf8(clean_body, max(0, self._max_frame_bytes - overhead))
@@ -623,6 +636,7 @@ class ActionMultiplexer:
             critical=critical,
             agent_name=agent_name,
             powerline=self._powerline,
+            theme=self._theme,
         )
         queue = self._queues.setdefault(agent_id, deque())
         queue.append(frame)
@@ -781,6 +795,7 @@ class ActionMultiplexer:
             sequence=sequence,
             critical=True,
             powerline=self._powerline,
+            theme=self._theme,
         )
 
     def _suppression_frame(self) -> ActionFrame:

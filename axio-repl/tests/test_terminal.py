@@ -7,6 +7,7 @@ import sys
 import termios
 import threading
 import time
+from datetime import datetime
 from io import TextIOWrapper
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 
 from axio_repl import ReplRenderer, _panel
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
+from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, TerminalTheme
 
 
 class _RecordingOutput(DummyOutput):
@@ -407,9 +409,11 @@ async def test_consumer_task_failure_is_propagated_while_process_state_is_restor
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal and termios test")
 @pytest.mark.parametrize("powerline", [False, True])
+@pytest.mark.parametrize("theme", [DEFAULT_THEME, MONOCHROME_THEME], ids=("default", "monochrome"))
 async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both_prompt_styles(
     monkeypatch: pytest.MonkeyPatch,
     powerline: bool,
+    theme: TerminalTheme,
 ) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = os.openpty()
@@ -427,17 +431,23 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
 
     try:
         with create_app_session(input=terminal_input, output=terminal_output):
-            session: Any = _panel.make_session(lambda: "temporary status")
+            session: Any = _panel.make_session(lambda: "temporary status", theme=theme)
             terminal = TerminalUI(session)
             await terminal.start()
-            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message(powerline=powerline)))
+            prompt_factory = _panel.make_prompt_factory(
+                "tester",
+                powerline=powerline,
+                theme=theme,
+                now_provider=lambda: datetime(2026, 8, 20, 9, 7),
+            )
+            prompt = asyncio.create_task(session.prompt_async(prompt_factory()))
             try:
                 await asyncio.sleep(0.05)
                 assert session.app.is_running
                 os.write(master_fd, b"par")
                 await asyncio.sleep(0.05)
                 if powerline:
-                    renderer = ReplRenderer(main_agent_name="axio-repl", powerline=True)
+                    renderer = ReplRenderer(main_agent_name="axio-repl", powerline=True, theme=theme)
                     await renderer.start_turn(
                         "main",
                         TurnStarted(prompt="inspect"),
@@ -484,20 +494,67 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
         rendered = b"".join(chunks).decode("utf-8", errors="replace")
 
         if powerline:
-            assert " axio-repl " in rendered
+            assert " 09:07 tester " in rendered
             assert "\ue0b0" in rendered
-            assert "\ue0b2" in rendered
-            assert "axio-repl>" not in rendered
+            assert "\ue0b2" not in rendered
+            assert "tester>" not in rendered
             assert "ordinary main response" in rendered
             assert "agent axio-repl (main)" not in rendered
         else:
             assert "asynchronous output" in rendered
-            assert "axio-repl> " in rendered
+            assert "09:07 tester> " in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
         assert after[1] == before[1]
         assert termios.ICANON & after[3] == termios.ICANON & before[3]
         assert termios.ECHO & after[3] == termios.ECHO & before[3]
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal layout test")
+async def test_tall_terminal_input_window_is_compact_and_grows_with_multiline_wrapped_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=80, columns=120),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "status")
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("09:07 tester")))
+            try:
+                await asyncio.sleep(0.05)
+                compact_height = session.app.renderer._last_screen.height
+                assert compact_height <= 3
+
+                content = "first line\n" + ("wrapped " * 40)
+                session.default_buffer.text = content
+                session.app.invalidate()
+                await asyncio.sleep(0.05)
+                expanded_height = session.app.renderer._last_screen.height
+
+                assert compact_height < expanded_height < 20
+                os.write(master_fd, b"\r")
+                assert await asyncio.wait_for(prompt, timeout=2) == content
+            finally:
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
     finally:
         terminal_input.close()
         reader.close()

@@ -109,6 +109,7 @@ version: 1
 defaults:
   runtime:
     max_iterations: 100
+    theme: default
     session_log: true
   sandbox:
     backend: docker
@@ -124,6 +125,9 @@ llama.cpp plus devpi command with `axio-repl --agent local`:
 # ~/.config/axio/agents/local/agent.yaml
 version: 1
 description: Local llama.cpp coding agent
+model_context: |-
+  Network access is routed through the configured local policy proxy.
+  Denied requests are policy outcomes, not transient connectivity failures.
 instructions:
   - instructions.md
 
@@ -138,6 +142,7 @@ runtime:
   max_iterations: 1000
   debug: false
   agent_actions: "off"
+  theme: default
   powerline: false
   session_log: true
 
@@ -173,6 +178,13 @@ to every nested setting. `tools: [all]` enables the complete built-in set and
 order. Docker-only `run_python` and environment-dependent `ast_grep` can be
 named when that backend actually provides them. Unknown or unavailable names,
 duplicates, and mixing `all` or `none` with named tools are errors.
+
+`model_context` is an optional trusted operator-policy description accepted
+only in the selected `agent.yaml`; it is not a layered global default and has
+no environment or CLI override. The exact block is supplied once to the main
+agent and its local children. It describes policy but does not enforce it, so
+do not put credentials, mutable guard state, or untrusted external content in
+it. `description` remains catalog/UI text and is not sent to the model.
 
 For an authenticated LLM endpoint, store only the environment-variable name:
 
@@ -234,7 +246,7 @@ The environment layer maps directly to manifest fields:
 | Area | Variables |
 |---|---|
 | Agent/transport | `AXIO_REPL_AGENT`, `AXIO_REPL_TRANSPORT`, `AXIO_REPL_TRANSPORT_BASE_URL`, `AXIO_REPL_TRANSPORT_API_KEY_ENV`, `AXIO_REPL_MODEL` |
-| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
+| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_THEME`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
 | Sandbox | `AXIO_REPL_SANDBOX`, `AXIO_REPL_SANDBOX_IMAGE`, `AXIO_REPL_SANDBOX_NETWORK`, `AXIO_REPL_SANDBOX_MEMORY`, `AXIO_REPL_SANDBOX_CPUS`, `AXIO_REPL_SANDBOX_PROXY`, `AXIO_REPL_SANDBOX_NO_PROXY`, `AXIO_REPL_SANDBOX_DATASETS`, `AXIO_REPL_SANDBOX_CA_CERT` |
 | Registries | `AXIO_REPL_SANDBOX_PYPI_INDEX`, `AXIO_REPL_SANDBOX_NPM_REGISTRY`, `AXIO_REPL_SANDBOX_CARGO_INDEX`, `AXIO_REPL_SANDBOX_GO_PROXY`, `AXIO_REPL_SANDBOX_GO_SUMDB` |
 | Tools | `AXIO_REPL_TOOLS` as a comma-separated list, `all`, or `none` |
@@ -277,6 +289,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--debug` | off | Log raw request/response bodies |
 | `--no-debug` | off | Explicitly disable debug logging after config resolution |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
+| `--theme` | `default` | Terminal palette: `default` or `monochrome` |
 | `--powerline` | off | Use Powerline segments for the prompt, tool names, and agent frames |
 | `--no-powerline` | — | Explicitly disable Powerline presentation after config resolution |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
@@ -299,8 +312,15 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--sandbox-ca-cert` | none | Full CA bundle (system roots plus interception CA) mounted read-only for common clients |
 | `--tools` | all | `all`, `none`, or a comma-separated tool whitelist |
 
-Powerline presentation uses filled colour segments with `U+E0B2` (``) and `U+E0B0` (``) separators. The terminal
-font must provide both glyphs; the REPL does not substitute a plain-text fallback.
+Powerline presentation uses filled colour segments with `U+E0B0` (``) separators. The terminal font must provide
+that glyph; the REPL does not substitute a plain-text fallback.
+
+The interactive prompt snapshots local time and the effective-UID username for
+each new prompt attempt: plain mode renders `HH:MM username>`, while Powerline
+mode renders a filled ` HH:MM username ` segment followed by ``. The username
+comes from the system account database, not `USER`; terminal recordings and the
+provider-visible runtime metadata expose it. The clock is UI-only and does not
+tick between prompt redraws.
 
 ## Session journals
 

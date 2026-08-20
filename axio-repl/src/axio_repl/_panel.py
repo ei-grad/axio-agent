@@ -16,6 +16,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,9 @@ from axio.types import Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
 from prompt_toolkit.formatted_text import FormattedText
 
+from axio_repl._multiplexer import sanitize_identity_component
 from axio_repl._powerline import prompt_badge
+from axio_repl._theme import DEFAULT_THEME, TerminalTheme
 
 HISTORY_PATH = Path.home() / ".axio_repl_history"
 
@@ -35,15 +38,39 @@ MAX_PANEL_MESSAGE_CHARS = 4096
 MAIN_AGENT = "main"
 
 
-def prompt_message(*, powerline: bool = False) -> FormattedText:
+def prompt_message(
+    label: str = "axio-repl",
+    *,
+    powerline: bool = False,
+    theme: TerminalTheme = DEFAULT_THEME,
+) -> FormattedText:
     """Build the input prompt in the selected presentation style."""
 
+    safe_label = sanitize_identity_component(label) or "unknown"
     if powerline:
-        return prompt_badge()
-    return PROMPT_MESSAGE
+        return prompt_badge(safe_label, theme)
+    return FormattedText([("class:repl-prompt", f"{safe_label}> ")])
 
 
-PROMPT_MESSAGE = FormattedText([("class:repl-prompt", "axio-repl> ")])
+def make_prompt_factory(
+    effective_username: str,
+    *,
+    powerline: bool = False,
+    theme: TerminalTheme = DEFAULT_THEME,
+    now_provider: Callable[[], datetime] | None = None,
+) -> Callable[[], FormattedText]:
+    """Capture stable identity and build one local-time label per prompt attempt."""
+
+    username = sanitize_identity_component(effective_username) or "unknown"
+
+    def build() -> FormattedText:
+        now = (now_provider or datetime.now)()
+        return prompt_message(f"{now:%H:%M} {username}", powerline=powerline, theme=theme)
+
+    return build
+
+
+PROMPT_MESSAGE = prompt_message()
 
 
 @dataclass
@@ -283,6 +310,8 @@ def make_session(
     on_empty_eof: Callable[[float], bool] | None = None,
     capture_target: Callable[[], str] | None = None,
     reserve_sequence: Callable[[], int] | None = None,
+    *,
+    theme: TerminalTheme = DEFAULT_THEME,
 ) -> Any:
     """A prompt session with history, a status line, and explicit controls.
 
@@ -294,6 +323,7 @@ def make_session(
     pending input before walking through persistent prompt history.
     """
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.filters import to_filter
     from prompt_toolkit.history import FileHistory, History
     from prompt_toolkit.styles import Style
 
@@ -325,8 +355,8 @@ def make_session(
         bottom_toolbar=status or (lambda: agent_summary() or None),
         style=Style.from_dict(
             {
-                "bottom-toolbar": "noreverse bg:default fg:#808080",
-                "repl-prompt": "bold ansicyan",
+                "bottom-toolbar": theme.panel,
+                "repl-prompt": theme.prompt.prompt_toolkit,
             }
         ),
         key_bindings=input_bindings(
@@ -338,6 +368,10 @@ def make_session(
         # Redraw while idle so finished agents show up without a keypress.
         refresh_interval=0.5,
     )
+    input_window = session.app.layout.current_window
+    if input_window is None or input_window.content is not session.app.layout.current_control:
+        raise RuntimeError("prompt session does not expose its input window")
+    input_window.dont_extend_height = to_filter(True)
     session._axio_claimed_history = history
     original_accept = session.default_buffer.accept_handler
     if original_accept is None:

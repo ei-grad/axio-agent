@@ -1,6 +1,8 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from axio import background
@@ -8,6 +10,7 @@ from axio.models import ModelSpec
 from axio.types import Usage
 
 from axio_repl import _panel
+from axio_repl._theme import MONOCHROME_THEME
 
 
 class _Record:
@@ -213,7 +216,7 @@ def test_prompt_is_named_and_visually_distinct_from_agent_text() -> None:
     assert to_formatted_text(_panel.PROMPT_MESSAGE) == [("class:repl-prompt", "axio-repl> ")]
     prompt_attrs = merged.get_attrs_for_style_str("class:repl-prompt")
     default_attrs = merged.get_attrs_for_style_str("")
-    assert prompt_attrs.color == "ansicyan"
+    assert prompt_attrs.color == "ansiwhite"
     assert prompt_attrs.bold is True
     assert prompt_attrs != default_attrs
 
@@ -222,9 +225,41 @@ def test_powerline_prompt_uses_a_coloured_segment_and_separator() -> None:
     from prompt_toolkit.formatted_text import to_formatted_text
 
     assert to_formatted_text(_panel.prompt_message(powerline=True)) == [
-        ("fg:ansicyan bg:default", "\ue0b2"),
         ("bold fg:ansiblack bg:ansicyan", " axio-repl "),
         ("fg:ansicyan bg:default", "\ue0b0"),
+        ("", " "),
+    ]
+
+
+def test_prompt_factory_snapshots_local_time_for_each_attempt() -> None:
+    from prompt_toolkit.formatted_text import to_formatted_text
+
+    times = iter((datetime(2026, 8, 20, 9, 7), datetime(2026, 8, 20, 9, 8)))
+    plain = _panel.make_prompt_factory("alice", now_provider=lambda: next(times))
+
+    assert to_formatted_text(plain()) == [("class:repl-prompt", "09:07 alice> ")]
+    assert to_formatted_text(plain()) == [("class:repl-prompt", "09:08 alice> ")]
+
+    powerline = _panel.make_prompt_factory(
+        "alice",
+        powerline=True,
+        now_provider=lambda: datetime(2026, 8, 20, 21, 5),
+    )
+    assert to_formatted_text(powerline()) == [
+        ("bold fg:ansiblack bg:ansicyan", " 21:05 alice "),
+        ("fg:ansicyan bg:default", "\ue0b0"),
+        ("", " "),
+    ]
+
+    monochrome = _panel.make_prompt_factory(
+        "alice",
+        powerline=True,
+        theme=MONOCHROME_THEME,
+        now_provider=lambda: datetime(2026, 8, 20, 21, 5),
+    )
+    assert to_formatted_text(monochrome()) == [
+        ("bold fg:ansiblack bg:ansiwhite", " 21:05 alice "),
+        ("fg:ansiwhite bg:default", "\ue0b0"),
         ("", " "),
     ]
 
@@ -265,12 +300,21 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     # The prompt is up for the whole session now, and it puts the terminal in
     # raw mode - so Ctrl+C arrives as a keypress, not as SIGINT, and the handler
     # that used to stop a running turn never fires.
+    from prompt_toolkit.formatted_text import to_formatted_text
+
     from axio_repl import ReplRenderer, _read_input_async
     from axio_repl._input import InputSubmitted, SubmissionDisposition
 
     interrupts: list[int] = []
     answers: list[object] = [KeyboardInterrupt(), KeyboardInterrupt(), "carry on"]
-    input_prompt = _panel.prompt_message(powerline=True)
+    times = iter(
+        (
+            datetime(2026, 8, 20, 10, 0),
+            datetime(2026, 8, 20, 10, 1),
+            datetime(2026, 8, 20, 10, 2),
+        )
+    )
+    prompt_factory = _panel.make_prompt_factory("alice", powerline=True, now_provider=lambda: next(times))
     observed_prompts: list[object] = []
 
     class _Session:
@@ -299,13 +343,49 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
         renderer,
         lambda: interrupts.append(1),
         admit,
-        prompt_message=input_prompt,
+        prompt_factory=prompt_factory,
     )
 
     assert result.text == "carry on"
     assert result.target_agent_id == "child"
     assert len(interrupts) == 2
-    assert observed_prompts == [input_prompt, input_prompt, input_prompt]
+    assert [to_formatted_text(cast(Any, prompt))[0][1] for prompt in observed_prompts] == [
+        " 10:00 alice ",
+        " 10:01 alice ",
+        " 10:02 alice ",
+    ]
+
+
+async def test_initial_editor_text_survives_prompt_retry_but_not_a_completed_empty_attempt() -> None:
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    answers: list[object] = [KeyboardInterrupt(), "", "submit"]
+    observed_defaults: list[object] = []
+
+    class Session:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            del prompt
+            observed_defaults.append(kwargs.get("default"))
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return str(answer)
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        del reserved_seq
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id="input-1",
+            arrival_seq=1,
+        )
+
+    result = await _read_input_async(Session(), ReplRenderer(), lambda: None, admit, "restored draft")
+
+    assert result.text == "submit"
+    assert observed_defaults == ["restored draft", "restored draft", None]
 
 
 async def test_enter_admission_completes_before_editor_clear_even_when_reader_is_cancelled() -> None:

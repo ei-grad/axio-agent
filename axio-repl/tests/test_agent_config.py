@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from axio_repl._agent_config import (
+    MAX_MODEL_CONTEXT_BYTES,
     AgentConfigError,
     apply_profile_to_args,
     default_config_dir,
@@ -128,6 +129,90 @@ def test_powerline_is_resolved_from_yaml_and_environment(tmp_path: Path) -> None
     args = Namespace(powerline=False, no_session_log=False)
     apply_profile_to_args(args, profile, explicit_cli_destinations(["--no-powerline"]))
     assert args.powerline is False
+
+
+def test_theme_uses_global_agent_environment_and_explicit_cli_precedence(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    write_config(
+        tmp_path / "config.yaml",
+        "version: 1\ndefaults:\n  runtime:\n    theme: default\n",
+    )
+    write_config(
+        tmp_path / "agents" / "local" / "agent.yaml",
+        "version: 1\nruntime:\n  theme: monochrome\n",
+    )
+
+    agent_profile = load_agent_profile(tmp_path, "local", {})
+    assert agent_profile.settings.runtime.theme == "monochrome"
+
+    environment_profile = load_agent_profile(tmp_path, "local", {"AXIO_REPL_THEME": "default"})
+    assert environment_profile.settings.runtime.theme == "default"
+
+    args = Namespace(theme="monochrome", no_session_log=False)
+    apply_profile_to_args(args, environment_profile, explicit_cli_destinations(["--theme=monochrome"]))
+    assert args.theme == "monochrome"
+    assert explicit_cli_destinations(["--theme=monochrome"]) == frozenset({"theme"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "version: 1\ndefaults:\n  runtime:\n    theme: unknown\n",
+        "version: 1\ndefaults:\n  runtime:\n    theme: 7\n",
+    ),
+)
+def test_theme_rejects_invalid_yaml_values(tmp_path: Path, content: str) -> None:
+    write_config(tmp_path / "config.yaml", content)
+
+    with pytest.raises(AgentConfigError, match="runtime.theme"):
+        load_agent_profile(tmp_path, None, {})
+
+
+def test_theme_rejects_invalid_environment_value(tmp_path: Path) -> None:
+    with pytest.raises(AgentConfigError, match="AXIO_REPL_THEME must be one of"):
+        load_agent_profile(tmp_path, None, {"AXIO_REPL_THEME": "unknown"})
+
+
+def test_selected_agent_manifest_exposes_trusted_model_context(tmp_path: Path) -> None:
+    write_config(
+        tmp_path / "agents" / "local" / "agent.yaml",
+        """\
+version: 1
+description: Catalog text only
+model_context: |-
+  Network access is routed through the configured policy proxy.
+  Treat denied requests as policy outcomes.
+""",
+    )
+
+    profile = load_agent_profile(tmp_path, "local", {})
+
+    assert profile.description == "Catalog text only"
+    assert profile.model_context == (
+        "Network access is routed through the configured policy proxy.\nTreat denied requests as policy outcomes."
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    (
+        ([], "model_context must be a non-empty string"),
+        ("bad\x1bcontext", "forbidden control character"),
+        ("bad\x7fcontext", "forbidden control character"),
+        ("x" * (MAX_MODEL_CONTEXT_BYTES + 1), "byte limit"),
+    ),
+)
+def test_model_context_rejects_invalid_values(tmp_path: Path, value: object, message: str) -> None:
+    import yaml
+
+    write_config(
+        tmp_path / "agents" / "local" / "agent.yaml",
+        yaml.safe_dump({"version": 1, "model_context": value}, sort_keys=False),
+    )
+
+    with pytest.raises(AgentConfigError, match=message):
+        load_agent_profile(tmp_path, "local", {})
 
 
 def test_global_defaults_load_without_named_agent(tmp_path: Path) -> None:
