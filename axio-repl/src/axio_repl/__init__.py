@@ -146,6 +146,7 @@ from axio_repl._multiplexer import (
     normalize_agent_name,
     sanitize_terminal_text,
 )
+from axio_repl._powerline import agent_header, tool_title
 from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
 from axio_repl._terminal import TerminalUI
 
@@ -651,8 +652,8 @@ class ReplRenderer:
         suspended_action_multiplexer: ActionMultiplexer | None = None,
         action_boundary_frames: int = 4,
         action_boundary_bytes: int = 16 * 1024,
-        show_main_turn_headers: bool = True,
         max_identity_cache: int = 256,
+        powerline: bool = False,
     ) -> None:
         if max_identity_cache < 2:
             raise ValueError("max_identity_cache must be at least 2")
@@ -664,7 +665,7 @@ class ReplRenderer:
         self._states: dict[str, _AgentRenderState] = {"main": _AgentRenderState()}
         self._agent_names: OrderedDict[str, str] = OrderedDict()
         self._max_identity_cache = max_identity_cache
-        self._show_main_turn_headers = show_main_turn_headers
+        self._powerline = powerline
         if normalized_main_name := normalize_agent_name(main_agent_name):
             self._agent_names["main"] = normalized_main_name
         self._turns: dict[_TurnKey, _TurnPresentation] = {}
@@ -679,10 +680,13 @@ class ReplRenderer:
         self._background_summaries: OrderedDict[_TurnKey, _BackgroundSummary] = OrderedDict()
         self._input_active = False
         self._panel_message = ""
-        self._actions = action_multiplexer or ActionMultiplexer(display_mode)
+        self._actions = action_multiplexer or ActionMultiplexer(display_mode, powerline=powerline)
         # A parent's sibling tool still belongs to the active turn while a child
         # owns the terminal, so it has an always-on queue separate from background actions.
-        self._suspended_actions = suspended_action_multiplexer or ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+        self._suspended_actions = suspended_action_multiplexer or ActionMultiplexer(
+            DisplayMode.ALL_ACTIONS,
+            powerline=powerline,
+        )
         self._suspended_tool_calls: set[tuple[str, str]] = set()
         self._action_boundary_frames = action_boundary_frames
         self._action_boundary_bytes = action_boundary_bytes
@@ -1043,6 +1047,11 @@ class ReplRenderer:
             if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
                 print()
                 self._state(self._active_agent).mode = _BoundaryMode()
+            if self._powerline and agent_id is not None:
+                identity = format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))
+                print(f"\n{agent_header(identity)}\n{text}\n")
+                self._drain_safe_boundary_locked()
+                return
             source = (
                 f" from agent {format_agent_identity(agent_id, agent_name or self._agent_name(agent_id))}"
                 if agent_id is not None
@@ -1156,10 +1165,13 @@ class ReplRenderer:
         if presentation.header_emitted:
             return
         presentation.header_emitted = True
-        if agent_id == "main" and not self._show_main_turn_headers:
+        if agent_id == "main":
             return
         identity = format_agent_identity(agent_id, presentation.agent_name)
-        print(f"\n{DIM}── agent {identity} ──{RESET}")
+        if self._powerline:
+            print(f"\n{agent_header(identity)}")
+        else:
+            print(f"\n{DIM}── agent {identity} ──{RESET}")
 
     def _parent_tool_key(
         self,
@@ -1321,7 +1333,10 @@ class ReplRenderer:
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
-                sys.stdout.write(f"\n{BOLD}{CYAN}\u25b6 {name}{RESET}")
+                if self._powerline:
+                    sys.stdout.write(f"\n{tool_title(name)}")
+                else:
+                    sys.stdout.write(f"\n{BOLD}{CYAN}▶ {name}{RESET}")
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tid)
@@ -1806,6 +1821,8 @@ async def _read_input_async(
     on_interrupt: Callable[[], None],
     admit_submission: Callable[[str, str, int | None], Awaitable[InputSubmitted]],
     initial_text: str = "",
+    *,
+    prompt_message: object = _panel.PROMPT_MESSAGE,
 ) -> InputSubmitted:
     async def finish_submission(
         editor_value: str,
@@ -1841,10 +1858,10 @@ async def _read_input_async(
         while True:
             try:
                 if initial_text:
-                    value = await session.prompt_async(_panel.PROMPT_MESSAGE, default=initial_text)
+                    value = await session.prompt_async(prompt_message, default=initial_text)
                     initial_text = ""
                 else:
-                    value = await session.prompt_async(_panel.PROMPT_MESSAGE)
+                    value = await session.prompt_async(prompt_message)
                 editor_value = str(value)
                 text = editor_value.strip()
                 if text:
@@ -2469,6 +2486,20 @@ def _build_argument_parser() -> Any:
         default=DisplayMode.ACTIVE_ONLY.value,
         help="Show framed actions from non-active agents (default: off)",
     )
+    powerline_group = parser.add_mutually_exclusive_group()
+    powerline_group.add_argument(
+        "--powerline",
+        dest="powerline",
+        action="store_true",
+        help="Use Powerline segments for the prompt, tool names, and agent frames",
+    )
+    powerline_group.add_argument(
+        "--no-powerline",
+        dest="powerline",
+        action="store_false",
+        help="Use the plain terminal presentation",
+    )
+    parser.set_defaults(powerline=False)
     session_log_group = parser.add_mutually_exclusive_group()
     session_log_group.add_argument(
         "--session-log", dest="no_session_log", action="store_false", help="Write the session JSONL journal"
@@ -2732,6 +2763,7 @@ async def main() -> None:
             ("temperature", getattr(transport, "temperature", None)),
             ("effort", effort.state.to_dict()),
             ("agent_actions", args.agent_actions),
+            ("powerline", args.powerline),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
 
@@ -2916,7 +2948,7 @@ async def main() -> None:
             stats=stats,
             current_model=lambda: transport.model,
             display_mode=DisplayMode.parse(args.agent_actions),
-            show_main_turn_headers=args.prompt is None,
+            powerline=args.powerline,
         )
         startup_notices: list[str] = []
 
@@ -3016,6 +3048,7 @@ async def main() -> None:
             capture_target=lambda: renderer.focused_agent,
             reserve_sequence=event_hub.reserve_sequence,
         )
+        input_prompt = _panel.prompt_message(powerline=args.powerline)
         terminal = TerminalUI(prompt_session)
         terminal_started = False
         shutdown_reason = "complete"
@@ -3746,6 +3779,7 @@ async def main() -> None:
                             _on_sigint,
                             _admit_editor_submission,
                             initial_editor_text,
+                            prompt_message=input_prompt,
                         )
                     )
                     initial_editor_text = ""

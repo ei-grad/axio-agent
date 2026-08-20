@@ -29,6 +29,7 @@ _RUNTIME_KEYS = frozenset(
         "max_iterations",
         "debug",
         "agent_actions",
+        "powerline",
         "session_log",
         "session_log_dir",
     }
@@ -61,6 +62,8 @@ _CLI_OPTION_DESTINATIONS = {
     "--debug": "debug",
     "--no-debug": "debug",
     "--agent-actions": "agent_actions",
+    "--powerline": "powerline",
+    "--no-powerline": "powerline",
     "--session-log": "no_session_log",
     "--no-session-log": "no_session_log",
     "--session-log-dir": "session_log_dir",
@@ -149,6 +152,7 @@ class RuntimeSettings:
     max_iterations: int | None = None
     debug: bool | None = None
     agent_actions: str | None = None
+    powerline: bool | None = None
     session_log: bool | None = None
     session_log_dir: Path | None = None
 
@@ -160,6 +164,7 @@ class RuntimeSettings:
             max_iterations=other.max_iterations if other.max_iterations is not None else self.max_iterations,
             debug=other.debug if other.debug is not None else self.debug,
             agent_actions=other.agent_actions if other.agent_actions is not None else self.agent_actions,
+            powerline=other.powerline if other.powerline is not None else self.powerline,
             session_log=other.session_log if other.session_log is not None else self.session_log,
             session_log_dir=(other.session_log_dir if other.session_log_dir is not None else self.session_log_dir),
         )
@@ -295,6 +300,7 @@ def apply_profile_to_args(args: Any, profile: ResolvedAgentProfile, explicit: fr
         "max_iterations": settings.runtime.max_iterations,
         "debug": settings.runtime.debug,
         "agent_actions": settings.runtime.agent_actions,
+        "powerline": settings.runtime.powerline,
         "session_log_dir": settings.runtime.session_log_dir,
         "sandbox": settings.sandbox.backend,
         "sandbox_image": settings.sandbox.image,
@@ -508,6 +514,7 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
         max_iterations=max_iterations,
         debug=_optional_bool(data, "debug", source, "runtime.debug"),
         agent_actions=agent_actions,
+        powerline=_optional_bool(data, "powerline", source, "runtime.powerline"),
         session_log=_optional_bool(data, "session_log", source, "runtime.session_log"),
         session_log_dir=_optional_path(data, "session_log_dir", source, "runtime.session_log_dir", base_dir),
     )
@@ -710,6 +717,7 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
         max_iterations=positive_int("AXIO_REPL_MAX_ITERATIONS"),
         debug=boolean("AXIO_REPL_DEBUG"),
         agent_actions=agent_actions,
+        powerline=boolean("AXIO_REPL_POWERLINE"),
         session_log=boolean("AXIO_REPL_SESSION_LOG"),
         session_log_dir=external_path("AXIO_REPL_SESSION_LOG_DIR"),
     )

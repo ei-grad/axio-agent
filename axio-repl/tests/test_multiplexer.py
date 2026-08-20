@@ -297,6 +297,30 @@ def test_boundary_drain_honours_frame_and_byte_budgets() -> None:
     assert mux.queued_count == 2
 
 
+def test_powerline_suppression_frame_honours_drain_and_retained_byte_budgets() -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        powerline=True,
+        max_queued_frames=2,
+        max_queued_bytes=2048,
+        max_frames_per_agent=2,
+        max_frame_bytes=512,
+        max_retained_bytes=4096,
+    )
+    for _ in range(6):
+        mux.observe("child", TurnStarted(prompt="ignored"))
+
+    assert mux.retained_bytes <= mux.max_retained_bytes
+    frames = mux.drain(max_frames=1, max_bytes=512)
+
+    assert len(frames) == 1
+    assert len(frames[0].encode()) <= 512
+    assert "4 action frames suppressed" in frames[0]
+    assert "\ue0b2" in frames[0]
+    assert "\ue0b0" in frames[0]
+    assert mux.queued_count == 2
+
+
 def test_frame_size_is_bounded_even_when_labels_contain_escapes() -> None:
     mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, max_frame_bytes=180)
     agent_id = ("agent\x1b[31m" * 50) + "\x1b]0;owned\x07"

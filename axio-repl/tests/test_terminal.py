@@ -11,13 +11,16 @@ from io import TextIOWrapper
 from typing import Any, cast
 
 import pytest
+from axio.events import SessionEndEvent, TextDelta
+from axio.types import StopReason, Usage
+from axio_tools_agents.runtime import ExecutionMode, TurnStarted
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 
-from axio_repl import _panel
+from axio_repl import ReplRenderer, _panel
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
 
 
@@ -403,8 +406,10 @@ async def test_consumer_task_failure_is_propagated_while_process_state_is_restor
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal and termios test")
-async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
+@pytest.mark.parametrize("powerline", [False, True])
+async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both_prompt_styles(
     monkeypatch: pytest.MonkeyPatch,
+    powerline: bool,
 ) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
     master_fd, slave_fd = os.openpty()
@@ -425,13 +430,37 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
             session: Any = _panel.make_session(lambda: "temporary status")
             terminal = TerminalUI(session)
             await terminal.start()
-            prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message(powerline=powerline)))
             try:
                 await asyncio.sleep(0.05)
                 assert session.app.is_running
                 os.write(master_fd, b"par")
                 await asyncio.sleep(0.05)
-                print("asynchronous output")
+                if powerline:
+                    renderer = ReplRenderer(main_agent_name="axio-repl", powerline=True)
+                    await renderer.start_turn(
+                        "main",
+                        TurnStarted(prompt="inspect"),
+                        run_id="main-run",
+                        turn_id="main-turn",
+                        execution_mode=ExecutionMode.FOREGROUND,
+                    )
+                    await renderer.render(
+                        "main",
+                        TextDelta(index=0, delta="ordinary main response"),
+                        run_id="main-run",
+                        turn_id="main-turn",
+                        execution_mode=ExecutionMode.FOREGROUND,
+                    )
+                    await renderer.render(
+                        "main",
+                        SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=Usage(1, 1)),
+                        run_id="main-run",
+                        turn_id="main-turn",
+                        execution_mode=ExecutionMode.FOREGROUND,
+                    )
+                else:
+                    print("asynchronous output")
                 await terminal.drain()
                 os.write(master_fd, b"tial\r")
                 assert await asyncio.wait_for(prompt, timeout=2) == "partial"
@@ -454,8 +483,16 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios(
             chunks.append(chunk)
         rendered = b"".join(chunks).decode("utf-8", errors="replace")
 
-        assert "asynchronous output" in rendered
-        assert "axio-repl> " in rendered
+        if powerline:
+            assert " axio-repl " in rendered
+            assert "\ue0b0" in rendered
+            assert "\ue0b2" in rendered
+            assert "axio-repl>" not in rendered
+            assert "ordinary main response" in rendered
+            assert "agent axio-repl (main)" not in rendered
+        else:
+            assert "asynchronous output" in rendered
+            assert "axio-repl> " in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
         assert after[1] == before[1]

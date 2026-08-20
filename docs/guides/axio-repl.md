@@ -138,6 +138,7 @@ runtime:
   max_iterations: 1000
   debug: false
   agent_actions: "off"
+  powerline: false
   session_log: true
 
 sandbox:
@@ -233,7 +234,7 @@ The environment layer maps directly to manifest fields:
 | Area | Variables |
 |---|---|
 | Agent/transport | `AXIO_REPL_AGENT`, `AXIO_REPL_TRANSPORT`, `AXIO_REPL_TRANSPORT_BASE_URL`, `AXIO_REPL_TRANSPORT_API_KEY_ENV`, `AXIO_REPL_MODEL` |
-| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
+| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
 | Sandbox | `AXIO_REPL_SANDBOX`, `AXIO_REPL_SANDBOX_IMAGE`, `AXIO_REPL_SANDBOX_NETWORK`, `AXIO_REPL_SANDBOX_MEMORY`, `AXIO_REPL_SANDBOX_CPUS`, `AXIO_REPL_SANDBOX_PROXY`, `AXIO_REPL_SANDBOX_NO_PROXY`, `AXIO_REPL_SANDBOX_DATASETS`, `AXIO_REPL_SANDBOX_CA_CERT` |
 | Registries | `AXIO_REPL_SANDBOX_PYPI_INDEX`, `AXIO_REPL_SANDBOX_NPM_REGISTRY`, `AXIO_REPL_SANDBOX_CARGO_INDEX`, `AXIO_REPL_SANDBOX_GO_PROXY`, `AXIO_REPL_SANDBOX_GO_SUMDB` |
 | Tools | `AXIO_REPL_TOOLS` as a comma-separated list, `all`, or `none` |
@@ -276,6 +277,8 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--debug` | off | Log raw request/response bodies |
 | `--no-debug` | off | Explicitly disable debug logging after config resolution |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
+| `--powerline` | off | Use Powerline segments for the prompt, tool names, and agent frames |
+| `--no-powerline` | — | Explicitly disable Powerline presentation after config resolution |
 | `--session-log-dir` | XDG state directory | Root for session JSONL journals |
 | `--no-session-log` | off | Disable the default session journal |
 | `--session-log` | on | Explicitly enable the journal after config resolution |
@@ -295,6 +298,9 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--sandbox-datasets` | none | Host directory mounted read-only at `/datasets` |
 | `--sandbox-ca-cert` | none | Full CA bundle (system roots plus interception CA) mounted read-only for common clients |
 | `--tools` | all | `all`, `none`, or a comma-separated tool whitelist |
+
+Powerline presentation uses filled colour segments with `U+E0B2` (``) and `U+E0B0` (``) separators. The terminal
+font must provide both glyphs; the REPL does not substitute a plain-text fallback.
 
 ## Session journals
 

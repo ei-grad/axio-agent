@@ -10,8 +10,9 @@ from enum import StrEnum
 from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, TurnFinished, TurnStarted
 
-RESET = "\033[0m"
+from axio_repl._powerline import action_frame_footer, action_frame_header
 
+RESET = "\033[0m"
 _MAX_DISPLAY_COUNT = 999_999_999
 
 
@@ -52,11 +53,16 @@ class ActionFrame:
     sequence: int
     critical: bool = False
     agent_name: str | None = None
+    powerline: bool = False
 
     def render(self) -> str:
         identity = format_agent_identity(self.agent_id, self.agent_name)
         kind = sanitize_terminal_text(self.kind).replace("\n", " ")[:40]
         body = sanitize_terminal_text(self.body).rstrip("\n")
+        if self.powerline:
+            return (
+                f"{RESET}\n{action_frame_header(identity, kind)}\n{body}\n{action_frame_footer(identity)}\n{RESET}\n"
+            )
         return f"{RESET}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{RESET}\n"
 
 
@@ -196,6 +202,7 @@ class ActionMultiplexer:
         self,
         mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
         *,
+        powerline: bool = False,
         max_queued_frames: int = 256,
         max_queued_bytes: int = 256 * 1024,
         max_frames_per_agent: int = 64,
@@ -227,10 +234,12 @@ class ActionMultiplexer:
             body="999999999+ action frames suppressed; 999999999+ incomplete actions discarded",
             sequence=0,
             critical=True,
+            powerline=powerline,
         )
         if max_retained_bytes < len(largest_suppression.render().encode("utf-8")):
             raise ValueError("max_retained_bytes is too small for the suppression marker")
         self._mode = mode
+        self._powerline = powerline
         self._max_queued_frames = max_queued_frames
         self._max_queued_bytes = max_queued_bytes
         self._max_frames_per_agent = max_frames_per_agent
@@ -566,8 +575,16 @@ class ActionMultiplexer:
         agent_name = normalize_agent_name(agent_name)
         kind = _fit_utf8(sanitize_terminal_text(kind).replace("\n", " "), 40, suffix="…") or "action"
         clean_body = sanitize_terminal_text(body)
-        identity = format_agent_identity(agent_id, agent_name)
-        overhead = len(f"{RESET}\n── agent {identity} · {kind} ──\n\n── /agent {identity} ──\n{RESET}\n".encode())
+        frame = ActionFrame(
+            agent_id=agent_id,
+            kind=kind,
+            body="",
+            sequence=0,
+            critical=critical,
+            agent_name=agent_name,
+            powerline=self._powerline,
+        )
+        overhead = len(frame.render().encode("utf-8"))
         if overhead >= self._max_frame_bytes:
             while overhead >= self._max_frame_bytes and (agent_name or len(agent_id.encode()) > 1):
                 excess = overhead - self._max_frame_bytes + 1
@@ -586,10 +603,16 @@ class ActionMultiplexer:
                         max(1, len(agent_id.encode()) - (excess + 1) // 2),
                         suffix="…",
                     )
-                identity = format_agent_identity(agent_id, agent_name)
-                overhead = len(
-                    f"{RESET}\n── agent {identity} · {kind} ──\n\n── /agent {identity} ──\n{RESET}\n".encode()
+                frame = ActionFrame(
+                    agent_id=agent_id,
+                    kind=kind,
+                    body="",
+                    sequence=0,
+                    critical=critical,
+                    agent_name=agent_name,
+                    powerline=self._powerline,
                 )
+                overhead = len(frame.render().encode("utf-8"))
         clean_body = _fit_utf8(clean_body, max(0, self._max_frame_bytes - overhead))
         self._sequence += 1
         frame = ActionFrame(
@@ -599,6 +622,7 @@ class ActionMultiplexer:
             sequence=self._sequence,
             critical=critical,
             agent_name=agent_name,
+            powerline=self._powerline,
         )
         queue = self._queues.setdefault(agent_id, deque())
         queue.append(frame)
@@ -756,6 +780,7 @@ class ActionMultiplexer:
             body=self._suppression_body(),
             sequence=sequence,
             critical=True,
+            powerline=self._powerline,
         )
 
     def _suppression_frame(self) -> ActionFrame:

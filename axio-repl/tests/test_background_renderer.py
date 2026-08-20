@@ -43,6 +43,7 @@ from axio_tools_agents.runtime import (
 
 from axio_repl import DIM, RED, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
+from axio_repl._powerline import agent_header
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
 
@@ -164,7 +165,7 @@ async def test_foreground_child_streams_without_changing_input_focus(capsys: pyt
     assert renderer.foreground_agent == "main"
 
 
-async def test_main_turn_labels_text_tool_and_error_with_one_source_header(
+async def test_main_turn_omits_redundant_source_header_but_keeps_error_attribution(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(main_agent_name="axio-repl")
@@ -192,11 +193,82 @@ async def test_main_turn_labels_text_tool_and_error_with_one_source_header(
 
     captured = capsys.readouterr()
     header = "── agent axio-repl (main) ──"
-    assert captured.out.count(header) == 1
-    assert captured.out.index(header) < captured.out.index("main answer")
-    assert captured.out.index(header) < captured.out.index("▶ shell")
+    assert header not in captured.out
+    assert captured.out.index("main answer") < captured.out.index("▶ shell")
     assert "Error from agent axio-repl (main): main failed" in captured.err
     assert "── main ──" not in captured.out
+
+
+async def test_powerline_styles_live_tool_and_subagent_frames(capsys: pytest.CaptureFixture[str]) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS, powerline=True)
+
+    await renderer.start_turn(
+        "main",
+        TurnStarted(prompt="inspect"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render(
+        "main",
+        ToolUseStart(index=0, tool_use_id="main-tool", name="shell"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await _queue_background_tool_action(renderer)
+    await renderer.mark_idle()
+
+    output = capsys.readouterr().out
+    assert "\ue0b0" in output
+    assert "\ue0b2" in output
+    assert "agent main" not in output
+    assert "▶ shell" in output
+    assert "agent child" in output
+    assert "\033[0m\n" in output
+
+
+async def test_powerline_labels_foreground_child_but_not_ordinary_main_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(main_agent_name="axio-repl", powerline=True)
+    await renderer.start_turn(
+        "main",
+        TurnStarted(prompt="inspect"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render(
+        "main",
+        TextDelta(index=0, delta="ordinary main response"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+
+    await renderer.remember_agent("child", "researcher")
+    await renderer.enter_foreground("child", parent_agent_id="main")
+    await renderer.start_turn(
+        "child",
+        TurnStarted(prompt="continue"),
+        run_id="child-run",
+        turn_id="child-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render(
+        "child",
+        TextDelta(index=0, delta="child response"),
+        run_id="child-run",
+        turn_id="child-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+
+    output = capsys.readouterr().out
+    assert "agent axio-repl (main)" not in output
+    child_header = " agent researcher (child) "
+    assert output.count(child_header) == 1
+    assert output.index(child_header) < output.index("child response")
 
 
 async def test_foreground_child_reasoning_and_tool_actions_keep_the_active_streaming_path(
@@ -301,7 +373,7 @@ async def test_background_actions_wait_until_reasoning_closes(capsys: pytest.Cap
 async def test_multiline_reasoning_reapplies_dim_after_every_terminal_line(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
 
     await renderer.render("main", ReasoningDelta(index=0, delta="first\nsecond"))
     await renderer.render("main", ReasoningDelta(index=0, delta=" continues\nthird"))
@@ -316,7 +388,7 @@ async def test_multiline_reasoning_reapplies_dim_after_every_terminal_line(
 async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
 
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"value 1'))
@@ -332,7 +404,7 @@ async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
 async def test_multiline_tool_output_reapplies_its_style_after_newlines(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
 
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
     await renderer.render(
@@ -347,7 +419,7 @@ async def test_multiline_tool_output_reapplies_its_style_after_newlines(
 async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
 
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
     await renderer.render(
@@ -370,7 +442,7 @@ async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
 async def test_agent_switch_closes_reasoning_style_before_other_agent_output(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
 
     await renderer.render("main", ReasoningDelta(index=0, delta="main reasoning"))
     await renderer.render(
@@ -389,7 +461,7 @@ async def test_agent_switch_closes_reasoning_style_before_other_agent_output(
 async def test_structured_tool_field_closes_dim_style_before_answer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer(show_main_turn_headers=False)
+    renderer = ReplRenderer()
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
     await renderer.render(
         "main",
@@ -1001,6 +1073,24 @@ async def test_focusing_a_running_hidden_turn_keeps_the_whole_turn_background(
     assert "incoming from agent analyst (child-id)" in output
 
 
+async def test_powerline_incoming_report_uses_the_shared_agent_badge(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(powerline=True)
+
+    await renderer.incoming(
+        "Report from background agent analyst (child-id):\n\nreport body",
+        agent_id="child-id",
+        agent_name="analyst",
+    )
+
+    output = capsys.readouterr().out
+    identity = "analyst (child-id)"
+    assert f"\n{agent_header(identity)}\n" in output
+    assert "report body" in output
+    assert "incoming from agent" not in output
+
+
 async def test_focusing_away_from_a_running_live_turn_keeps_the_whole_turn_live(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1165,7 +1255,7 @@ async def test_error_only_turn_is_self_labelled_on_stderr_without_a_stdout_heade
     assert f"{RED}Error from agent axio-repl (main): boom{RESET}" in stderr.getvalue()
 
 
-async def test_error_after_stdout_keeps_both_source_attributions() -> None:
+async def test_error_after_stdout_keeps_error_attribution_without_a_main_header() -> None:
     stdout = io.StringIO()
     stderr = io.StringIO()
     renderer = ReplRenderer(main_agent_name="axio-repl")
@@ -1189,7 +1279,7 @@ async def test_error_after_stdout_keeps_both_source_attributions() -> None:
             dataclasses.replace(envelope, event=Error(exception=RuntimeError("later boom"))),
         )
 
-    assert stdout.getvalue().count("── agent axio-repl (main) ──") == 1
+    assert "── agent axio-repl (main) ──" not in stdout.getvalue()
     assert stdout.getvalue().endswith("partial")
     assert "Error from agent axio-repl (main): later boom" in stderr.getvalue()
 

@@ -25,13 +25,24 @@ from axio.types import Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
 from prompt_toolkit.formatted_text import FormattedText
 
+from axio_repl._powerline import prompt_badge
+
 HISTORY_PATH = Path.home() / ".axio_repl_history"
 
 SEPARATOR = " │ "
 MAX_PANEL_MESSAGE_LINES = 8
 MAX_PANEL_MESSAGE_CHARS = 4096
-
 MAIN_AGENT = "main"
+
+
+def prompt_message(*, powerline: bool = False) -> FormattedText:
+    """Build the input prompt in the selected presentation style."""
+
+    if powerline:
+        return prompt_badge()
+    return PROMPT_MESSAGE
+
+
 PROMPT_MESSAGE = FormattedText([("class:repl-prompt", "axio-repl> ")])
 
 

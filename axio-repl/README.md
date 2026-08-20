@@ -145,7 +145,12 @@ axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.json
 
 # Show framed tool and lifecycle actions from background agents
 axio-repl --agent-actions on
+
+# Use Powerline segments for the prompt, tool names, and agent frames
+axio-repl --powerline
 ```
+
+Powerline mode requires a terminal font that provides the `U+E0B2` (``) and `U+E0B0` (``) separator glyphs.
 
 ## Agent configuration
 

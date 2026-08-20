@@ -218,6 +218,17 @@ def test_prompt_is_named_and_visually_distinct_from_agent_text() -> None:
     assert prompt_attrs != default_attrs
 
 
+def test_powerline_prompt_uses_a_coloured_segment_and_separator() -> None:
+    from prompt_toolkit.formatted_text import to_formatted_text
+
+    assert to_formatted_text(_panel.prompt_message(powerline=True)) == [
+        ("fg:ansicyan bg:default", "\ue0b2"),
+        ("bold fg:ansiblack bg:ansicyan", " axio-repl "),
+        ("fg:ansicyan bg:default", "\ue0b0"),
+        ("", " "),
+    ]
+
+
 def test_status_line_reports_action_visibility_and_backlog() -> None:
     from axio.models import ModelSpec
 
@@ -259,9 +270,12 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
 
     interrupts: list[int] = []
     answers: list[object] = [KeyboardInterrupt(), KeyboardInterrupt(), "carry on"]
+    input_prompt = _panel.prompt_message(powerline=True)
+    observed_prompts: list[object] = []
 
     class _Session:
         async def prompt_async(self, prompt: object) -> str:
+            observed_prompts.append(prompt)
             answer = answers.pop(0)
             if isinstance(answer, BaseException):
                 raise answer
@@ -280,11 +294,18 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
             arrival_seq=1,
         )
 
-    result = await _read_input_async(_Session(), renderer, lambda: interrupts.append(1), admit)
+    result = await _read_input_async(
+        _Session(),
+        renderer,
+        lambda: interrupts.append(1),
+        admit,
+        prompt_message=input_prompt,
+    )
 
     assert result.text == "carry on"
     assert result.target_agent_id == "child"
     assert len(interrupts) == 2
+    assert observed_prompts == [input_prompt, input_prompt, input_prompt]
 
 
 async def test_enter_admission_completes_before_editor_clear_even_when_reader_is_cancelled() -> None:

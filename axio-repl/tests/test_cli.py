@@ -38,6 +38,14 @@ def test_agent_actions_default_to_off() -> None:
     assert args.agent_actions == "off"
 
 
+def test_powerline_defaults_to_off_and_can_be_enabled() -> None:
+    parser = _build_argument_parser()
+
+    assert parser.parse_args([]).powerline is False
+    assert parser.parse_args(["--powerline", "inspect"]).powerline is True
+    assert parser.parse_args(["--no-powerline"]).powerline is False
+
+
 def test_agent_actions_can_be_enabled() -> None:
     args = _build_argument_parser().parse_args(["--agent-actions", "on", "inspect"])
 
@@ -675,7 +683,8 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
     ) -> PromptSession:
-        del capture_target, status, on_interrupt, on_shutdown, recall_pending, on_empty_eof, reserve_sequence
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, status
         return prompt_session
 
     journal_root = tmp_path / "journals"
@@ -800,7 +809,8 @@ async def test_resume_copies_context_and_restores_editor_before_input(
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
     ) -> PromptSession:
-        del capture_target, status, on_interrupt, on_shutdown, recall_pending, on_empty_eof, reserve_sequence
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, status
         return prompt_session
 
     resumed_root = tmp_path / "resumed"
