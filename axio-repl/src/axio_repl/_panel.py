@@ -97,11 +97,13 @@ class SessionStats:
     an answer is still being written; a turn's total is the sum of its
     iterations, so counting both would double everything.
 
-    Cost is priced at the model in use when the tokens were spent, which is the
-    right answer for a spawned agent sharing the parent's model and an
-    approximation for one that does not. Models without applicable pricing
-    still contribute token usage and permanently mark the aggregate cost as
-    incomplete, rather than turning missing prices into zero cost.
+    Provider-reported cost is authoritative and complete without ModelSpec
+    pricing. Otherwise the tokens are estimated at the model in use, which is
+    exact for model attribution only when a spawned agent shares the parent's
+    model. The status distinguishes reported, estimated, and mixed totals. A
+    total becomes incomplete only when an operation has neither reported cost
+    nor an available model-price estimate; missing model pricing alone does not
+    invalidate an operation that already has reported cost.
     """
 
     input_tokens: int = 0

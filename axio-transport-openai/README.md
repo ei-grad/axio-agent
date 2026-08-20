@@ -120,15 +120,25 @@ reports a validated, non-negative USD cost for that operation. OpenRouter's
 terminal `usage.cost` is such a value, so `OpenRouterTransport` exposes it with
 `cost_source == CostSource.provider`. It is not recomputed from catalogue token
 prices and is recorded only once even if a compatible endpoint sends more than
-one usage chunk.
+one usage chunk. OpenRouter's [usage-accounting documentation](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+describes `usage.cost` as the total charged and says detailed usage is included
+automatically in the final streaming message; it also marks
+`usage: {"include": true}` and `stream_options: {"include_usage": true}` as
+deprecated no-ops. Its
+[currency FAQ](https://openrouter.ai/docs/faq) states that API pricing is
+denominated in US dollars.
 
-OpenAI and Nebius currently return token usage, not a monetary total, in their
-Chat Completions streaming responses. Their `cost_usd` and `cost_source` fields
-therefore remain `None`. Hosts may estimate from `ModelSpec.input_cost` and
-`ModelSpec.output_cost`; `axio-repl` labels that fallback as `est.` and labels
-provider totals as `reported`. The estimate is not a billing statement and may
-differ when cached tokens, long-context or service tiers, request fees, images,
-or hosted tools have separate prices.
+The documented Chat Completions usage schemas for
+[OpenAI](https://developers.openai.com/api/reference/resources/chat) and
+[Nebius](https://docs.tokenfactory.nebius.com/api-reference/inference/create-chat-completion)
+expose token counts but no monetary total. Their `cost_usd` and `cost_source`
+fields therefore remain `None` unless the configured endpoint supplies a cost
+under a provider-specific contract that this transport recognizes. Hosts may
+estimate from `ModelSpec.input_cost` and `ModelSpec.output_cost`; `axio-repl`
+labels that fallback as `est.` and labels provider totals as `reported`. The
+estimate is not a billing statement and may differ when cached tokens,
+long-context or service tiers, request fees, images, or hosted tools have
+separate prices.
 
 Usage normally arrives in the terminal SSE chunk. If a stream is interrupted
 before that chunk, the transport does not fabricate token usage or cost.
