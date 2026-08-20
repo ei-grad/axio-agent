@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -10,10 +11,16 @@ from axio_repl._theme import TerminalTheme
 
 _MAX_RESULT_BYTES = 32 * 1024
 _MAX_HEADER_CHARS = 512
-_SUMMARY = re.compile(r"^\+(\d+) -(\d+)$")
-_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: [A-Za-z_$~][A-Za-z0-9_$~:.<>]*)?$")
-_WRITE = re.compile(r"^Wrote \d+ bytes to (.+)$")
+_COUNT = r"[0-9]{1,10}"
+_SUMMARY = re.compile(rf"^\+({_COUNT}) -({_COUNT})$")
+_HUNK = re.compile(
+    rf"^@@ -(?P<old_start>{_COUNT})(?:,(?P<old_count>{_COUNT}))? "
+    rf"\+(?P<new_start>{_COUNT})(?:,(?P<new_count>{_COUNT}))? @@"
+    r"(?: [A-Za-z_$~][A-Za-z0-9_$~:.<>]*)?$"
+)
+_WRITE = re.compile(rf"^Wrote {_COUNT} bytes to (.+)$")
 _TRUNCATED = "...[diff truncated]"
+_NO_NEWLINE = "\\ No newline at end of file"
 
 
 class DiffLineKind(StrEnum):
@@ -40,25 +47,36 @@ class PatchResultDisplay:
         prefix = (f"path: {self.fallback_path}",) if self.fallback_path is not None else ()
         return "\n".join((*prefix, *(line.text for line in self.lines)))
 
+    def line_kinds(self) -> tuple[DiffLineKind, ...]:
+        prefix = (DiffLineKind.METADATA,) if self.fallback_path is not None else ()
+        return (*prefix, *(line.kind for line in self.lines))
+
     def styled_text(self, theme: TerminalTheme) -> str:
-        rendered: list[str] = []
-        if self.fallback_path is not None:
-            rendered.append(_styled_line(theme.stdout.ansi, f"path: {self.fallback_path}", theme.reset))
-        for line in self.lines:
-            style = {
-                DiffLineKind.SUMMARY: theme.stdout.ansi,
-                DiffLineKind.HUNK: theme.tool.ansi,
-                DiffLineKind.ADDITION: theme.success.ansi,
-                DiffLineKind.DELETION: theme.error.ansi,
-                DiffLineKind.CONTEXT: theme.reasoning.ansi,
-                DiffLineKind.METADATA: theme.stdout.ansi,
-            }[line.kind]
-            rendered.append(_styled_line(style, line.text, theme.reset))
-        return "\n".join(rendered)
+        return style_classified_text(self.plain_text(), self.line_kinds(), theme)
+
+
+@dataclass(slots=True)
+class _HunkState:
+    expected_old: int
+    expected_new: int
+    observed_old: int = 0
+    observed_new: int = 0
+    saw_change: bool = False
+    metadata_allowed: bool = False
+
+    def is_complete(self) -> bool:
+        return self.saw_change and self.observed_old == self.expected_old and self.observed_new == self.expected_new
 
 
 def parse_patch_result(content: str, *, include_legacy_path: bool = False) -> PatchResultDisplay | None:
     """Parse a compact patch diff, failing open with ``None`` on any mismatch."""
+    try:
+        return _parse_patch_result(content, include_legacy_path=include_legacy_path)
+    except (UnicodeError, ValueError, OverflowError):
+        return None
+
+
+def _parse_patch_result(content: str, *, include_legacy_path: bool) -> PatchResultDisplay | None:
     if not content or "\r" in content or len(content.encode("utf-8")) > _MAX_RESULT_BYTES:
         return None
     raw_lines = content.splitlines()
@@ -81,43 +99,56 @@ def parse_patch_result(content: str, *, include_legacy_path: bool = False) -> Pa
     parsed: list[DiffDisplayLine] = []
     additions = 0
     deletions = 0
-    saw_hunk = False
-    saw_change_in_hunk = False
+    hunk: _HunkState | None = None
     truncated = False
     for index, line in enumerate(raw_lines):
         if line == _TRUNCATED:
-            if index != len(raw_lines) - 1 or not saw_hunk:
+            if index != len(raw_lines) - 1 or hunk is None or summary is None:
                 return None
             parsed.append(DiffDisplayLine(line, DiffLineKind.METADATA))
             truncated = True
             continue
         if line.startswith("@@"):
-            if len(line) > _MAX_HEADER_CHARS or _HUNK.fullmatch(line) is None:
+            match = _HUNK.fullmatch(line)
+            if len(line) > _MAX_HEADER_CHARS or match is None:
                 return None
-            if saw_hunk and not saw_change_in_hunk:
+            if hunk is not None and not hunk.is_complete():
                 return None
+            old_start = int(match.group("old_start"))
+            new_start = int(match.group("new_start"))
+            old_count = int(match.group("old_count") or "1")
+            new_count = int(match.group("new_count") or "1")
+            if (old_start == 0 and old_count > 0) or (new_start == 0 and new_count > 0):
+                return None
+            hunk = _HunkState(expected_old=old_count, expected_new=new_count)
             parsed.append(DiffDisplayLine(line, DiffLineKind.HUNK))
-            saw_hunk = True
-            saw_change_in_hunk = False
             continue
-        if not saw_hunk:
+        if hunk is None:
             return None
         if line.startswith("+"):
             additions += 1
-            saw_change_in_hunk = True
+            hunk.observed_new += 1
+            hunk.saw_change = True
+            hunk.metadata_allowed = True
             kind = DiffLineKind.ADDITION
         elif line.startswith("-"):
             deletions += 1
-            saw_change_in_hunk = True
+            hunk.observed_old += 1
+            hunk.saw_change = True
+            hunk.metadata_allowed = True
             kind = DiffLineKind.DELETION
         elif line.startswith(" "):
+            hunk.observed_old += 1
+            hunk.observed_new += 1
+            hunk.metadata_allowed = True
             kind = DiffLineKind.CONTEXT
-        elif line.startswith("\\"):
+        elif line == _NO_NEWLINE and hunk.metadata_allowed:
+            hunk.metadata_allowed = False
             kind = DiffLineKind.METADATA
         else:
             return None
         parsed.append(DiffDisplayLine(line, kind))
-    if not saw_hunk or (not saw_change_in_hunk and not truncated):
+    if hunk is None or (not truncated and not hunk.is_complete()):
         return None
     if summary is not None and not truncated and summary != (additions, deletions):
         return None
@@ -129,12 +160,40 @@ def parse_patch_result(content: str, *, include_legacy_path: bool = False) -> Pa
 
 def is_write_file_result(content: str) -> bool:
     """Recognize only the exact successful result shapes produced by write_file."""
-    if not content or "\r" in content or len(content.encode("utf-8")) > _MAX_RESULT_BYTES:
+    try:
+        within_bound = len(content.encode("utf-8")) <= _MAX_RESULT_BYTES
+    except UnicodeError:
+        return False
+    if not content or "\r" in content or not within_bound:
         return False
     lines = content.splitlines()
     if len(lines) == 1:
         return _WRITE.fullmatch(lines[0]) is not None
     return _legacy_body(lines) is not None and parse_patch_result(content) is not None
+
+
+def style_classified_text(
+    text: str,
+    line_kinds: Sequence[DiffLineKind],
+    theme: TerminalTheme,
+) -> str:
+    """Apply owned semantic styles to already-sanitized physical lines."""
+    rendered: list[str] = []
+    for index, line in enumerate(text.split("\n")):
+        if index >= len(line_kinds):
+            rendered.append(line)
+            continue
+        kind = line_kinds[index]
+        style = {
+            DiffLineKind.SUMMARY: theme.stdout.ansi,
+            DiffLineKind.HUNK: theme.tool.ansi,
+            DiffLineKind.ADDITION: theme.success.ansi,
+            DiffLineKind.DELETION: theme.error.ansi,
+            DiffLineKind.CONTEXT: theme.reasoning.ansi,
+            DiffLineKind.METADATA: theme.stdout.ansi,
+        }[kind]
+        rendered.append(_styled_line(style, line, theme.reset))
+    return "\n".join(rendered)
 
 
 def _legacy_body(lines: list[str]) -> tuple[str, list[str]] | None:
@@ -151,6 +210,6 @@ def _legacy_body(lines: list[str]) -> tuple[str, list[str]] | None:
 
 
 def _styled_line(style: str, text: str, reset: str) -> str:
-    if not style:
+    if not text or not style:
         return text
     return f"{style}{text}{reset}"

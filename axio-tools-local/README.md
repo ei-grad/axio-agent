@@ -127,6 +127,10 @@ the change instead of a bare byte count.
 
 - `patch_file` needs to split the target into lines, so a non-UTF-8 file is an
   error (`File is not valid UTF-8`).
+- A replacement that reaches the end of the file preserves whether `content`
+  has a final newline. Missing final newlines are shown with the conventional
+  `\ No newline at end of file` marker; middle replacements are terminated so
+  they cannot merge with the next existing line.
 - `write_file` only needs the old content for the diff, so replacing a binary,
   unreadable, or very large file still succeeds - the result just reports the
   size with no diff. Creating a new file reports no diff either.
@@ -146,9 +150,12 @@ the change instead of a bare byte count.
 This is the compact `patch_file` result. The path remains in the immediately
 preceding tool arguments instead of being repeated in the result. Each hunk
 header gets best-effort function context for Python and common brace-delimited
-languages. `write_file` retains its byte acknowledgement and full file headers
-in the model-visible result because it also covers whole-file creation and
-replacement; the interactive REPL omits its redundant successful acknowledgement.
+languages. The heuristic masks comments, strings, high-confidence JavaScript
+regex literals, and control-flow conditions; it omits the suffix when changed lines span a
+named symbol and module scope or when syntax is uncertain. `write_file` retains
+its byte acknowledgement and full file headers in the model-visible result
+because it also covers whole-file creation and replacement; the interactive
+REPL omits its redundant successful acknowledgement.
 
 ### list_files
 

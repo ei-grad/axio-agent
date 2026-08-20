@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
@@ -12,7 +12,12 @@ from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, 
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
-from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
+from axio_repl._tool_result_display import (
+    DiffLineKind,
+    is_write_file_result,
+    parse_patch_result,
+    style_classified_text,
+)
 
 _MAX_DISPLAY_COUNT = 999_999_999
 
@@ -56,12 +61,15 @@ class ActionFrame:
     agent_name: str | None = None
     powerline: bool = False
     theme: TerminalTheme = DEFAULT_THEME
+    body_line_kinds: tuple[DiffLineKind, ...] | None = None
 
     def render(self) -> str:
         reset = self.theme.reset
         identity = format_agent_identity(self.agent_id, self.agent_name)
         kind = sanitize_terminal_text(self.kind).replace("\n", " ")[:40]
         body = sanitize_terminal_text(self.body).rstrip("\n")
+        if self.body_line_kinds is not None:
+            body = style_classified_text(body, self.body_line_kinds, self.theme)
         if self.powerline:
             return (
                 f"{reset}\n{action_frame_header(identity, kind, self.theme)}\n{body}\n"
@@ -239,6 +247,7 @@ class ActionMultiplexer:
             <= 0
         ):
             raise ValueError("multiplexer limits must be positive")
+        powerline = powerline and bool(theme.reset)
         largest_suppression = ActionFrame(
             agent_id="all agents",
             kind="suppressed",
@@ -401,6 +410,9 @@ class ActionMultiplexer:
                         else None
                     )
                     if action is None:
+                        patch_kinds = (
+                            (DiffLineKind.METADATA, *patch_display.line_kinds()) if patch_display is not None else None
+                        )
                         self._enqueue(
                             agent_id,
                             "tool error" if is_error else "tool result",
@@ -413,6 +425,7 @@ class ActionMultiplexer:
                             ),
                             critical=True,
                             agent_name=agent_name,
+                            body_line_kinds=patch_kinds,
                         )
                         return
                     self._emit_call(agent_id, action, retained=False)
@@ -432,6 +445,7 @@ class ActionMultiplexer:
                             f"✓ {action.name}\n{patch_display.plain_text()}",
                             critical=True,
                             agent_name=action.agent_name,
+                            body_line_kinds=(DiffLineKind.METADATA, *patch_display.line_kinds()),
                         )
                     elif name == action.name == "write_file" and is_write_file_result(safe_content):
                         pass
@@ -616,6 +630,7 @@ class ActionMultiplexer:
         *,
         critical: bool = False,
         agent_name: str | None = None,
+        body_line_kinds: tuple[DiffLineKind, ...] | None = None,
     ) -> None:
         agent_id = self._queue_agent_id(agent_id)
         agent_name = normalize_agent_name(agent_name)
@@ -672,7 +687,13 @@ class ActionMultiplexer:
             agent_name=agent_name,
             powerline=self._powerline,
             theme=self._theme,
+            body_line_kinds=body_line_kinds,
         )
+        while self._frame_size(frame) > self._max_frame_bytes and clean_body:
+            excess = self._frame_size(frame) - self._max_frame_bytes
+            body_budget = max(0, len(clean_body.encode("utf-8")) - max(1, excess))
+            clean_body = _fit_utf8(clean_body, body_budget)
+            frame = replace(frame, body=clean_body)
         queue = self._queues.setdefault(agent_id, deque())
         queue.append(frame)
         self._queued_bytes += self._frame_size(frame)

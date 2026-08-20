@@ -126,6 +126,51 @@ def test_strings_and_comments_do_not_create_or_break_brace_context() -> None:
     assert "@@ -1,2 +1,2 @@\n" in _replace("plain.js", comment_only, "value = 1", "value = 2")
 
 
+@pytest.mark.parametrize(
+    ("path", "before", "symbol"),
+    [
+        ("flow.c", "void run() {\n    if (ready()) {\n        value++;\n    }\n}\n", "run"),
+        ("flow.js", "function run() {\n  if (ready()) {\n    value++;\n  }\n}\n", "run"),
+        (
+            "Flow.java",
+            "class Flow {\n    void run() {\n        if (ready()) {\n            value++;\n        }\n    }\n}\n",
+            "Flow.run",
+        ),
+        (
+            "Flow.cs",
+            "class Flow {\n    void Run() {\n        if (Ready()) {\n            value++;\n        }\n    }\n}\n",
+            "Flow.Run",
+        ),
+    ],
+)
+def test_control_flow_nested_calls_never_become_symbols(path: str, before: str, symbol: str) -> None:
+    result = _replace(path, before, "value++", "value += 2")
+
+    assert f"@@ {symbol}\n" in result
+    assert ".ready" not in result.lower()
+
+
+def test_javascript_regex_braces_do_not_corrupt_later_function_nesting() -> None:
+    before = "function one() {\n  const opening = /\\{/;\n  return 1;\n}\n\nfunction two() {\n  return 2;\n}\n"
+
+    result = _replace("functions.js", before, "return 2", "return 3")
+
+    assert "@@ -4,5 +4,5 @@ two\n" in result
+    assert "one.two" not in result
+
+
+def test_javascript_division_is_not_misread_as_a_regex() -> None:
+    before = "function one(total, divisor) {\n  return total / divisor;\n}\n\nfunction two() {\n  return 2;\n}\n"
+
+    assert "@@ -3,5 +3,5 @@ two\n" in _replace("division.js", before, "return 2", "return 3")
+
+
+def test_valid_nested_javascript_function_keeps_nearest_context() -> None:
+    before = "function outer() {\n  function inner() {\n    return 1;\n  }\n}\n"
+
+    assert "@@ -1,5 +1,5 @@ outer.inner\n" in _replace("nested.js", before, "return 1", "return 2")
+
+
 def test_non_code_and_unicode_or_control_tainted_symbols_have_no_context() -> None:
     text = "heading\nvalue one\nvalue two\n"
     assert "@@ -1,3 +1,3 @@\n" in _replace("notes.txt", text, "value one", "changed")
@@ -147,6 +192,24 @@ def test_one_hunk_touching_multiple_symbols_omits_ambiguous_context() -> None:
 
     assert result.count("@@ -") == 1
     assert "@@ -1,5 +1,5 @@\n" in result
+
+
+def test_one_hunk_touching_a_symbol_and_module_scope_omits_context() -> None:
+    before = "def run():\n    return 1\n\nvalue = 2\n"
+    after = before.replace("return 1", "return 10").replace("value = 2", "value = 20")
+
+    result = describe_patch("mixed.py", before, after)
+
+    assert "@@ -1,4 +1,4 @@\n" in result
+
+
+def test_replacing_a_named_symbol_with_module_code_omits_context() -> None:
+    before = "def run():\n    return 1\n"
+    after = "value = 1\n"
+
+    result = describe_patch("mixed.py", before, after)
+
+    assert "@@ -1,2 +1 @@\n" in result
 
 
 def test_multiple_hunks_choose_their_own_context() -> None:

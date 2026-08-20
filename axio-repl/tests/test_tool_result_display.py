@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from axio.diff import describe_patch
+
 from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
 from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
 
-_COMPACT = "+1 -1\n@@ -1,3 +1,3 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
+_COMPACT = "+1 -1\n@@ -1,2 +1,2 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
 
 
 def test_compact_patch_result_has_exact_plain_and_owned_ansi_lines() -> None:
@@ -13,7 +15,7 @@ def test_compact_patch_result_has_exact_plain_and_owned_ansi_lines() -> None:
     assert display.plain_text() == _COMPACT.rstrip("\n")
     assert display.styled_text(DEFAULT_THEME) == (
         f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}\n"
-        f"{DEFAULT_THEME.tool.ansi}@@ -1,3 +1,3 @@ Service.run{DEFAULT_THEME.reset}\n"
+        f"{DEFAULT_THEME.tool.ansi}@@ -1,2 +1,2 @@ Service.run{DEFAULT_THEME.reset}\n"
         f"{DEFAULT_THEME.reasoning.ansi} class Service:{DEFAULT_THEME.reset}\n"
         f"{DEFAULT_THEME.error.ansi}-    return 1{DEFAULT_THEME.reset}\n"
         f"{DEFAULT_THEME.success.ansi}+    return 2{DEFAULT_THEME.reset}"
@@ -50,6 +52,54 @@ def test_parser_fails_open_on_malformed_unbounded_or_inconsistent_text() -> None
     assert parse_patch_result("+9 -1\n@@ -1 +1 @@\n-old\n+new") is None
     assert parse_patch_result("+1 -0\n@@ -1 +1 @@ injected\x1b[2J\n+new") is None
     assert parse_patch_result("+1 -0\n@@ -1 +1 @@\n+" + "x" * (33 * 1024)) is None
+
+
+def test_parser_is_total_for_huge_counts_and_invalid_unicode() -> None:
+    huge = "9" * 5000
+
+    assert parse_patch_result(f"+{huge} -0\n@@ -0,0 +1 @@\n+new") is None
+    assert parse_patch_result(f"+1 -0\n@@ -0,0 +1,{huge} @@\n+new") is None
+    assert parse_patch_result("+1 -0\n@@ -0,0 +1 @@\n+bad\ud800") is None
+
+
+def test_parser_validates_each_complete_hunk_count() -> None:
+    valid = "+2 -2\n@@ -1,2 +1,2 @@ one\n same\n-old\n+new\n@@ -10 +10 @@ two\n-before\n+after\n"
+    bad_first = valid.replace("@@ -1,2 +1,2 @@", "@@ -1,3 +1,2 @@")
+    bad_second = valid.replace("@@ -10 +10 @@", "@@ -10,2 +10 @@")
+
+    assert parse_patch_result(valid) is not None
+    assert parse_patch_result(bad_first) is None
+    assert parse_patch_result(bad_second) is None
+    assert parse_patch_result(valid.replace("@@ -1,2 +1,2 @@", "@@ -0,2 +1,2 @@")) is None
+
+
+def test_parser_accepts_only_conventional_no_newline_metadata() -> None:
+    valid = "+1 -1\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n"
+
+    assert parse_patch_result(valid) is not None
+    assert parse_patch_result(valid.replace("No newline at end of file", "unexpected metadata")) is None
+    assert parse_patch_result(valid.replace("-old\n\\", "\\\n-old\n\\")) is None
+
+
+def test_only_truncated_final_hunk_is_exempt_from_exact_counts() -> None:
+    valid = "+20 -20\n@@ -1 +1 @@ one\n-old\n+new\n@@ -20,19 +20,19 @@ two\n-partial\n...[diff truncated]\n"
+    bad_complete_hunk = valid.replace("@@ -1 +1 @@", "@@ -1,2 +1 @@")
+
+    assert parse_patch_result(valid) is not None
+    assert parse_patch_result(bad_complete_hunk) is None
+    assert parse_patch_result(valid.replace("...[diff truncated]\n", "")) is None
+    assert parse_patch_result(valid + "+after-marker\n") is None
+
+
+def test_parser_accepts_the_actual_bounded_patch_result() -> None:
+    before = "line0\n"
+    after = before + "".join(f"new{index}\n" for index in range(5000))
+    result = describe_patch("large.txt", before, after)
+
+    display = parse_patch_result(result)
+
+    assert display is not None
+    assert display.plain_text().endswith("...[diff truncated]")
 
 
 def test_write_result_recognizer_is_tool_handler_specific() -> None:

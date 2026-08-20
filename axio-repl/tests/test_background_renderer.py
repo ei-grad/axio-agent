@@ -359,7 +359,7 @@ async def test_patch_file_result_is_compact_colored_and_keeps_tool_event_unchang
     powerline: bool,
 ) -> None:
     renderer = ReplRenderer(powerline=powerline)
-    content = "+1 -1\n@@ -1,3 +1,3 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
+    content = "+1 -1\n@@ -1,2 +1,2 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
     event = ToolResult(tool_use_id="patch", name="patch_file", is_error=False, content=content)
     event_before = dataclasses.asdict(event)
 
@@ -381,9 +381,9 @@ async def test_patch_file_result_is_compact_colored_and_keeps_tool_event_unchang
     assert "Changed src/service.py" not in visible
     assert "---" not in visible
     assert "+++" not in visible
-    assert "+1 -1\n@@ -1,3 +1,3 @@ Service.run" in visible
+    assert "+1 -1\n@@ -1,2 +1,2 @@ Service.run" in visible
     assert f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}\n" in raw
-    assert f"{DEFAULT_THEME.tool.ansi}@@ -1,3 +1,3 @@ Service.run{DEFAULT_THEME.reset}\n" in raw
+    assert f"{DEFAULT_THEME.tool.ansi}@@ -1,2 +1,2 @@ Service.run{DEFAULT_THEME.reset}\n" in raw
     assert f"{DEFAULT_THEME.reasoning.ansi} class Service:{DEFAULT_THEME.reset}\n" in raw
     assert f"{DEFAULT_THEME.error.ansi}-    return 1{DEFAULT_THEME.reset}\n" in raw
     assert f"{DEFAULT_THEME.success.ansi}+    return 2{DEFAULT_THEME.reset}\n" in raw
@@ -423,14 +423,14 @@ async def test_malformed_patch_result_fails_open_to_existing_sanitized_display(
             tool_use_id="orphan",
             name="patch_file",
             is_error=False,
-            content="+1 -0\nnot-a-hunk\n+visible\x1b[2J",
+            content="+1 -1\n@@ -1,2 +1 @@ run\n-old\n+visible\x1b[2J",
         ),
     )
 
     raw = capsys.readouterr().out
-    assert "not-a-hunk" in raw and "+visible" in raw
+    assert "@@ -1,2 +1 @@ run" in raw and "+visible" in raw
     assert "\x1b[2J" not in raw
-    assert f"{DEFAULT_THEME.success.ansi}+1 -0" in raw
+    assert f"{DEFAULT_THEME.success.ansi}+1 -1" in raw
 
 
 async def test_successful_write_ack_is_suppressed_only_for_a_known_write_call(

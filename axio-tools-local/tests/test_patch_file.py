@@ -151,6 +151,63 @@ class TestNewlineHandling:
         await patch(f, 2, 2, "B\n")
         assert f.read_text() == "a\nB\nc"
 
+    @pytest.mark.parametrize(
+        ("before", "from_line", "to_line", "content", "after", "expected_result"),
+        [
+            (
+                "same",
+                1,
+                1,
+                "same\n",
+                "same\n",
+                "+1 -1\n@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n",
+            ),
+            (
+                "same\n",
+                1,
+                1,
+                "same",
+                "same",
+                "+1 -1\n@@ -1 +1 @@\n-same\n+same\n\\ No newline at end of file\n",
+            ),
+            (
+                "one\ntwo",
+                2,
+                2,
+                "two\n",
+                "one\ntwo\n",
+                "+1 -1\n@@ -1,2 +1,2 @@\n one\n-two\n\\ No newline at end of file\n+two\n",
+            ),
+            (
+                "one\ntwo\n",
+                2,
+                2,
+                "two",
+                "one\ntwo",
+                "+1 -1\n@@ -1,2 +1,2 @@\n one\n-two\n+two\n\\ No newline at end of file\n",
+            ),
+            ("", 1, 0, "\n", "\n", "+1 -0\n@@ -0,0 +1 @@\n+\n"),
+            ("\n", 1, 1, "", "", "+0 -1\n@@ -1 +0,0 @@\n-\n"),
+        ],
+    )
+    async def test_final_newline_changes_are_exact(
+        self,
+        tmp_cwd: Path,
+        before: str,
+        from_line: int,
+        to_line: int,
+        content: str,
+        after: str,
+        expected_result: str,
+    ) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text(before)
+
+        result = await patch(f, from_line, to_line, content)
+
+        assert f.read_text() == after
+        assert result == expected_result
+
 
 class TestEdgeCases:
     async def test_file_not_found(self, tmp_cwd: Path) -> None:

@@ -53,6 +53,25 @@ def test_missing_trailing_newline_keeps_lines_apart() -> None:
     assert "+new content\n" in diff
 
 
+def test_compact_patch_distinguishes_adding_and_removing_final_newline() -> None:
+    added = describe_patch("f.txt", "same", "same\n")
+    removed = describe_patch("f.txt", "same\n", "same")
+
+    assert added == ("+1 -1\n@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n")
+    assert removed == ("+1 -1\n@@ -1 +1 @@\n-same\n+same\n\\ No newline at end of file\n")
+
+
+def test_compact_patch_marks_missing_newline_on_last_line_of_multiline_file() -> None:
+    result = describe_patch("f.txt", "one\ntwo", "one\ntwo\n")
+
+    assert result == ("+1 -1\n@@ -1,2 +1,2 @@\n one\n-two\n\\ No newline at end of file\n+two\n")
+
+
+def test_compact_patch_handles_empty_and_single_line_newline_transitions() -> None:
+    assert describe_patch("f.txt", "", "\n") == "+1 -0\n@@ -0,0 +1 @@\n+\n"
+    assert describe_patch("f.txt", "\n", "") == "+0 -1\n@@ -1 +0,0 @@\n-\n"
+
+
 def test_oversized_diff_is_truncated() -> None:
     """A large rewrite must stay a summary instead of flooding the context."""
     before = "line0\n"

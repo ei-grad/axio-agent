@@ -951,6 +951,74 @@ async def test_patch_file_handler_reports_compact_path_free_diff() -> None:
     assert member.read() == b"line1\nREPLACED\nline3\n"
 
 
+@pytest.mark.parametrize(
+    ("before", "from_line", "to_line", "content", "after", "expected_result"),
+    [
+        (
+            b"same",
+            1,
+            1,
+            "same\n",
+            b"same\n",
+            "+1 -1\n@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n",
+        ),
+        (
+            b"same\n",
+            1,
+            1,
+            "same",
+            b"same",
+            "+1 -1\n@@ -1 +1 @@\n-same\n+same\n\\ No newline at end of file\n",
+        ),
+        (
+            b"one\ntwo",
+            2,
+            2,
+            "two\n",
+            b"one\ntwo\n",
+            "+1 -1\n@@ -1,2 +1,2 @@\n one\n-two\n\\ No newline at end of file\n+two\n",
+        ),
+        (
+            b"one\ntwo\n",
+            2,
+            2,
+            "two",
+            b"one\ntwo",
+            "+1 -1\n@@ -1,2 +1,2 @@\n one\n-two\n+two\n\\ No newline at end of file\n",
+        ),
+        (b"", 1, 0, "\n", b"\n", "+1 -0\n@@ -0,0 +1 @@\n+\n"),
+        (b"\n", 1, 1, "", b"", "+0 -1\n@@ -1 +0,0 @@\n-\n"),
+    ],
+)
+async def test_patch_file_handler_reports_final_newline_changes_exactly(
+    before: bytes,
+    from_line: int,
+    to_line: int,
+    content: str,
+    after: bytes,
+    expected_result: str,
+) -> None:
+    cls, client, container = mock_docker_factory(archive_content=make_tar_file("f.txt", before))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                result = await sandbox_module.patch_file(
+                    path="f.txt",
+                    from_line=from_line,
+                    to_line=to_line,
+                    content=content,
+                )
+            finally:
+                CONTEXT.reset(token)
+
+    assert result == expected_result
+    written = container.put_archive.call_args.kwargs["data"]
+    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("f.txt")
+    assert member is not None
+    assert member.read() == after
+
+
 async def test_write_file_handler_diffs_only_when_replacing_text() -> None:
     """Replacing text shows a diff; a new or binary target still gets written.
 

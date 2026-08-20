@@ -53,6 +53,10 @@ _JS_ARROW = re.compile(
 )
 _CALLABLE_NAME = re.compile(r"(?P<name>[A-Za-z_$~][A-Za-z0-9_$~]*)[ \t]*(?:<[^;{}()]*>)?[ \t]*\(")
 _CONTROL_NAMES = frozenset({"catch", "do", "else", "for", "if", "lock", "match", "switch", "while", "with"})
+_JS_REGEX_PREFIX_WORDS = frozenset(
+    {"await", "case", "delete", "do", "else", "in", "instanceof", "of", "return", "throw", "typeof", "void", "yield"}
+)
+_JS_REGEX_PREFIX_CHARS = frozenset("=([{,:;!?&|+-*%^~<>")
 _MAX_SIGNATURE_LINES = 8
 _MAX_SIGNATURE_CHARS = 1200
 _MAX_SYMBOL_BYTES = 120
@@ -229,31 +233,31 @@ def _signature_ending_at(lines: Sequence[str], index: int, opening: int) -> str:
 def _brace_candidate(signature: str, extension: str, parent: str | None) -> str | None:
     if not signature or signature.startswith("#"):
         return None
-    class_match = _CLASS_SYMBOL.search(signature)
+    class_match = _top_level_match(_CLASS_SYMBOL, signature)
     if class_match is not None:
         return _nested_label(parent, class_match.group("name"))
     if extension == ".go":
-        type_match = _GO_TYPE.search(signature)
+        type_match = _top_level_match(_GO_TYPE, signature)
         if type_match is not None:
             return _nested_label(parent, type_match.group("name"))
-        function_match = _GO_FUNCTION.search(signature)
+        function_match = _top_level_match(_GO_FUNCTION, signature)
         if function_match is not None:
             receiver = function_match.group("receiver")
             name = function_match.group("name")
             return sanitize_symbol(f"{receiver}.{name}" if receiver else name)
         return None
     if extension == ".rs":
-        impl_match = _RUST_IMPL_FOR.search(signature) or _RUST_IMPL.search(signature)
+        impl_match = _top_level_match(_RUST_IMPL_FOR, signature) or _top_level_match(_RUST_IMPL, signature)
         if impl_match is not None:
             name = impl_match.group("name").split("::")[-1]
             return _nested_label(parent, name)
-        function_match = _RUST_FUNCTION.search(signature)
+        function_match = _top_level_match(_RUST_FUNCTION, signature)
         if function_match is not None:
             return _nested_label(parent, function_match.group("name"))
         return None
     if extension in _JAVASCRIPT_EXTENSIONS:
         for pattern in (_JS_FUNCTION, _JS_ARROW):
-            function_match = pattern.search(signature)
+            function_match = _top_level_match(pattern, signature)
             if function_match is not None:
                 return _nested_label(parent, function_match.group("name"))
         return _c_like_callable(signature, parent, allow_bare_method=True)
@@ -265,7 +269,9 @@ def _brace_candidate(signature: str, extension: str, parent: str | None) -> str 
 def _c_like_callable(signature: str, parent: str | None, *, allow_bare_method: bool) -> str | None:
     if "=>" in signature or "=" in signature.split("(", maxsplit=1)[0]:
         return None
-    matches = list(_CALLABLE_NAME.finditer(signature))
+    matches = [
+        match for match in _CALLABLE_NAME.finditer(signature) if _parenthesis_depth(signature, match.start()) == 0
+    ]
     if not matches:
         return None
     match = matches[-1]
@@ -282,6 +288,23 @@ def _c_like_callable(signature: str, parent: str | None, *, allow_bare_method: b
 
 def _nested_label(parent: str | None, name: str) -> str | None:
     return sanitize_symbol(f"{parent}.{name}" if parent else name)
+
+
+def _top_level_match(pattern: re.Pattern[str], signature: str) -> re.Match[str] | None:
+    return next(
+        (match for match in pattern.finditer(signature) if _parenthesis_depth(signature, match.start()) == 0),
+        None,
+    )
+
+
+def _parenthesis_depth(text: str, end: int) -> int:
+    depth = 0
+    for character in text[:end]:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth = max(0, depth - 1)
+    return depth
 
 
 def _mask_brace_source(lines: Sequence[str], extension: str) -> list[str]:
@@ -332,6 +355,11 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> list[str]:
                 output.extend((" ", " "))
                 index += 2
                 continue
+            if extension in _JAVASCRIPT_EXTENSIONS and character == "/" and _starts_javascript_regex(output):
+                end = _javascript_regex_end(raw_line, index)
+                output.extend("\n" if item == "\n" else " " for item in raw_line[index:end])
+                index = end
+                continue
             if character in {'"', "'", "`"} and _starts_quote(raw_line, index, character, extension):
                 quote = character
                 output.append(" ")
@@ -351,3 +379,36 @@ def _starts_quote(line: str, index: int, quote: str, extension: str) -> bool:
         return True
     closing = line.find("'", index + 1, min(len(line), index + 6))
     return closing > index + 1
+
+
+def _starts_javascript_regex(output: list[str]) -> bool:
+    prefix = "".join(output).rstrip()
+    if not prefix or prefix[-1] in _JS_REGEX_PREFIX_CHARS:
+        return True
+    word_match = re.search(r"[A-Za-z_$][A-Za-z0-9_$]*$", prefix)
+    return word_match is not None and word_match.group() in _JS_REGEX_PREFIX_WORDS
+
+
+def _javascript_regex_end(line: str, start: int) -> int:
+    escaped = False
+    in_character_class = False
+    index = start + 1
+    while index < len(line):
+        character = line[index]
+        if character == "\n":
+            return index
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "[":
+            in_character_class = True
+        elif character == "]":
+            in_character_class = False
+        elif character == "/" and not in_character_class:
+            index += 1
+            while index < len(line) and line[index].isalpha():
+                index += 1
+            return index
+        index += 1
+    return index

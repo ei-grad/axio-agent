@@ -25,6 +25,7 @@ MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
+_NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
 
 
@@ -51,9 +52,9 @@ def describe_write(path: str, written: int, before: str | None, after: str) -> s
 
 def describe_patch(path: str, before: str, after: str) -> str:
     """Render the compact, path-free result returned by ``patch_file``."""
-    before_lines = _terminated(before)
-    after_lines = _terminated(after)
-    lines = list(unified_diff(before_lines, after_lines, n=CONTEXT_LINES))
+    before_lines = _source_lines(before)
+    after_lines = _source_lines(after)
+    lines = _unified_diff(before_lines, after_lines)
     if not lines:
         return "No changes"
     body = lines[2:]
@@ -72,31 +73,39 @@ def render_diff(path: str, before: str, after: str) -> str:
     explicit marker so the tool result stays a summary rather than a dump.
     """
     label = path.lstrip("/")
-    lines = list(
-        unified_diff(
-            _terminated(before),
-            _terminated(after),
-            f"a/{label}",
-            f"b/{label}",
-            n=CONTEXT_LINES,
-        )
+    lines = _unified_diff(
+        _source_lines(before),
+        _source_lines(after),
+        fromfile=f"a/{label}",
+        tofile=f"b/{label}",
     )
     if not lines:
         return ""
     return f"Changed {path}:\n{_bounded(''.join(lines))}"
 
 
-def _terminated(text: str) -> list[str]:
-    r"""Split into lines, forcing a final newline for rendering only.
-
-    ``diff -u`` marks a missing final newline with ``\ No newline at end of
-    file``. The tools already report exact byte counts, so that note is noise -
-    and without the newline the last ``-`` and ``+`` lines run together on one
-    line. The real file content is never touched.
-    """
-    if text and not text.endswith("\n"):
-        text += "\n"
+def _source_lines(text: str) -> list[str]:
+    """Split source without erasing whether its final line has a newline."""
     return text.splitlines(keepends=True)
+
+
+def _unified_diff(
+    before: list[str],
+    after: list[str],
+    *,
+    fromfile: str = "",
+    tofile: str = "",
+) -> list[str]:
+    """Render records with conventional missing-final-newline metadata."""
+    rendered: list[str] = []
+    for line in unified_diff(before, after, fromfile, tofile, n=CONTEXT_LINES):
+        if line.endswith("\n"):
+            rendered.append(line)
+            continue
+        rendered.append(f"{line}\n")
+        if line.startswith((" ", "+", "-")):
+            rendered.append(_NO_NEWLINE_MARKER)
+    return rendered
 
 
 def _bounded(diff_text: str) -> str:
@@ -149,18 +158,23 @@ def _hunk_symbol(
     new_symbols: list[str | None] = []
     for line in lines:
         if line.startswith("+"):
-            new_symbols.append(_at(new_contexts, new_line))
+            if line[1:].strip():
+                new_symbols.append(_at(new_contexts, new_line))
             new_line += 1
         elif line.startswith("-"):
-            old_symbols.append(_at(old_contexts, old_line))
+            if line[1:].strip():
+                old_symbols.append(_at(old_contexts, old_line))
             old_line += 1
         elif line.startswith(" "):
             old_line += 1
             new_line += 1
-    preferred = _consistent_context(new_symbols) if new_symbols else _consistent_context(old_symbols)
-    if preferred is _AMBIGUOUS or preferred is not None:
-        return preferred
-    return _consistent_context(old_symbols)
+    new_context = _consistent_context(new_symbols)
+    old_context = _consistent_context(old_symbols)
+    if new_context is _AMBIGUOUS or old_context is _AMBIGUOUS:
+        return _AMBIGUOUS
+    if new_symbols and old_symbols and (new_context is None) != (old_context is None):
+        return _AMBIGUOUS
+    return new_context if new_symbols else old_context
 
 
 def _at(contexts: tuple[str | None, ...], line_number: int) -> str | None:
@@ -170,7 +184,7 @@ def _at(contexts: tuple[str | None, ...], line_number: int) -> str | None:
 
 
 def _consistent_context(symbols: list[str | None]) -> str | _AmbiguousContext | None:
-    distinct = {symbol for symbol in symbols if symbol is not None}
+    distinct = set(symbols)
     if len(distinct) > 1:
         return _AMBIGUOUS
     return next(iter(distinct), None)

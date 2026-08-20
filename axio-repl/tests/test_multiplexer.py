@@ -6,7 +6,7 @@ from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
-from axio_repl._theme import NO_COLOR_THEME
+from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
 
 
 def test_display_mode_accepts_cli_and_descriptive_names() -> None:
@@ -63,8 +63,9 @@ def test_streaming_output_is_grouped_by_lines_and_flushed_at_result() -> None:
     assert "ignored duplicate" not in result
 
 
-def test_background_patch_result_is_compact_plain_and_reuses_argument_path() -> None:
-    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+@pytest.mark.parametrize("powerline", [False, True])
+def test_background_patch_result_has_owned_semantic_colors_and_reuses_argument_path(powerline: bool) -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, powerline=powerline)
     mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
     mux.observe(
         "child",
@@ -74,6 +75,34 @@ def test_background_patch_result_is_compact_plain_and_reuses_argument_path() -> 
             partial_json='{"path":"src/app.py","from_line":1,"to_line":1,"content":"new\\n"}',
         ),
     )
+    event = ToolResult(
+        tool_use_id="patch",
+        name="patch_file",
+        is_error=False,
+        content=("+1 -1\n@@ -1 +1 @@ run\n-old\n\\ No newline at end of file\n+\x1b[2Jnew\n"),
+    )
+    mux.observe("child", event)
+
+    call, result = mux.drain(max_frames=2)
+    combined = call + result
+    assert sanitize_terminal_text(combined).count("src/app.py") == 1
+    assert f"{DEFAULT_THEME.stdout.ansi}✓ patch_file{DEFAULT_THEME.reset}\n" in result
+    assert f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}\n" in result
+    assert f"{DEFAULT_THEME.tool.ansi}@@ -1 +1 @@ run{DEFAULT_THEME.reset}\n" in result
+    assert f"{DEFAULT_THEME.error.ansi}-old{DEFAULT_THEME.reset}\n" in result
+    assert f"{DEFAULT_THEME.stdout.ansi}\\ No newline at end of file{DEFAULT_THEME.reset}\n" in result
+    assert f"{DEFAULT_THEME.success.ansi}+new{DEFAULT_THEME.reset}\n" in result
+    assert result.count(DEFAULT_THEME.error.ansi) == 1
+    assert "\x1b[2J" not in result
+    assert "\x1b[2J" in event.content
+    assert "Wrote" not in result and "Changed" not in result
+    assert "---" not in result and "+++" not in result
+
+
+def test_background_patch_result_respects_no_color_even_if_powerline_is_requested() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, powerline=True, theme=NO_COLOR_THEME)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="patch", partial_json="{}"))
     mux.observe(
         "child",
         ToolResult(
@@ -85,12 +114,70 @@ def test_background_patch_result_is_compact_plain_and_reuses_argument_path() -> 
     )
 
     call, result = mux.drain(max_frames=2)
-    combined = call + result
-    assert combined.count("src/app.py") == 1
     assert "+1 -1\n@@ -1 +1 @@ run\n-old\n+new" in result
-    assert "Wrote" not in result and "Changed" not in result
-    assert "---" not in result and "+++" not in result
-    assert "\x1b[" not in result
+    assert "\x1b[" not in call + result
+    assert "\ue0b0" not in call + result
+
+
+def test_background_malformed_hunk_fails_open_without_diff_styles() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    content = "+1 -1\n@@ -1,2 +1 @@ run\n-old\n+new\n"
+    event = ToolResult(tool_use_id="patch", name="patch_file", is_error=False, content=content)
+
+    mux.observe("child", event)
+
+    [result] = mux.drain()
+    assert content.rstrip() in sanitize_terminal_text(result)
+    assert DEFAULT_THEME.success.ansi not in result
+    assert DEFAULT_THEME.error.ansi not in result
+    assert event.content == content
+
+
+def test_background_styled_patch_frame_byte_accounting_includes_ansi_and_truncation() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, powerline=True, max_frame_bytes=512)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="patch", partial_json="{}"))
+    mux.drain()
+    mux.observe(
+        "child",
+        ToolResult(
+            tool_use_id="patch",
+            name="patch_file",
+            is_error=False,
+            content=("+20 -20\n@@ -20,20 +20,20 @@ run\n-old\n+new\n...[diff truncated]\n"),
+        ),
+    )
+    retained = mux.queued_bytes
+
+    [result] = mux.drain(max_frames=1, max_bytes=512)
+
+    assert retained == len(result.encode("utf-8"))
+    assert len(result.encode("utf-8")) <= 512
+    assert f"{DEFAULT_THEME.stdout.ansi}...[diff truncated]{DEFAULT_THEME.reset}" in result
+
+
+def test_background_styled_patch_frame_remains_bounded_when_body_is_cut() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, max_frame_bytes=260)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="patch", partial_json="{}"))
+    mux.drain()
+    mux.observe(
+        "child",
+        ToolResult(
+            tool_use_id="patch",
+            name="patch_file",
+            is_error=False,
+            content=f"+1 -1\n@@ -1 +1 @@ run\n-{'x' * 300}\n+{'y' * 300}\n",
+        ),
+    )
+    retained = mux.queued_bytes
+
+    [result] = mux.drain(max_frames=1, max_bytes=260)
+
+    assert retained == len(result.encode("utf-8"))
+    assert len(result.encode("utf-8")) <= 260
+    assert DEFAULT_THEME.error.ansi in result
+    assert f"{DEFAULT_THEME.reset}\n── /agent child" in result
 
 
 def test_background_write_ack_suppression_is_structural_and_errors_remain_visible() -> None:

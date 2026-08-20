@@ -36,11 +36,11 @@ async def patch_file(
             with resolved.open("r") as f:
                 before = f.read()
 
+            lines = before.splitlines(keepends=True)
             content_lines = content.splitlines(keepends=True)
-            if content_lines and not content_lines[-1].endswith("\n"):
+            if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
                 content_lines[-1] += "\n"
 
-            lines = before.splitlines(keepends=True)
             after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
             with resolved.open("w") as f:
                 f.write(after)

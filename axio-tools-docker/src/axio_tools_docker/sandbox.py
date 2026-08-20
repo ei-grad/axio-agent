@@ -391,7 +391,7 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     content_lines = content.splitlines(keepends=True)
-    if content_lines and not content_lines[-1].endswith("\n"):
+    if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
         content_lines[-1] += "\n"
     after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
     await sandbox.write_file(resolved, after, mode=mode)
