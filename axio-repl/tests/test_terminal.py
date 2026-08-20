@@ -1015,6 +1015,111 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
         os.close(slave_fd)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal Unicode streaming test")
+async def test_malformed_unicode_tool_arguments_remain_strict_utf8_with_prompt_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(
+        os.fdopen(os.dup(slave_fd), "rb", buffering=0),
+        encoding="utf-8",
+        errors="strict",
+        newline="",
+    )
+    writer = TextIOWrapper(
+        os.fdopen(os.dup(slave_fd), "wb", buffering=0),
+        encoding="utf-8",
+        errors="strict",
+        newline="",
+    )
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=24, columns=100),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+    os.set_blocking(master_fd, False)
+
+    async def read_stage() -> str:
+        await asyncio.sleep(0.02)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="strict")
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "temporary status", theme=DEFAULT_THEME)
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(theme=DEFAULT_THEME, effective_username="tester")
+            await terminal.start()
+            prompt = asyncio.create_task(session.prompt_async(_panel.make_prompt_factory("tester")()))
+            try:
+                await asyncio.sleep(0.05)
+                await read_stage()
+                renderer.set_input_active(True)
+                await renderer.render("main", ToolUseStart(index=0, tool_use_id="complete", name="write_file"))
+                complete = r'{"path":"\uDC00","content":"first\n\uD800\uD800\nlast"}'
+                for character in complete:
+                    await renderer.render(
+                        "main",
+                        ToolInputDelta(index=0, tool_use_id="complete", partial_json=character),
+                    )
+                await terminal.drain()
+                complete_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolUseStart(index=1, tool_use_id="interrupted", name="write_file"),
+                )
+                interrupted = r'{"content":"before\uD800'
+                for character in interrupted:
+                    await renderer.render(
+                        "main",
+                        ToolInputDelta(index=1, tool_use_id="interrupted", partial_json=character),
+                    )
+                await terminal.drain()
+                interrupted_stage = await read_stage()
+                await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
+                await terminal.drain()
+                error_stage = await read_stage()
+            finally:
+                renderer.set_input_active(False)
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
+                await terminal.close()
+                late_stage = await read_stage()
+
+        complete_output = sanitize_terminal_text(complete_stage)
+        assert "  path: \ufffd\n" in complete_output
+        assert "  content:\nfirst\n\ufffd\ufffd\nlast\n" in complete_output
+        interrupted_output = sanitize_terminal_text(interrupted_stage)
+        assert "content:" not in interrupted_output and "before" not in interrupted_output
+        assert "  content: before\ufffd\n" in sanitize_terminal_text(error_stage)
+        assert "provider stream failed" in sanitize_terminal_text(error_stage)
+        combined = complete_stage + error_stage + late_stage
+        assert "\033[46m \033[0m " in combined
+        assert f"{DEFAULT_THEME.reasoning.ansi}\ufffd\ufffd{DEFAULT_THEME.reset}\r\n" in combined
+        assert "\x1b[?1049h" not in combined
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal layout test")
 async def test_tall_terminal_input_window_is_compact_and_grows_with_multiline_wrapped_content(
     monkeypatch: pytest.MonkeyPatch,

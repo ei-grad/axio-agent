@@ -878,6 +878,44 @@ async def test_character_chunks_preserve_json_escapes_unicode_and_block_indentat
     assert "(continued)" not in output
 
 
+async def test_strict_utf8_renderer_recovers_malformed_unicode_in_inline_block_and_error_boundaries() -> None:
+    stdout_bytes = io.BytesIO()
+    stderr_bytes = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_bytes, encoding="utf-8", errors="strict", write_through=True)
+    stderr = io.TextIOWrapper(stderr_bytes, encoding="utf-8", errors="strict", write_through=True)
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        await renderer.render("main", ToolUseStart(index=0, tool_use_id="complete", name="write_file"))
+        complete = r'{"path":"\uDC00","content":"first\n\uD800\uD800\nlast"}'
+        for character in complete:
+            await renderer.render(
+                "main",
+                ToolInputDelta(index=0, tool_use_id="complete", partial_json=character),
+            )
+
+        await renderer.render("main", ToolUseStart(index=1, tool_use_id="interrupted", name="write_file"))
+        interrupted = r'{"content":"before\uD800'
+        for character in interrupted:
+            await renderer.render(
+                "main",
+                ToolInputDelta(index=1, tool_use_id="interrupted", partial_json=character),
+            )
+        await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
+
+    raw_output = stdout_bytes.getvalue().decode("utf-8", errors="strict")
+    output = sanitize_terminal_text(raw_output)
+    error = sanitize_terminal_text(stderr_bytes.getvalue().decode("utf-8", errors="strict"))
+    assert "  path: \ufffd\n" in output
+    assert "  content:\nfirst\n\ufffd\ufffd\nlast\n" in output
+    assert "  content: before\ufffd\n" in output
+    assert output.count("content:") == 2
+    assert f"{DEFAULT_THEME.reasoning.ansi}\ufffd\ufffd{DEFAULT_THEME.reset}\n" in raw_output
+    assert "\ud800" not in raw_output
+    assert error.startswith("\nError from agent main: provider stream failed")
+
+
 async def test_incomplete_active_tool_argument_line_closes_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1547,6 +1585,39 @@ async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exa
     assert output.index("\n\n") < output.index("agent main · shell stdout")
     assert output.index("shell completed") < output.index("child continues")
     assert output.count("unique sibling line") == 1
+
+
+async def test_suspended_sibling_result_finishes_unicode_before_cleanup_without_tearing_child_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="agent-call", name="run_agent"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="agent-call", partial_json='{"task":"go"}'))
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="sibling-call", name="write_file"))
+    partial = r'{"content":"argument-prefix\uD800'
+    for character in partial:
+        await renderer.render(
+            "main",
+            ToolInputDelta(index=1, tool_use_id="sibling-call", partial_json=character),
+        )
+
+    await renderer.enter_foreground("child", "agent-call")
+    await renderer.render("child", TextDelta(index=0, delta="child-prefix"))
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="sibling-call", name="write_file", is_error=False, content="sibling done"),
+    )
+    await renderer.render("child", TextDelta(index=0, delta="child-suffix"))
+
+    raw_output = capsys.readouterr().out
+    output = sanitize_terminal_text(raw_output)
+    assert output.count("content:") == 1
+    assert output.count("\ufffd") == 1
+    assert output.index("argument-prefix") < output.index("child-prefix") < output.index("\ufffd")
+    assert output.index("\ufffd") < output.index("child-suffix")
+    assert "child-prefix\ufffd" not in output
+    assert f"{DIM}\ufffd{RESET}\n" in raw_output
+    assert "(continued)" not in output
 
 
 async def test_suspended_tool_collector_obeys_the_total_retained_byte_cap(

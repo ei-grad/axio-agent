@@ -1498,6 +1498,7 @@ class ReplRenderer:
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
+                self._finish_tool_arg_stream_locked(state, tid)
                 self._activate_tool_field_locked(state, tid)
                 if isinstance(state.mode, _ToolFieldMode):
                     self._close_tool_field_locked(state)
@@ -1568,6 +1569,7 @@ class ReplRenderer:
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
+                self._finish_all_tool_arg_streams_locked(state)
                 self._close_all_tool_fields_locked(state)
                 if presentation is not None:
                     presentation.error_seen = True
@@ -1591,6 +1593,7 @@ class ReplRenderer:
                     self._discard_suspended_owner_locked(agent_id)
                     self._drain_safe_boundary_locked()
                     return
+                self._finish_all_tool_arg_streams_locked(state)
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
@@ -1713,6 +1716,8 @@ class ReplRenderer:
 
     def _observe_suspended_tool_event_locked(self, agent_id: str, event: StreamEvent) -> None:
         state = self._state(agent_id)
+        if isinstance(event, ToolResult):
+            self._finish_suspended_tool_field_locked(state, event.tool_use_id)
         self._suspended_actions.observe(agent_id, event, agent_name=self._agent_name(agent_id))
         match event:
             case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
@@ -1736,6 +1741,19 @@ class ReplRenderer:
                 self._suspended_tool_calls.discard((agent_id, tool_use_id))
             case _:
                 pass
+
+    def _finish_suspended_tool_field_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
+        stream = state.arg_streams.get(tool_use_id)
+        mode = state.tool_field_modes.get(tool_use_id)
+        if stream is None and mode is None:
+            return
+        with self._persistent_insertion_locked():
+            self._activate_tool_field_locked(state, tool_use_id)
+            if stream is not None:
+                for event in stream.finish():
+                    self._render_field_event(state, tool_use_id, event)
+            if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                self._close_tool_field_locked(state)
 
     def _discard_suspended_owner_locked(self, agent_id: str) -> None:
         self._suspended_actions.discard_agent(agent_id)
@@ -1834,6 +1852,18 @@ class ReplRenderer:
             state.mode = _BoundaryMode()
         if mode := state.tool_field_modes.get(tool_use_id):
             state.mode = mode
+
+    def _finish_tool_arg_stream_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
+        stream = state.arg_streams.get(tool_use_id)
+        if stream is None:
+            return
+        self._activate_tool_field_locked(state, tool_use_id)
+        for event in stream.finish():
+            self._render_field_event(state, tool_use_id, event)
+
+    def _finish_all_tool_arg_streams_locked(self, state: _AgentRenderState) -> None:
+        for tool_use_id in tuple(state.arg_streams):
+            self._finish_tool_arg_stream_locked(state, tool_use_id)
 
     def _append_tool_field_text_locked(self, state: _AgentRenderState, text: str) -> None:
         mode = state.mode
