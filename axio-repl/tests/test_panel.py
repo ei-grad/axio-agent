@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,7 +10,7 @@ from axio.models import ModelSpec
 from axio.types import Usage
 
 from axio_repl import _panel
-from axio_repl._theme import MONOCHROME_THEME
+from axio_repl._theme import MONOCHROME_THEME, NO_COLOR_THEME
 
 
 class _Record:
@@ -225,28 +225,26 @@ def test_powerline_prompt_uses_a_coloured_segment_and_separator() -> None:
     from prompt_toolkit.formatted_text import to_formatted_text
 
     assert to_formatted_text(_panel.prompt_message(powerline=True)) == [
-        ("bold fg:ansiblack bg:ansicyan", " axio-repl "),
+        ("bold fg:ansiwhite bg:ansicyan", " axio-repl "),
         ("fg:ansicyan bg:default", "\ue0b0"),
         ("", " "),
     ]
 
 
-def test_prompt_factory_snapshots_local_time_for_each_attempt() -> None:
+def test_prompt_factory_uses_only_the_stable_effective_username() -> None:
     from prompt_toolkit.formatted_text import to_formatted_text
 
-    times = iter((datetime(2026, 8, 20, 9, 7), datetime(2026, 8, 20, 9, 8)))
-    plain = _panel.make_prompt_factory("alice", now_provider=lambda: next(times))
+    plain = _panel.make_prompt_factory("alice")
 
-    assert to_formatted_text(plain()) == [("class:repl-prompt", "09:07 alice> ")]
-    assert to_formatted_text(plain()) == [("class:repl-prompt", "09:08 alice> ")]
+    assert to_formatted_text(plain()) == [("class:repl-prompt", "alice> ")]
+    assert to_formatted_text(plain()) == [("class:repl-prompt", "alice> ")]
 
     powerline = _panel.make_prompt_factory(
         "alice",
         powerline=True,
-        now_provider=lambda: datetime(2026, 8, 20, 21, 5),
     )
     assert to_formatted_text(powerline()) == [
-        ("bold fg:ansiblack bg:ansicyan", " 21:05 alice "),
+        ("bold fg:ansiwhite bg:ansicyan", " alice "),
         ("fg:ansicyan bg:default", "\ue0b0"),
         ("", " "),
     ]
@@ -255,13 +253,24 @@ def test_prompt_factory_snapshots_local_time_for_each_attempt() -> None:
         "alice",
         powerline=True,
         theme=MONOCHROME_THEME,
-        now_provider=lambda: datetime(2026, 8, 20, 21, 5),
     )
     assert to_formatted_text(monochrome()) == [
-        ("bold fg:ansiblack bg:ansiwhite", " 21:05 alice "),
+        ("bold fg:ansiblack bg:ansiwhite", " alice "),
         ("fg:ansiwhite bg:default", "\ue0b0"),
         ("", " "),
     ]
+
+
+def test_submitted_message_uses_accept_time_without_changing_message_text() -> None:
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+
+    assert _panel.submitted_message("first\nsecond", "alice", submitted_at) == (
+        "\x1b[1;97m12:41 alice>\x1b[0m first\nsecond"
+    )
+    assert _panel.submitted_message("ping", "alice", submitted_at, powerline=True) == (
+        "\x1b[1;97;46m 12:41 alice \x1b[22;36;49m\ue0b0\x1b[0m ping"
+    )
+    assert _panel.submitted_message("ping", "alice", submitted_at, theme=NO_COLOR_THEME) == "12:41 alice> ping"
 
 
 def test_status_line_reports_action_visibility_and_backlog() -> None:
@@ -307,14 +316,7 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
 
     interrupts: list[int] = []
     answers: list[object] = [KeyboardInterrupt(), KeyboardInterrupt(), "carry on"]
-    times = iter(
-        (
-            datetime(2026, 8, 20, 10, 0),
-            datetime(2026, 8, 20, 10, 1),
-            datetime(2026, 8, 20, 10, 2),
-        )
-    )
-    prompt_factory = _panel.make_prompt_factory("alice", powerline=True, now_provider=lambda: next(times))
+    prompt_factory = _panel.make_prompt_factory("alice", powerline=True)
     observed_prompts: list[object] = []
 
     class _Session:
@@ -350,9 +352,9 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     assert result.target_agent_id == "child"
     assert len(interrupts) == 2
     assert [to_formatted_text(cast(Any, prompt))[0][1] for prompt in observed_prompts] == [
-        " 10:00 alice ",
-        " 10:01 alice ",
-        " 10:02 alice ",
+        " alice ",
+        " alice ",
+        " alice ",
     ]
 
 
@@ -386,6 +388,72 @@ async def test_initial_editor_text_survives_prompt_retry_but_not_a_completed_emp
 
     assert result.text == "submit"
     assert observed_defaults == ["restored draft", "restored draft", None]
+
+
+async def test_enter_time_is_captured_before_delayed_admission_and_rendered_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from axio_repl import ReplRenderer, _read_input_async
+    from axio_repl._input import InputSubmitted, SubmissionDisposition
+
+    submitted_at = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+    provider_calls: list[datetime] = []
+    admission_started = asyncio.Event()
+    release_admission = asyncio.Event()
+
+    def capture_time() -> datetime:
+        provider_calls.append(submitted_at)
+        return submitted_at
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        assert text == "queued message"
+        assert target_agent_id == "main"
+        assert reserved_seq == 1
+        admission_started.set()
+        await release_admission.wait()
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id="input-1",
+            arrival_seq=reserved_seq,
+        )
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(
+                lambda: "status",
+                reserve_sequence=lambda: 1,
+                accepted_at_provider=capture_time,
+            )
+            reader = asyncio.create_task(
+                _read_input_async(
+                    session,
+                    ReplRenderer(effective_username="alice"),
+                    lambda: None,
+                    admit,
+                    prompt_factory=_panel.make_prompt_factory("alice"),
+                )
+            )
+            pipe.send_text("queued message\r")
+            await asyncio.wait_for(admission_started.wait(), timeout=1)
+
+            assert provider_calls == [submitted_at]
+            assert _panel.accepted_at(session) == submitted_at
+            assert not reader.done()
+
+            release_admission.set()
+            submitted = await asyncio.wait_for(reader, timeout=1)
+
+    assert submitted.text == "queued message"
+    output = capsys.readouterr().out
+    assert output.count("12:41 alice>") == 1
+    assert output.endswith("12:41 alice>\x1b[0m queued message\n")
+    assert _panel.accepted_at(session) is None
 
 
 async def test_enter_admission_completes_before_editor_clear_even_when_reader_is_cancelled() -> None:

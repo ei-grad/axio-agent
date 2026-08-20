@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -71,11 +70,8 @@ def test_prompt_and_system_metadata_share_the_same_resolved_identity() -> None:
         geteuid=lambda: 1001,
         getpwuid=lambda _uid: SimpleNamespace(pw_name="shared-user"),
     )
-    prompt = make_prompt_factory(
-        username,
-        now_provider=lambda: datetime(2026, 8, 20, 9, 7),
-    )()
+    prompt = make_prompt_factory(username)()
     system = append_runtime_identity_metadata("system", username)
 
-    assert to_formatted_text(prompt) == [("class:repl-prompt", "09:07 shared-user> ")]
+    assert to_formatted_text(prompt) == [("class:repl-prompt", "shared-user> ")]
     assert system.count('"effective_username":"shared-user"') == 1

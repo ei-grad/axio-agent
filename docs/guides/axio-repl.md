@@ -283,6 +283,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--agent` | `AXIO_REPL_AGENT` or none | Named bundle below `CONFIG_DIR/agents` |
 | `--config-dir` | XDG config directory | Configuration root; overrides `AXIO_CONFIG_DIR` |
 | `--list-agents` | off | List named bundles and exit without starting a transport |
+| `--version` | off | Show distribution, launcher, module, interpreter, and local Git provenance, then exit |
 | `--transport` | auto | Transport name (see table above) |
 | `--transport-base-url` | transport default | Transport API base URL |
 | `--transport-api-key-env` | none | Environment variable containing the transport API key |
@@ -326,12 +327,20 @@ presentation whenever stdout is not a TTY. Interactive `prompt_toolkit` still
 uses terminal cursor controls for editor redraws; `NO_COLOR` governs colour and
 presentation styling, not those required input-control sequences.
 
-The interactive prompt snapshots local time and the effective-UID username for
-each new prompt attempt: plain mode renders `HH:MM username>`, while Powerline
-mode renders a filled ` HH:MM username ` segment followed by ``. The username
-comes from the system account database, not `USER`; terminal recordings and the
-provider-visible runtime metadata expose it. The clock is UI-only and does not
-tick between prompt redraws.
+The active editor prompt contains only the effective-UID username: plain mode
+renders `username>`, while Powerline mode renders a filled ` username ` segment
+followed by ``. After Enter accepts a user message, the persistent scrollback
+line gains a local `HH:MM` timestamp captured synchronously at that keypress.
+Queueing, admission, and model-start delays do not change it; recalled text gets
+a new timestamp when resubmitted. The username comes from the system account
+database, not `USER`; terminal recordings and provider-visible runtime metadata
+expose it, while recordings also expose submission times.
+
+`axio-repl --version` exits before agent configuration, sandbox, or provider
+initialization. Its local-only report identifies the distribution version,
+resolved launcher, imported module source, Python interpreter, and the short Git
+revision when the module is inside a checkout. Installed wheels without checkout
+metadata report the revision as unavailable.
 
 ## Session journals
 
@@ -561,7 +570,7 @@ There is no continuation prefix, so each explicit continuation starts at column
 zero; any indentation shown is part of the editor content:
 
 ```
-axio-repl> Refactor this function:
+12:41 username> Refactor this function:
 def old(x):
     return x + 1
 ```

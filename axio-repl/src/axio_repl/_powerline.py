@@ -73,6 +73,13 @@ def prompt_badge(label: str, theme: TerminalTheme = DEFAULT_THEME) -> FormattedT
     return badge.formatted_text(trailing=" ")
 
 
+def submitted_prompt_badge(label: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
+    """Return the reset-safe prompt badge used for accepted scrollback."""
+
+    style = theme.prompt_badge
+    return PowerlineBadge((PowerlineSegment(f" {label} ", style.foreground, style.background),)).ansi()
+
+
 def tool_title(name: str, theme: TerminalTheme = DEFAULT_THEME) -> str:
     """Return a reset-safe Powerline badge for a live tool call."""
 

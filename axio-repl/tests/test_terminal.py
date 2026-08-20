@@ -7,7 +7,7 @@ import sys
 import termios
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from io import TextIOWrapper
 from typing import Any, cast
 
@@ -21,7 +21,8 @@ from prompt_toolkit.input.defaults import create_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 
-from axio_repl import ReplRenderer, _panel
+from axio_repl import ReplRenderer, _panel, _read_input_async
+from axio_repl._input import InputSubmitted, SubmissionDisposition
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, TerminalTheme
 
@@ -480,7 +481,6 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
                 "tester",
                 powerline=powerline,
                 theme=theme,
-                now_provider=lambda: datetime(2026, 8, 20, 9, 7),
             )
             prompt = asyncio.create_task(session.prompt_async(prompt_factory()))
             try:
@@ -536,7 +536,7 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
         rendered = b"".join(chunks).decode("utf-8", errors="replace")
 
         if powerline:
-            assert " 09:07 tester " in rendered
+            assert " tester " in rendered
             assert "\ue0b0" in rendered
             assert "\ue0b2" not in rendered
             assert "tester>" not in rendered
@@ -544,12 +544,118 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
             assert "agent axio-repl (main)" not in rendered
         else:
             assert "asynchronous output" in rendered
-            assert "09:07 tester> " in rendered
+            assert "tester> " in rendered
         assert "\x1b[J" in rendered
         assert "\x1b[?1049h" not in rendered
         assert after[1] == before[1]
         assert termios.ICANON & after[3] == termios.ICANON & before[3]
         assert termios.ECHO & after[3] == termios.ECHO & before[3]
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal submission test")
+async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerline_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=20, columns=80),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+    accepted_time = datetime(2026, 8, 20, 12, 41, tzinfo=UTC)
+    admission_started = asyncio.Event()
+    release_admission = asyncio.Event()
+    clock_calls: list[datetime] = []
+
+    def now() -> datetime:
+        clock_calls.append(accepted_time)
+        return accepted_time
+
+    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+        admission_started.set()
+        await release_admission.wait()
+        return InputSubmitted(
+            text=text,
+            target_agent_id=target_agent_id,
+            disposition=SubmissionDisposition.PENDING,
+            input_id="input-1",
+            arrival_seq=1,
+        )
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(
+                lambda: "temporary status",
+                reserve_sequence=lambda: 1,
+                accepted_at_provider=now,
+                theme=DEFAULT_THEME,
+            )
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(
+                powerline=True,
+                theme=DEFAULT_THEME,
+                effective_username="tester",
+            )
+            await terminal.start()
+            input_task = asyncio.create_task(
+                _read_input_async(
+                    session,
+                    renderer,
+                    lambda: None,
+                    admit,
+                    prompt_factory=_panel.make_prompt_factory(
+                        "tester",
+                        powerline=True,
+                        theme=DEFAULT_THEME,
+                    ),
+                )
+            )
+            try:
+                await asyncio.sleep(0.05)
+                os.write(master_fd, b"ping\r")
+                await asyncio.wait_for(admission_started.wait(), timeout=1)
+                assert clock_calls == [accepted_time]
+                assert not input_task.done()
+
+                release_admission.set()
+                submitted = await asyncio.wait_for(input_task, timeout=1)
+                await terminal.drain()
+                assert submitted.text == "ping"
+            finally:
+                release_admission.set()
+                if not input_task.done():
+                    input_task.cancel()
+                    await asyncio.gather(input_task, return_exceptions=True)
+                await terminal.close()
+
+        os.set_blocking(master_fd, False)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        rendered = b"".join(chunks).decode("utf-8", errors="replace")
+
+        assert rendered.count("12:41 tester") == 1
+        assert "\x1b[1;97;46m 12:41 tester \x1b[22;36;49m\ue0b0\x1b[0m ping\r\n" in rendered
+        assert "\x1b[?1049h" not in rendered
     finally:
         terminal_input.close()
         reader.close()
@@ -578,7 +684,7 @@ async def test_tall_terminal_input_window_is_compact_and_grows_with_multiline_wr
     try:
         with create_app_session(input=terminal_input, output=terminal_output):
             session: Any = _panel.make_session(lambda: "status")
-            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("09:07 tester")))
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("tester")))
             try:
                 await asyncio.sleep(0.05)
                 compact_height = session.app.renderer._last_screen.height

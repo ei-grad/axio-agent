@@ -124,6 +124,9 @@ are recorded separately as configuration changes.
 # Interactive REPL (auto-detects transport from API keys)
 axio-repl
 
+# Identify the installed entry point, imported source, interpreter, and checkout
+axio-repl --version
+
 # Single prompt (non-interactive)
 axio-repl "list the files in this project"
 
@@ -157,9 +160,11 @@ axio-repl --theme monochrome
 ```
 
 Powerline mode requires a terminal font that provides the `U+E0B0` (``) separator glyph.
-The interactive prompt shows local time and the effective-UID username as `HH:MM username`.
-Terminal recordings therefore expose that local username. Built-in themes are `default` and
-`monochrome`; unknown names stop startup.
+The active editor prompt shows only the effective-UID username (`username>` in plain mode or a
+filled ` username ` Powerline segment). When Enter accepts a user message, its persistent
+scrollback line is stamped with the local `HH:MM` captured at that keypress. Queueing and model
+startup delays do not change it. Terminal recordings therefore expose the local username and
+submission times. Built-in themes are `default` and `monochrome`; unknown names stop startup.
 
 Set `NO_COLOR` to disable application-owned ANSI styling. It takes precedence
 over `--theme` and also disables Powerline. One-shot output automatically uses

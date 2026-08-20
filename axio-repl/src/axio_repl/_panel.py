@@ -26,8 +26,8 @@ from axio.types import Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
 from prompt_toolkit.formatted_text import FormattedText
 
-from axio_repl._multiplexer import sanitize_identity_component
-from axio_repl._powerline import prompt_badge
+from axio_repl._multiplexer import sanitize_identity_component, sanitize_terminal_text
+from axio_repl._powerline import prompt_badge, submitted_prompt_badge
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
 
 HISTORY_PATH = Path.home() / ".axio_repl_history"
@@ -57,17 +57,33 @@ def make_prompt_factory(
     *,
     powerline: bool = False,
     theme: TerminalTheme = DEFAULT_THEME,
-    now_provider: Callable[[], datetime] | None = None,
 ) -> Callable[[], FormattedText]:
-    """Capture stable identity and build one local-time label per prompt attempt."""
+    """Capture stable identity for every active editor prompt."""
 
     username = sanitize_identity_component(effective_username) or "unknown"
 
     def build() -> FormattedText:
-        now = (now_provider or datetime.now)()
-        return prompt_message(f"{now:%H:%M} {username}", powerline=powerline, theme=theme)
+        return prompt_message(username, powerline=powerline, theme=theme)
 
     return build
+
+
+def submitted_message(
+    text: str,
+    effective_username: str,
+    submitted_at: datetime,
+    *,
+    powerline: bool = False,
+    theme: TerminalTheme = DEFAULT_THEME,
+) -> str:
+    """Format one accepted user message for persistent terminal scrollback."""
+
+    username = sanitize_identity_component(effective_username) or "unknown"
+    safe_text = sanitize_terminal_text(text)
+    label = f"{submitted_at:%H:%M} {username}"
+    if powerline:
+        return f"{submitted_prompt_badge(label, theme)} {safe_text}"
+    return f"{theme.prompt.ansi}{label}>{theme.reset} {safe_text}"
 
 
 PROMPT_MESSAGE = prompt_message()
@@ -310,6 +326,7 @@ def make_session(
     on_empty_eof: Callable[[float], bool] | None = None,
     capture_target: Callable[[], str] | None = None,
     reserve_sequence: Callable[[], int] | None = None,
+    accepted_at_provider: Callable[[], datetime] | None = None,
     *,
     theme: TerminalTheme = DEFAULT_THEME,
 ) -> Any:
@@ -367,6 +384,7 @@ def make_session(
         ),
         # Redraw while idle so finished agents show up without a keypress.
         refresh_interval=0.5,
+        erase_when_done=True,
     )
     input_window = session.app.layout.current_window
     if input_window is None or input_window.content is not session.app.layout.current_control:
@@ -385,6 +403,11 @@ def make_session(
         buffer._axio_accepted_target = target_agent_id
         if str(buffer.text).strip() and reserve_sequence is not None:
             buffer._axio_accepted_seq = reserve_sequence()
+        if str(buffer.text).strip():
+            submitted_at = (accepted_at_provider or (lambda: datetime.now().astimezone()))()
+            if submitted_at.tzinfo is None or submitted_at.utcoffset() is None:
+                raise ValueError("accepted submission time must be timezone-aware")
+            buffer._axio_accepted_at = submitted_at
         return keep_text
 
     session.default_buffer.accept_handler = capture_accept
@@ -425,6 +448,16 @@ def accepted_sequence(session: Any) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
+def accepted_at(session: Any) -> datetime | None:
+    """Return the local wall clock captured by the last non-empty Enter."""
+
+    buffer = getattr(session, "default_buffer", None)
+    value = getattr(buffer, "_axio_accepted_at", None)
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        return None
+    return value
+
+
 def complete_submission(session: Any, text: str, *, clear_editor: bool) -> None:
     """Finish one accepted Enter after its coordinator transaction settles."""
 
@@ -437,3 +470,5 @@ def complete_submission(session: Any, text: str, *, clear_editor: bool) -> None:
         del buffer._axio_accepted_target
     with suppress(AttributeError):
         del buffer._axio_accepted_seq
+    with suppress(AttributeError):
+        del buffer._axio_accepted_at

@@ -23,6 +23,7 @@ from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
+from datetime import datetime
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import MappingProxyType
@@ -126,7 +127,7 @@ from axio_tools_local.read_file import read_file
 from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
-from axio_repl import _agent_config, _journal, _panel, _sandbox, _search
+from axio_repl import _agent_config, _journal, _panel, _sandbox, _search, _version
 from axio_repl._coordinator import (
     ClaimBatch,
     ContextArrival,
@@ -146,6 +147,7 @@ from axio_repl._multiplexer import (
     DisplayModeChange,
     format_agent_identity,
     normalize_agent_name,
+    sanitize_identity_component,
 )
 from axio_repl._powerline import agent_header, tool_title
 from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
@@ -719,6 +721,7 @@ class ReplRenderer:
         max_identity_cache: int = 256,
         powerline: bool = False,
         theme: TerminalTheme = DEFAULT_THEME,
+        effective_username: str = "unknown",
     ) -> None:
         if max_identity_cache < 2:
             raise ValueError("max_identity_cache must be at least 2")
@@ -732,6 +735,7 @@ class ReplRenderer:
         self._max_identity_cache = max_identity_cache
         self._powerline = powerline
         self._theme = theme
+        self._effective_username = sanitize_identity_component(effective_username) or "unknown"
         if normalized_main_name := normalize_agent_name(main_agent_name):
             self._agent_names["main"] = normalized_main_name
         self._turns: dict[_TurnKey, _TurnPresentation] = {}
@@ -1093,6 +1097,20 @@ class ReplRenderer:
                 self._discard_background_summaries_locked()
             else:
                 self._flush_background_summaries_locked()
+
+    async def submitted(self, text: str, submitted_at: datetime) -> None:
+        """Persist one accepted editor value after coordinator admission."""
+
+        async with self._lock:
+            print(
+                _panel.submitted_message(
+                    text,
+                    self._effective_username,
+                    submitted_at,
+                    powerline=self._powerline,
+                    theme=self._theme,
+                )
+            )
 
     async def incoming(
         self,
@@ -1933,6 +1951,7 @@ async def _read_input_async(
         editor_value: str,
         target_agent_id: str,
         reserved_seq: int | None,
+        submitted_at: datetime | None,
         prior_failure: BaseException | None = None,
     ) -> InputSubmitted:
         admission: asyncio.Future[InputSubmitted] = asyncio.ensure_future(
@@ -1949,11 +1968,25 @@ async def _read_input_async(
                     failure = failure or exc
                     break
                 failure = failure or exc
-        _panel.complete_submission(
-            session,
-            editor_value,
-            clear_editor=submitted.disposition is SubmissionDisposition.PENDING,
-        )
+        try:
+            if submitted.disposition is SubmissionDisposition.PENDING and submitted_at is not None:
+                rendering = asyncio.ensure_future(renderer.submitted(submitted.text, submitted_at))
+                while True:
+                    try:
+                        await asyncio.shield(rendering)
+                        break
+                    except asyncio.CancelledError as exc:
+                        if rendering.done():
+                            rendering.result()
+                            failure = failure or exc
+                            break
+                        failure = failure or exc
+        finally:
+            _panel.complete_submission(
+                session,
+                editor_value,
+                clear_editor=submitted.disposition is SubmissionDisposition.PENDING,
+            )
         if failure is not None:
             raise failure
         return submitted
@@ -1975,6 +2008,7 @@ async def _read_input_async(
                         editor_value,
                         target_agent_id,
                         _panel.accepted_sequence(session),
+                        _panel.accepted_at(session),
                     )
                 _panel.complete_submission(session, editor_value, clear_editor=True)
             except KeyboardInterrupt as exc:
@@ -1986,7 +2020,13 @@ async def _read_input_async(
                 if reserved_seq is not None:
                     editor_value = _panel.editor_text(session)
                     target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
-                    await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                    await finish_submission(
+                        editor_value,
+                        target_agent_id,
+                        reserved_seq,
+                        _panel.accepted_at(session),
+                        exc,
+                    )
                     raise exc
                 on_interrupt()
             except asyncio.CancelledError as exc:
@@ -1995,7 +2035,13 @@ async def _read_input_async(
                     raise
                 editor_value = _panel.editor_text(session)
                 target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
-                await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                await finish_submission(
+                    editor_value,
+                    target_agent_id,
+                    reserved_seq,
+                    _panel.accepted_at(session),
+                    exc,
+                )
                 raise exc
             except BaseException as exc:
                 reserved_seq = _panel.accepted_sequence(session)
@@ -2003,7 +2049,13 @@ async def _read_input_async(
                     raise
                 editor_value = _panel.editor_text(session)
                 target_agent_id = _panel.accepted_target(session, renderer.focused_agent)
-                await finish_submission(editor_value, target_agent_id, reserved_seq, exc)
+                await finish_submission(
+                    editor_value,
+                    target_agent_id,
+                    reserved_seq,
+                    _panel.accepted_at(session),
+                    exc,
+                )
                 raise exc
     finally:
         renderer.set_input_active(False)
@@ -2585,8 +2637,26 @@ async def _session_journal(
 def _build_argument_parser() -> Any:
     import argparse
 
+    class VersionAction(argparse.Action):
+        def __call__(
+            self,
+            parser: argparse.ArgumentParser,
+            namespace: argparse.Namespace,
+            values: object,
+            option_string: str | None = None,
+        ) -> None:
+            del namespace, option_string, values
+            print(_version.version_report(module_source=__file__))
+            parser.exit(0)
+
     parser = argparse.ArgumentParser(description="REPL coding assistant (axio)", allow_abbrev=False)
     parser.add_argument("prompt", nargs="?", default=None, help="Single prompt (non-interactive)")
+    parser.add_argument(
+        "--version",
+        action=VersionAction,
+        nargs=0,
+        help="Show executable and source provenance, then exit",
+    )
     parser.add_argument("--agent", default=None, help="Named agent bundle from CONFIG_DIR/agents/NAME")
     parser.add_argument("--config-dir", type=Path, default=None, help="Configuration root (default: XDG config/axio)")
     parser.add_argument("--list-agents", action="store_true", help="List available named agent bundles and exit")
@@ -3114,6 +3184,7 @@ async def main() -> None:
             display_mode=DisplayMode.parse(args.agent_actions),
             powerline=args.powerline,
             theme=theme,
+            effective_username=effective_username,
         )
         startup_notices: list[str] = []
 
