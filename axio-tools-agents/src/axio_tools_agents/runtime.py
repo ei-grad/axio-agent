@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from uuid import uuid4
 
+from axio._asyncio import shield_until_done
 from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import ContextStore, SessionInfo
@@ -631,7 +632,9 @@ async def _observe_agent_turn_current(
         raised = exc
     finally:
         try:
-            await stream.aclose()
+            _, close_cancellation = await shield_until_done(stream.aclose())
+            if cancelled is None:
+                cancelled = close_cancellation
         except asyncio.CancelledError as exc:
             if cancelled is None:
                 cancelled = exc
@@ -641,15 +644,19 @@ async def _observe_agent_turn_current(
 
     result_text = "".join(text)
     if cancelled is not None:
-        await _commit_partial_text(
-            context,
-            "".join(current_iteration_text),
-            history_boundary=history_boundary,
-        )
-        await hub.publish_for(
-            identity,
-            TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="turn cancelled"),
-        )
+
+        async def finalize_cancelled_turn() -> None:
+            await _commit_partial_text(
+                context,
+                "".join(current_iteration_text),
+                history_boundary=history_boundary,
+            )
+            await hub.publish_for(
+                identity,
+                TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="turn cancelled"),
+            )
+
+        await shield_until_done(finalize_cancelled_turn())
         raise cancelled
 
     if raised is not None:

@@ -16,6 +16,7 @@ from typing import Any, Self
 from uuid import uuid4
 
 from axio import notify
+from axio._asyncio import cancel_task_once
 from axio.agent import Agent
 from axio.context import ContextStore
 from axio.events import StreamEvent
@@ -972,15 +973,14 @@ async def _start_background_agent(
     async def _on_stop(_from_id: str, _reason: str) -> None:
         async with accept_lock:
             background.stopping = True
-            if background.current_turn is not None and not background.current_turn.done():
-                background.current_turn.cancel()
+            if background.current_turn is not None:
+                cancel_task_once(background.current_turn)
             background.inbox.put_nowait(_QueuedPrompt(None))
 
     async def _on_interrupt(_from_id: str, _reason: str) -> None:
         async with accept_lock:
-            if background.current_turn is not None and not background.current_turn.done():
+            if background.current_turn is not None and cancel_task_once(background.current_turn):
                 background.interrupted = True
-                background.current_turn.cancel()
 
     peer = await PeerServer(
         name,
@@ -1069,11 +1069,12 @@ def interrupt_local_agent_turn(agent_id: str, turn_id: str) -> bool:
         return False
     identity = background.current_identity
     current_turn = background.current_turn
-    if identity is None or identity.turn_id != turn_id or current_turn is None or current_turn.done():
+    if identity is None or identity.turn_id != turn_id or current_turn is None:
         return False
-    background.interrupted = True
-    current_turn.cancel()
-    return True
+    if cancel_task_once(current_turn):
+        background.interrupted = True
+        return True
+    return False
 
 
 async def wait_local_background_agents_idle(agent_ids: list[str] | None = None) -> None:
@@ -1186,8 +1187,8 @@ async def stop_local_background_agents() -> None:
     backgrounds = list(_background_agents.values())
     for background in backgrounds:
         background.stopping = True
-        if background.current_turn is not None and not background.current_turn.done():
-            background.current_turn.cancel()
+        if background.current_turn is not None:
+            cancel_task_once(background.current_turn)
         background.inbox.put_nowait(_QueuedPrompt(None))
     for background in backgrounds:
         if background.runner is not None:

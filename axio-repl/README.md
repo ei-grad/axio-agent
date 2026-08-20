@@ -72,7 +72,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   editor text is never submitted or changed by Escape. Without pending user
   input, no replacement model turn starts.
 - **Ctrl-D** on an empty editor warns once; a second press within two seconds
-  exits gracefully.
+  closes input, lets the active turn and already submitted work drain, then
+  exits without starting another editor prompt.
 - **Ctrl-C** starts graceful shutdown. It does not submit or clear the editor;
   the shutdown journal retains it for `--resume`.
 
@@ -104,9 +105,11 @@ scroll region: normal output remains in terminal scrollback while one serialized
 owner erases and redraws the temporary `prompt_toolkit` editor around
 asynchronous stdout, stderr, logging, and agent output. Bounded output overload
 and late writes are represented by explicit skip markers, and terminal state is
-restored during shutdown or failure handling. ANSI styles are reset and
-re-established on each physical line so reasoning or tool colours cannot leak
-into a later answer block.
+restored during shutdown or failure handling. Model text, tool arguments, tool
+output, and results are incrementally stripped of terminal control sequences,
+including controls split across streaming chunks. Application-owned ANSI styles
+are reset and re-established on each physical line so reasoning or tool colours
+cannot leak into a later answer block.
 
 The bottom panel shows whether the active agent is idle, waiting for the model,
 reasoning, responding, or running named tools. Startup details, command output,
@@ -157,6 +160,11 @@ Powerline mode requires a terminal font that provides the `U+E0B0` (``) separ
 The interactive prompt shows local time and the effective-UID username as `HH:MM username`.
 Terminal recordings therefore expose that local username. Built-in themes are `default` and
 `monochrome`; unknown names stop startup.
+
+Set `NO_COLOR` to disable application-owned ANSI styling. It takes precedence
+over `--theme` and also disables Powerline. One-shot output automatically uses
+the same plain presentation when stdout is not a TTY, so redirected output does
+not contain ANSI colour sequences or Powerline glyphs.
 
 ## Agent configuration
 

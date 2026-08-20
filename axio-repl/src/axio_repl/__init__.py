@@ -31,6 +31,7 @@ from uuid import uuid4
 
 import aiohttp
 from axio import notify
+from axio._asyncio import cancel_task_once
 from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import ContextStore, MemoryContextStore
@@ -145,12 +146,18 @@ from axio_repl._multiplexer import (
     DisplayModeChange,
     format_agent_identity,
     normalize_agent_name,
-    sanitize_terminal_text,
 )
 from axio_repl._powerline import agent_header, tool_title
 from axio_repl._recovery import RecoveryError, RecoveryMaterialization, materialize_recovery
 from axio_repl._terminal import TerminalUI
-from axio_repl._theme import DEFAULT_THEME, TerminalTheme, resolve_theme, theme_names
+from axio_repl._terminal_sanitizer import IncrementalTerminalSanitizer, sanitize_terminal_text
+from axio_repl._theme import (
+    DEFAULT_THEME,
+    TerminalTheme,
+    resolve_terminal_presentation,
+    resolve_theme,
+    theme_names,
+)
 from axio_repl._theme import RESET as RESET
 
 LAST_ITERATION_HINT = Message(
@@ -190,6 +197,8 @@ def _styled(style: str, text: str) -> str:
     """Apply a style without relying on terminal state across line redraws."""
     if not text:
         return ""
+    if not style:
+        return text
     line_break = f"{RESET}\n{style}"
     return style + text.replace("\n", line_break) + RESET
 
@@ -559,6 +568,10 @@ class _AgentRenderState:
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
+        self.text_sanitizer = IncrementalTerminalSanitizer()
+        self.reasoning_sanitizer = IncrementalTerminalSanitizer()
+        self.tool_output_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
+        self.tool_field_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -657,12 +670,25 @@ def _pending_prompt_count(
     return peer_queue.qsize() + len(buffered_prompts) + claimed_by_inbox
 
 
+def _retain_interrupted_partial(
+    partials: dict[str, str],
+    pending_interrupt_turns: set[str],
+    *,
+    turn_id: str,
+    partial: str,
+    preemption_reason: str | None,
+) -> None:
+    """Retain only partials that shutdown or an accepted interrupt must consume."""
+
+    if partial and (preemption_reason is None or turn_id in pending_interrupt_turns):
+        partials[turn_id] = partial
+
+
 async def _cancel_and_settle_tasks(*tasks: asyncio.Task[Any] | None) -> tuple[Any, ...]:
     """Cancel unfinished coordinator tasks and retrieve every task outcome."""
     managed_tasks = tuple(task for task in tasks if task is not None)
     for task in managed_tasks:
-        if not task.done():
-            task.cancel()
+        cancel_task_once(task)
     if not managed_tasks:
         return ()
     return tuple(await asyncio.gather(*managed_tasks, return_exceptions=True))
@@ -1085,6 +1111,7 @@ class ReplRenderer:
         async with self._lock:
             if suppress_display:
                 return
+            text = sanitize_terminal_text(text)
             if self._active_agent is not None and isinstance(self._state(self._active_agent).mode, _TextMode):
                 print()
                 self._state(self._active_agent).mode = _BoundaryMode()
@@ -1098,7 +1125,7 @@ class ReplRenderer:
                 if agent_id is not None
                 else ""
             )
-            print(f"\n{self._theme.agent.ansi}{'─' * 3} incoming{source} {'─' * 3}{RESET}\n{text}\n")
+            print(f"\n{self._theme.agent.ansi}{'─' * 3} incoming{source} {'─' * 3}{self._theme.reset}\n{text}\n")
             self._drain_safe_boundary_locked()
 
     async def notice(self, text: str) -> None:
@@ -1118,6 +1145,10 @@ class ReplRenderer:
         state.pending_text.clear()
         state.background_tools.clear()
         state.background_errors.clear()
+        state.text_sanitizer.reset()
+        state.reasoning_sanitizer.reset()
+        state.tool_output_sanitizers.clear()
+        state.tool_field_sanitizers.clear()
 
     def _remember_agent_locked(self, agent_id: str, agent_name: str) -> None:
         normalized = normalize_agent_name(agent_name)
@@ -1212,7 +1243,7 @@ class ReplRenderer:
         if self._powerline:
             print(f"\n{agent_header(identity, self._theme)}")
         else:
-            print(f"\n{self._theme.agent.ansi}── agent {identity} ──{RESET}")
+            print(f"\n{self._theme.agent.ansi}── agent {identity} ──{self._theme.reset}")
 
     def _parent_tool_key(
         self,
@@ -1310,8 +1341,12 @@ class ReplRenderer:
         state, switched = self._switch_agent(agent_id)
         if self._event_starts_stdout(event, presentation):
             self._ensure_stdout_header_locked(agent_id, presentation)
+        if not isinstance(event, TextDelta):
+            state.text_sanitizer.reset()
+        if not isinstance(event, ReasoningDelta):
+            state.reasoning_sanitizer.reset()
         if switched and isinstance(state.mode, _ToolFieldMode):
-            sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){RESET}: ")
+            sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){self._theme.reset}: ")
             self._flush()
             state.mode = dataclasses.replace(state.mode, first_delta=True)
         if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
@@ -1321,6 +1356,7 @@ class ReplRenderer:
             self._drain_safe_boundary_locked()
         match event:
             case ReasoningDelta(delta=delta):
+                delta = state.reasoning_sanitizer.feed(delta)
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
@@ -1336,22 +1372,23 @@ class ReplRenderer:
                 self._flush()
 
             case TextDelta(delta=delta):
+                safe_delta = state.text_sanitizer.feed(delta)
                 if not isinstance(state.mode, _TextMode):
                     state.mode = _TextMode()
                 state.pending_text.append(delta)
-                if "[Output truncated:" in delta:
-                    sys.stdout.write(f"\n{_styled(self._theme.error.ansi, delta.strip())}\n")
+                if "[Output truncated:" in safe_delta:
+                    sys.stdout.write(f"\n{_styled(self._theme.error.ansi, safe_delta.strip())}\n")
                     state.mode = _BoundaryMode()
                     self._drain_safe_boundary_locked()
                 else:
-                    self._render_text_delta_locked(state, delta)
+                    self._render_text_delta_locked(state, safe_delta)
 
             case ImageOutput(data=data, media_type=mt):
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{self._theme.success.ansi}[image saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[image saved: {path}]{self._theme.reset}")
                 self._drain_safe_boundary_locked()
 
             case AudioOutput(data=data, media_type=mt):
@@ -1359,7 +1396,7 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{self._theme.success.ansi}[audio saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[audio saved: {path}]{self._theme.reset}")
                 self._drain_safe_boundary_locked()
 
             case VideoOutput(data=data, media_type=mt):
@@ -1367,17 +1404,18 @@ class ReplRenderer:
                     print()
                     state.mode = _BoundaryMode()
                 path = _save_media(data, mt)
-                print(f"{self._theme.success.ansi}[video saved: {path}]{RESET}")
+                print(f"{self._theme.success.ansi}[video saved: {path}]{self._theme.reset}")
                 self._drain_safe_boundary_locked()
 
             case ToolUseStart(index=index, tool_use_id=tid, name=name):
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
+                safe_name = sanitize_terminal_text(name)
                 if self._powerline:
-                    sys.stdout.write(f"\n{tool_title(name, self._theme)}")
+                    sys.stdout.write(f"\n{tool_title(safe_name, self._theme)}")
                 else:
-                    sys.stdout.write(f"\n{self._theme.tool.ansi}▶ {name}{RESET}")
+                    sys.stdout.write(f"\n{self._theme.tool.ansi}▶ {safe_name}{self._theme.reset}")
                 self._flush()
                 state.arg_streams[tid] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tid)
@@ -1400,10 +1438,12 @@ class ReplRenderer:
                     sys.stdout.write("\n")
                 state.streamed_tool_ids.add(tid)
                 color = self._theme.stderr.ansi if key == "stderr" else self._theme.stdout.ansi
-                sys.stdout.write(_styled(color, delta))
+                sanitizer = state.tool_output_sanitizers.setdefault((tid, key), IncrementalTerminalSanitizer())
+                sys.stdout.write(_styled(color, sanitizer.feed(delta)))
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
+                content = sanitize_terminal_text(content)
                 parent_key = self._parent_tool_key(agent_id, tid, presentation)
                 foreground_result = self._streamed_foreground_calls.pop(parent_key, None)
                 if foreground_result is not None:
@@ -1425,19 +1465,25 @@ class ReplRenderer:
                         if foreground_status is TurnStatus.SUCCEEDED
                         else self._theme.error.ansi
                     )
-                    sys.stdout.write(f"{RESET}\n{_styled(color, content)}\n")
+                    sys.stdout.write(f"{self._theme.reset}\n{_styled(color, content)}\n")
                 elif is_error:
-                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.error.ansi, content)}\n")
+                    sys.stdout.write(f"{self._theme.reset}\n{_styled(self._theme.error.ansi, content)}\n")
                 elif name in {"run_agent", "spawn_agent"}:
-                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.success.ansi, content)}\n")
+                    sys.stdout.write(f"{self._theme.reset}\n{_styled(self._theme.success.ansi, content)}\n")
                 elif tid in state.streamed_tool_ids:
-                    sys.stdout.write(f"{RESET}\n")
+                    sys.stdout.write(f"{self._theme.reset}\n")
                 else:
-                    sys.stdout.write(f"{RESET}\n{_styled(self._theme.success.ansi, content)}\n")
+                    sys.stdout.write(f"{self._theme.reset}\n{_styled(self._theme.success.ansi, content)}\n")
                 self._flush()
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
                 state.tool_names.pop(tid, None)
+                for sanitizer_key in tuple(state.tool_output_sanitizers):
+                    if sanitizer_key[0] == tid:
+                        state.tool_output_sanitizers.pop(sanitizer_key).reset()
+                for sanitizer_key in tuple(state.tool_field_sanitizers):
+                    if sanitizer_key[0] == tid:
+                        state.tool_field_sanitizers.pop(sanitizer_key).reset()
                 if (not state.active_tool_ids and not state.arg_streams) or self._only_passive_tools_active(state):
                     self._drain_safe_boundary_locked()
 
@@ -1445,6 +1491,8 @@ class ReplRenderer:
                 # The agent has written this iteration into the context itself;
                 # what is kept here is only ever the unfinished tail.
                 state.pending_text.clear()
+                state.text_sanitizer.reset()
+                state.reasoning_sanitizer.reset()
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
@@ -1456,8 +1504,9 @@ class ReplRenderer:
                     agent_id,
                     presentation.agent_name if presentation is not None else self._agent_name(agent_id),
                 )
+                error_text = sanitize_terminal_text(f"Error from agent {identity}: {exc}")
                 print(
-                    f"\n{_styled(self._theme.error.ansi, f'Error from agent {identity}: {exc}')}",
+                    f"\n{_styled(self._theme.error.ansi, error_text)}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1656,22 +1705,29 @@ class ReplRenderer:
     ) -> None:
         match event:
             case ToolFieldStart(key=key):
-                sys.stdout.write(f"\n  {self._theme.warning.ansi}{key}{RESET}: ")
+                key = sanitize_terminal_text(key).replace("\n", " ")
+                sys.stdout.write(f"\n  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
                 self._flush()
                 state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
+                state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
             case ToolFieldDelta(text=text):
                 mode = state.mode
                 if not isinstance(mode, _ToolFieldMode) or mode.tool_use_id != tool_use_id:
                     raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
+                sanitizer = state.tool_field_sanitizers.setdefault(
+                    (tool_use_id, mode.key), IncrementalTerminalSanitizer()
+                )
+                text = sanitizer.feed(text)
                 if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.mode = dataclasses.replace(mode, first_delta=False)
                 sys.stdout.write(_styled(self._theme.reasoning.ansi, text))
                 self._flush()
             case ToolFieldEnd():
-                sys.stdout.write(RESET)
+                sys.stdout.write(self._theme.reset)
                 self._flush()
                 if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                    state.tool_field_sanitizers.pop((tool_use_id, state.mode.key), None)
                     state.mode = _BoundaryMode()
 
 
@@ -2666,6 +2722,13 @@ async def main() -> None:
         parser.error(str(error))
     effective_username = resolve_effective_username()
     model_context = profile.model_context or ""
+    theme, args.powerline = resolve_terminal_presentation(
+        theme,
+        powerline=args.powerline,
+        one_shot=args.prompt is not None,
+        stdout_is_tty=sys.stdout.isatty(),
+        no_color="NO_COLOR" in os.environ,
+    )
     if (args.transport_base_url is not None or args.transport_api_key_env is not None) and args.transport is None:
         parser.error("transport connection settings require an explicit transport name")
     recovery: RecoveryMaterialization | None = None
@@ -3170,9 +3233,11 @@ async def main() -> None:
                 and request.captured_turn_id == foreground_state.active_turn_id("main")
                 and prompt_task is not None
                 and not prompt_task.done()
+                and prompt_task.cancelling() == 0
             ):
+                pending_interrupt_turns.add(request.captured_turn_id)
                 deferred_tools.request_preemption(request.captured_turn_id)
-                prompt_task.cancel()
+                cancel_task_once(prompt_task)
             await interrupt_queue.put(_AcceptedInterrupt(envelope.seq, request))
 
         def _queue_notification(text: str) -> None:
@@ -3187,6 +3252,7 @@ async def main() -> None:
             await _admit_incoming(_peer_incoming_prompt(message), source="peer")
 
         interrupted_partials: dict[str, str] = {}
+        pending_interrupt_turns: set[str] = set()
         tool_preemption_reasons: dict[str, str] = {}
 
         async def _run_turn(
@@ -3242,7 +3308,7 @@ async def main() -> None:
                     if terminal_failure_task in done:
                         shutdown_reason = "terminal_failure"
                         if not prompt_task.done():
-                            prompt_task.cancel()
+                            cancel_task_once(prompt_task)
                             await asyncio.gather(prompt_task, return_exceptions=True)
                         await terminal_failure_task
                         raise RuntimeError("terminal failure monitor stopped unexpectedly")
@@ -3251,12 +3317,17 @@ async def main() -> None:
             except asyncio.CancelledError:
                 main_status = TurnStatus.CANCELLED
                 if prompt_task is not None and not prompt_task.done():
-                    prompt_task.cancel()
+                    cancel_task_once(prompt_task)
                     await asyncio.gather(prompt_task, return_exceptions=True)
                 partial = renderer.take_pending_text("main")
-                if partial:
-                    interrupted_partials[identity.turn_id] = partial
                 reason = tool_preemption_reasons.pop(identity.turn_id, None)
+                _retain_interrupted_partial(
+                    interrupted_partials,
+                    pending_interrupt_turns,
+                    turn_id=identity.turn_id,
+                    partial=partial,
+                    preemption_reason=reason,
+                )
                 if reason is None:
                     renderer.show_panel("Main turn interrupted.")
                 else:
@@ -3337,11 +3408,16 @@ async def main() -> None:
         def _preempt_active_tool_dispatch(reason: str) -> None:
             current = prompt_task
             active_turn_id = foreground_state.active_turn_id("main")
-            if current is not None and not current.done() and deferred_tools.has_active_dispatch(active_turn_id):
+            if (
+                current is not None
+                and not current.done()
+                and current.cancelling() == 0
+                and deferred_tools.has_active_dispatch(active_turn_id)
+            ):
                 if active_turn_id is not None:
                     tool_preemption_reasons.setdefault(active_turn_id, reason)
                 deferred_tools.request_preemption(active_turn_id)
-                current.cancel()
+                cancel_task_once(current)
 
         def _request_target_tool_preemption(target_agent_id: str) -> str | None:
             if target_agent_id == "main":
@@ -3634,6 +3710,8 @@ async def main() -> None:
                     if request.captured_turn_id is not None
                     else ""
                 )
+                if request.captured_turn_id is not None:
+                    pending_interrupt_turns.discard(request.captured_turn_id)
                 claimed_ids = (
                     tuple(entry.id for entry in transaction.claimed.entries) if transaction.claimed is not None else ()
                 )
@@ -3762,8 +3840,8 @@ async def main() -> None:
                     and not foreground_task.done()
                 )
                 if current_matches:
-                    if current_prompt_task is not None and not current_prompt_task.done():
-                        current_prompt_task.cancel()
+                    if current_prompt_task is not None:
+                        cancel_task_once(current_prompt_task)
                     settling_interrupts.append(transaction)
                     return
                 await _finalize_interrupt(transaction)
@@ -3855,8 +3933,12 @@ async def main() -> None:
                         input_closed
                         and pending_input.pending_count == 0
                         and not ready_claims
+                        and not pending_commands
+                        and not settling_interrupts
                         and not pending_peer_prompts
                         and peer_queue.empty()
+                        and (inbox_task is None or not inbox_task.done())
+                        and (interrupt_task is None or not interrupt_task.done())
                         and not incoming_admission_tasks
                     ):
                         break
@@ -3889,6 +3971,8 @@ async def main() -> None:
                     wait_tasks.add(foreground_task)
                 if terminal_failure_task is not None:
                     wait_tasks.add(terminal_failure_task)
+                admission_waiters = tuple(incoming_admission_tasks)
+                wait_tasks.update(admission_waiters)
                 done, _ = await asyncio.wait(
                     wait_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -3898,6 +3982,10 @@ async def main() -> None:
                     shutdown_reason = "terminal_failure"
                     await terminal_failure_task
                     raise RuntimeError("terminal failure monitor stopped unexpectedly")
+
+                for admission_task in admission_waiters:
+                    if admission_task in done:
+                        admission_task.result()
 
                 if shutdown_task in done:
                     shutdown_reason = shutdown_task.result()
@@ -3934,7 +4022,7 @@ async def main() -> None:
                     print()
                     shutdown_reason = "double_eof"
                     input_closed = True
-                    break
+                    continue
                 finally:
                     input_task = None
 

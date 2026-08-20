@@ -6,6 +6,7 @@ from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
+from axio_repl._theme import NO_COLOR_THEME
 
 
 def test_display_mode_accepts_cli_and_descriptive_names() -> None:
@@ -13,6 +14,16 @@ def test_display_mode_accepts_cli_and_descriptive_names() -> None:
     assert DisplayMode.parse("active-only") is DisplayMode.ACTIVE_ONLY
     assert DisplayMode.parse("on") is DisplayMode.ALL_ACTIONS
     assert DisplayMode.parse("all-actions") is DisplayMode.ALL_ACTIONS
+
+
+def test_no_color_action_frames_emit_no_ansi() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+    mux.observe("child", AgentStarted(name="child", kind="spawned-agent"))
+
+    [frame] = mux.drain()
+
+    assert "agent child" in frame
+    assert "\x1b[" not in frame
 
 
 def test_tool_arguments_are_framed_only_after_complete_json() -> None:

@@ -41,10 +41,19 @@ from axio_tools_agents.runtime import (
     TurnStatus,
 )
 
-from axio_repl import DIM, RED, RESET, ReplRenderer, _peer_incoming_prompt, render_runtime_event, run_prompt
+from axio_repl import (
+    DIM,
+    MUTED_AMBER,
+    RED,
+    RESET,
+    ReplRenderer,
+    _peer_incoming_prompt,
+    render_runtime_event,
+    run_prompt,
+)
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._powerline import agent_header
-from axio_repl._theme import MONOCHROME_THEME
+from axio_repl._theme import MONOCHROME_THEME, NO_COLOR_THEME
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
 
@@ -258,6 +267,89 @@ async def test_monochrome_theme_reaches_plain_and_powerline_renderers(
     assert "\033[1;30;107m ▶ shell " in output
     assert "\033[1;97;100m agent child " in output
     assert "\033[1;30;47m tool call " in output
+
+
+async def test_live_stream_strips_complete_and_split_terminal_controls_but_keeps_owned_styles(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    await renderer.render("main", TextDelta(index=0, delta="text-before\x1b["))
+    await renderer.render("main", TextDelta(index=0, delta="?1049htext-after\x1b[3J"))
+    await renderer.render("main", ReasoningDelta(index=0, delta="reason-before\x1b]"))
+    await renderer.render("main", ReasoningDelta(index=0, delta="52;c;clipboard\x07reason-after"))
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="stream", name="shell"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="stream",
+            partial_json='{"command":"field-before\\u001b[2Jfield-after"}',
+        ),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="stream", name="shell", key="stderr", delta="stderr-before\x1bPpayload"),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="stream", name="shell", key="stderr", delta="\x1b\\stderr-after"),
+    )
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="stream", name="shell", is_error=False, content="ignored streamed result"),
+    )
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="result", name="read_file"))
+    await renderer.render(
+        "main",
+        ToolResult(
+            tool_use_id="result",
+            name="read_file",
+            is_error=True,
+            content="result-before\x1b[2J\x1b]0;title\x07result-after",
+        ),
+    )
+
+    output = capsys.readouterr().out
+    for control in ("\x1b[?1049h", "\x1b[3J", "\x1b[2J", "\x1b]", "\x1bP", "\x1b\\"):
+        assert control not in output
+    for text in (
+        "text-before",
+        "text-after",
+        "reason-before",
+        "reason-after",
+        "stderr-before",
+        "stderr-after",
+        "field-before",
+        "field-after",
+        "result-before",
+        "result-after",
+    ):
+        assert text in output
+    assert f"{DIM}> reason-before" in output
+    assert f"{MUTED_AMBER}stderr-before" in output
+    assert f"{RED}result-before" in output
+
+
+async def test_no_color_interactive_renderer_emits_no_ansi_or_powerline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME, powerline=False)
+
+    await renderer.render("main", ReasoningDelta(index=0, delta="thinking"))
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="call", name="shell", is_error=True, content="failed"),
+    )
+    await renderer.render("main", Error(exception=RuntimeError("broken")))
+
+    captured = capsys.readouterr()
+    assert "thinking" in captured.out
+    assert "failed" in captured.out
+    assert "broken" in captured.err
+    assert "\x1b[" not in captured.out + captured.err
+    assert "\ue0b0" not in captured.out + captured.err
 
 
 async def test_powerline_labels_foreground_child_but_not_ordinary_main_output(

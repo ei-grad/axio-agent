@@ -25,6 +25,7 @@ from axio_repl import (
     _handle_agent_actions,
     _IncomingPrompt,
     _pending_prompt_count,
+    _retain_interrupted_partial,
     _select_configured_tools,
     main,
 )
@@ -62,6 +63,34 @@ def test_theme_rejects_unknown_name_with_available_choices(capsys: pytest.Captur
     assert "invalid choice: 'unknown'" in error
     assert "default" in error
     assert "monochrome" in error
+
+
+def test_repeated_tool_preemption_does_not_retain_unconsumable_partials() -> None:
+    partials: dict[str, str] = {}
+    pending_interrupt_turns: set[str] = set()
+
+    for index in range(1000):
+        _retain_interrupted_partial(
+            partials,
+            pending_interrupt_turns,
+            turn_id=f"preempted-{index}",
+            partial=f"partial {index}",
+            preemption_reason="queued user input",
+        )
+
+    assert partials == {}
+
+    pending_interrupt_turns.add("escape-turn")
+    _retain_interrupted_partial(
+        partials,
+        pending_interrupt_turns,
+        turn_id="escape-turn",
+        partial="visible partial",
+        preemption_reason="queued user input",
+    )
+    assert partials.pop("escape-turn") == "visible partial"
+    pending_interrupt_turns.discard("escape-turn")
+    assert partials == {}
 
 
 async def test_invalid_config_theme_fails_before_transport_initialization(
@@ -645,18 +674,21 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
             await asyncio.gather(repl_task, return_exceptions=True)
 
 
-async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor(
+async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import axio_repl
 
     turn_started = asyncio.Event()
-    turn_cancelled = asyncio.Event()
+    release_active = asyncio.Event()
+    pending_started = asyncio.Event()
+    release_pending_tool = asyncio.Event()
     inputs: asyncio.Queue[str | BaseException] = asyncio.Queue()
     prompt_calls = 0
+    calls: list[list[Message]] = []
 
-    class BlockingTransport:
+    class DrainingTransport:
         name = "stub"
 
         def __init__(self, **kwargs: object) -> None:
@@ -676,15 +708,26 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
             tools: list[Tool[object]],
             system: str,
         ) -> AsyncIterator[StreamEvent]:
-            del messages, tools, system
-            turn_started.set()
-            try:
-                await asyncio.Future()
-            except asyncio.CancelledError:
-                turn_cancelled.set()
-                raise
-            if False:
-                yield TextDelta(index=0, delta="unreachable")
+            del tools, system
+            calls.append(list(messages))
+            if len(calls) == 1:
+                turn_started.set()
+                await release_active.wait()
+            elif len(calls) == 2:
+                yield ToolUseStart(index=0, tool_use_id="drain-call", name="drain_tool")
+                yield ToolInputDelta(index=0, tool_use_id="drain-call", partial_json="{}")
+                yield IterationEnd(
+                    iteration=2,
+                    stop_reason=StopReason.tool_use,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            yield TextDelta(index=0, delta=f"answer {len(calls)}")
+            yield IterationEnd(
+                iteration=len(calls),
+                stop_reason=StopReason.end_turn,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
 
     class Buffer:
         text = ""
@@ -719,6 +762,15 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
 
     prompt_session = PromptSession()
 
+    async def drain_tool() -> str:
+        pending_started.set()
+        await release_pending_tool.wait()
+        return "drained tool result"
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [Tool(name="drain_tool", handler=drain_tool)], "test", tmp_path, ""
+
     def make_prompt_session(
         status: object,
         *,
@@ -736,7 +788,8 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
 
     journal_root = tmp_path / "journals"
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
-    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (BlockingTransport, ""))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (DrainingTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
     monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
     monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
     monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
@@ -757,20 +810,37 @@ async def test_double_eof_shutdown_recovers_active_turn_pending_input_and_editor
     assert prompt_calls >= 3
     prompt_session.default_buffer.text = "unsent editor"
     await inputs.put(EOFError())
+    prompt_calls_at_eof = prompt_calls
+
+    await asyncio.sleep(0)
+    assert not repl_task.done()
+    release_active.set()
+    await asyncio.wait_for(pending_started.wait(), timeout=1)
+    assert not repl_task.done()
+    release_pending_tool.set()
 
     await asyncio.wait_for(repl_task, timeout=2)
-    await asyncio.wait_for(turn_cancelled.wait(), timeout=1)
+    assert prompt_calls == prompt_calls_at_eof
+    assert len(calls) == 3
+    assert any(
+        isinstance(block, TextBlock) and block.text == "pending request"
+        for message in calls[1]
+        for block in message.content
+    )
 
     events_paths = list(journal_root.rglob("events.jsonl"))
     assert len(events_paths) == 1
     recovered = materialize_recovery(events_paths[0])
-    assert [entry.text for entry in recovered.pending_inputs] == ["pending request"]
+    assert recovered.pending_inputs == ()
     assert recovered.editor_text == "unsent editor"
-    assert any(
-        isinstance(block, TextBlock) and "Recorded reason: double_eof" in block.text
-        for message in recovered.messages
-        for block in message.content
+    shutdown = next(
+        record for record in read_journal(events_paths[0]).records if record["kind"] == "shutdown_recorded"
     )
+    shutdown_payload = shutdown["payload"]
+    assert isinstance(shutdown_payload, dict)
+    shutdown_event = shutdown_payload["event"]
+    assert isinstance(shutdown_event, dict)
+    assert shutdown_event["reason"] == "double_eof"
 
 
 async def test_resume_copies_context_and_restores_editor_before_input(
@@ -822,10 +892,14 @@ async def test_resume_copies_context_and_restores_editor_before_input(
     class Buffer:
         text = ""
 
+    prompt_calls = 0
+
     class PromptSession:
         default_buffer = Buffer()
 
         async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            nonlocal prompt_calls
+            prompt_calls += 1
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             assert kwargs == {"default": "restored editor"}
             self.default_buffer.text = "restored editor"
@@ -882,6 +956,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
 
     await asyncio.wait_for(main(), timeout=2)
 
+    assert prompt_calls == 1
     resumed_paths = list(resumed_root.rglob("events.jsonl"))
     assert len(resumed_paths) == 1
     records = read_journal(resumed_paths[0]).records

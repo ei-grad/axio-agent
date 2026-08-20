@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Protocol, Self
 
 from . import background, notify
+from ._asyncio import shield_until_done
 from .blocks import AudioBlock, ContentBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from .context import ContextStore
 from .events import (
@@ -591,82 +592,86 @@ class Agent:
                                 dispatched = []
                             results = dispatched + error_results
                         except asyncio.CancelledError:
-                            completed_results: dict[str, ToolResultBlock] = {}
-                            deferred = False
-                            if dispatch is not None and dispatch_task is not None:
-                                prefer_deferral = (
-                                    self.deferred_tool_sink is not None
-                                    and self.deferred_tool_sink.should_defer(dispatch)
-                                )
-                                if prefer_deferral and self.deferred_tool_sink is not None:
-                                    self.deferred_tool_sink.defer(dispatch)
-                                    deferred = True
-                                elif dispatch_task.done() and not dispatch_task.cancelled():
-                                    try:
-                                        completed_results = {
-                                            result.tool_use_id: result for result in dispatch_task.result()
-                                        }
-                                    except BaseException:
-                                        completed_results = {}
-                                    if self.deferred_tool_sink is not None:
-                                        self.deferred_tool_sink.dispatch_finished(dispatch)
-                                else:
-                                    if not dispatch_task.done():
-                                        dispatch_task.cancel()
-                                        await asyncio.gather(dispatch_task, return_exceptions=True)
-                                    if self.deferred_tool_sink is not None:
-                                        self.deferred_tool_sink.dispatch_finished(dispatch)
-                            interrupted_results: list[ToolResultBlock] = []
-                            for b in tool_blocks:
-                                completed = completed_results.get(b.id)
-                                if completed is not None:
-                                    interrupted_results.append(completed)
-                                    continue
-                                if deferred and b.id not in malformed:
-                                    interrupted_results.append(
-                                        ToolResultBlock(
-                                            tool_use_id=b.id,
-                                            content=(
-                                                f"Tool {b.name} continues after interruption. "
-                                                "Its actual result will arrive as a later user message."
-                                            ),
-                                        )
+
+                            async def finalize_interrupted_dispatch() -> None:
+                                completed_results: dict[str, ToolResultBlock] = {}
+                                deferred = False
+                                if dispatch is not None and dispatch_task is not None:
+                                    prefer_deferral = (
+                                        self.deferred_tool_sink is not None
+                                        and self.deferred_tool_sink.should_defer(dispatch)
                                     )
-                                    continue
-                                malformed_result = next(
-                                    (result for result in error_results if result.tool_use_id == b.id),
-                                    None,
-                                )
-                                if malformed_result is not None:
-                                    interrupted_results.append(malformed_result)
-                                    continue
-                                chunks = partial_output.get(b.id, [])
-                                tool = self._find_tool(b.name)
-                                if chunks and tool:
-                                    msg = tool.format_stream_result(chunks) + "\n[interrupted by user]"
-                                elif chunks:
-                                    msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
-                                else:
-                                    msg = "[interrupted by user]"
-                                interrupted_results.append(
-                                    ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
-                                )
-                            await context.append_many(
-                                [
-                                    Message(role="assistant", content=list(content)),
-                                    Message(
-                                        role="user",
-                                        content=list(interrupted_results),
-                                        provenance=InputProvenance(
-                                            human_authored=False,
-                                            source="tool-result",
-                                            author="axio",
+                                    if prefer_deferral and self.deferred_tool_sink is not None:
+                                        self.deferred_tool_sink.defer(dispatch)
+                                        deferred = True
+                                    elif dispatch_task.done() and not dispatch_task.cancelled():
+                                        try:
+                                            completed_results = {
+                                                result.tool_use_id: result for result in dispatch_task.result()
+                                            }
+                                        except BaseException:
+                                            completed_results = {}
+                                        if self.deferred_tool_sink is not None:
+                                            self.deferred_tool_sink.dispatch_finished(dispatch)
+                                    else:
+                                        if not dispatch_task.done():
+                                            dispatch_task.cancel()
+                                            await asyncio.gather(dispatch_task, return_exceptions=True)
+                                        if self.deferred_tool_sink is not None:
+                                            self.deferred_tool_sink.dispatch_finished(dispatch)
+                                interrupted_results: list[ToolResultBlock] = []
+                                for b in tool_blocks:
+                                    completed = completed_results.get(b.id)
+                                    if completed is not None:
+                                        interrupted_results.append(completed)
+                                        continue
+                                    if deferred and b.id not in malformed:
+                                        interrupted_results.append(
+                                            ToolResultBlock(
+                                                tool_use_id=b.id,
+                                                content=(
+                                                    f"Tool {b.name} continues after interruption. "
+                                                    "Its actual result will arrive as a later user message."
+                                                ),
+                                            )
+                                        )
+                                        continue
+                                    malformed_result = next(
+                                        (result for result in error_results if result.tool_use_id == b.id),
+                                        None,
+                                    )
+                                    if malformed_result is not None:
+                                        interrupted_results.append(malformed_result)
+                                        continue
+                                    chunks = partial_output.get(b.id, [])
+                                    tool = self._find_tool(b.name)
+                                    if chunks and tool:
+                                        msg = tool.format_stream_result(chunks) + "\n[interrupted by user]"
+                                    elif chunks:
+                                        msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
+                                    else:
+                                        msg = "[interrupted by user]"
+                                    interrupted_results.append(
+                                        ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
+                                    )
+                                await context.append_many(
+                                    [
+                                        Message(role="assistant", content=list(content)),
+                                        Message(
+                                            role="user",
+                                            content=list(interrupted_results),
+                                            provenance=InputProvenance(
+                                                human_authored=False,
+                                                source="tool-result",
+                                                author="axio",
+                                            ),
                                         ),
-                                    ),
-                                ]
-                            )
-                            if deferred and dispatch is not None and self.deferred_tool_sink is not None:
-                                self.deferred_tool_sink.protocol_closed(dispatch)
+                                    ]
+                                )
+                                if deferred and dispatch is not None and self.deferred_tool_sink is not None:
+                                    self.deferred_tool_sink.protocol_closed(dispatch)
+
+                            await shield_until_done(finalize_interrupted_dispatch())
                             raise
                         except BaseException:
                             if dispatch_task is not None and not dispatch_task.done():

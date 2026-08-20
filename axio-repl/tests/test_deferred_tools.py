@@ -9,7 +9,15 @@ from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.testing import StubTransport, make_tool_use_response
 from axio.tool import Tool
-from axio_tools_agents.runtime import ExecutionMode, SessionEventHub, new_turn_identity, observe_agent_turn
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    ExecutionMode,
+    MessageCommitted,
+    ObservedContextStore,
+    SessionEventHub,
+    new_turn_identity,
+    observe_agent_turn,
+)
 
 from axio_repl._deferred_tools import (
     DeferredToolNotification,
@@ -185,4 +193,91 @@ async def test_background_turn_deferral_retains_owner_and_closes_protocol_once()
     assert delivered[0].run_id == "child-run"
     assert delivered[0].tool_use_id == "call-1"
     assert delivered[0].text == "actual child result"
+    assert registry.snapshots() == ()
+
+
+async def test_repeat_cancel_cannot_tear_deferred_tool_protocol_finalization() -> None:
+    tool_started = asyncio.Event()
+    tool_release = asyncio.Event()
+    assistant_commit_started = asyncio.Event()
+    assistant_commit_release = asyncio.Event()
+    committed: list[MessageCommitted] = []
+    delivered: list[DeferredToolNotification] = []
+
+    async def slow_tool() -> str:
+        tool_started.set()
+        await tool_release.wait()
+        return "actual result"
+
+    async def deliver(notification: DeferredToolNotification) -> None:
+        delivered.append(notification)
+
+    async def observe_commit(envelope: AgentEventEnvelope) -> None:
+        event = envelope.event
+        if not isinstance(event, MessageCommitted):
+            return
+        committed.append(event)
+        if event.message.role == "assistant" and any(
+            isinstance(block, ToolUseBlock) for block in event.message.content
+        ):
+            assistant_commit_started.set()
+            await assistant_commit_release.wait()
+
+    hub = SessionEventHub()
+    hub.subscribe(observe_commit)
+    registry = DeferredToolRegistry(deliver)
+    context = ObservedContextStore(MemoryContextStore(), hub)
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        context_id=context.session_id,
+    )
+    agent = Agent(
+        system="main",
+        transport=StubTransport([make_tool_use_response("slow", "call-1", {})]),
+        tools=[Tool[Any](name="slow", handler=slow_tool)],
+        deferred_tool_sink=registry,
+    )
+    turn = asyncio.create_task(
+        observe_agent_turn(
+            agent=agent,
+            context=context,
+            prompt="run",
+            identity=identity,
+            hub=hub,
+        )
+    )
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    assert registry.request_preemption(identity.turn_id)
+    turn.cancel("initial cancellation")
+    await asyncio.wait_for(assistant_commit_started.wait(), timeout=1)
+    turn.cancel("late cancellation")
+    assistant_commit_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(turn, timeout=1)
+    assert cancelled.value.args == ("initial cancellation",)
+
+    tool_result_commits = [
+        event
+        for event in committed
+        if event.message.role == "user"
+        and any(
+            isinstance(block, ToolResultBlock) and block.tool_use_id == "call-1" for block in event.message.content
+        )
+    ]
+    assert len(tool_result_commits) == 1
+    assert registry.snapshots()[0].phase is DeferredToolPhase.PROTOCOL_CLOSED
+
+    tool_release.set()
+    for _ in range(10):
+        if delivered:
+            break
+        await asyncio.sleep(0)
+
+    assert len(delivered) == 1
+    assert delivered[0].tool_use_id == "call-1"
+    assert delivered[0].text == "actual result"
     assert registry.snapshots() == ()

@@ -16,7 +16,16 @@ from typing import Any
 import pytest
 from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
-from axio.events import Error, ImageOutput, IterationEnd, StreamEvent, TextDelta
+from axio.events import (
+    Error,
+    ImageOutput,
+    IterationEnd,
+    ReasoningDelta,
+    StreamEvent,
+    TextDelta,
+    ToolInputDelta,
+    ToolUseStart,
+)
 from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.testing import make_text_response, make_tool_use_response
@@ -335,6 +344,84 @@ async def test_one_shot_root_stdout_keeps_the_unlabelled_projection(
     output = capsys.readouterr().out
     assert "stub answer" in output
     assert "── agent axio-repl (main) ──" not in output
+
+
+@pytest.mark.parametrize("no_color", [False, True], ids=("non-tty", "no-color"))
+async def test_one_shot_pipe_emits_no_ansi_or_powerline_even_with_explicit_theme(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    no_color: bool,
+) -> None:
+    import axio_repl
+
+    class StyledOneShotTransport(_OneShotTransport):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.calls = 0
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            self.calls += 1
+            if self.calls == 1:
+                yield ToolUseStart(index=0, tool_use_id="styled-call", name="styled")
+                yield ToolInputDelta(index=0, tool_use_id="styled-call", partial_json="{}")
+                yield IterationEnd(
+                    iteration=1,
+                    stop_reason=StopReason.tool_use,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            yield ReasoningDelta(index=0, delta="visible reasoning")
+            yield TextDelta(index=0, delta="visible answer")
+            yield IterationEnd(
+                iteration=2,
+                stop_reason=StopReason.end_turn,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    async def styled() -> str:
+        return "visible tool result"
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [Tool(name="styled", handler=styled)], "test", tmp_path, ""
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    if no_color:
+        monkeypatch.setenv("NO_COLOR", "1")
+    else:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (StyledOneShotTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "axio-repl",
+            "test prompt",
+            "--sandbox",
+            "none",
+            "--no-session-log",
+            "--theme",
+            "monochrome",
+            "--powerline",
+        ],
+    )
+
+    await main()
+
+    output = capsys.readouterr().out
+    assert "visible reasoning" in output
+    assert "visible tool result" in output
+    assert "visible answer" in output
+    assert "\x1b[" not in output
+    assert "\ue0b0" not in output
 
 
 @pytest.mark.parametrize("agent_actions", ["off", "on"])

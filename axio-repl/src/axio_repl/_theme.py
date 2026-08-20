@@ -39,6 +39,7 @@ class TerminalTheme:
     """Immutable semantic palette shared by every terminal rendering path."""
 
     name: str
+    reset: str
     prompt: TextStyle
     panel: str
     emphasis: TextStyle
@@ -67,6 +68,7 @@ _YELLOW = TerminalColor(33, 43, "ansiyellow")
 
 DEFAULT_THEME = TerminalTheme(
     name="default",
+    reset=RESET,
     prompt=TextStyle("\033[1;97m", "bold ansiwhite"),
     panel="noreverse bg:default fg:#808080",
     emphasis=TextStyle("\033[1m", "bold"),
@@ -87,6 +89,7 @@ DEFAULT_THEME = TerminalTheme(
 
 MONOCHROME_THEME = TerminalTheme(
     name="monochrome",
+    reset=RESET,
     prompt=TextStyle("\033[1;97m", "bold ansiwhite"),
     panel="noreverse bg:default fg:ansiwhite",
     emphasis=TextStyle("\033[1;97m", "bold ansiwhite"),
@@ -103,6 +106,27 @@ MONOCHROME_THEME = TerminalTheme(
     tool_badge=PowerlineStyle(_BLACK, _WHITE),
     agent_badge=PowerlineStyle(_WHITE, _BRIGHT_BLACK),
     action_badge=PowerlineStyle(_BLACK, _GRAY),
+)
+
+NO_COLOR_THEME = TerminalTheme(
+    name="no-color",
+    reset="",
+    prompt=TextStyle(),
+    panel="",
+    emphasis=TextStyle(),
+    tool=TextStyle(),
+    agent=TextStyle(),
+    action=TextStyle(),
+    reasoning=TextStyle(),
+    stdout=TextStyle(),
+    stderr=TextStyle(),
+    error=TextStyle(),
+    success=TextStyle(),
+    warning=TextStyle(),
+    prompt_badge=DEFAULT_THEME.prompt_badge,
+    tool_badge=DEFAULT_THEME.tool_badge,
+    agent_badge=DEFAULT_THEME.agent_badge,
+    action_badge=DEFAULT_THEME.action_badge,
 )
 
 _BUILTIN_THEMES = MappingProxyType(
@@ -127,3 +151,18 @@ def resolve_theme(name: str) -> TerminalTheme:
     except KeyError as exc:
         available = ", ".join(theme_names())
         raise ValueError(f"unknown theme {name!r}; available themes: {available}") from exc
+
+
+def resolve_terminal_presentation(
+    theme: TerminalTheme,
+    *,
+    powerline: bool,
+    one_shot: bool,
+    stdout_is_tty: bool,
+    no_color: bool,
+) -> tuple[TerminalTheme, bool]:
+    """Apply accessibility and output-medium constraints to a selected theme."""
+
+    if no_color or (one_shot and not stdout_is_tty):
+        return NO_COLOR_THEME, False
+    return theme, powerline

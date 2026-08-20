@@ -630,3 +630,56 @@ async def test_cancelled_observed_turn_commits_available_partial_text_once() -> 
         if message.role == "assistant" and message.content == [TextBlock(text="available partial")]
     ]
     assert len(partial_messages) == 1
+
+
+async def test_repeat_cancel_cannot_tear_partial_commit_or_cancelled_lifecycle() -> None:
+    transport = _PartialBlockingTransport()
+    hub = SessionEventHub()
+    inner = MemoryContextStore()
+    context = ObservedContextStore(inner, hub)
+    partial_commit_started = asyncio.Event()
+    partial_commit_release = asyncio.Event()
+    finished: list[TurnFinished] = []
+
+    async def observe(envelope: AgentEventEnvelope) -> None:
+        event = envelope.event
+        if isinstance(event, MessageCommitted) and event.message.role == "assistant":
+            partial_commit_started.set()
+            await partial_commit_release.wait()
+        elif isinstance(event, TurnFinished):
+            finished.append(event)
+
+    hub.subscribe(observe)
+    identity = new_turn_identity(
+        agent_id="child",
+        parent_agent_id="main",
+        execution_mode=ExecutionMode.BACKGROUND,
+        context_id=context.session_id,
+    )
+    task = asyncio.create_task(
+        observe_agent_turn(
+            agent=Agent(system="child", transport=transport),
+            context=context,
+            prompt="work",
+            identity=identity,
+            hub=hub,
+        )
+    )
+    await transport.partial_sent.wait()
+
+    task.cancel("initial cancellation")
+    await asyncio.wait_for(partial_commit_started.wait(), timeout=1)
+    task.cancel("late cancellation")
+    partial_commit_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await asyncio.wait_for(task, timeout=1)
+    assert cancelled.value.args == ("initial cancellation",)
+
+    partial_messages = [
+        message
+        for message in await inner.get_history()
+        if message.role == "assistant" and message.content == [TextBlock(text="available partial")]
+    ]
+    assert len(partial_messages) == 1
+    assert finished == [TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="turn cancelled")]

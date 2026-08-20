@@ -397,6 +397,7 @@ async def test_local_interrupt_is_generation_checked_and_input_admission_reports
     captured_turn_id = admitted[-1][1]
     assert captured_turn_id is not None
     assert interrupt_local_agent_turn(agent_id, captured_turn_id)
+    assert not interrupt_local_agent_turn(agent_id, captured_turn_id)
     await asyncio.wait_for(transport.cancelled[0].wait(), timeout=1)
     await asyncio.wait_for(transport.started[1].wait(), timeout=1)
 

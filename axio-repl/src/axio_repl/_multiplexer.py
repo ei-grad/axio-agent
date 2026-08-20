@@ -11,7 +11,7 @@ from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta,
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, TurnFinished, TurnStarted
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
-from axio_repl._theme import DEFAULT_THEME, RESET, TerminalTheme
+from axio_repl._theme import DEFAULT_THEME, TerminalTheme
 
 _MAX_DISPLAY_COUNT = 999_999_999
 
@@ -57,21 +57,22 @@ class ActionFrame:
     theme: TerminalTheme = DEFAULT_THEME
 
     def render(self) -> str:
+        reset = self.theme.reset
         identity = format_agent_identity(self.agent_id, self.agent_name)
         kind = sanitize_terminal_text(self.kind).replace("\n", " ")[:40]
         body = sanitize_terminal_text(self.body).rstrip("\n")
         if self.powerline:
             return (
-                f"{RESET}\n{action_frame_header(identity, kind, self.theme)}\n{body}\n"
-                f"{action_frame_footer(identity, self.theme)}\n{RESET}\n"
+                f"{reset}\n{action_frame_header(identity, kind, self.theme)}\n{body}\n"
+                f"{action_frame_footer(identity, self.theme)}\n{reset}\n"
             )
         style = self.theme.action.ansi
         if style:
             return (
-                f"{RESET}\n{style}── agent {identity} · {kind} ──{RESET}\n{body}\n"
-                f"{style}── /agent {identity} ──{RESET}\n{RESET}\n"
+                f"{reset}\n{style}── agent {identity} · {kind} ──{reset}\n{body}\n"
+                f"{style}── /agent {identity} ──{reset}\n{reset}\n"
             )
-        return f"{RESET}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{RESET}\n"
+        return f"{reset}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{reset}\n"
 
 
 @dataclass(slots=True)

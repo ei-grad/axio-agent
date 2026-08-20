@@ -54,6 +54,11 @@ autowrap, process streams, and terminal input state.
 Reasoning, answer text, tool fields, and tool output establish and reset their
 own style on every physical terminal line. A later block therefore cannot
 inherit an earlier block's colour after a newline or asynchronous redraw.
+Untrusted model text, tool arguments, streaming tool channels, incoming reports,
+and tool results pass through an incremental terminal-control filter before
+those styles are applied. CSI, OSC, DCS, APC, cursor, screen, scrollback, and
+clipboard controls are removed even when a sequence spans multiple chunks;
+ordinary text, newlines, and tabs remain.
 
 The bottom panel continuously reports the active agent phase: idle, waiting for
 the model, reasoning, responding, or the names and counts of active tools. REPL
@@ -314,6 +319,12 @@ axio-repl --transport openai "write tests for src/auth.py"
 
 Powerline presentation uses filled colour segments with `U+E0B0` (``) separators. The terminal font must provide
 that glyph; the REPL does not substitute a plain-text fallback.
+
+`NO_COLOR` disables application-owned ANSI styling and Powerline regardless of
+the selected `--theme`. A one-shot invocation also selects this plain
+presentation whenever stdout is not a TTY. Interactive `prompt_toolkit` still
+uses terminal cursor controls for editor redraws; `NO_COLOR` governs colour and
+presentation styling, not those required input-control sequences.
 
 The interactive prompt snapshots local time and the effective-UID username for
 each new prompt attempt: plain mode renders `HH:MM username>`, while Powerline
@@ -587,8 +598,11 @@ standard Alt-key word-motion bindings such as Alt+B and Alt+F are therefore not
 available in this prompt.
 
 On an empty editor, the first **Ctrl-D** warns that exit is armed for two
-seconds. A second Ctrl-D during that window starts graceful shutdown. With text
-in the editor, Ctrl-D keeps its normal forward-delete behavior.
+seconds. A second Ctrl-D during that window closes the input source: no new
+editor prompt is created, while the active turn, already submitted input, ready
+claims, peer arrivals, and admission work drain in chronological order before
+shutdown. With text in the editor, Ctrl-D keeps its normal forward-delete
+behavior.
 
 **Ctrl-C** starts graceful REPL shutdown and neither submits nor clears the
 editor. Its current text is included in the shutdown snapshot and restored by
