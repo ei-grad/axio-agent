@@ -668,13 +668,125 @@ async def test_incomplete_active_tool_argument_line_closes_before_error(
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
     await renderer.render(
         "main",
-        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/incomplete'),
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/visible'),
     )
+    visible = sanitize_terminal_text(capsys.readouterr().out)
+    assert visible.endswith("path: /tmp/visible\n")
+
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json="\x1b[3"),
+    )
+    assert capsys.readouterr().out == ""
+
     await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
 
     captured = capsys.readouterr()
-    assert sanitize_terminal_text(captured.out).endswith("path: /tmp/incomplete\n")
+    assert "(continued)" not in captured.out
     assert sanitize_terminal_text(captured.err).startswith("\nError from agent main: provider stream failed")
+
+
+@pytest.mark.parametrize("terminator", ["tool-result", "field-end"])
+async def test_swallowed_active_tool_fragment_never_leaves_a_label_before_termination(
+    capsys: pytest.CaptureFixture[str],
+    terminator: str,
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"visible'),
+    )
+    capsys.readouterr()
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="\x1b[3"))
+    assert capsys.readouterr().out == ""
+
+    if terminator == "tool-result":
+        await renderer.render(
+            "main",
+            ToolResult(tool_use_id="call", name="write_file", is_error=True, content="provider failed"),
+        )
+    else:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert "content (continued):" not in output
+    assert not output.endswith("content: ")
+
+
+async def test_control_only_fragment_defers_exactly_one_label_until_printable_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    capsys.readouterr()
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"\x1b[3'),
+    )
+    assert capsys.readouterr().out == ""
+
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json="1mprintable"),
+    )
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output == "\n  content: printable\n"
+    assert output.count("content:") == 1
+
+
+@pytest.mark.parametrize("terminator", ["error", "tool-result", "field-end"])
+async def test_initial_swallowed_fragment_terminates_on_a_closed_unlabelled_line(
+    capsys: pytest.CaptureFixture[str],
+    terminator: str,
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"\x1b[3'),
+    )
+    if terminator == "error":
+        await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
+    elif terminator == "tool-result":
+        await renderer.render(
+            "main",
+            ToolResult(tool_use_id="call", name="write_file", is_error=True, content="provider failed"),
+        )
+    else:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
+
+    captured = capsys.readouterr()
+    output = sanitize_terminal_text(captured.out)
+    assert "content:" not in output
+    assert output.endswith("\n")
+
+
+async def test_swallowed_continuation_fragment_waits_for_printable_text_before_label(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"visible'),
+    )
+    capsys.readouterr()
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="\x1b[3"))
+    assert capsys.readouterr().out == ""
+
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="1mprintable"))
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output == "  content (continued): printable\n"
+    assert output.count("content (continued):") == 1
 
 
 async def test_multiline_tool_output_reapplies_its_style_after_newlines(

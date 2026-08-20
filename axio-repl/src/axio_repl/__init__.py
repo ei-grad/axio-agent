@@ -1176,10 +1176,14 @@ class ReplRenderer:
         yield
         if continuation is not None:
             state, mode = continuation
-            sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
-            state.tool_arg_at_line_start = False
-            state.mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
-            self._flush()
+            if self._input_active:
+                state.tool_arg_at_line_start = True
+                state.mode = dataclasses.replace(mode, chunk_line_closed=not mode.first_delta)
+            else:
+                sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
+                state.tool_arg_at_line_start = False
+                state.mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
+                self._flush()
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
         state.mode = _BoundaryMode()
@@ -1394,10 +1398,17 @@ class ReplRenderer:
         if not isinstance(event, ReasoningDelta):
             state.reasoning_sanitizer.reset()
         if switched and isinstance(state.mode, _ToolFieldMode):
-            sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){self._theme.reset}: ")
-            self._flush()
-            state.tool_arg_at_line_start = False
-            state.mode = dataclasses.replace(state.mode, first_delta=True, chunk_line_closed=False)
+            if self._input_active:
+                state.tool_arg_at_line_start = True
+                state.mode = dataclasses.replace(
+                    state.mode,
+                    chunk_line_closed=not state.mode.first_delta,
+                )
+            else:
+                sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){self._theme.reset}: ")
+                self._flush()
+                state.tool_arg_at_line_start = False
+                state.mode = dataclasses.replace(state.mode, first_delta=True, chunk_line_closed=False)
         if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
             sys.stdout.write("\n")
             self._flush()
@@ -1549,6 +1560,12 @@ class ReplRenderer:
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
+                if self._input_active and isinstance(state.mode, _ToolFieldMode):
+                    if not state.mode.chunk_line_closed:
+                        sys.stdout.write(f"{self._theme.reset}\n")
+                        self._flush()
+                    state.mode = _BoundaryMode()
+                    state.tool_arg_at_line_start = False
                 if presentation is not None:
                     presentation.error_seen = True
                     if presentation.stdout_started:
@@ -1759,24 +1776,31 @@ class ReplRenderer:
         match event:
             case ToolFieldStart(key=key):
                 key = sanitize_terminal_text(key).replace("\n", " ")
-                leading = "" if state.tool_arg_at_line_start else "\n"
-                sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
-                self._flush()
                 state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
-                state.tool_arg_at_line_start = False
                 state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
+                if not self._input_active:
+                    leading = "" if state.tool_arg_at_line_start else "\n"
+                    sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
+                    self._flush()
+                    state.tool_arg_at_line_start = False
             case ToolFieldDelta(text=text):
                 mode = state.mode
                 if not isinstance(mode, _ToolFieldMode) or mode.tool_use_id != tool_use_id:
                     raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
-                if mode.chunk_line_closed:
-                    sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
-                    state.tool_arg_at_line_start = False
-                    mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
                 sanitizer = state.tool_field_sanitizers.setdefault(
                     (tool_use_id, mode.key), IncrementalTerminalSanitizer()
                 )
                 text = sanitizer.feed(text)
+                if not text:
+                    return
+                if mode.chunk_line_closed:
+                    sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
+                    state.tool_arg_at_line_start = False
+                    mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
+                elif self._input_active and mode.first_delta:
+                    leading = "" if state.tool_arg_at_line_start else "\n"
+                    sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{mode.key}{self._theme.reset}: ")
+                    state.tool_arg_at_line_start = False
                 if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.mode = dataclasses.replace(mode, first_delta=False)
@@ -1795,7 +1819,7 @@ class ReplRenderer:
                 self._flush()
             case ToolFieldEnd():
                 if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
-                    if not state.mode.chunk_line_closed:
+                    if not state.mode.chunk_line_closed and not (self._input_active and state.mode.first_delta):
                         sys.stdout.write(self._theme.reset)
                         self._flush()
                     state.tool_field_sanitizers.pop((tool_use_id, state.mode.key), None)
