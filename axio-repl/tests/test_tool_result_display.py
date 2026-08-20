@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from axio.diff import describe_patch
 
 from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
@@ -89,6 +90,26 @@ def test_only_truncated_final_hunk_is_exempt_from_exact_counts() -> None:
     assert parse_patch_result(bad_complete_hunk) is None
     assert parse_patch_result(valid.replace("...[diff truncated]\n", "")) is None
     assert parse_patch_result(valid + "+after-marker\n") is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "+2 -0\n@@ -0,0 +1 @@\n+one\n+two\n...[diff truncated]\n",
+        "+0 -2\n@@ -1 +0,0 @@\n-one\n-two\n...[diff truncated]\n",
+        "+1 -0\n@@ -1 +1 @@\n context\n+extra\n...[diff truncated]\n",
+        "+1 -1\n@@ -1 +1 @@\n-old\n+new\n context\n...[diff truncated]\n",
+        ("+3 -2\n@@ -1 +1 @@ one\n-old\n+new\n@@ -10 +10 @@ two\n-before\n+after\n+overflow\n...[diff truncated]\n"),
+    ],
+)
+def test_truncation_never_exempts_old_or_new_overcount(content: str) -> None:
+    assert parse_patch_result(content) is None
+
+
+def test_truncated_final_hunk_may_be_under_count_but_not_over_count() -> None:
+    content = "+20 -20\n@@ -1 +1 @@ one\n-old\n+new\n@@ -20,19 +20,19 @@ two\n-partial\n...[diff truncated]\n"
+
+    assert parse_patch_result(content) is not None
 
 
 def test_parser_accepts_the_actual_bounded_patch_result() -> None:

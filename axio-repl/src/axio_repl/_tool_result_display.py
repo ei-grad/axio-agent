@@ -67,6 +67,9 @@ class _HunkState:
     def is_complete(self) -> bool:
         return self.saw_change and self.observed_old == self.expected_old and self.observed_new == self.expected_new
 
+    def is_overfull(self) -> bool:
+        return self.observed_old > self.expected_old or self.observed_new > self.expected_new
+
 
 def parse_patch_result(content: str, *, include_legacy_path: bool = False) -> PatchResultDisplay | None:
     """Parse a compact patch diff, failing open with ``None`` on any mismatch."""
@@ -146,6 +149,8 @@ def _parse_patch_result(content: str, *, include_legacy_path: bool) -> PatchResu
             hunk.metadata_allowed = False
             kind = DiffLineKind.METADATA
         else:
+            return None
+        if hunk.is_overfull():
             return None
         parsed.append(DiffDisplayLine(line, kind))
     if hunk is None or (not truncated and not hunk.is_complete()):

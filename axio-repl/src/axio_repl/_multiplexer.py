@@ -20,6 +20,8 @@ from axio_repl._tool_result_display import (
 )
 
 _MAX_DISPLAY_COUNT = 999_999_999
+_FRAME_TRUNCATION_NOTICE = "[… truncated]"
+_FRAME_TRUNCATION_SUFFIX = f"\n{_FRAME_TRUNCATION_NOTICE}"
 
 
 class DisplayMode(StrEnum):
@@ -199,7 +201,7 @@ def format_agent_identity(agent_id: str, agent_name: str | None = None) -> str:
     return f"{clean_name} ({clean_id})"
 
 
-def _fit_utf8(text: str, limit: int, *, suffix: str = "\n[… truncated]") -> str:
+def _fit_utf8(text: str, limit: int, *, suffix: str = _FRAME_TRUNCATION_SUFFIX) -> str:
     data = text.encode("utf-8")
     if limit <= 0:
         return ""
@@ -211,6 +213,24 @@ def _fit_utf8(text: str, limit: int, *, suffix: str = "\n[… truncated]") -> st
     available = max(0, limit - len(suffix_bytes))
     prefix = data[:available].decode("utf-8", errors="ignore")
     return prefix + suffix
+
+
+def _align_line_kinds(
+    text: str,
+    line_kinds: tuple[DiffLineKind, ...] | None,
+    *,
+    generated_truncation: bool,
+) -> tuple[DiffLineKind, ...] | None:
+    if line_kinds is None:
+        return None
+    lines = text.split("\n")
+    aligned = list(line_kinds[: len(lines)])
+    aligned.extend(DiffLineKind.METADATA for _ in range(len(lines) - len(aligned)))
+    if generated_truncation:
+        for index, line in enumerate(lines):
+            if line == _FRAME_TRUNCATION_NOTICE:
+                aligned[index] = DiffLineKind.METADATA
+    return tuple(aligned)
 
 
 class ActionMultiplexer:
@@ -676,7 +696,14 @@ class ActionMultiplexer:
                     theme=self._theme,
                 )
                 overhead = len(frame.render().encode("utf-8"))
+        unfitted_body = clean_body
         clean_body = _fit_utf8(clean_body, max(0, self._max_frame_bytes - overhead))
+        generated_truncation = clean_body != unfitted_body
+        fitted_line_kinds = _align_line_kinds(
+            clean_body,
+            body_line_kinds,
+            generated_truncation=generated_truncation,
+        )
         self._sequence += 1
         frame = ActionFrame(
             agent_id=agent_id,
@@ -687,13 +714,20 @@ class ActionMultiplexer:
             agent_name=agent_name,
             powerline=self._powerline,
             theme=self._theme,
-            body_line_kinds=body_line_kinds,
+            body_line_kinds=fitted_line_kinds,
         )
         while self._frame_size(frame) > self._max_frame_bytes and clean_body:
             excess = self._frame_size(frame) - self._max_frame_bytes
             body_budget = max(0, len(clean_body.encode("utf-8")) - max(1, excess))
+            previous_body = clean_body
             clean_body = _fit_utf8(clean_body, body_budget)
-            frame = replace(frame, body=clean_body)
+            generated_truncation = generated_truncation or clean_body != previous_body
+            fitted_line_kinds = _align_line_kinds(
+                clean_body,
+                body_line_kinds,
+                generated_truncation=generated_truncation,
+            )
+            frame = replace(frame, body=clean_body, body_line_kinds=fitted_line_kinds)
         queue = self._queues.setdefault(agent_id, deque())
         queue.append(frame)
         self._queued_bytes += self._frame_size(frame)

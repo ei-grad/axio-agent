@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePath
 
 _PYTHON_EXTENSIONS = frozenset({".py", ".pyi"})
@@ -73,6 +73,48 @@ class _IndentSymbol:
 class _BraceSymbol:
     open_depth: int
     label: str
+
+
+@dataclass(slots=True)
+class _MaskMetrics:
+    lexical_steps: int = 0
+
+
+@dataclass(slots=True)
+class _JavaScriptLineState:
+    expression_start: bool = True
+    last_significant_category: str = "line-start"
+    word: list[str] = field(default_factory=list)
+
+    def can_start_regex(self) -> bool:
+        self.finish_word()
+        return self.expression_start and self.last_significant_category in {
+            "line-start",
+            "operator",
+            "keyword",
+        }
+
+    def consume(self, character: str) -> None:
+        if character.isascii() and (character.isalnum() or character in "_$"):
+            self.word.append(character)
+            self.last_significant_category = "word"
+            return
+        self.finish_word()
+        if not character.isspace():
+            self.expression_start = character == "/" or character in _JS_REGEX_PREFIX_CHARS
+            self.last_significant_category = "operator" if self.expression_start else "value"
+
+    def consume_value(self) -> None:
+        self.word.clear()
+        self.expression_start = False
+        self.last_significant_category = "value"
+
+    def finish_word(self) -> None:
+        if not self.word:
+            return
+        self.expression_start = "".join(self.word) in _JS_REGEX_PREFIX_WORDS
+        self.last_significant_category = "keyword" if self.expression_start else "value"
+        self.word.clear()
 
 
 def line_contexts(path: str, lines: Sequence[str]) -> tuple[str | None, ...]:
@@ -309,7 +351,12 @@ def _parenthesis_depth(text: str, end: int) -> int:
     return depth
 
 
-def _mask_brace_source(lines: Sequence[str], extension: str) -> tuple[list[str], bool]:
+def _mask_brace_source(
+    lines: Sequence[str],
+    extension: str,
+    *,
+    metrics: _MaskMetrics | None = None,
+) -> tuple[list[str], bool]:
     masked: list[str] = []
     reliable = True
     block_depth = 0
@@ -318,6 +365,7 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> tuple[list[str],
     preprocessor_continuation = False
 
     for raw_line in lines:
+        javascript = _JavaScriptLineState()
         if extension in _C_FAMILY_EXTENSIONS and (preprocessor_continuation or raw_line.lstrip().startswith("#")):
             preprocessor_continuation = raw_line.rstrip().endswith("\\")
             masked.append(" " * len(raw_line))
@@ -325,6 +373,7 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> tuple[list[str],
         output: list[str] = []
         index = 0
         while index < len(raw_line):
+            _record_mask_work(metrics)
             character = raw_line[index]
             following = raw_line[index + 1] if index + 1 < len(raw_line) else ""
             if block_depth:
@@ -348,31 +397,42 @@ def _mask_brace_source(lines: Sequence[str], extension: str) -> tuple[list[str],
                     escaped = True
                 elif character == quote:
                     quote = None
+                    if extension in _JAVASCRIPT_EXTENSIONS:
+                        javascript.consume_value()
                 index += 1
                 continue
             if character == "/" and following == "/":
+                javascript.finish_word()
+                _record_mask_work(metrics, len(raw_line) - index)
                 output.extend(" " * (len(raw_line) - index))
                 break
             if character == "/" and following == "*":
+                javascript.finish_word()
                 block_depth = 1
                 output.extend((" ", " "))
                 index += 2
                 continue
-            if extension in _JAVASCRIPT_EXTENSIONS and character == "/" and _starts_javascript_regex(output):
-                end, _ = _javascript_regex_end(raw_line, index)
+            if extension in _JAVASCRIPT_EXTENSIONS and character == "/" and javascript.can_start_regex():
+                end, _ = _javascript_regex_end(raw_line, index, metrics=metrics)
+                _record_mask_work(metrics, end - index)
                 output.extend("\n" if item == "\n" else " " for item in raw_line[index:end])
                 index = end
+                javascript.consume_value()
                 continue
             if extension in _JAVASCRIPT_EXTENSIONS and character == "/":
-                possible_end, closed = _javascript_regex_end(raw_line, index)
+                possible_end, closed = _javascript_regex_end(raw_line, index, metrics=metrics)
                 if closed and any(item in "{}" for item in raw_line[index:possible_end]):
                     reliable = False
             if character in {'"', "'", "`"} and _starts_quote(raw_line, index, character, extension):
                 quote = character
+                if extension in _JAVASCRIPT_EXTENSIONS:
+                    javascript.consume_value()
                 output.append(" ")
                 index += 1
                 continue
             output.append(character if character >= " " or character == "\t" else " ")
+            if extension in _JAVASCRIPT_EXTENSIONS:
+                javascript.consume(character)
             index += 1
         if quote in {'"', "'"}:
             quote = None
@@ -388,19 +448,17 @@ def _starts_quote(line: str, index: int, quote: str, extension: str) -> bool:
     return closing > index + 1
 
 
-def _starts_javascript_regex(output: list[str]) -> bool:
-    prefix = "".join(output).rstrip()
-    if not prefix or prefix[-1] in _JS_REGEX_PREFIX_CHARS:
-        return True
-    word_match = re.search(r"[A-Za-z_$][A-Za-z0-9_$]*$", prefix)
-    return word_match is not None and word_match.group() in _JS_REGEX_PREFIX_WORDS
-
-
-def _javascript_regex_end(line: str, start: int) -> tuple[int, bool]:
+def _javascript_regex_end(
+    line: str,
+    start: int,
+    *,
+    metrics: _MaskMetrics | None = None,
+) -> tuple[int, bool]:
     escaped = False
     in_character_class = False
     index = start + 1
     while index < len(line):
+        _record_mask_work(metrics)
         character = line[index]
         if character == "\n":
             return index, False
@@ -419,3 +477,8 @@ def _javascript_regex_end(line: str, start: int) -> tuple[int, bool]:
             return index, True
         index += 1
     return index, False
+
+
+def _record_mask_work(metrics: _MaskMetrics | None, amount: int = 1) -> None:
+    if metrics is not None:
+        metrics.lexical_steps += amount

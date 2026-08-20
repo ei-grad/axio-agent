@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from axio.diff import describe_patch
+from axio.symbol_context import _mask_brace_source, _MaskMetrics
 
 
 def _replace(path: str, before: str, old: str, new: str) -> str:
@@ -172,6 +173,27 @@ def test_ambiguous_javascript_regex_position_omits_context_instead_of_guessing()
 
     assert "@@ -3,5 +3,5 @@\n" in result
     assert "one.two" not in result
+
+
+def test_javascript_slash_masking_has_linear_deterministic_work() -> None:
+    measurements: list[tuple[int, int]] = []
+    for target_size in (4_000, 8_000, 16_000, 32_000):
+        divisions = "a/b;" * (target_size // 4)
+        source = f"function run() {{{divisions}const matcher=/\\{{/;return matcher;}}\n"
+        metrics = _MaskMetrics()
+
+        [masked], reliable = _mask_brace_source([source], ".js", metrics=metrics)
+
+        assert reliable
+        assert len(masked) == len(source)
+        assert "a/b;" in masked
+        assert "/\\{/" not in masked
+        assert metrics.lexical_steps <= 6 * len(source)
+        measurements.append((len(source), metrics.lexical_steps))
+
+    for (previous_size, previous_steps), (size, steps) in zip(measurements, measurements[1:]):
+        assert size <= 2 * previous_size + 64
+        assert steps <= 2 * previous_steps + 64
 
 
 def test_valid_nested_javascript_function_keeps_nearest_context() -> None:

@@ -6,7 +6,7 @@ from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
-from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
+from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME
 
 
 def test_display_mode_accepts_cli_and_descriptive_names() -> None:
@@ -156,8 +156,14 @@ def test_background_styled_patch_frame_byte_accounting_includes_ansi_and_truncat
     assert f"{DEFAULT_THEME.stdout.ansi}...[diff truncated]{DEFAULT_THEME.reset}" in result
 
 
-def test_background_styled_patch_frame_remains_bounded_when_body_is_cut() -> None:
-    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, max_frame_bytes=260)
+@pytest.mark.parametrize("powerline", [False, True])
+def test_background_styled_patch_frame_remains_bounded_when_body_is_cut(powerline: bool) -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        powerline=powerline,
+        theme=MONOCHROME_THEME,
+        max_frame_bytes=260,
+    )
     mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
     mux.observe("child", ToolInputDelta(index=0, tool_use_id="patch", partial_json="{}"))
     mux.drain()
@@ -176,8 +182,39 @@ def test_background_styled_patch_frame_remains_bounded_when_body_is_cut() -> Non
 
     assert retained == len(result.encode("utf-8"))
     assert len(result.encode("utf-8")) <= 260
-    assert DEFAULT_THEME.error.ansi in result
-    assert f"{DEFAULT_THEME.reset}\n── /agent child" in result
+    notice = f"{MONOCHROME_THEME.stdout.ansi}[… truncated]{MONOCHROME_THEME.reset}"
+    assert notice in result
+    assert f"{MONOCHROME_THEME.success.ansi}[… truncated]" not in result
+    assert f"{MONOCHROME_THEME.error.ansi}[… truncated]" not in result
+    assert f"{MONOCHROME_THEME.reasoning.ansi}[… truncated]" not in result
+    if powerline:
+        assert " /agent child " in result
+    else:
+        assert "── /agent child ──" in result
+
+
+def test_background_generated_truncation_notice_respects_no_color() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME, max_frame_bytes=220)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="patch", partial_json="{}"))
+    mux.drain()
+    mux.observe(
+        "child",
+        ToolResult(
+            tool_use_id="patch",
+            name="patch_file",
+            is_error=False,
+            content=f"+1 -1\n@@ -1 +1 @@ run\n-{'x' * 300}\n+{'y' * 300}\n",
+        ),
+    )
+    retained = mux.queued_bytes
+
+    [result] = mux.drain(max_frames=1, max_bytes=220)
+
+    assert retained == len(result.encode("utf-8"))
+    assert len(result.encode("utf-8")) <= 220
+    assert "[… truncated]" in result
+    assert "\x1b[" not in result
 
 
 def test_background_write_ack_suppression_is_structural_and_errors_remain_visible() -> None:
