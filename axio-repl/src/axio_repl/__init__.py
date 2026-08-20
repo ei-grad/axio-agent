@@ -25,6 +25,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, supp
 from contextvars import ContextVar
 from datetime import datetime
 from importlib.metadata import entry_points
+from io import StringIO
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple, cast
@@ -184,7 +185,6 @@ it gets silence where the report should be.
 AGENT_NAME = "axio-repl"
 MAX_PENDING_INPUTS = 32
 AGENT_VERSION = "0.2.3"
-TOOL_ARG_PREVIEW_CHARS = 256
 
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
@@ -550,14 +550,12 @@ class _ReasoningMode:
     pass
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(slots=True)
 class _ToolFieldMode:
     tool_use_id: str
     key: str
-    bounded_preview: bool = False
-    first_delta: bool = True
-    chunk_line_closed: bool = False
-    preview_buffer: str = ""
+    multiline: bool = False
+    pending: StringIO = dataclasses.field(default_factory=StringIO)
 
 
 type _StructuralMode = _BoundaryMode | _TextMode | _ReasoningMode | _ToolFieldMode
@@ -578,6 +576,7 @@ class _AgentRenderState:
         self.reasoning_sanitizer = IncrementalTerminalSanitizer()
         self.tool_output_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
         self.tool_field_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
+        self.tool_field_modes: dict[str, _ToolFieldMode] = {}
         self.tool_arg_at_line_start = False
 
 
@@ -1161,34 +1160,23 @@ class ReplRenderer:
     def _persistent_insertion_locked(self) -> Iterator[None]:
         """Bracket an out-of-band scrollback line without tearing stream structure."""
 
-        continuation: tuple[_AgentRenderState, _ToolFieldMode] | None = None
         if self._active_agent is not None:
             state = self._state(self._active_agent)
-            if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
-                self._drain_prompt_tool_field_preview_locked(state, force=True)
             mode = state.mode
             if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
                 sys.stdout.write(self._theme.reset)
                 state.mode = _BoundaryMode()
-            elif isinstance(mode, _ToolFieldMode) and mode.chunk_line_closed:
-                state.mode = _BoundaryMode()
+            elif isinstance(mode, _ToolFieldMode):
+                self._force_tool_field_boundary_locked(state)
+                if not state.tool_arg_at_line_start:
+                    sys.stdout.write(f"{self._theme.reset}\n")
+                    state.tool_arg_at_line_start = True
+                    self._flush()
             elif not isinstance(mode, _BoundaryMode):
                 sys.stdout.write(f"{self._theme.reset}\n")
                 self._flush()
                 state.mode = _BoundaryMode()
-            if isinstance(mode, _ToolFieldMode):
-                continuation = (state, mode)
         yield
-        if continuation is not None:
-            state, mode = continuation
-            if mode.bounded_preview:
-                state.tool_arg_at_line_start = True
-                state.mode = dataclasses.replace(mode, chunk_line_closed=not mode.first_delta)
-            else:
-                sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
-                state.tool_arg_at_line_start = False
-                state.mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
-                self._flush()
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
         state.mode = _BoundaryMode()
@@ -1204,6 +1192,9 @@ class ReplRenderer:
         state.reasoning_sanitizer.reset()
         state.tool_output_sanitizers.clear()
         state.tool_field_sanitizers.clear()
+        for mode in state.tool_field_modes.values():
+            mode.pending.close()
+        state.tool_field_modes.clear()
         state.tool_arg_at_line_start = False
 
     def _remember_agent_locked(self, agent_id: str, agent_name: str) -> None:
@@ -1376,8 +1367,6 @@ class ReplRenderer:
         if switched:
             if self._active_agent is not None:
                 active_state = self._state(self._active_agent)
-                if isinstance(active_state.mode, _ToolFieldMode) and active_state.mode.bounded_preview:
-                    self._drain_prompt_tool_field_preview_locked(active_state, force=True)
                 if isinstance(active_state.mode, _ReasoningMode):
                     sys.stdout.write("\n")
                     active_state.mode = _BoundaryMode()
@@ -1385,8 +1374,11 @@ class ReplRenderer:
                     print()
                     active_state.mode = _BoundaryMode()
                 elif isinstance(active_state.mode, _ToolFieldMode):
-                    if not active_state.mode.chunk_line_closed:
-                        sys.stdout.write("\n")
+                    self._force_tool_field_boundary_locked(active_state)
+                    if not active_state.tool_arg_at_line_start:
+                        sys.stdout.write(f"{self._theme.reset}\n")
+                        active_state.tool_arg_at_line_start = True
+                        self._flush()
             self._active_agent = agent_id
         state = self._state(agent_id)
         return state, switched
@@ -1397,25 +1389,13 @@ class ReplRenderer:
         event: StreamEvent,
         presentation: _TurnPresentation | None,
     ) -> None:  # noqa: C901
-        state, switched = self._switch_agent(agent_id)
+        state, _ = self._switch_agent(agent_id)
         if self._event_starts_stdout(event, presentation):
             self._ensure_stdout_header_locked(agent_id, presentation)
         if not isinstance(event, TextDelta):
             state.text_sanitizer.reset()
         if not isinstance(event, ReasoningDelta):
             state.reasoning_sanitizer.reset()
-        if switched and isinstance(state.mode, _ToolFieldMode):
-            if state.mode.bounded_preview:
-                state.tool_arg_at_line_start = True
-                state.mode = dataclasses.replace(
-                    state.mode,
-                    chunk_line_closed=not state.mode.first_delta,
-                )
-            else:
-                sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){self._theme.reset}: ")
-                self._flush()
-                state.tool_arg_at_line_start = False
-                state.mode = dataclasses.replace(state.mode, first_delta=True, chunk_line_closed=False)
         if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
             sys.stdout.write("\n")
             self._flush()
@@ -1478,6 +1458,9 @@ class ReplRenderer:
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
+                elif isinstance(state.mode, _ToolFieldMode):
+                    self._force_tool_field_boundary_locked(state)
+                    state.mode = _BoundaryMode()
                 safe_name = sanitize_terminal_text(name)
                 if self._powerline:
                     sys.stdout.write(f"\n{tool_title(safe_name, self._theme)}")
@@ -1490,6 +1473,7 @@ class ReplRenderer:
                 state.tool_arg_at_line_start = False
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
+                self._activate_tool_field_locked(state, tid)
                 stream = state.arg_streams.get(tid)
                 if stream:
                     for fe in stream.feed(pj):
@@ -1497,7 +1481,7 @@ class ReplRenderer:
                     if stream.done:
                         if not state.tool_arg_at_line_start:
                             sys.stdout.write("\n")
-                        state.tool_arg_at_line_start = False
+                        state.tool_arg_at_line_start = True
                         self._flush()
                         del state.arg_streams[tid]
                         if self._only_passive_tools_active(state):
@@ -1513,10 +1497,9 @@ class ReplRenderer:
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
-                if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
-                    if state.mode.tool_use_id == tid:
-                        self._drain_prompt_tool_field_preview_locked(state, force=True)
-                        state.mode = _BoundaryMode()
+                self._activate_tool_field_locked(state, tid)
+                if isinstance(state.mode, _ToolFieldMode):
+                    self._close_tool_field_locked(state)
                 content = sanitize_terminal_text(content)
                 parent_key = self._parent_tool_key(agent_id, tid, presentation)
                 foreground_result = self._streamed_foreground_calls.pop(parent_key, None)
@@ -1552,6 +1535,8 @@ class ReplRenderer:
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
                 state.tool_names.pop(tid, None)
+                if mode := state.tool_field_modes.pop(tid, None):
+                    mode.pending.close()
                 state.tool_arg_at_line_start = False
                 for sanitizer_key in tuple(state.tool_output_sanitizers):
                     if sanitizer_key[0] == tid:
@@ -1571,13 +1556,7 @@ class ReplRenderer:
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
-                if isinstance(state.mode, _ToolFieldMode) and state.mode.bounded_preview:
-                    self._drain_prompt_tool_field_preview_locked(state, force=True)
-                    if not state.mode.chunk_line_closed:
-                        sys.stdout.write(f"{self._theme.reset}\n")
-                        self._flush()
-                    state.mode = _BoundaryMode()
-                    state.tool_arg_at_line_start = False
+                self._close_all_tool_fields_locked(state)
                 if presentation is not None:
                     presentation.error_seen = True
                     if presentation.stdout_started:
@@ -1603,6 +1582,8 @@ class ReplRenderer:
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
+                else:
+                    self._close_all_tool_fields_locked(state)
                 state.mode = _BoundaryMode()
                 self._discard_suspended_owner_locked(agent_id)
                 self._drain_safe_boundary_locked()
@@ -1730,12 +1711,16 @@ class ReplRenderer:
                         state.arg_streams.pop(tool_use_id, None)
                         if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
                             state.mode = _BoundaryMode()
+                        if mode := state.tool_field_modes.pop(tool_use_id, None):
+                            mode.pending.close()
             case ToolOutputDelta(tool_use_id=tool_use_id):
                 state.streamed_tool_ids.add(tool_use_id)
             case ToolResult(tool_use_id=tool_use_id):
                 state.active_tool_ids.discard(tool_use_id)
                 state.arg_streams.pop(tool_use_id, None)
                 state.tool_names.pop(tool_use_id, None)
+                if mode := state.tool_field_modes.pop(tool_use_id, None):
+                    mode.pending.close()
                 self._suspended_tool_calls.discard((agent_id, tool_use_id))
             case _:
                 pass
@@ -1788,90 +1773,116 @@ class ReplRenderer:
         match event:
             case ToolFieldStart(key=key):
                 key = sanitize_terminal_text(key).replace("\n", " ")
-                state.mode = _ToolFieldMode(
-                    tool_use_id=tool_use_id,
-                    key=key,
-                    bounded_preview=self._input_active,
-                )
+                started_mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
+                state.tool_field_modes[tool_use_id] = started_mode
+                state.mode = started_mode
                 state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
-                if not state.mode.bounded_preview:
-                    leading = "" if state.tool_arg_at_line_start else "\n"
-                    sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
-                    self._flush()
-                    state.tool_arg_at_line_start = False
             case ToolFieldDelta(text=text):
-                mode = state.mode
-                if not isinstance(mode, _ToolFieldMode) or mode.tool_use_id != tool_use_id:
+                delta_mode = state.tool_field_modes.get(tool_use_id)
+                if delta_mode is None:
                     raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
+                state.mode = delta_mode
                 sanitizer = state.tool_field_sanitizers.setdefault(
-                    (tool_use_id, mode.key), IncrementalTerminalSanitizer()
+                    (tool_use_id, delta_mode.key), IncrementalTerminalSanitizer()
                 )
                 text = sanitizer.feed(text)
                 if not text:
                     return
-                if mode.bounded_preview:
-                    state.mode = dataclasses.replace(mode, preview_buffer=mode.preview_buffer + text)
-                    self._drain_prompt_tool_field_preview_locked(state, force=False)
-                    return
-                if mode.chunk_line_closed:
-                    sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
-                    state.tool_arg_at_line_start = False
-                    mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
-                if mode.first_delta and "\n" in text:
-                    sys.stdout.write("\n")
-                state.mode = dataclasses.replace(mode, first_delta=False)
-                sys.stdout.write(_styled(self._theme.reasoning.ansi, text))
-                self._flush()
+                self._append_tool_field_text_locked(state, text)
             case ToolFieldEnd():
-                if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
-                    if state.mode.bounded_preview:
-                        self._drain_prompt_tool_field_preview_locked(state, force=True)
-                    if not state.mode.chunk_line_closed and not (
-                        state.mode.bounded_preview and state.mode.first_delta
-                    ):
-                        sys.stdout.write(self._theme.reset)
-                        self._flush()
-                    state.tool_field_sanitizers.pop((tool_use_id, state.mode.key), None)
-                    state.mode = _BoundaryMode()
+                ended_mode = state.tool_field_modes.get(tool_use_id)
+                if ended_mode is not None:
+                    state.mode = ended_mode
+                    self._close_tool_field_locked(state)
 
-    def _drain_prompt_tool_field_preview_locked(
-        self,
-        state: _AgentRenderState,
-        *,
-        force: bool,
-    ) -> None:
+    def _tool_field_header(self, key: str) -> str:
+        if self._theme.reset:
+            background = self._theme.tool_badge.background.ansi_background
+            margin = f"\033[{background}m {self._theme.reset} "
+        else:
+            margin = ""
+        return f"{margin}{self._theme.warning.ansi}{key}{self._theme.reset}:"
+
+    def _write_tool_field_header_locked(self, state: _AgentRenderState, key: str) -> None:
+        leading = "" if state.tool_arg_at_line_start else "\n"
+        sys.stdout.write(f"{leading}{self._tool_field_header(key)}")
+        state.tool_arg_at_line_start = False
+
+    def _write_tool_field_block_lines_locked(self, state: _AgentRenderState, text: str) -> None:
+        if not text.endswith("\n"):
+            raise ValueError("tool field block fragments must end at a natural line boundary")
+        for line in text.split("\n")[:-1]:
+            sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, line)}\n")
+        state.tool_arg_at_line_start = True
+
+    def _activate_tool_field_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
+        current = state.mode
+        if isinstance(current, _ToolFieldMode) and current.tool_use_id != tool_use_id:
+            self._force_tool_field_boundary_locked(state)
+            state.mode = _BoundaryMode()
+        if mode := state.tool_field_modes.get(tool_use_id):
+            state.mode = mode
+
+    def _append_tool_field_text_locked(self, state: _AgentRenderState, text: str) -> None:
+        mode = state.mode
+        if not isinstance(mode, _ToolFieldMode):
+            raise RuntimeError("tool field text requires tool field render mode")
+
+        if "\n" not in text:
+            mode.pending.write(text)
+            return
+
+        mode.pending.write(text)
+        pending = mode.pending.getvalue()
+        complete_end = pending.rfind("\n") + 1
+        if not mode.multiline:
+            self._write_tool_field_header_locked(state, mode.key)
+            sys.stdout.write("\n")
+            mode.multiline = True
+        self._write_tool_field_block_lines_locked(state, pending[:complete_end])
+        mode.pending.seek(0)
+        mode.pending.truncate(0)
+        mode.pending.write(pending[complete_end:])
+        self._flush()
+
+    def _force_tool_field_boundary_locked(self, state: _AgentRenderState) -> None:
+        mode = state.mode
+        if not isinstance(mode, _ToolFieldMode) or mode.pending.tell() == 0:
+            return
+        if not mode.multiline:
+            self._write_tool_field_header_locked(state, mode.key)
+            sys.stdout.write("\n")
+            mode.multiline = True
+        sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, mode.pending.getvalue())}\n")
+        state.tool_arg_at_line_start = True
+        mode.pending.seek(0)
+        mode.pending.truncate(0)
+        self._flush()
+
+    def _close_tool_field_locked(self, state: _AgentRenderState) -> None:
         mode = state.mode
         if not isinstance(mode, _ToolFieldMode):
             return
-        emitted = False
-        while mode.preview_buffer:
-            newline = mode.preview_buffer.find("\n")
-            if 0 <= newline <= TOOL_ARG_PREVIEW_CHARS:
-                end = newline + 1
-            elif len(mode.preview_buffer) >= TOOL_ARG_PREVIEW_CHARS:
-                end = TOOL_ARG_PREVIEW_CHARS
-            elif force:
-                end = len(mode.preview_buffer)
-            else:
-                break
+        pending = mode.pending.getvalue()
+        if mode.multiline:
+            if pending:
+                sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, pending)}\n")
+        else:
+            self._write_tool_field_header_locked(state, mode.key)
+            sys.stdout.write(f" {_styled(self._theme.reasoning.ansi, pending)}\n")
+        state.tool_arg_at_line_start = True
+        sanitizer = state.tool_field_sanitizers.pop((mode.tool_use_id, mode.key), None)
+        if sanitizer is not None:
+            sanitizer.reset()
+        mode.pending.close()
+        state.tool_field_modes.pop(mode.tool_use_id, None)
+        state.mode = _BoundaryMode()
+        self._flush()
 
-            text = mode.preview_buffer[:end]
-            mode = dataclasses.replace(mode, preview_buffer=mode.preview_buffer[end:])
-            leading = "" if state.tool_arg_at_line_start else "\n"
-            label = mode.key if mode.first_delta else f"{mode.key} (continued)"
-            sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{label}{self._theme.reset}: ")
-            styled = _styled(self._theme.reasoning.ansi, text)
-            if text.endswith("\n") and self._theme.reasoning.ansi:
-                styled = styled[: -len(self._theme.reasoning.ansi + self._theme.reset)]
-            sys.stdout.write(styled)
-            if not text.endswith("\n"):
-                sys.stdout.write(f"{self._theme.reset}\n")
-            state.tool_arg_at_line_start = True
-            mode = dataclasses.replace(mode, first_delta=False, chunk_line_closed=True)
+    def _close_all_tool_fields_locked(self, state: _AgentRenderState) -> None:
+        for mode in tuple(state.tool_field_modes.values()):
             state.mode = mode
-            emitted = True
-        if emitted:
-            self._flush()
+            self._close_tool_field_locked(state)
 
 
 async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvelope) -> None:

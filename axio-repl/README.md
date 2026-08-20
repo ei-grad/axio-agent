@@ -34,8 +34,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
 - **Runtime model switching** — `/model <query>` to switch models mid-session
   without restarting. Capabilities (vision, reasoning, image generation) are
   re-evaluated and the system prompt adapts automatically.
-- **Streaming tool arguments** — tool call fields appear before execution at
-  decoded newlines, field completion, or bounded 256-character preview chunks.
+- **Streaming tool arguments** — completed single-line fields render inline;
+  multiline fields switch to an unindented block at their first decoded newline.
 - **Streaming tool output** — tagged shell stdout/stderr chunks appear as soon
   as the executor observes them instead of waiting for completion or a newline.
 - **Vision** — `read_file` on images (PNG, JPG, GIF, WebP) and videos returns
@@ -111,14 +111,34 @@ including controls split across streaming chunks. Application-owned ANSI styles
 are reset and re-established on each physical line so reasoning or tool colours
 cannot leak into a later answer block.
 
-With an interactive prompt open, tool argument previews are grouped by decoded
-field lines rather than provider transport deltas. A newline-free value is
-flushed every 256 sanitized characters, and any remaining tail is flushed when
-the field completes or another persistent output line must be inserted. This
-keeps progress visible and preview memory bounded without turning token-sized
-provider chunks into one scrollback line each. The exact incremental JSON stream
-still goes to the tool argument parser; this grouping changes only its terminal
-projection.
+Tool argument presentation does not expose provider transport chunks. The
+renderer buffers a field until its first decoded newline or completion. A
+single-line value is then shown inline; the first newline instead produces one
+parameter header followed by value lines at column zero. Complete natural lines
+stream immediately and only the unfinished tail remains buffered. A long
+newline-free value is intentionally retained until completion, so display memory
+for that field grows with its sanitized length.
+
+Parameter headers carry a one-cell tool-coloured background margin followed by
+a normal separating space. Consecutive headers therefore form a narrow vertical
+stripe, while multiline value rows have no margin or indentation added by the
+renderer. `NO_COLOR` omits the margin cell and separator completely. For example,
+the ANSI-stripped coloured layout is:
+
+```text
+  path: .
+  content:
+first line
+  indentation belongs to the value
+  mode: overwrite
+```
+
+If submitted input, an incoming message, or a tool-call or agent source switch
+must be inserted while a value tail is incomplete, the renderer first commits
+that tail as a block line, performs the insertion, and resumes the same block at
+column zero. The parameter label is never repeated. The exact incremental JSON
+stream still goes to the tool argument parser unchanged; these rules affect only
+its terminal projection.
 
 The bottom panel shows whether the active agent is idle, waiting for the model,
 reasoning, responding, or running named tools. Startup details, command output,

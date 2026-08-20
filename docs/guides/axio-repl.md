@@ -60,13 +60,35 @@ those styles are applied. CSI, OSC, DCS, APC, cursor, screen, scrollback, and
 clipboard controls are removed even when a sequence spans multiple chunks;
 ordinary text, newlines, and tabs remain.
 
-While the interactive editor is open, decoded tool argument fields are written
-to scrollback at natural newlines, field completion, persistent insertion
-boundaries, or every 256 sanitized characters for a long newline-free value.
-The renderer therefore provides bounded incremental progress without creating a
-new `field (continued)` line for every provider token. This is a display-only
-projection: the parser still receives every `ToolInputDelta` exactly and does
-not interpret or rewrite malformed provider content.
+Decoded tool argument fields are buffered until their first newline or field
+completion, whether the editor is open or idle. A completed single-line field
+is written inline. The first decoded newline instead writes the parameter header
+once and starts an unindented value block at column zero; subsequent complete
+natural lines appear immediately while the incomplete tail remains buffered. A
+long newline-free value deliberately waits for field completion, so its
+sanitized display buffer is proportional to that value's length.
+
+In coloured output, each parameter header starts with one tool-accent background
+cell and a normal separating space. Consecutive headers form a one-cell margin;
+block value rows have neither that margin nor artificial indentation. `NO_COLOR`
+omits the cell and separator, placing the label at column zero. ANSI-stripped
+coloured output has this shape:
+
+```text
+  path: .
+  content:
+first line
+  indentation belongs to the value
+  mode: overwrite
+```
+
+An out-of-band submitted input, incoming message, or tool-call or agent source
+switch cannot pass an already received incomplete value. Before that insertion,
+the renderer promotes the field to block form if necessary, writes the
+accumulated tail as a complete physical line, then resumes block content at
+column zero without repeating the header. This remains a display-only
+projection: the parser receives every raw `ToolInputDelta` exactly and does not
+interpret or rewrite malformed provider content.
 
 The bottom panel continuously reports the active agent phase: idle, waiting for
 the model, reasoning, responding, or the names and counts of active tools. REPL

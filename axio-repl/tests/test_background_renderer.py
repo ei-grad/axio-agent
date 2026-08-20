@@ -54,7 +54,7 @@ from axio_repl import (
 )
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
 from axio_repl._powerline import agent_header
-from axio_repl._theme import MONOCHROME_THEME, NO_COLOR_THEME
+from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
 
@@ -542,7 +542,7 @@ async def test_submitted_input_reopens_reasoning_with_prefix_and_owned_style(
     assert f"{DIM}> thinking after input{RESET}" in raw_output
 
 
-async def test_submitted_input_preserves_a_streaming_tool_field_continuation(
+async def test_submitted_input_forces_pending_tool_field_into_a_single_labelled_block(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(effective_username="alice")
@@ -554,7 +554,9 @@ async def test_submitted_input_preserves_a_streaming_tool_field_continuation(
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=' after"}'))
 
     output = sanitize_terminal_text(capsys.readouterr().out)
-    assert "content: before\n12:41 alice> queued input\n  content (continued):  after" in output
+    assert "  content:\nbefore\n12:41 alice> queued input\n after\n" in output
+    assert output.count("content:") == 1
+    assert "(continued)" not in output
     assert output.index("before") < output.index("12:41 alice>") < output.index(" after")
 
 
@@ -593,9 +595,9 @@ async def test_peer_incoming_closes_and_resumes_every_open_structural_mode(
         assert "> after reasoning" in output
         assert output.index("before reasoning") < output.index(header) < output.index("after reasoning")
     else:
-        assert "content: before" in output
-        assert "content (continued):  after" in output
-        assert output.index("content: before") < output.index(header) < output.index(" after")
+        assert "  content:\nbefore" in output
+        assert "(continued)" not in output
+        assert output.index("before") < output.index(header) < output.index(" after")
 
 
 async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
@@ -609,13 +611,13 @@ async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='\\nvalue 3"}'))
 
     output = capsys.readouterr().out
-    assert f": {DIM}value 1{RESET}" in output
+    assert f"content{RESET}:\n{DIM}value 1{RESET}" in output
     assert f"\n{DIM}value 2{RESET}" in output
     assert f"\n{DIM}value 3{RESET}" in output
 
 
 @pytest.mark.parametrize("powerline", [False, True])
-async def test_write_file_argument_fragments_render_after_each_received_delta_while_idle(
+async def test_write_file_arguments_wait_for_shape_then_stream_only_complete_lines_while_idle(
     capsys: pytest.CaptureFixture[str],
     powerline: bool,
 ) -> None:
@@ -633,10 +635,12 @@ async def test_write_file_argument_fragments_render_after_each_received_delta_wh
         await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=chunk))
         stages.append(sanitize_terminal_text(capsys.readouterr().out))
 
-    assert "path" in stages[0] and "/tmp/stream-" in stages[0]
-    assert "demo.txt" in stages[1] and "content" in stages[1]
-    assert "alpha-one\nbet" in stages[1]
-    assert 'a-two with "gamma-' in stages[2]
+    assert "/tmp/stream-" not in stages[0]
+    assert "  path: /tmp/stream-demo.txt\n" in stages[1]
+    assert "  content:\nalpha-one\n" in stages[1]
+    assert "bet" not in stages[1]
+    assert stages[2] == ""
+    assert 'beta-two with "gamma-' in stages[3]
     assert 'three" and \\ delta-four' in stages[3]
     combined = "".join(stages)
     for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", "gamma-", "delta-four"):
@@ -655,8 +659,107 @@ async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.Ca
     )
 
     output = capsys.readouterr().out
-    assert "path" in output and "/tmp/demo" in output and "content" in output and "value" in output
+    assert output == "\n▶ write_file\npath: /tmp/demo\ncontent: value\n"
     assert "\x1b[" not in output
+
+
+@pytest.mark.parametrize("input_active", [False, True])
+async def test_tool_field_waits_for_first_newline_then_streams_complete_block_lines(
+    capsys: pytest.CaptureFixture[str],
+    input_active: bool,
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(input_active)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    capsys.readouterr()
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"first'),
+    )
+    assert capsys.readouterr().out == ""
+
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json=" line\\nsecond"),
+    )
+    first_line = sanitize_terminal_text(capsys.readouterr().out)
+    assert first_line == "\n  content:\nfirst line\n"
+    assert "second" not in first_line
+
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json=" line\\nthird"),
+    )
+    assert sanitize_terminal_text(capsys.readouterr().out) == "second line\n"
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=' line"}'))
+    assert sanitize_terminal_text(capsys.readouterr().out) == "third line\n"
+
+
+@pytest.mark.parametrize("powerline", [False, True])
+async def test_parameter_headers_use_one_reset_safe_tool_background_cell(
+    capsys: pytest.CaptureFixture[str],
+    powerline: bool,
+) -> None:
+    renderer = ReplRenderer(powerline=powerline, theme=DEFAULT_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    capsys.readouterr()
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="call",
+            partial_json='{"path":".","content":"one\\ntwo","empty":""}',
+        ),
+    )
+
+    margin = "\033[46m \033[0m "
+    output = capsys.readouterr().out
+    assert output == (
+        f"\n{margin}\033[33mpath\033[0m: \033[2m.\033[0m\n"
+        f"{margin}\033[33mcontent\033[0m:\n"
+        "\033[2mone\033[0m\n"
+        "\033[2mtwo\033[0m\n"
+        f"{margin}\033[33mempty\033[0m: \n"
+    )
+    assert output.count(margin) == 3
+    assert not any(margin in line for line in output.splitlines() if "one" in line or "two" in line)
+
+
+async def test_parameter_header_margin_uses_active_theme_tool_background(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=MONOCHROME_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="list_files"))
+    capsys.readouterr()
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"."}'),
+    )
+
+    output = capsys.readouterr().out
+    assert output.startswith("\n\033[107m \033[0m ")
+    assert "\033[46m " not in output
+
+
+async def test_character_chunks_preserve_json_escapes_unicode_and_block_indentation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+    encoded = '{"content":"alpha \\uD83D\\uDE00\\n  beta\\t\\"q\\"\\\\tail"}'
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    capsys.readouterr()
+    for character in encoded:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output == '\n  content:\nalpha 😀\n  beta\t"q"\\tail\n'
+    assert output.count("content:") == 1
+    assert "(continued)" not in output
 
 
 async def test_incomplete_active_tool_argument_line_closes_before_error(
@@ -743,7 +846,7 @@ async def test_control_only_fragment_defers_exactly_one_label_until_printable_te
 
 
 @pytest.mark.parametrize("terminator", ["error", "tool-result", "field-end"])
-async def test_initial_swallowed_fragment_terminates_on_a_closed_unlabelled_line(
+async def test_initial_swallowed_fragment_terminates_as_one_empty_inline_field(
     capsys: pytest.CaptureFixture[str],
     terminator: str,
 ) -> None:
@@ -767,11 +870,12 @@ async def test_initial_swallowed_fragment_terminates_on_a_closed_unlabelled_line
 
     captured = capsys.readouterr()
     output = sanitize_terminal_text(captured.out)
-    assert "content:" not in output
+    assert output.count("content:") == 1
+    assert "[3" not in output
     assert output.endswith("\n")
 
 
-async def test_swallowed_continuation_fragment_waits_for_printable_text_before_label(
+async def test_swallowed_control_between_block_lines_does_not_repeat_the_label(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer()
@@ -783,7 +887,7 @@ async def test_swallowed_continuation_fragment_waits_for_printable_text_before_l
         ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"visible\\n'),
     )
     visible = sanitize_terminal_text(capsys.readouterr().out)
-    assert visible.endswith("content: visible\n")
+    assert visible.endswith("  content:\nvisible\n")
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json="\x1b[3"))
     assert capsys.readouterr().out == ""
 
@@ -791,35 +895,42 @@ async def test_swallowed_continuation_fragment_waits_for_printable_text_before_l
     assert capsys.readouterr().out == ""
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
     output = sanitize_terminal_text(capsys.readouterr().out)
-    assert output == "  content (continued): printable\n"
-    assert output.count("content (continued):") == 1
+    assert output == "printable\n"
+    assert "content:" not in output
+    assert "(continued)" not in output
 
 
-async def test_prompt_active_token_sized_malformed_path_uses_bounded_visual_chunks(
+async def test_prompt_active_character_sized_dsml_uses_one_label_and_natural_lines(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer()
     renderer.set_input_active(True)
-    value = "<|DSML|>" + ("malformed-provider-token" * 30)
+    complete_lines = ["<|DSML|>", "malformed-provider-token", "second natural line"]
+    tail = "unterminated-tail"
+    value = "\n".join((*complete_lines, tail))
+    encoded = value.replace("\n", "\\n")
 
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="list_files"))
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"'))
     capsys.readouterr()
-    for character in value:
+    for character in encoded:
         await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
 
     streaming_output = sanitize_terminal_text(capsys.readouterr().out)
     assert streaming_output.count("path:") == 1
-    assert streaming_output.count("path (continued):") == 1
+    assert "(continued)" not in streaming_output
+    assert streaming_output == "\n  path:\n" + "\n".join(complete_lines) + "\n"
+    assert tail not in streaming_output
     await renderer.render("main", Error(exception=RuntimeError("malformed arguments")))
-    output = streaming_output + sanitize_terminal_text(capsys.readouterr().out)
-    value_lines = [line.split(": ", 1)[1] for line in output.splitlines() if line.startswith("  path")]
-    assert "".join(value_lines) == value
-    assert len(value_lines) == 3
-    assert output.count("path (continued):") == 2
+    captured = capsys.readouterr()
+    output = streaming_output + sanitize_terminal_text(captured.out)
+    assert tail in output
+    assert output.count("path:") == 1
+    assert "(continued)" not in output
+    assert sanitize_terminal_text(captured.err).startswith("\nError from agent main: malformed arguments")
 
 
-async def test_prompt_active_character_chunks_flush_on_newline_threshold_and_completion(
+async def test_prompt_active_character_chunks_hold_long_tail_until_completion(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer()
@@ -837,19 +948,15 @@ async def test_prompt_active_character_chunks_flush_on_newline_threshold_and_com
     for character in encoded:
         await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
     streaming_stage = sanitize_terminal_text(capsys.readouterr().out)
-    assert "content: first line" in streaming_stage
-    assert streaming_stage.count("content (continued):") == 1
+    assert streaming_stage == "  content:\nfirst line\n"
+    assert "x" not in streaming_stage
+    assert "(continued)" not in streaming_stage
 
     await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
     completion_stage = sanitize_terminal_text(capsys.readouterr().out)
-    rendered_lines = [
-        line.split(": ", 1)[1]
-        for line in (streaming_stage + completion_stage).splitlines()
-        if line.startswith("  content")
-    ]
-    assert "".join(rendered_lines) == content.replace("\n", "")
-    assert len(rendered_lines) == 3
-    assert completion_stage.count("content (continued):") == 1
+    assert completion_stage == content.split("\n", 1)[1] + "\n"
+    assert "content:" not in completion_stage
+    assert "(continued)" not in completion_stage
 
 
 async def test_multiline_tool_output_reapplies_its_style_after_newlines(
@@ -990,6 +1097,60 @@ async def test_structured_tool_field_closes_dim_style_before_answer(
     output = capsys.readouterr().out
     assert f"{DIM}first{RESET}\n{DIM}second{RESET}" in output
     assert output.endswith("\nanswer")
+
+
+async def test_interleaved_parallel_tool_fields_keep_distinct_state_and_event_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="one", name="first_tool"))
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="two", name="second_tool"))
+    capsys.readouterr()
+
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="one", partial_json='{"command":"one-prefix'),
+    )
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=1, tool_use_id="two", partial_json='{"command":"two-prefix'),
+    )
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="one", partial_json='-one-tail"}'),
+    )
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=1, tool_use_id="two", partial_json='-two-tail"}'),
+    )
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output.count("command:") == 2
+    assert (
+        output.index("one-prefix") < output.index("two-prefix") < output.index("-one-tail") < output.index("-two-tail")
+    )
+    for fragment in ("one-prefix", "two-prefix", "-one-tail", "-two-tail"):
+        assert output.count(fragment) == 1
+    assert "(continued)" not in output
+
+
+async def test_large_character_sized_single_line_uses_one_completion_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+    value = "x" * 100_000
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='{"content":"'))
+    capsys.readouterr()
+    for character in value:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+    assert capsys.readouterr().out == ""
+
+    await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'))
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert output == "\n  content: " + value + "\n"
 
 
 async def test_background_actions_wait_for_all_parallel_active_tools(

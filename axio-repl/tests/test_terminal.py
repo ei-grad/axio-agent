@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import sys
 import termios
 import threading
@@ -717,7 +716,7 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal argument streaming test")
 @pytest.mark.parametrize("powerline", [False, True])
-async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_with_prompt_open(
+async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundaries_with_prompt_open(
     monkeypatch: pytest.MonkeyPatch,
     powerline: bool,
 ) -> None:
@@ -748,14 +747,6 @@ async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_w
             chunks.append(chunk)
         return b"".join(chunks).decode("utf-8", errors="replace")
 
-    long_middle = "long-" + ("x" * 256)
-    argument_chunks = (
-        '{"path":"/tmp/stream-',
-        'demo.txt","content":"alpha-one\\nbet',
-        'a-two with \\"gamma-' + long_middle,
-        'three\\" and \\\\ delta-four"}',
-    )
-
     try:
         with create_app_session(input=terminal_input, output=terminal_output):
             session: Any = _panel.make_session(lambda: "temporary status", theme=DEFAULT_THEME)
@@ -776,27 +767,75 @@ async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_w
                 renderer.set_input_active(True)
                 await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
                 await terminal.drain()
-                await read_stage()
+                title_stage = await read_stage()
 
-                stages: list[str] = []
-                for index, chunk in enumerate(argument_chunks):
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/stream-'),
+                )
+                await terminal.drain()
+                path_partial_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(
+                        index=0,
+                        tool_use_id="call",
+                        partial_json='demo.txt","content":"alpha-one',
+                    ),
+                )
+                await terminal.drain()
+                path_complete_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json="\\nbeta"),
+                )
+                await terminal.drain()
+                first_line_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json="-two\\ngamma"),
+                )
+                await terminal.drain()
+                second_line_stage = await read_stage()
+
+                await renderer.submitted(
+                    "queued input",
+                    datetime(2026, 8, 20, 12, 41, tzinfo=UTC),
+                )
+                await terminal.drain()
+                submitted_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json=" after"),
+                )
+                await terminal.drain()
+                incomplete_after_insert_stage = await read_stage()
+                await renderer.incoming("peer body", agent_id="child", agent_name="peer")
+                await terminal.drain()
+                incoming_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json='","long":"'),
+                )
+                long_value = "long-" + ("x" * 400)
+                for character in long_value:
                     await renderer.render(
                         "main",
-                        ToolInputDelta(index=0, tool_use_id="call", partial_json=chunk),
+                        ToolInputDelta(index=0, tool_use_id="call", partial_json=character),
                     )
-                    await terminal.drain()
-                    stages.append(await read_stage())
-                    if index == 1:
-                        await renderer.submitted(
-                            "queued input",
-                            datetime(2026, 8, 20, 12, 41, tzinfo=UTC),
-                        )
-                        await terminal.drain()
-                        stages.append(await read_stage())
-                    if index == 2:
-                        await renderer.incoming("peer body", agent_id="child", agent_name="peer")
-                        await terminal.drain()
-                        stages.append(await read_stage())
+                await terminal.drain()
+                long_partial_stage = await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=0, tool_use_id="call", partial_json='"}'),
+                )
+                await terminal.drain()
+                long_complete_stage = await read_stage()
 
                 await renderer.render(
                     "main",
@@ -812,7 +851,7 @@ async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_w
 
                 await renderer.render(
                     "main",
-                    ToolUseStart(index=1, tool_use_id="error-call", name="write_file"),
+                    ToolUseStart(index=1, tool_use_id="tool-result-close", name="list_files"),
                 )
                 await terminal.drain()
                 await read_stage()
@@ -820,18 +859,52 @@ async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_w
                     "main",
                     ToolInputDelta(
                         index=1,
-                        tool_use_id="error-call",
-                        partial_json='{"content":"visible-before-error',
+                        tool_use_id="tool-result-close",
+                        partial_json='{"path":"partial-before-result',
                     ),
                 )
                 await terminal.drain()
-                error_visible_stage = await read_stage()
+                result_partial_stage = await read_stage()
                 await renderer.render(
                     "main",
-                    ToolInputDelta(index=1, tool_use_id="error-call", partial_json="\x1b[3"),
+                    ToolResult(
+                        tool_use_id="tool-result-close",
+                        name="list_files",
+                        is_error=False,
+                        content="partial result",
+                    ),
                 )
                 await terminal.drain()
-                swallowed_stage = await read_stage()
+                forced_result_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolUseStart(index=2, tool_use_id="error-call", name="list_files"),
+                )
+                await terminal.drain()
+                await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json='{"path":"'),
+                )
+                dsml_value = "<|DSML|>\nsecond natural line\nunterminated-tail"
+                for character in dsml_value.replace("\n", "\\n"):
+                    await renderer.render(
+                        "main",
+                        ToolInputDelta(index=2, tool_use_id="error-call", partial_json=character),
+                    )
+                await terminal.drain()
+                dsml_streaming_stage = await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json="\x1b[3"),
+                )
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json="1m"),
+                )
+                await terminal.drain()
+                sanitizer_only_stage = await read_stage()
                 await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
                 await terminal.drain()
                 error_stage = await read_stage()
@@ -843,34 +916,58 @@ async def test_tool_arguments_reach_the_terminal_at_logical_preview_boundaries_w
                 await terminal.close()
                 late_stage = await read_stage()
 
-        assert stages[0] == ""
-        assert "path" in stages[1] and "/tmp/stream-demo.txt" in stages[1]
-        assert "content" in stages[1] and "alpha-one" in stages[1]
-        assert "bet" not in stages[1]
-        assert "bet" in stages[2] and "12:41 tester" in stages[2] and "queued input" in stages[2]
-        assert 'a-two with "gamma-' in stages[3]
-        assert "peer body" in stages[4]
-        assert 'three" and \\ delta-four' in stages[5]
+        assert "write_file" not in title_stage
+        assert path_partial_stage == ""
+        assert "/tmp/stream-demo.txt" in path_complete_stage
+        assert "content" not in path_complete_stage and "alpha-one" not in path_complete_stage
+        assert "content" in first_line_stage and "alpha-one" in first_line_stage
+        assert "beta" not in first_line_stage
+        assert "beta-two" in second_line_stage and "gamma" not in second_line_stage
+        submitted = sanitize_terminal_text(submitted_stage)
+        assert submitted.index("gamma") < submitted.index("12:41 tester") < submitted.index("queued input")
+        assert incomplete_after_insert_stage == ""
+        incoming = sanitize_terminal_text(incoming_stage)
+        assert incoming.index(" after") < incoming.index("peer body")
+        assert long_partial_stage == ""
+        assert long_value in sanitize_terminal_text(long_complete_stage)
         assert "wrote stream demo" in result_stage
-        assert error_visible_stage == ""
-        assert "(continued)" not in swallowed_stage
-        assert "content" in error_stage and "visible-before-error" in error_stage
+        assert result_partial_stage == ""
+        forced_result = sanitize_terminal_text(forced_result_stage)
+        assert forced_result.index("path: partial-before-result") < forced_result.index("partial result")
+        dsml_streaming = sanitize_terminal_text(dsml_streaming_stage)
+        assert dsml_streaming.count("path:") == 1
+        assert "<|DSML|>\nsecond natural line\n" in dsml_streaming
+        assert "unterminated-tail" not in dsml_streaming
+        assert sanitizer_only_stage == ""
+        assert "unterminated-tail" in sanitize_terminal_text(error_stage)
         assert "provider stream failed" in error_stage
         assert "(continued)" not in error_stage
         assert "(continued)" not in late_stage
 
-        combined = "".join(stages)
+        combined = "".join(
+            (
+                title_stage,
+                path_complete_stage,
+                first_line_stage,
+                second_line_stage,
+                submitted_stage,
+                incoming_stage,
+                long_complete_stage,
+                result_stage,
+                forced_result_stage,
+                dsml_streaming_stage,
+                error_stage,
+                late_stage,
+            )
+        )
         sanitized = sanitize_terminal_text(combined)
-        content_lines = [
-            match.group(1)
-            for line in sanitized.splitlines()
-            if (match := re.search(r"  content(?: \(continued\))?: (.*)$", line))
-        ]
-        assert "".join(content_lines) == ('alpha-onebeta-two with "gamma-' + long_middle + 'three" and \\ delta-four')
         assert sanitized.count("content:") == 1
-        assert sanitized.count("content (continued):") == 4
+        assert sanitized.count("long:") == 1
+        assert sanitized.count("partial-before-result") == 1
+        assert sanitized.count("<|DSML|>") == 1
+        assert "(continued)" not in sanitized
         assert sanitized.index("/tmp/stream-demo.txt") < sanitized.index("alpha-one")
-        assert sanitized.index("alpha-one") < sanitized.index("gamma-") < sanitized.index("delta-four")
+        assert sanitized.index("alpha-one") < sanitized.index("beta-two") < sanitized.index("gamma")
         assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()
