@@ -125,6 +125,7 @@ class TerminalUI:
         self._session = prompt_session
         self._output = prompt_session.app.output
         self._inline_output = PromptToolkitInlineOutput(prompt_session)
+        self._reset = cast(str, getattr(prompt_session, "_axio_terminal_reset", RESET))
         self._loop: asyncio.AbstractEventLoop | None = None
         self._consumer: asyncio.Task[None] | None = None
         self._consumer_error: BaseException | None = None
@@ -159,7 +160,7 @@ class TerminalUI:
             self._original_stderr = cast(TextIO, sys.stderr)
             self.stdout = _TerminalStream(self, "stdout", self._original_stdout)
             self.stderr = _TerminalStream(self, "stderr", self._original_stderr)
-            ingress = TerminalIngress()
+            ingress = TerminalIngress(reset=self._reset)
             self._ingress = ingress
             self._wake = asyncio.Event()
             self._drained = asyncio.Event()
@@ -389,7 +390,7 @@ class TerminalUI:
                 fallback.flush()
             if late.dropped_frames:
                 self._original_stderr.write(
-                    f"{RESET}\n[late terminal output skipped: {late.dropped_frames} frame(s), "
+                    f"{self._reset}\n[late terminal output skipped: {late.dropped_frames} frame(s), "
                     f"{late.dropped_chars} character(s)]\n"
                 )
                 self._original_stderr.flush()

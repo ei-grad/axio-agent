@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from axio_repl._terminal_ingress import (
+    RESET,
     IngressDestination,
     IngressPhase,
     OutputFrame,
@@ -50,6 +51,7 @@ def test_ingress_bounds_active_and_late_output_with_explicit_markers() -> None:
     active = _drain_active(ingress)
     assert active.startswith("12345678")
     assert "terminal output skipped: 1 frame(s), 4 character(s)" in active
+    assert f"{RESET}\n[terminal output skipped:" in active
 
     assert ingress.seal()
     ingress.wake_delivered()
@@ -58,6 +60,17 @@ def test_ingress_bounds_active_and_late_output_with_explicit_markers() -> None:
     late = ingress.close_late()
     assert late.frames == (OutputFrame("12345"),)
     assert (late.dropped_frames, late.dropped_chars) == (1, 4)
+
+
+def test_no_color_ingress_skip_marker_has_no_sgr() -> None:
+    ingress = TerminalIngress(max_pending_chars=4, max_batch_chars=4, reset="")
+    ingress.submit(OutputFrame("keep"))
+    ingress.submit(OutputFrame("drop"))
+
+    marker = _drain_active(ingress)
+
+    assert "terminal output skipped: 1 frame(s), 4 character(s)" in marker
+    assert "\x1b[" not in marker
 
 
 def test_fail_discards_active_output_but_retains_subsequent_late_writes() -> None:

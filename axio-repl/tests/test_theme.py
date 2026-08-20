@@ -49,6 +49,7 @@ def test_no_color_overrides_explicit_theme_and_powerline(one_shot: bool) -> None
         for style in (
             theme.prompt,
             theme.emphasis,
+            theme.command,
             theme.tool,
             theme.agent,
             theme.action,

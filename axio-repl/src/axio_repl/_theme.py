@@ -43,6 +43,7 @@ class TerminalTheme:
     prompt: TextStyle
     panel: str
     emphasis: TextStyle
+    command: TextStyle
     tool: TextStyle
     agent: TextStyle
     action: TextStyle
@@ -72,6 +73,7 @@ DEFAULT_THEME = TerminalTheme(
     prompt=TextStyle("\033[1;97m", "bold ansiwhite"),
     panel="noreverse bg:default fg:#808080",
     emphasis=TextStyle("\033[1m", "bold"),
+    command=TextStyle("\033[1m", "bold"),
     tool=TextStyle("\033[1m\033[36m", "bold ansicyan"),
     agent=TextStyle("\033[2m", "dim"),
     action=TextStyle(),
@@ -93,6 +95,7 @@ MONOCHROME_THEME = TerminalTheme(
     prompt=TextStyle("\033[1;97m", "bold ansiwhite"),
     panel="noreverse bg:default fg:ansiwhite",
     emphasis=TextStyle("\033[1;97m", "bold ansiwhite"),
+    command=TextStyle("\033[1m", "bold"),
     tool=TextStyle("\033[1;97m", "bold ansiwhite"),
     agent=TextStyle("\033[1;97m", "bold ansiwhite"),
     action=TextStyle("\033[1;97m", "bold ansiwhite"),
@@ -114,6 +117,7 @@ NO_COLOR_THEME = TerminalTheme(
     prompt=TextStyle(),
     panel="",
     emphasis=TextStyle(),
+    command=TextStyle(),
     tool=TextStyle(),
     agent=TextStyle(),
     action=TextStyle(),

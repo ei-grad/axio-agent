@@ -186,7 +186,7 @@ AGENT_VERSION = "0.2.3"
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
 DIM = DEFAULT_THEME.reasoning.ansi
-BOLD = DEFAULT_THEME.emphasis.ansi
+BOLD = DEFAULT_THEME.command.ansi
 GREEN = DEFAULT_THEME.success.ansi
 YELLOW = DEFAULT_THEME.warning.ansi
 RED = DEFAULT_THEME.error.ansi
@@ -2080,24 +2080,39 @@ class Command(NamedTuple):
 
 
 _COMMAND_OUTPUT: ContextVar[list[str] | None] = ContextVar("axio_repl_command_output", default=None)
+_COMMAND_THEME: ContextVar[TerminalTheme] = ContextVar("axio_repl_command_theme", default=DEFAULT_THEME)
 
 
 def _command_print(*values: object, sep: str = " ", end: str = "\n") -> None:
+    rendered = sep.join(str(value) for value in values) + end
+    theme = _COMMAND_THEME.get()
+    if theme is not DEFAULT_THEME:
+        rendered = rendered.replace(BOLD, theme.command.ansi).replace(RESET, theme.reset)
     output = _COMMAND_OUTPUT.get()
     if output is None:
-        print(*values, sep=sep, end=end)
+        print(rendered, end="")
         return
-    output.append(sep.join(str(value) for value in values) + end)
+    output.append(rendered)
 
 
 @contextmanager
-def _capture_command_output() -> Iterator[list[str]]:
-    output: list[str] = []
-    token = _COMMAND_OUTPUT.set(output)
+def _command_theme(theme: TerminalTheme) -> Iterator[None]:
+    token = _COMMAND_THEME.set(theme)
     try:
-        yield output
+        yield
     finally:
-        _COMMAND_OUTPUT.reset(token)
+        _COMMAND_THEME.reset(token)
+
+
+@contextmanager
+def _capture_command_output(theme: TerminalTheme = DEFAULT_THEME) -> Iterator[list[str]]:
+    output: list[str] = []
+    output_token = _COMMAND_OUTPUT.set(output)
+    with _command_theme(theme):
+        try:
+            yield output
+        finally:
+            _COMMAND_OUTPUT.reset(output_token)
 
 
 # CLI arg attr → slash command name (for unified init).
@@ -2836,7 +2851,8 @@ async def main() -> None:
             "/max-tokens": Command(lambda: _show_max_tokens(transport), lambda a: _apply_max_tokens(transport, a)),
             "/debug": Command(lambda: _show_debug(transport), lambda a: _apply_debug(transport, a)),
         }
-        _apply_cli_args(args, commands)
+        with _command_theme(theme):
+            _apply_cli_args(args, commands)
 
         try:
             tools, sandbox_desc, tool_root, sandbox_note = await _sandbox.build_tools(
@@ -3198,6 +3214,7 @@ async def main() -> None:
             reserve_sequence=event_hub.reserve_sequence,
             theme=theme,
         )
+        setattr(prompt_session, "_axio_terminal_reset", theme.reset)
         input_prompt_factory = _panel.make_prompt_factory(
             effective_username,
             powerline=args.powerline,
@@ -3605,7 +3622,7 @@ async def main() -> None:
                 return False, False
 
             async def _dispatch_command_to_panel(user_input: str) -> tuple[bool, bool]:
-                with _capture_command_output() as output:
+                with _capture_command_output(theme) as output:
                     handled, should_exit = await _dispatch_command(user_input)
                 if output:
                     renderer.show_panel("".join(output))

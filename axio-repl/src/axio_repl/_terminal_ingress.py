@@ -58,12 +58,14 @@ class TerminalIngress:
         max_pending_chars: int = MAX_PENDING_CHARS,
         max_batch_chars: int = MAX_BATCH_CHARS,
         max_late_chars: int = MAX_LATE_CHARS,
+        reset: str = RESET,
     ) -> None:
         if min(max_pending_chars, max_batch_chars, max_late_chars) < 1:
             raise ValueError("terminal ingress limits must be positive")
         self._max_pending_chars = max_pending_chars
         self._max_batch_chars = max_batch_chars
         self._max_late_chars = max_late_chars
+        self._reset = reset
         self._lock = threading.RLock()
         self._phase = IngressPhase.OPEN
         self._pending: deque[OutputFrame] = deque()
@@ -146,7 +148,10 @@ class TerminalIngress:
                 self._dropped_frames = 0
                 self._dropped_chars = 0
                 self._writing = True
-                return f"{RESET}\n[terminal output skipped: {dropped_frames} frame(s), {dropped_chars} character(s)]\n"
+                return (
+                    f"{self._reset}\n[terminal output skipped: {dropped_frames} frame(s), "
+                    f"{dropped_chars} character(s)]\n"
+                )
             self._writing = False
             return None
 

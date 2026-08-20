@@ -22,16 +22,20 @@ from axio_repl import (
     ReplRenderer,
     _build_argument_parser,
     _cancel_and_settle_tasks,
+    _capture_command_output,
     _handle_agent_actions,
     _IncomingPrompt,
     _pending_prompt_count,
     _retain_interrupted_partial,
     _select_configured_tools,
+    _show_agents,
+    _show_model,
     main,
 )
 from axio_repl._journal import SessionJournal, read_journal
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._recovery import materialize_recovery
+from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME, TerminalTheme
 
 
 def test_agent_actions_default_to_off() -> None:
@@ -91,6 +95,35 @@ def test_repeated_tool_preemption_does_not_retain_unconsumable_partials() -> Non
     assert partials.pop("escape-turn") == "visible partial"
     pending_interrupt_turns.discard("escape-turn")
     assert partials == {}
+
+
+@pytest.mark.parametrize(
+    "theme",
+    [DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME],
+    ids=("default", "monochrome", "no-color"),
+)
+def test_command_feedback_uses_the_active_presentation(
+    monkeypatch: pytest.MonkeyPatch,
+    theme: TerminalTheme,
+) -> None:
+    model = ModelSpec(id="stub/model", capabilities=frozenset({Capability.text}))
+    transport = type("Transport", (), {"model": model, "models": ModelRegistry([model])})()
+    renderer = ReplRenderer(theme=theme)
+    monkeypatch.setattr("axio_repl.local_background_agent_records", lambda: [])
+
+    with _capture_command_output(theme) as output:
+        _show_model(transport)
+        _show_agents(renderer)
+
+    feedback = "".join(output)
+    assert "Current model:" in feedback
+    assert "Focused agent:" in feedback
+    if theme is NO_COLOR_THEME:
+        assert "\x1b[" not in feedback
+    else:
+        assert f"{theme.command.ansi}stub/model{theme.reset}" in feedback
+        assert f"{theme.command.ansi}main{theme.reset}" in feedback
+        assert theme.command.ansi == DEFAULT_THEME.command.ansi
 
 
 async def test_invalid_config_theme_fails_before_transport_initialization(

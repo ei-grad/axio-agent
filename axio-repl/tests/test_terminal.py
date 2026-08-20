@@ -44,8 +44,9 @@ class _RecordingOutput(DummyOutput):
 
 
 class _Session:
-    def __init__(self, output: _RecordingOutput) -> None:
+    def __init__(self, output: _RecordingOutput, *, reset: str = RESET) -> None:
         self.app = type("App", (), {"output": output, "is_running": False})()
+        self._axio_terminal_reset = reset
 
 
 class _FailingOutput(_RecordingOutput):
@@ -120,7 +121,24 @@ async def test_terminal_ui_coalesces_and_bounds_a_stalled_producer() -> None:
     rendered = "".join(output.raw)
     assert "00000 " in rendered
     assert "[terminal output skipped:" in rendered
+    assert f"{RESET}\n[terminal output skipped:" in rendered
     assert len(output.raw) < 50
+
+
+async def test_no_color_terminal_skip_marker_has_no_sgr() -> None:
+    output = _RecordingOutput()
+    terminal = TerminalUI(_Session(output, reset=""))
+
+    await terminal.start()
+    try:
+        for index in range(5_000):
+            print(f"{index:05d} {'x' * 60}")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    marker = next(chunk for chunk in output.raw if "[terminal output skipped:" in chunk)
+    assert "\x1b[" not in marker
 
 
 async def test_terminal_ui_surfaces_write_failure_and_restores_streams() -> None:
@@ -322,7 +340,31 @@ async def test_late_output_overflow_is_reported_after_terminal_restore(
     monkeypatch.setattr(terminal, "_restore_terminal", overflow_during_restore)
     await terminal.close()
 
-    assert "late terminal output skipped: 1 frame" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "late terminal output skipped: 1 frame" in error
+    assert error.startswith(RESET)
+
+
+async def test_no_color_late_output_skip_marker_has_no_sgr(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = TerminalUI(_Session(_RecordingOutput(), reset=""))
+    await terminal.start()
+    retained = terminal.stderr
+    assert retained is not None
+    restore = terminal._restore_terminal
+
+    def overflow_during_restore() -> None:
+        retained.write("x" * (64 * 1024 + 1) + "\n")
+        restore()
+
+    monkeypatch.setattr(terminal, "_restore_terminal", overflow_during_restore)
+    await terminal.close()
+
+    error = capsys.readouterr().err
+    assert "late terminal output skipped: 1 frame" in error
+    assert "\x1b[" not in error
 
 
 async def test_restore_failure_still_closes_ingress_and_process_streams(
