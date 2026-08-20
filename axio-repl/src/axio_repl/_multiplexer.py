@@ -12,6 +12,7 @@ from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, 
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
+from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
 
 _MAX_DISPLAY_COUNT = 999_999_999
 
@@ -393,11 +394,23 @@ class ActionMultiplexer:
                     self._emit_complete_output(agent_id, action)
                 case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
                     action = self._pop_tool(agent_id, tool_use_id)
+                    safe_content = sanitize_terminal_text(content)
+                    patch_display = (
+                        parse_patch_result(safe_content, include_legacy_path=action is None)
+                        if name == "patch_file" and (action is None or action.name == name) and not is_error
+                        else None
+                    )
                     if action is None:
                         self._enqueue(
                             agent_id,
                             "tool error" if is_error else "tool result",
-                            f"{'✗' if is_error else '✓'} {name}\n{content}" if content else name,
+                            (
+                                f"✓ {name}\n{patch_display.plain_text()}"
+                                if patch_display is not None
+                                else f"{'✗' if is_error else '✓'} {name}\n{safe_content}"
+                                if safe_content
+                                else name
+                            ),
                             critical=True,
                             agent_name=agent_name,
                         )
@@ -408,10 +421,20 @@ class ActionMultiplexer:
                         self._enqueue(
                             agent_id,
                             "tool error",
-                            f"✗ {action.name}\n{content}",
+                            f"✗ {action.name}\n{safe_content}",
                             critical=True,
                             agent_name=action.agent_name,
                         )
+                    elif patch_display is not None:
+                        self._enqueue(
+                            agent_id,
+                            "tool result",
+                            f"✓ {action.name}\n{patch_display.plain_text()}",
+                            critical=True,
+                            agent_name=action.agent_name,
+                        )
+                    elif name == action.name == "write_file" and is_write_file_result(safe_content):
+                        pass
                     elif action.saw_output:
                         self._enqueue(
                             agent_id,
@@ -421,7 +444,7 @@ class ActionMultiplexer:
                             agent_name=action.agent_name,
                         )
                     else:
-                        suffix = f"\n{content}" if content else ""
+                        suffix = f"\n{safe_content}" if safe_content else ""
                         self._enqueue(
                             agent_id,
                             "tool result",

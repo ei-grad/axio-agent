@@ -796,7 +796,7 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
                         tool_use_id="call",
                         name="write_file",
                         is_error=False,
-                        content="wrote stream demo",
+                        content="Wrote 14719 bytes to /tmp/stream-demo.txt",
                     ),
                 )
                 await terminal.drain()
@@ -804,14 +804,44 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
 
                 await renderer.render(
                     "main",
-                    ToolUseStart(index=1, tool_use_id="error-call", name="write_file"),
+                    ToolUseStart(index=1, tool_use_id="patch-call", name="patch_file"),
+                )
+                await renderer.render(
+                    "main",
+                    ToolInputDelta(
+                        index=1,
+                        tool_use_id="patch-call",
+                        partial_json=(
+                            '{"path":"src/service.py","from_line":3,"to_line":3,"content":"        return 2\\n"}'
+                        ),
+                    ),
+                )
+                await terminal.drain()
+                patch_argument_stage = await read_stage()
+                await renderer.render(
+                    "main",
+                    ToolResult(
+                        tool_use_id="patch-call",
+                        name="patch_file",
+                        is_error=False,
+                        content=(
+                            "+1 -1\n@@ -1,3 +1,3 @@ Service.run\n class Service:\n-    return 1\n+    return 2\n"
+                        ),
+                    ),
+                )
+                await terminal.drain()
+                patch_result_stage = await read_stage()
+
+                await renderer.render(
+                    "main",
+                    ToolUseStart(index=2, tool_use_id="error-call", name="write_file"),
                 )
                 await terminal.drain()
                 await read_stage()
                 await renderer.render(
                     "main",
                     ToolInputDelta(
-                        index=1,
+                        index=2,
                         tool_use_id="error-call",
                         partial_json='{"content":"visible-before-error',
                     ),
@@ -820,7 +850,7 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
                 error_visible_stage = await read_stage()
                 await renderer.render(
                     "main",
-                    ToolInputDelta(index=1, tool_use_id="error-call", partial_json="\x1b[3"),
+                    ToolInputDelta(index=2, tool_use_id="error-call", partial_json="\x1b[3"),
                 )
                 await terminal.drain()
                 swallowed_stage = await read_stage()
@@ -842,20 +872,26 @@ async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with
         assert 'a-two with "gamma-' in stages[3] and long_middle in stages[3]
         assert "peer body" in stages[4]
         assert 'three" and \\ delta-four' in stages[5]
-        assert "wrote stream demo" in result_stage
+        assert "Wrote 14719 bytes" not in result_stage
+        assert patch_argument_stage.count("src/service.py") == 1
+        assert "src/service.py" not in patch_result_stage
+        assert "+1 -1" in patch_result_stage
+        assert "Service.run" in patch_result_stage
+        assert "return 1" in patch_result_stage and "return 2" in patch_result_stage
         assert "content" in error_visible_stage and "visible-before-error" in error_visible_stage
         assert "(continued)" not in swallowed_stage
         assert "provider stream failed" in error_stage
         assert "(continued)" not in error_stage
         assert "(continued)" not in late_stage
 
-        combined = "".join(stages)
+        combined = "".join((*stages, result_stage, patch_argument_stage, patch_result_stage))
         for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", long_middle, "gamma-", "delta-four"):
             assert combined.count(fragment) == 1
         assert combined.index("/tmp/stream-") < combined.index("demo.txt") < combined.index("alpha-one")
         assert combined.index("alpha-one") < combined.index("gamma-") < combined.index("delta-four")
         assert f"{DEFAULT_THEME.reasoning.ansi}/tmp/stream-{DEFAULT_THEME.reset}" in combined
         assert f"{DEFAULT_THEME.reset}\r\n{DEFAULT_THEME.reasoning.ansi}bet" in combined
+        assert combined.count("src/service.py") == 1
         assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()

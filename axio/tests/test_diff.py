@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from axio.diff import CONTEXT_LINES, MAX_DIFF_LINES, describe_write, render_diff
+from axio.diff import CONTEXT_LINES, MAX_DIFF_LINES, describe_patch, describe_write, render_diff
 
 
 def _numbered(count: int) -> str:
@@ -72,3 +72,27 @@ def test_describe_write_appends_a_diff_only_when_there_is_one() -> None:
     message = describe_write("f.txt", 5, "there", "hello")
     assert message.startswith("Wrote 5 bytes to f.txt\nChanged f.txt:\n")
     assert "+hello\n" in message
+
+
+def test_describe_patch_is_a_path_free_compact_diff_fragment() -> None:
+    result = describe_patch("src/app.py", "def run():\n    return 1\n", "def run():\n    return 2\n")
+
+    assert result == ("+1 -1\n@@ -1,2 +1,2 @@ run\n def run():\n-    return 1\n+    return 2\n")
+    assert "src/app.py" not in result
+    assert "---" not in result
+    assert "+++" not in result
+
+
+def test_describe_patch_reports_an_exact_noop_without_a_path() -> None:
+    assert describe_patch("secret/name.py", "same\n", "same\n") == "No changes"
+
+
+def test_compact_patch_diff_is_bounded_after_adding_exact_stats() -> None:
+    before = "def build():\n    return []\n"
+    after = before + "".join(f"value_{index} = {index}\n" for index in range(5000))
+
+    result = describe_patch("large.py", before, after)
+
+    assert result.startswith("+5000 -0\n")
+    assert "...[diff truncated]" in result
+    assert len(result.splitlines()) <= MAX_DIFF_LINES + 2

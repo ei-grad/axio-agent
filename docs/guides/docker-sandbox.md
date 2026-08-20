@@ -61,8 +61,10 @@ The `tools` property is only valid inside the `async with` block. Accessing it
 outside raises `RuntimeError`.
 
 `write_file` and `patch_file` are text tools with the same UTF-8 contract as
-their `axio-tools-local` counterparts: both write UTF-8 and report a unified
-diff of the change. `patch_file` rejects a non-UTF-8 target; `write_file` can
+their `axio-tools-local` counterparts: both write UTF-8 and report the change.
+`patch_file` returns a compact path-free diff whose hunk headers include
+best-effort function context; `write_file` retains a full unified diff.
+`patch_file` rejects a non-UTF-8 target; `write_file` can
 replace one but reports no diff for it, and none for a new file either. The
 container round-trip that reads the previous content is also what detects
 whether the file exists, so an overwrite costs one archive fetch, not two.

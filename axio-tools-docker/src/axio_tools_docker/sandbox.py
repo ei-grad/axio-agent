@@ -22,7 +22,7 @@ from typing import Any, cast
 import aiodocker
 from aiodocker.exceptions import DockerError
 from axio._asyncio import shield_until_done
-from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_write
+from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_patch, describe_write
 from axio.exceptions import HandlerError
 from axio.schema import build_tool_schema
 from axio.tool import CONTEXT, Tool
@@ -376,8 +376,9 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
     to get correct line numbers. Use this for surgical edits instead of
-    rewriting the whole file with write_file. The result reports a unified diff
-    of the change. Binary files cannot be patched."""
+    rewriting the whole file with write_file. The result reports a compact diff
+    fragment with function context when it can be inferred. Binary files cannot
+    be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:
@@ -394,7 +395,7 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
         content_lines[-1] += "\n"
     after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
     await sandbox.write_file(resolved, after, mode=mode)
-    return describe_write(path, len(after.encode()), before, after)
+    return describe_patch(path, before, after)
 
 
 # ---------------------------------------------------------------------------
