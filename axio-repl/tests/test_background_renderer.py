@@ -614,6 +614,69 @@ async def test_multiline_tool_values_reapply_dim_across_streamed_chunks(
     assert f"\n{DIM}value 3{RESET}" in output
 
 
+@pytest.mark.parametrize("powerline", [False, True])
+async def test_write_file_argument_fragments_render_after_each_received_delta_while_idle(
+    capsys: pytest.CaptureFixture[str],
+    powerline: bool,
+) -> None:
+    renderer = ReplRenderer(powerline=powerline)
+    chunks = (
+        '{"path":"/tmp/stream-',
+        'demo.txt","content":"alpha-one\\nbet',
+        'a-two with \\"gamma-',
+        'three\\" and \\\\ delta-four"}',
+    )
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    stages: list[str] = []
+    for chunk in chunks:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=chunk))
+        stages.append(sanitize_terminal_text(capsys.readouterr().out))
+
+    assert "path" in stages[0] and "/tmp/stream-" in stages[0]
+    assert "demo.txt" in stages[1] and "content" in stages[1]
+    assert "alpha-one\nbet" in stages[1]
+    assert 'a-two with "gamma-' in stages[2]
+    assert 'three" and \\ delta-four' in stages[3]
+    combined = "".join(stages)
+    for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", "gamma-", "delta-four"):
+        assert combined.count(fragment) == 1
+    assert combined.index("/tmp/stream-") < combined.index("demo.txt") < combined.index("alpha-one")
+    assert combined.index("alpha-one") < combined.index("gamma-") < combined.index("delta-four")
+
+
+async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.CaptureFixture[str]) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/demo","content":"value"}'),
+    )
+
+    output = capsys.readouterr().out
+    assert "path" in output and "/tmp/demo" in output and "content" in output and "value" in output
+    assert "\x1b[" not in output
+
+
+async def test_incomplete_active_tool_argument_line_closes_before_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/incomplete'),
+    )
+    await renderer.render("main", Error(exception=RuntimeError("provider stream failed")))
+
+    captured = capsys.readouterr()
+    assert sanitize_terminal_text(captured.out).endswith("path: /tmp/incomplete\n")
+    assert sanitize_terminal_text(captured.err).startswith("\nError from agent main: provider stream failed")
+
+
 async def test_multiline_tool_output_reapplies_its_style_after_newlines(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

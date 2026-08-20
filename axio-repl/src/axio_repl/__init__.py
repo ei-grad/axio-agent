@@ -554,6 +554,7 @@ class _ToolFieldMode:
     tool_use_id: str
     key: str
     first_delta: bool = True
+    chunk_line_closed: bool = False
 
 
 type _StructuralMode = _BoundaryMode | _TextMode | _ReasoningMode | _ToolFieldMode
@@ -574,6 +575,7 @@ class _AgentRenderState:
         self.reasoning_sanitizer = IncrementalTerminalSanitizer()
         self.tool_output_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
         self.tool_field_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
+        self.tool_arg_at_line_start = False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1163,6 +1165,8 @@ class ReplRenderer:
             if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
                 sys.stdout.write(self._theme.reset)
                 state.mode = _BoundaryMode()
+            elif isinstance(mode, _ToolFieldMode) and mode.chunk_line_closed:
+                state.mode = _BoundaryMode()
             elif not isinstance(mode, _BoundaryMode):
                 sys.stdout.write(f"{self._theme.reset}\n")
                 self._flush()
@@ -1173,7 +1177,8 @@ class ReplRenderer:
         if continuation is not None:
             state, mode = continuation
             sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
-            state.mode = dataclasses.replace(mode, first_delta=True)
+            state.tool_arg_at_line_start = False
+            state.mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
             self._flush()
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
@@ -1190,6 +1195,7 @@ class ReplRenderer:
         state.reasoning_sanitizer.reset()
         state.tool_output_sanitizers.clear()
         state.tool_field_sanitizers.clear()
+        state.tool_arg_at_line_start = False
 
     def _remember_agent_locked(self, agent_id: str, agent_name: str) -> None:
         normalized = normalize_agent_name(agent_name)
@@ -1368,7 +1374,8 @@ class ReplRenderer:
                     print()
                     active_state.mode = _BoundaryMode()
                 elif isinstance(active_state.mode, _ToolFieldMode):
-                    sys.stdout.write("\n")
+                    if not active_state.mode.chunk_line_closed:
+                        sys.stdout.write("\n")
             self._active_agent = agent_id
         state = self._state(agent_id)
         return state, switched
@@ -1389,7 +1396,8 @@ class ReplRenderer:
         if switched and isinstance(state.mode, _ToolFieldMode):
             sys.stdout.write(f"  {self._theme.warning.ansi}{state.mode.key} (continued){self._theme.reset}: ")
             self._flush()
-            state.mode = dataclasses.replace(state.mode, first_delta=True)
+            state.tool_arg_at_line_start = False
+            state.mode = dataclasses.replace(state.mode, first_delta=True, chunk_line_closed=False)
         if isinstance(state.mode, _ReasoningMode) and not isinstance(event, ReasoningDelta):
             sys.stdout.write("\n")
             self._flush()
@@ -1461,6 +1469,7 @@ class ReplRenderer:
                 state.arg_streams[tid] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tid)
                 state.tool_names[tid] = name
+                state.tool_arg_at_line_start = False
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
                 stream = state.arg_streams.get(tid)
@@ -1468,7 +1477,9 @@ class ReplRenderer:
                     for fe in stream.feed(pj):
                         self._render_field_event(state, tid, fe)
                     if stream.done:
-                        sys.stdout.write("\n")
+                        if not state.tool_arg_at_line_start:
+                            sys.stdout.write("\n")
+                        state.tool_arg_at_line_start = False
                         self._flush()
                         del state.arg_streams[tid]
                         if self._only_passive_tools_active(state):
@@ -1519,6 +1530,7 @@ class ReplRenderer:
                 state.active_tool_ids.discard(tid)
                 state.arg_streams.pop(tid, None)
                 state.tool_names.pop(tid, None)
+                state.tool_arg_at_line_start = False
                 for sanitizer_key in tuple(state.tool_output_sanitizers):
                     if sanitizer_key[0] == tid:
                         state.tool_output_sanitizers.pop(sanitizer_key).reset()
@@ -1747,14 +1759,20 @@ class ReplRenderer:
         match event:
             case ToolFieldStart(key=key):
                 key = sanitize_terminal_text(key).replace("\n", " ")
-                sys.stdout.write(f"\n  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
+                leading = "" if state.tool_arg_at_line_start else "\n"
+                sys.stdout.write(f"{leading}  {self._theme.warning.ansi}{key}{self._theme.reset}: ")
                 self._flush()
                 state.mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
+                state.tool_arg_at_line_start = False
                 state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
             case ToolFieldDelta(text=text):
                 mode = state.mode
                 if not isinstance(mode, _ToolFieldMode) or mode.tool_use_id != tool_use_id:
                     raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
+                if mode.chunk_line_closed:
+                    sys.stdout.write(f"  {self._theme.warning.ansi}{mode.key} (continued){self._theme.reset}: ")
+                    state.tool_arg_at_line_start = False
+                    mode = dataclasses.replace(mode, first_delta=True, chunk_line_closed=False)
                 sanitizer = state.tool_field_sanitizers.setdefault(
                     (tool_use_id, mode.key), IncrementalTerminalSanitizer()
                 )
@@ -1762,12 +1780,24 @@ class ReplRenderer:
                 if mode.first_delta and "\n" in text:
                     sys.stdout.write("\n")
                 state.mode = dataclasses.replace(mode, first_delta=False)
-                sys.stdout.write(_styled(self._theme.reasoning.ansi, text))
+                styled = _styled(self._theme.reasoning.ansi, text)
+                if self._input_active and text.endswith("\n") and self._theme.reasoning.ansi:
+                    styled = styled[: -len(self._theme.reasoning.ansi + self._theme.reset)]
+                sys.stdout.write(styled)
+                if self._input_active and text:
+                    # A partial terminal frame would share a row with prompt_toolkit's
+                    # redraw. Complete one visual line per received value fragment;
+                    # the next fragment is labelled as a continuation of this field.
+                    if not text.endswith("\n"):
+                        sys.stdout.write(f"{self._theme.reset}\n")
+                    state.tool_arg_at_line_start = True
+                    state.mode = dataclasses.replace(state.mode, chunk_line_closed=True)
                 self._flush()
             case ToolFieldEnd():
-                sys.stdout.write(self._theme.reset)
-                self._flush()
                 if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                    if not state.mode.chunk_line_closed:
+                        sys.stdout.write(self._theme.reset)
+                        self._flush()
                     state.tool_field_sanitizers.pop((tool_use_id, state.mode.key), None)
                     state.mode = _BoundaryMode()
 

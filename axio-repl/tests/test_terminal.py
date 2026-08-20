@@ -12,7 +12,7 @@ from io import TextIOWrapper
 from typing import Any, cast
 
 import pytest
-from axio.events import SessionEndEvent, TextDelta
+from axio.events import SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import ExecutionMode, TurnStarted
 from prompt_toolkit.application import create_app_session
@@ -140,6 +140,41 @@ async def test_no_color_terminal_skip_marker_has_no_sgr() -> None:
 
     marker = next(chunk for chunk in output.raw if "[terminal output skipped:" in chunk)
     assert "\x1b[" not in marker
+
+
+async def test_no_color_active_tool_argument_frames_have_no_sgr() -> None:
+    from axio_repl._theme import NO_COLOR_THEME
+
+    output = _RecordingOutput()
+    terminal = TerminalUI(_Session(output, reset=""))
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await terminal.start()
+    try:
+        renderer.set_input_active(True)
+        await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+        await terminal.drain()
+        output.raw.clear()
+
+        await renderer.render(
+            "main",
+            ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/stream-'),
+        )
+        await terminal.drain()
+        first_frame = next(chunk for chunk in output.raw if "/tmp/stream-" in chunk)
+        assert "\x1b[" not in first_frame
+
+        output.raw.clear()
+        await renderer.render(
+            "main",
+            ToolInputDelta(index=0, tool_use_id="call", partial_json='demo","content":"value"}'),
+        )
+        await terminal.drain()
+        second_frame = next(chunk for chunk in output.raw if "content" in chunk and "value" in chunk)
+        assert "\x1b[" not in second_frame
+    finally:
+        renderer.set_input_active(False)
+        await terminal.close()
 
 
 async def test_terminal_ui_surfaces_write_failure_and_restores_streams() -> None:
@@ -664,6 +699,132 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
         assert rendered.index("12:41 tester") < rendered.index("remaining model output")
         assert "\x1b[1;30;107m 12:41 tester \x1b[22;97;49m\ue0b0\x1b[0m ping\r\n" in rendered
         assert "\x1b[?1049h" not in rendered
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal argument streaming test")
+@pytest.mark.parametrize("powerline", [False, True])
+async def test_tool_arguments_reach_the_terminal_after_every_received_delta_with_prompt_open(
+    monkeypatch: pytest.MonkeyPatch,
+    powerline: bool,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=24, columns=100),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+    os.set_blocking(master_fd, False)
+
+    async def read_stage() -> str:
+        await asyncio.sleep(0.02)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    long_middle = "long-" + ("x" * 256)
+    argument_chunks = (
+        '{"path":"/tmp/stream-',
+        'demo.txt","content":"alpha-one\\nbet',
+        'a-two with \\"gamma-' + long_middle,
+        'three\\" and \\\\ delta-four"}',
+    )
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "temporary status", theme=DEFAULT_THEME)
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(
+                powerline=powerline,
+                theme=DEFAULT_THEME,
+                effective_username="tester",
+            )
+            await terminal.start()
+            prompt = asyncio.create_task(
+                session.prompt_async(_panel.make_prompt_factory("tester", powerline=powerline)())
+            )
+            try:
+                await asyncio.sleep(0.05)
+                await read_stage()
+                renderer.set_input_active(True)
+                await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+                await terminal.drain()
+                await read_stage()
+
+                stages: list[str] = []
+                for index, chunk in enumerate(argument_chunks):
+                    await renderer.render(
+                        "main",
+                        ToolInputDelta(index=0, tool_use_id="call", partial_json=chunk),
+                    )
+                    await terminal.drain()
+                    stages.append(await read_stage())
+                    if index == 1:
+                        await renderer.submitted(
+                            "queued input",
+                            datetime(2026, 8, 20, 12, 41, tzinfo=UTC),
+                        )
+                        await terminal.drain()
+                        stages.append(await read_stage())
+                    if index == 2:
+                        await renderer.incoming("peer body", agent_id="child", agent_name="peer")
+                        await terminal.drain()
+                        stages.append(await read_stage())
+
+                await renderer.render(
+                    "main",
+                    ToolResult(
+                        tool_use_id="call",
+                        name="write_file",
+                        is_error=False,
+                        content="wrote stream demo",
+                    ),
+                )
+                await terminal.drain()
+                result_stage = await read_stage()
+            finally:
+                renderer.set_input_active(False)
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
+                await terminal.close()
+
+        assert "path" in stages[0] and "/tmp/stream-" in stages[0]
+        assert "demo.txt" in stages[1] and "content" in stages[1]
+        assert "alpha-one" in stages[1] and "bet" in stages[1]
+        assert "12:41 tester" in stages[2] and "queued input" in stages[2]
+        assert 'a-two with "gamma-' in stages[3] and long_middle in stages[3]
+        assert "peer body" in stages[4]
+        assert 'three" and \\ delta-four' in stages[5]
+        assert "wrote stream demo" in result_stage
+
+        combined = "".join(stages)
+        for fragment in ("/tmp/stream-", "demo.txt", "alpha-one", long_middle, "gamma-", "delta-four"):
+            assert combined.count(fragment) == 1
+        assert combined.index("/tmp/stream-") < combined.index("demo.txt") < combined.index("alpha-one")
+        assert combined.index("alpha-one") < combined.index("gamma-") < combined.index("delta-four")
+        assert f"{DEFAULT_THEME.reasoning.ansi}/tmp/stream-{DEFAULT_THEME.reset}" in combined
+        assert f"{DEFAULT_THEME.reset}\r\n{DEFAULT_THEME.reasoning.ansi}bet" in combined
+        assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()
         reader.close()
