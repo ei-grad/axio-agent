@@ -311,7 +311,7 @@ async def _shell_stream(
     try:
         proc = await asyncio.create_subprocess_exec(
             executable.path,
-            "-lc",
+            "-c",
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -547,7 +547,8 @@ async def shell(
     Live and final output preserve executor-observed stdout/stderr order; this
     does not imply a global syscall order across the two descriptors. Avoid
     interactive commands. Commands default to the first shell discovered on
-    PATH (bash is preferred); pass shell to select another advertised shell."""
+    PATH (bash is preferred); pass shell to select another advertised shell.
+    Commands use non-login ``-c`` mode and do not load login profiles."""
     records: list[OutputRecord] = []
     t0 = time.monotonic()
     async for key, text in _shell_stream(command, timeout, cwd, stdin, max_output_chars, shell):

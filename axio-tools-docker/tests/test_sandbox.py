@@ -48,6 +48,7 @@ def mock_docker_factory(
     exec_exit_code: int = 0,
     archive_content: tarfile.TarFile | None = None,
     shell_paths: tuple[str, ...] = ("/bin/sh",),
+    login_profile_noise: bytes | None = None,
 ) -> tuple[MagicMock, MagicMock, MagicMock]:
     """Return (mock_docker_class, mock_client, mock_container)."""
     if exec_messages is None:
@@ -86,6 +87,25 @@ def mock_docker_factory(
             probe_exec.start = MagicMock(return_value=probe_stream)
             probe_exec.inspect = AsyncMock(return_value={"ExitCode": 0 if cmd[0] in shell_paths else 127})
             return probe_exec
+        if login_profile_noise is not None and "l" in cmd[1]:
+            noise_messages = [(2, login_profile_noise)]
+
+            async def read_noise() -> Any:
+                if noise_messages:
+                    stream_type, data = noise_messages.pop(0)
+                    msg = MagicMock()
+                    msg.stream = stream_type
+                    msg.data = data
+                    return msg
+                return None
+
+            noise_stream = MagicMock()
+            noise_stream.read_out = read_noise
+            noise_stream.close = AsyncMock()
+            noise_exec = MagicMock()
+            noise_exec.start = MagicMock(return_value=noise_stream)
+            noise_exec.inspect = AsyncMock(return_value={"ExitCode": 0})
+            return noise_exec
         return cast(MagicMock, mock_container.command_exec)
 
     mock_container.exec = AsyncMock(side_effect=exec_command, return_value=mock_exec)
@@ -318,8 +338,8 @@ async def test_shell_discovery_falls_back_to_sh_and_is_cached() -> None:
                 == probe_count
             )
 
-    command_calls = [call.kwargs["cmd"] for call in container.exec.await_args_list if call.kwargs["cmd"][1] == "-lc"]
-    assert command_calls == [["/bin/sh", "-lc", "true"], ["/bin/sh", "-lc", "true"]]
+    command_calls = [call.kwargs["cmd"] for call in container.exec.await_args_list if call.kwargs["cmd"][2] == "true"]
+    assert command_calls == [["/bin/sh", "-c", "true"], ["/bin/sh", "-c", "true"]]
 
 
 async def test_shell_explicit_selection_uses_cached_path() -> None:
@@ -328,7 +348,7 @@ async def test_shell_explicit_selection_uses_cached_path() -> None:
         async with DockerSandbox() as sb:
             await sb.exec("printf selected", shell="sh")
 
-    assert container.exec.await_args.kwargs["cmd"] == ["/bin/sh", "-lc", "printf selected"]
+    assert container.exec.await_args.kwargs["cmd"] == ["/bin/sh", "-c", "printf selected"]
 
 
 async def test_shell_invalid_selection_cannot_become_argv() -> None:
@@ -383,12 +403,20 @@ async def test_tools_unavailable_after_exit() -> None:
 async def test_shell_discovery_cancellation_cleans_up_container_and_client() -> None:
     cls, client, container = mock_docker_factory()
     discovery_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
 
     async def blocked_discovery(self: DockerSandbox) -> tuple[sandbox_module._ShellExecutable, ...]:
         discovery_started.set()
         await asyncio.Event().wait()
         return ()
 
+    async def blocked_delete(*, force: bool) -> None:
+        assert force is True
+        cleanup_started.set()
+        await allow_cleanup.wait()
+
+    container.delete = AsyncMock(side_effect=blocked_delete)
     with (
         patch("axio_tools_docker.sandbox.aiodocker.Docker", cls),
         patch.object(DockerSandbox, "_discover_shells", blocked_discovery),
@@ -397,9 +425,61 @@ async def test_shell_discovery_cancellation_cleans_up_container_and_client() -> 
         enter_task = asyncio.create_task(sandbox.__aenter__())
         await discovery_started.wait()
         enter_task.cancel()
+        await cleanup_started.wait()
+        enter_task.cancel()
+        allow_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await enter_task
 
+    container.delete.assert_awaited_once_with(force=True)
+    client.close.assert_awaited_once()
+    assert sandbox._container is None
+    assert sandbox._client is None
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(404, "No such container"), (409, "Container is not running")],
+)
+async def test_shell_discovery_container_lifecycle_failure_is_not_absent_shell(status: int, message: str) -> None:
+    cls, client, container = mock_docker_factory()
+    stopped = aiodocker.exceptions.DockerError(status, message)
+    container.exec = AsyncMock(side_effect=stopped)
+    sandbox = DockerSandbox()
+
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        with pytest.raises(aiodocker.exceptions.DockerError) as raised:
+            await sandbox.__aenter__()
+
+    assert raised.value is stopped
+    container.delete.assert_awaited_once_with(force=True)
+    client.close.assert_awaited_once()
+    assert sandbox._container is None
+    assert sandbox._client is None
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+async def test_shell_discovery_base_exception_preserved_and_cleaned_up(
+    failure_type: type[BaseException],
+) -> None:
+    cls, client, container = mock_docker_factory()
+    failure = failure_type("startup stopped")
+
+    async def failed_discovery(self: DockerSandbox) -> tuple[sandbox_module._ShellExecutable, ...]:
+        raise failure
+
+    sandbox = DockerSandbox()
+    caught: BaseException | None = None
+    with (
+        patch("axio_tools_docker.sandbox.aiodocker.Docker", cls),
+        patch.object(DockerSandbox, "_discover_shells", failed_discovery),
+    ):
+        try:
+            await sandbox.__aenter__()
+        except BaseException as exc:
+            caught = exc
+
+    assert caught is failure
     container.delete.assert_awaited_once_with(force=True)
     client.close.assert_awaited_once()
     assert sandbox._container is None
@@ -706,6 +786,25 @@ async def test_list_files_uses_depth_one_exec_without_archive() -> None:
     assert 'cd "$target"' in command
     assert "find . ! -path ." in command
     assert "-prune -exec" in command
+
+
+async def test_list_files_protocol_does_not_load_noisy_login_profile() -> None:
+    output = make_listing_output(("81a4", 3, 1_700_000_000, "/workspace/project/result.txt"))
+    cls, client, container = mock_docker_factory(
+        exec_messages=[(1, output)],
+        shell_paths=("/usr/bin/bash",),
+        login_profile_noise=b"login-profile-noise\n",
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox(workdir="/workspace/project") as sandbox:
+            token = _bind_context(sandbox)
+            try:
+                result = await sandbox_module.list_files()
+            finally:
+                CONTEXT.reset(token)
+
+    assert "result.txt" in result
+    assert container.exec.await_args.kwargs["cmd"][0:2] == ["/usr/bin/bash", "-c"]
 
 
 async def test_list_files_empty_directory() -> None:

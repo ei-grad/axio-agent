@@ -42,7 +42,10 @@ def failing_large_output_command() -> str:
 def make_fake_shell(directory: Path, name: str, log_path: Path) -> Path:
     executable = directory / name
     executable.write_text(
-        f'#!/bin/sh\nprintf \'%s\\n\' "$#" "$1" "$2" > {shlex.quote(str(log_path))}\nexec /bin/sh "$@"\n'
+        f"#!/bin/sh\n"
+        f'printf \'%s\\n\' "$#" "$1" "$2" > {shlex.quote(str(log_path))}\n'
+        "case \"$1\" in *l*) printf 'login-profile-noise\\n' >&2 ;; esac\n"
+        'exec /bin/sh "$@"\n'
     )
     executable.chmod(0o755)
     return executable
@@ -82,7 +85,8 @@ class TestShellSelection:
 
         assert "selected" in result
         assert not bash_log.exists()
-        assert sh_log.read_text().splitlines() == ["2", "-lc", command]
+        assert "login-profile-noise" not in result
+        assert sh_log.read_text().splitlines() == ["2", "-c", command]
 
     async def test_default_uses_preferred_discovered_shell(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -92,9 +96,10 @@ class TestShellSelection:
         make_fake_shell(tmp_path, "bash", bash_log)
         monkeypatch.setattr(shell_module, "_AVAILABLE_SHELLS", _discover_shells(str(tmp_path)))
 
-        await shell(command="true")
+        result = await shell(command="true")
 
-        assert bash_log.read_text().splitlines() == ["2", "-lc", "true"]
+        assert "login-profile-noise" not in result
+        assert bash_log.read_text().splitlines() == ["2", "-c", "true"]
 
     async def test_invalid_selection_lists_choices_and_cannot_inject(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

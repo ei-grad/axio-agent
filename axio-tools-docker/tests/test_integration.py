@@ -116,9 +116,14 @@ async def test_standard_image_defaults_to_bash(docker: str) -> None:
         pull_missing=False,
     ) as sandbox:
         assert sandbox.available_shells[0] == "bash"
+        await sandbox.write_file("/tmp/.bash_profile", "printf 'login-profile-noise\\n' >&2\n")
+        list_tool = next(item for item in sandbox.tools if item.name == "list_files")
+        listing = await list_tool(path="/tmp")
         tool = next(item for item in sandbox.tools if item.name == "shell")
         result = await tool(command='test -n "$BASH_VERSION" && printf bash')
 
+    assert ".bash_profile" in listing
+    assert "login-profile-noise" not in result
     assert result == "bash"
 
 

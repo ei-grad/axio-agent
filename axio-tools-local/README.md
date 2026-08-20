@@ -83,7 +83,7 @@ on the process `PATH`. It prefers `bash`, then `sh`, `zsh`, and `dash`. The
 generated tool schema lists the names found in that snapshot. Omit `shell` to
 use the first one, or pass one of those names explicitly; paths and shell flags
 are not accepted. Each command is passed as one argument to
-`[discovered_shell_path, "-lc", command]`.
+`[discovered_shell_path, "-c", command]`. Login profiles are not loaded.
 
 Streaming emits bounded, UTF-8-decoded chunks without waiting for a newline.
 The live stream and final result retain stdout/stderr tags in the order observed

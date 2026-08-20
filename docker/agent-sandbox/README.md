@@ -84,10 +84,12 @@ For Cypress, select it with `npx cypress run --browser "$CHROME_BIN"`.
 `make sandbox-image-smoke` builds the image, prints both installed versions,
 renders a local `data:` page headlessly as fixed non-root UID 1000, and verifies
 that the Docker shell tool defaults to Bash. Docker's default seccomp profile
-blocks the namespace transition required by Chromium's nested sandbox, so the
-smoke browser process uses `--no-sandbox`; the surrounding test container still
-has no network, drops all capabilities, and enables `no-new-privileges`. Do not
-use that flag for untrusted pages: provide a container security profile that
-supports Chromium's installed setuid sandbox instead. The smoke also uses
-`--disable-dev-shm-usage` because Docker's default `/dev/shm` is small; give
-browser-heavy tests a larger `shm_size` and omit that performance tradeoff.
+blocks the namespace transition required by Chromium's nested sandbox, while
+the smoke container's `no-new-privileges` setting independently prevents the
+installed setuid sandbox from elevating. The browser process therefore uses
+`--no-sandbox`; the surrounding test container still has no network and drops
+all capabilities. Do not use that flag for untrusted pages: provide a container
+security profile that supports Chromium's installed sandbox instead. The smoke
+also uses `--disable-dev-shm-usage` because Docker's default `/dev/shm` is
+small; give browser-heavy tests a larger `shm_size` and omit that performance
+tradeoff.

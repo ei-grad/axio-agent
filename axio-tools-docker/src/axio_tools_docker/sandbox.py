@@ -169,7 +169,8 @@ async def shell(
     stdout/stderr order; this does not imply a global syscall order across the
     two descriptors. Commands default to the first shell discovered in the
     container (bash is preferred); pass shell to select another advertised
-    shell. Prefer short timeouts and avoid interactive commands."""
+    shell. Commands use non-login ``-c`` mode and do not load login profiles.
+    Prefer short timeouts and avoid interactive commands."""
     records: list[_ShellRecord] = []
     async for key, text in _shell_stream(command, timeout, cwd, stdin, shell):
         records.append((0.0, key, text))
@@ -671,11 +672,12 @@ class DockerSandbox:
                 Tool(name="run_python", handler=run_python, context=self),
                 Tool(name="patch_file", handler=patch_file, context=self),
             ]
-        except asyncio.CancelledError:
-            await shield_until_done(self.__aexit__())
-            raise
-        except Exception:
-            await self.__aexit__()
+        except BaseException:
+            # Discovery is part of startup: no failure may leave its unpublished container running.
+            try:
+                await shield_until_done(self.__aexit__())
+            except BaseException:  # cleanup failure must not replace the original startup failure
+                logger.exception("Failed to clean up sandbox after startup failure")
             raise
         return self
 
@@ -757,8 +759,6 @@ class DockerSandbox:
             info = await exec_obj.inspect()
             exit_code = info.get("ExitCode")
             return isinstance(exit_code, int) and exit_code == 0
-        except (DockerError, TimeoutError):
-            return False
         finally:
             if stream is not None:
                 await stream.close()
@@ -830,7 +830,7 @@ class DockerSandbox:
         executable = _select_shell(shell, self._shells)
 
         exec_obj = await self._container.exec(
-            cmd=[executable.path, "-lc", command],
+            cmd=[executable.path, "-c", command],
             stdout=True,
             stderr=True,
             tty=False,

@@ -144,9 +144,10 @@ The standard image exports `CHROME_BIN=/usr/bin/chromium` and
 and Puppeteer. Run `make sandbox-image-smoke` to exercise the installed browser,
 driver, installed setuid sandbox, and a real headless render. Docker's default
 seccomp profile blocks the namespace transition required by Chromium's nested
-sandbox, so the smoke browser process uses `--no-sandbox` inside a no-network,
-capability-free container with `no-new-privileges`. Do not use that browser flag
-for untrusted pages: provide a container security profile that supports the
+sandbox, while `no_new_privs` independently prevents the setuid helper from
+elevating. The smoke browser process therefore uses `--no-sandbox` inside a
+no-network, capability-free container. Do not use that browser flag for
+untrusted pages: provide a container security profile that supports the
 installed sandbox instead. `--disable-dev-shm-usage` handles Docker's small
 default `/dev/shm`; browser-heavy runs should use a larger `shm_size` and omit
 that performance tradeoff.
@@ -545,7 +546,7 @@ For an HTTP PyPI mirror, the REPL validates the URL and derives
 is intentionally weaker transport security and should be limited to the
 isolated internal network; prefer an HTTPS mirror.
 
-Ubuntu's system Python in the standard image is externally managed under
+Debian's system Python in the standard image is externally managed under
 PEP 668. Use `uv add`, `uv sync`, or `uvx` rather than global
 `pip install`. The `python-data` command selects the baked data-analysis
 environment.

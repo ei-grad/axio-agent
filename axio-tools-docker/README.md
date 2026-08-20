@@ -79,7 +79,9 @@ and caches the supported executables. It prefers `bash`, then `sh`, `zsh`, and
 `dash`; minimal images without Bash therefore use `sh`. The runtime-generated
 tool schema lists the container's choices. Pass `shell="sh"` (or another listed
 name) to select explicitly. Arbitrary paths and flags are rejected, and the
-command is executed as `[cached_shell_path, "-lc", command]`. Discovery cannot
+command is executed as `[cached_shell_path, "-c", command]`, including internal
+file/listing protocol commands, so login profile output cannot corrupt their
+machine-readable results. Discovery cannot
 happen at Python module import because the host `PATH` says nothing about an
 image that has not been created yet.
 
