@@ -76,6 +76,11 @@ asyncio.run(shell(command="cat", stdin="hello"))
 
 Parameters: `command: str`, `timeout: int = 5`, `cwd: str = "."`, `stdin: str | None = None`, `max_output_chars: int = 4096`
 
+Streaming emits bounded, UTF-8-decoded chunks without waiting for a newline.
+The live stream and final result retain stdout/stderr tags in the order observed
+by the executor. Independent file descriptors do not provide a global ordering
+of the child process's write syscalls.
+
 If output exceeds `max_output_chars`, the tool saves the full stdout/stderr log
 to a local file and returns only the first 5 and last 5 output lines. Those
 inline lines are also capped to `max_output_chars` total.

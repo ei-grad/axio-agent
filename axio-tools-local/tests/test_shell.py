@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import shlex
 import sys
@@ -13,7 +15,7 @@ from typing import Any, cast
 import pytest
 from axio.exceptions import HandlerError
 
-from axio_tools_local.shell import shell
+from axio_tools_local.shell import _format_records, shell
 
 
 async def sh(command: str, **kwargs: Any) -> str:
@@ -183,6 +185,57 @@ class TestShellStreaming:
         assert any("out" in t for t in stdout)
         assert any("err" in t for t in stderr)
 
+    async def test_stream_preserves_observed_order_without_waiting_for_newlines(self, tmp_path: Path) -> None:
+        release_stderr = tmp_path / "release-stderr"
+        release_stdout = tmp_path / "release-stdout"
+        code = f"""
+import pathlib
+import sys
+import time
+
+sys.stdout.write("first")
+sys.stdout.flush()
+while not pathlib.Path({str(release_stderr)!r}).exists():
+    time.sleep(0.001)
+sys.stderr.write("second\\n")
+sys.stderr.flush()
+while not pathlib.Path({str(release_stdout)!r}).exists():
+    time.sleep(0.001)
+sys.stdout.write("third\\n")
+sys.stdout.flush()
+"""
+        chunks = shell_stream(command=f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}", timeout=2)
+
+        assert await asyncio.wait_for(anext(chunks), timeout=1) == ("stdout", "first")
+        release_stderr.touch()
+        assert await asyncio.wait_for(anext(chunks), timeout=1) == ("stderr", "second\n")
+        release_stdout.touch()
+        assert await asyncio.wait_for(anext(chunks), timeout=1) == ("stdout", "third\n")
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(chunks), timeout=1)
+
+    async def test_stream_decodes_utf8_split_across_bounded_reads(self, tmp_path: Path) -> None:
+        release_tail = tmp_path / "release-tail"
+        code = f"""
+import pathlib
+import sys
+import time
+
+sys.stdout.buffer.write(b"price: \\xe2")
+sys.stdout.buffer.flush()
+while not pathlib.Path({str(release_tail)!r}).exists():
+    time.sleep(0.001)
+sys.stdout.buffer.write(b"\\x82\\xac\\n")
+sys.stdout.buffer.flush()
+"""
+        chunks = shell_stream(command=f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}", timeout=2)
+
+        assert await asyncio.wait_for(anext(chunks), timeout=1) == ("stdout", "price: ")
+        release_tail.touch()
+        assert await asyncio.wait_for(anext(chunks), timeout=1) == ("stdout", "€\n")
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(chunks), timeout=1)
+
     async def test_stream_exit_code_on_stderr_key(self) -> None:
         chunks: list[tuple[str, str]] = []
         async for chunk in shell_stream(command="echo out; exit 1"):
@@ -234,6 +287,31 @@ class TestShellStreaming:
         assert "line00-" in result
         assert "line19-" in result
         assert "[truncated]" in result
+
+    async def test_stream_close_kills_process_group_and_emits_no_late_output(self) -> None:
+        chunks = shell_stream(command="printf '%s\\n' \"$$\"; sleep 30", timeout=60)
+        key, text = await asyncio.wait_for(anext(chunks), timeout=1)
+        assert key == "stdout"
+        process_group_leader = int(text)
+
+        await chunks.aclose()
+
+        with pytest.raises(ProcessLookupError):
+            os.kill(process_group_leader, 0)
+        with pytest.raises(StopAsyncIteration):
+            await anext(chunks)
+
+
+def test_final_formatter_preserves_non_adjacent_channel_transitions() -> None:
+    result = _format_records(
+        [
+            (0.0, "stdout", "first"),
+            (0.1, "stderr", "second"),
+            (0.2, "stdout", "third"),
+        ]
+    )
+
+    assert result == "[00:00.000 stdout] first\n[00:00.100 stderr] second\n[00:00.200 stdout] third"
 
 
 class TestShellExpectedFailures:

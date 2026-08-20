@@ -432,7 +432,7 @@ async def test_shell_tool_streams_and_preserves_final_format() -> None:
         ("stdout", "second\n"),
         ("stderr", "[exit code: 7]"),
     ]
-    assert result == "first\nsecond\n\n[stderr]\nwarning\n\n[exit code: 7]"
+    assert result == "first\n\n[stderr]\nwarning\n\n[stdout]\nsecond\n\n[exit code: 7]"
 
 
 async def test_exec_stdin_writes_temp_file() -> None:

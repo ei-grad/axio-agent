@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
+import contextlib
 import os
 import re
 import signal
 import tempfile
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
@@ -21,6 +24,8 @@ _INLINE_TAIL_LINES = 5
 _PREFIX_TRUNCATION_MARKER = "\n...[truncated]\n"
 _SUFFIX_TRUNCATION_MARKER = "[truncated]...\n"
 _LIMIT_RE = re.compile(r"within (?P<limit>\d+) chars")
+_PIPE_READ_BYTES = 4096
+_PIPE_QUEUE_ITEMS = 32
 
 
 class _LargeOutputNotice(str):
@@ -31,12 +36,21 @@ class _ShellControl(str):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _ReaderDone:
+    error: Exception | None = None
+
+
 def _kill_process(proc: asyncio.subprocess.Process) -> None:
     """Kill the process and its entire process group."""
     try:
         os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
     except OSError:
-        proc.kill()
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
 
 
 def _format_timestamp(ts: float) -> str:
@@ -221,6 +235,18 @@ def _format_records(records: list[OutputRecord]) -> str:
     return _format_records_plain(records)
 
 
+def _split_decoded_output(text: str) -> list[str]:
+    """Split decoded reads at newlines without withholding a partial tail."""
+    chunks: list[str] = []
+    start = 0
+    while (newline := text.find("\n", start)) >= 0:
+        chunks.append(text[start : newline + 1])
+        start = newline + 1
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
 async def _shell_stream(
     command: str,
     timeout: int = 5,
@@ -228,7 +254,11 @@ async def _shell_stream(
     stdin: str | None = None,
     max_output_chars: int = _MAX_INLINE_OUTPUT_CHARS,
 ) -> AsyncGenerator[tuple[str, str], None]:
-    """Yield ``(key, text)`` tuples where *key* is ``"stdout"`` or ``"stderr"``."""
+    """Yield tagged chunks in the order accepted from the two pipe readers.
+
+    This is the executor's observed order, not a global ordering of writes to
+    the process's independent stdout and stderr file descriptors.
+    """
     if max_output_chars < 0:
         raise HandlerError("max_output_chars must be >= 0")
 
@@ -244,31 +274,33 @@ async def _shell_stream(
     except OSError as exc:
         raise HandlerError(f"Failed to start shell command: {exc}") from exc
 
-    if stdin is not None:
-        assert proc.stdin is not None
-        proc.stdin.write(stdin.encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
-
     assert proc.stdout is not None
     assert proc.stderr is not None
 
-    queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, str] | _ReaderDone] = asyncio.Queue(maxsize=_PIPE_QUEUE_ITEMS)
 
     async def _read_pipe(pipe: asyncio.StreamReader, key: str) -> None:
-        while True:
-            line = await pipe.readline()
-            if not line:
-                break
-            await queue.put((key, line.decode(errors="replace")))
-        await queue.put(None)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while data := await pipe.read(_PIPE_READ_BYTES):
+                text = decoder.decode(data)
+                if text:
+                    await queue.put((key, text))
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                await queue.put((key, tail))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await queue.put(_ReaderDone(exc))
+        else:
+            await queue.put(_ReaderDone())
 
     stdout_task = asyncio.create_task(_read_pipe(proc.stdout, "stdout"))
     stderr_task = asyncio.create_task(_read_pipe(proc.stderr, "stderr"))
+    reader_tasks = (stdout_task, stderr_task)
 
     timed_out = False
-    deadline = time.monotonic() + timeout
-    t0 = time.monotonic()
     output_chars = 0
     output_record_count = 0
     yielded_output_count = 0
@@ -279,6 +311,36 @@ async def _shell_stream(
     tail_records: list[OutputRecord] = []
     output_log: TextIO | None = None
     output_log_path: str | None = None
+    cleanup_complete = False
+
+    async def _stop_process_and_readers() -> None:
+        nonlocal cleanup_complete
+        if cleanup_complete:
+            return
+        if proc.returncode is None or any(not task.done() for task in reader_tasks):
+            _kill_process(proc)
+        for task in reader_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*reader_tasks, return_exceptions=True)
+        await proc.wait()
+        cleanup_complete = True
+
+    if stdin is not None:
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(stdin.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except asyncio.CancelledError:
+            await _stop_process_and_readers()
+            raise
+        except Exception:
+            await _stop_process_and_readers()
+            raise
+
+    deadline = time.monotonic() + timeout
+    t0 = time.monotonic()
 
     def _elapsed() -> float:
         return time.monotonic() - t0
@@ -376,37 +438,47 @@ async def _shell_stream(
             except TimeoutError:
                 timed_out = True
                 break
-            if item is None:
+            if isinstance(item, _ReaderDone):
                 done_count += 1
+                if item.error is not None:
+                    raise item.error
             else:
-                for chunk in _record_output(*item):
-                    yield chunk
+                key, text = item
+                for record_text in _split_decoded_output(text):
+                    for chunk in _record_output(key, record_text):
+                        yield chunk
 
-        if not timed_out:
-            await asyncio.gather(stdout_task, stderr_task)
-    finally:
         if timed_out:
-            _kill_process(proc)
-            stdout_task.cancel()
-            stderr_task.cancel()
-            await proc.wait()
+            await _stop_process_and_readers()
+            while True:
+                try:
+                    accepted = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if isinstance(accepted, _ReaderDone):
+                    continue
+                key, text = accepted
+                for record_text in _split_decoded_output(text):
+                    for chunk in _record_output(key, record_text):
+                        yield chunk
 
-    if timed_out:
-        timeout_control_records = [_record_control("stderr", f"[timeout: command exceeded {timeout}s]")]
-        for _, key, text in [*_pending_records(), *timeout_control_records]:
+            timeout_control_records = [_record_control("stderr", f"[timeout: command exceeded {timeout}s]")]
+            for _, key, text in [*_pending_records(), *timeout_control_records]:
+                yield (key, text)
+            return
+
+        await asyncio.gather(*reader_tasks)
+        returncode = await proc.wait()
+        cleanup_complete = True
+        control_records: list[OutputRecord] = []
+        if returncode != 0:
+            control_records.append(_record_control("stderr", f"[exit code: {returncode}]"))
+        for _, key, text in [*_pending_records(), *control_records]:
             yield (key, text)
+    finally:
+        await _stop_process_and_readers()
         if output_log is not None:
             output_log.close()
-        return
-
-    control_records: list[OutputRecord] = []
-    returncode = await proc.wait()
-    if returncode != 0:
-        control_records.append(_record_control("stderr", f"[exit code: {returncode}]"))
-    for _, key, text in [*_pending_records(), *control_records]:
-        yield (key, text)
-    if output_log is not None:
-        output_log.close()
 
 
 async def shell(
@@ -423,7 +495,9 @@ async def shell(
     commands (installs, builds, and test suites often need 60-300s). Output
     larger than max_output_chars is saved to a local log file; inline output is
     summarized to the first 5 and last 5 lines.
-    Avoid interactive commands."""
+    Live and final output preserve executor-observed stdout/stderr order; this
+    does not imply a global syscall order across the two descriptors. Avoid
+    interactive commands."""
     records: list[OutputRecord] = []
     t0 = time.monotonic()
     async for key, text in _shell_stream(command, timeout, cwd, stdin, max_output_chars):

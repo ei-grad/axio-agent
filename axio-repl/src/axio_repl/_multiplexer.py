@@ -81,7 +81,7 @@ class _ToolAction:
     arguments: list[str] = field(default_factory=list)
     arguments_bytes: int = 0
     call_emitted: bool = False
-    output: dict[str, str] = field(default_factory=dict)
+    output: deque[tuple[str, str]] = field(default_factory=deque)
     output_bytes: int = 0
     saw_output: bool = False
 
@@ -388,8 +388,8 @@ class ActionMultiplexer:
                         return
                     self._emit_call(agent_id, action, retained=True)
                     action.saw_output = True
-                    self._set_output_buffer(action, key, action.output.get(key, "") + delta)
-                    self._emit_complete_output(agent_id, action, key)
+                    self._append_output_buffer(action, key, delta)
+                    self._emit_complete_output(agent_id, action)
                 case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
                     action = self._pop_tool(agent_id, tool_use_id)
                     if action is None:
@@ -402,8 +402,7 @@ class ActionMultiplexer:
                         )
                         return
                     self._emit_call(agent_id, action, retained=False)
-                    for key in tuple(action.output):
-                        self._flush_output(agent_id, action, key)
+                    self._flush_output(agent_id, action)
                     if is_error:
                         self._enqueue(
                             agent_id,
@@ -543,8 +542,9 @@ class ActionMultiplexer:
         action.arguments.clear()
         action.arguments_bytes = 0
 
-    def _emit_complete_output(self, agent_id: str, action: _ToolAction, key: str) -> None:
-        while buffer := action.output.get(key, ""):
+    def _emit_complete_output(self, agent_id: str, action: _ToolAction) -> None:
+        while action.output:
+            key, buffer = action.output[0]
             newline = buffer.rfind("\n", 0, self._output_chunk_chars + 1)
             if newline >= 0:
                 end = newline + 1
@@ -553,25 +553,36 @@ class ActionMultiplexer:
             else:
                 break
             self._enqueue(agent_id, f"{action.name} {key}", buffer[:end], agent_name=action.agent_name)
-            self._set_output_buffer(action, key, buffer[end:])
+            old_bytes = len(key.encode("utf-8")) + len(buffer.encode("utf-8"))
+            remainder = buffer[end:]
+            if remainder:
+                action.output[0] = key, remainder
+                new_bytes = len(key.encode("utf-8")) + len(remainder.encode("utf-8"))
+            else:
+                action.output.popleft()
+                new_bytes = 0
+            delta = new_bytes - old_bytes
+            action.output_bytes += delta
+            self._collector_bytes += delta
 
-    def _flush_output(self, agent_id: str, action: _ToolAction, key: str) -> None:
-        buffer = action.output.pop(key, "")
-        if buffer:
+    def _flush_output(self, agent_id: str, action: _ToolAction) -> None:
+        while action.output:
+            key, buffer = action.output.popleft()
             self._enqueue(agent_id, f"{action.name} {key}", buffer, agent_name=action.agent_name)
+        action.output_bytes = 0
 
-    def _set_output_buffer(self, action: _ToolAction, key: str, value: str) -> None:
-        old = action.output.get(key)
-        old_bytes = 0 if old is None else len(key.encode("utf-8")) + len(old.encode("utf-8"))
-        if value:
-            new_bytes = len(key.encode("utf-8")) + len(value.encode("utf-8"))
-            action.output[key] = value
+    def _append_output_buffer(self, action: _ToolAction, key: str, delta: str) -> None:
+        if not delta:
+            return
+        if action.output and action.output[-1][0] == key:
+            previous_key, previous_text = action.output[-1]
+            action.output[-1] = previous_key, previous_text + delta
+            added_bytes = len(delta.encode("utf-8"))
         else:
-            new_bytes = 0
-            action.output.pop(key, None)
-        delta = new_bytes - old_bytes
-        action.output_bytes += delta
-        self._collector_bytes += delta
+            action.output.append((key, delta))
+            added_bytes = len(key.encode("utf-8")) + len(delta.encode("utf-8"))
+        action.output_bytes += added_bytes
+        self._collector_bytes += added_bytes
 
     def _enqueue(
         self,
