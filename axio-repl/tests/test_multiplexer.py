@@ -52,6 +52,30 @@ def test_streaming_output_is_grouped_by_lines_and_flushed_at_result() -> None:
     assert "ignored duplicate" not in result
 
 
+def test_partial_output_segments_flush_in_executor_observed_order() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, output_chunk_chars=64)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    assert "tool call" in mux.drain()[0]
+
+    mux.observe("child", ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="first"))
+    mux.observe("child", ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="second\n"))
+    mux.observe("child", ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="third"))
+    assert mux.drain() == []
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="call", name="shell", is_error=False, content="firstsecond\nthird"),
+    )
+    first, second, third, result = mux.drain(max_frames=4)
+
+    assert "shell stdout" in first and "first" in first
+    assert "shell stderr" in second and "second" in second
+    assert "shell stdout" in third and "third" in third
+    assert "shell completed" in result
+    assert "firstsecond" not in result
+
+
 def test_round_robin_keeps_one_agent_from_monopolizing_a_boundary() -> None:
     mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
     mux.observe("alpha", TurnStarted(prompt="one"))
@@ -149,7 +173,7 @@ def test_invalid_partial_input_payload_is_included_in_the_global_retained_byte_c
     assert "incomplete action discarded" in mux.drain(max_frames=1, max_bytes=retained_limit)[0]
 
 
-def test_incomplete_output_fragments_are_included_in_the_global_retained_byte_cap() -> None:
+def test_ordered_output_fragments_are_included_in_the_global_retained_byte_cap() -> None:
     retained_limit = 4096
     mux = ActionMultiplexer(
         DisplayMode.ALL_ACTIONS,
@@ -160,10 +184,15 @@ def test_incomplete_output_fragments_are_included_in_the_global_retained_byte_ca
     mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
     mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
 
-    for _ in range(10_000):
+    for index in range(10_000):
         mux.observe(
             "child",
-            ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="x" * 1024),
+            ToolOutputDelta(
+                tool_use_id="call",
+                name="shell",
+                key="stdout" if index % 2 == 0 else "stderr",
+                delta="x" * 1024,
+            ),
         )
 
     assert mux.retained_bytes <= retained_limit

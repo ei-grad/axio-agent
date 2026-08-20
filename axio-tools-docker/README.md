@@ -61,12 +61,18 @@ These mirror `axio-tools-local` exactly - same names and field schemas:
 
 | Tool | Description |
 |---|---|
-| `shell` | Run a shell command with streaming stdout/stderr. Supports `timeout`, `cwd`, `stdin`. |
+| `shell` | Run a shell command with streaming stdout/stderr in Docker-observed order. Supports `timeout`, `cwd`, `stdin`. |
 | `write_file` | Create or overwrite a file with UTF-8 text. Parent directories are created automatically. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, `max_chars`. |
 | `list_files` | List immediate directory entries without reading descendant contents; directories first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess. Supports `timeout`, `cwd`, `stdin`. |
 | `patch_file` | Replace lines `from_line`..`to_line` in a UTF-8 text file (1-indexed, inclusive). `to_line = from_line - 1` inserts. |
+
+The shell stream and final result retain Docker's multiplex-frame order. Channel
+transitions in the final string are labelled `[stdout]` or `[stderr]`; an
+initial stdout segment stays unlabelled for compatibility. This observed order
+is not a global ordering of writes to the container's independent file
+descriptors.
 
 ## Container lifecycle
 

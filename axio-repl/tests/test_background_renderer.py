@@ -416,6 +416,73 @@ async def test_multiline_tool_output_reapplies_its_style_after_newlines(
     assert f"{DIM}one{RESET}\n{DIM}two{RESET}\n{DIM}three{RESET}" in output
 
 
+async def test_foreground_tool_output_preserves_channel_order_styles_and_no_success_replay(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="first"),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="second"),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="third"),
+    )
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="call", name="shell", is_error=False, content="firstsecondthird"),
+    )
+
+    output = capsys.readouterr().out
+    muted_amber = "\033[2;33m"
+    first = f"{DIM}first{RESET}"
+    second = f"{muted_amber}second{RESET}"
+    third = f"{DIM}third{RESET}"
+    assert output.index(first) < output.index(second) < output.index(third)
+    assert output.count("first") == output.count("second") == output.count("third") == 1
+
+
+async def test_background_tool_output_preserves_partial_channel_order(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    await renderer.render("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    capsys.readouterr()
+
+    await renderer.render(
+        "child",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="first"),
+    )
+    await renderer.render(
+        "child",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="second\n"),
+    )
+    await renderer.render(
+        "child",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="third"),
+    )
+    await renderer.render(
+        "child",
+        ToolResult(tool_use_id="call", name="shell", is_error=False, content="firstsecond\nthird"),
+    )
+    await renderer.mark_idle()
+
+    output = capsys.readouterr().out
+    first = output.index("agent child · shell stdout")
+    second = output.index("agent child · shell stderr")
+    third = output.index("agent child · shell stdout", first + 1)
+    completed = output.index("agent child · tool result")
+    assert first < second < third < completed
+    assert output.count("first") == output.count("second") == output.count("third") == 1
+
+
 async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

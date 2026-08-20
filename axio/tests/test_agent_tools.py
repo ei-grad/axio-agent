@@ -494,6 +494,7 @@ class TestStreamingToolDispatch:
         async def _stream(msg: str) -> AsyncGenerator[tuple[str, str], None]:
             yield ("stdout", "line1\n")
             yield ("stderr", "warn\n")
+            yield ("stdout", "line2\n")
 
         async def streaming_handler(msg: str) -> str:
             parts = []
@@ -513,16 +514,18 @@ class TestStreamingToolDispatch:
             events.append(e)
 
         deltas = [e for e in events if isinstance(e, ToolOutputDelta)]
-        assert len(deltas) == 2
+        assert len(deltas) == 3
         assert deltas[0].key == "stdout"
         assert deltas[0].delta == "line1\n"
         assert deltas[1].key == "stderr"
         assert deltas[1].delta == "warn\n"
+        assert deltas[2].key == "stdout"
+        assert deltas[2].delta == "line2\n"
         assert deltas[0].name == "streamer"
 
         results = [e for e in events if isinstance(e, ToolResult)]
         assert len(results) == 1
-        assert results[0].content == "line1\nwarn\n"
+        assert results[0].content == "line1\nwarn\nline2\n"
         assert not results[0].is_error
 
     async def test_non_streaming_tool_no_output_deltas(self) -> None:

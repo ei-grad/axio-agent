@@ -36,8 +36,8 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   re-evaluated and the system prompt adapts automatically.
 - **Streaming tool arguments** — tool call fields appear incrementally as the
   model generates them, so you see what's happening before execution starts.
-- **Streaming tool output** — shell command stdout/stderr streams line-by-line
-  in real time instead of buffering until completion.
+- **Streaming tool output** — tagged shell stdout/stderr chunks appear as soon
+  as the executor observes them instead of waiting for completion or a newline.
 - **Vision** — `read_file` on images (PNG, JPG, GIF, WebP) and videos returns
   multimodal content blocks. The model sees the actual pixels, not a description.
 - **Image & video generation** — when the Google transport is installed,
@@ -284,7 +284,8 @@ the child's paragraph, reasoning, arguments, or tool output.
 `spawn_agent` starts a persistent background peer. By default, its prose and
 actions stay out of the active stream and the REPL prints a completion summary.
 Use `/agent-actions on` (or start with `--agent-actions on`) to show its complete
-tool calls, line-grouped tool output, results, errors, and lifecycle changes.
+tool calls, ordered channel-tagged tool output, results, errors, and lifecycle
+changes.
 These labelled frames appear only after a complete active paragraph, after
 reasoning closes, after media, or after every active parallel tool call has
 finished. Background prose and reasoning remain hidden.

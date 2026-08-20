@@ -78,15 +78,31 @@ type _ShellRecord = tuple[float, str, str]
 
 
 def _format_shell_records(records: list[_ShellRecord]) -> str:
-    stdout = "".join(text for _, key, text in records if key == "stdout" and not isinstance(text, _ShellControl))
-    stderr = "".join(text for _, key, text in records if key == "stderr" and not isinstance(text, _ShellControl))
-    controls = [text for _, _, text in records if isinstance(text, _ShellControl)]
+    segments: list[tuple[str, str]] = []
+    for _, key, text in records:
+        if (
+            segments
+            and segments[-1][0] == key
+            and not isinstance(segments[-1][1], _ShellControl)
+            and not isinstance(text, _ShellControl)
+        ):
+            previous_key, previous_text = segments[-1]
+            segments[-1] = previous_key, previous_text + text
+        else:
+            segments.append((key, text))
 
-    output = stdout
-    if stderr:
-        output += "\n[stderr]\n" + stderr
-    if controls:
-        output += ("\n" if output else "") + "\n".join(controls)
+    output = ""
+    current_key: str | None = None
+    for key, text in segments:
+        if isinstance(text, _ShellControl):
+            output += ("\n" if output else "") + text
+            current_key = None
+            continue
+        if key != current_key:
+            if output or key != "stdout":
+                output += ("\n" if output else "") + f"[{key}]\n"
+            current_key = key
+        output += text
     return output.strip() or "(no output)"
 
 
@@ -107,7 +123,9 @@ async def shell(command: str, timeout: float = 5, cwd: str = ".", stdin: str | N
     """Run a shell command and return combined stdout/stderr. Use for git,
     build tools, grep, tests, or any CLI operation. Non-zero exit codes
     are reported. Optionally pass stdin data for commands that read from
-    standard input. Prefer short timeouts and avoid interactive commands."""
+    standard input. Live and final output preserve Docker-observed
+    stdout/stderr order; this does not imply a global syscall order across the
+    two descriptors. Prefer short timeouts and avoid interactive commands."""
     records: list[_ShellRecord] = []
     async for key, text in _shell_stream(command, timeout, cwd, stdin):
         records.append((0.0, key, text))
@@ -677,7 +695,7 @@ class DockerSandbox:
         timeout: float = 30,
         stdin: str | None = None,
     ) -> AsyncGenerator[tuple[str, str], None]:
-        """Execute a shell command and yield Docker stdout/stderr frames."""
+        """Yield tagged chunks in Docker's observed multiplex-frame order."""
         assert self._container is not None
         command = await self._prepare_exec_command(command, stdin)
 
