@@ -32,7 +32,7 @@ from axio_repl import (
     _show_model,
     main,
 )
-from axio_repl._journal import SessionJournal, read_journal
+from axio_repl._journal import SEMANTIC_FILENAME, SessionJournal, read_journal
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._recovery import materialize_recovery
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME, TerminalTheme
@@ -162,6 +162,12 @@ def test_agent_actions_can_be_enabled() -> None:
 def test_agent_actions_rejects_unknown_modes() -> None:
     with pytest.raises(SystemExit):
         _build_argument_parser().parse_args(["--agent-actions", "verbose"])
+
+
+def test_session_replay_is_disabled_by_default_and_has_explicit_toggle() -> None:
+    assert _build_argument_parser().parse_args([]).session_replay is False
+    assert _build_argument_parser().parse_args(["--session-replay"]).session_replay is True
+    assert _build_argument_parser().parse_args(["--no-session-replay"]).session_replay is False
 
 
 def test_sandbox_networking_defaults_to_fail_closed() -> None:
@@ -503,7 +509,7 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         await asyncio.sleep(0)
         assert not repl_task.done()
         await asyncio.wait_for(repl_task, timeout=1)
-        journal_paths = list((tmp_path / "journals").rglob("events.jsonl"))
+        journal_paths = list((tmp_path / "journals").rglob(SEMANTIC_FILENAME))
         assert len(journal_paths) == 1
         records = read_journal(journal_paths[0]).records
         assert all(
@@ -861,7 +867,7 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
         for block in message.content
     )
 
-    events_paths = list(journal_root.rglob("events.jsonl"))
+    events_paths = list(journal_root.rglob(SEMANTIC_FILENAME))
     assert len(events_paths) == 1
     recovered = materialize_recovery(events_paths[0])
     assert recovered.pending_inputs == ()
@@ -990,7 +996,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
     await asyncio.wait_for(main(), timeout=2)
 
     assert prompt_calls == 1
-    resumed_paths = list(resumed_root.rglob("events.jsonl"))
+    resumed_paths = list(resumed_root.rglob(SEMANTIC_FILENAME))
     assert len(resumed_paths) == 1
     records = read_journal(resumed_paths[0]).records
     assert any(record.get("kind") == "recovery_applied" for record in records)

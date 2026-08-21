@@ -35,6 +35,7 @@ _RUNTIME_KEYS = frozenset(
         "theme",
         "powerline",
         "session_log",
+        "session_replay",
         "session_log_dir",
     }
 )
@@ -72,6 +73,8 @@ _CLI_OPTION_DESTINATIONS = {
     "--no-powerline": "powerline",
     "--session-log": "no_session_log",
     "--no-session-log": "no_session_log",
+    "--session-replay": "session_replay",
+    "--no-session-replay": "session_replay",
     "--session-log-dir": "session_log_dir",
     "--sandbox": "sandbox",
     "--sandbox-image": "sandbox_image",
@@ -161,6 +164,7 @@ class RuntimeSettings:
     theme: str | None = None
     powerline: bool | None = None
     session_log: bool | None = None
+    session_replay: bool | None = None
     session_log_dir: Path | None = None
 
     def overlay(self, other: RuntimeSettings) -> RuntimeSettings:
@@ -174,6 +178,7 @@ class RuntimeSettings:
             theme=other.theme if other.theme is not None else self.theme,
             powerline=other.powerline if other.powerline is not None else self.powerline,
             session_log=other.session_log if other.session_log is not None else self.session_log,
+            session_replay=other.session_replay if other.session_replay is not None else self.session_replay,
             session_log_dir=(other.session_log_dir if other.session_log_dir is not None else self.session_log_dir),
         )
 
@@ -311,6 +316,7 @@ def apply_profile_to_args(args: Any, profile: ResolvedAgentProfile, explicit: fr
         "agent_actions": settings.runtime.agent_actions,
         "theme": settings.runtime.theme,
         "powerline": settings.runtime.powerline,
+        "session_replay": settings.runtime.session_replay,
         "session_log_dir": settings.runtime.session_log_dir,
         "sandbox": settings.sandbox.backend,
         "sandbox_image": settings.sandbox.image,
@@ -533,6 +539,7 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
         theme=theme,
         powerline=_optional_bool(data, "powerline", source, "runtime.powerline"),
         session_log=_optional_bool(data, "session_log", source, "runtime.session_log"),
+        session_replay=_optional_bool(data, "session_replay", source, "runtime.session_replay"),
         session_log_dir=_optional_path(data, "session_log_dir", source, "runtime.session_log_dir", base_dir),
     )
 
@@ -756,6 +763,7 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
         theme=theme,
         powerline=boolean("AXIO_REPL_POWERLINE"),
         session_log=boolean("AXIO_REPL_SESSION_LOG"),
+        session_replay=boolean("AXIO_REPL_SESSION_REPLAY"),
         session_log_dir=external_path("AXIO_REPL_SESSION_LOG_DIR"),
     )
     if runtime.effort is not None and runtime.effort not in _EFFORT_VALUES:

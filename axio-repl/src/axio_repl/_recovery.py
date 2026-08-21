@@ -21,7 +21,7 @@ from axio.blocks import (
 )
 from axio.messages import InputProvenance, Message
 
-from axio_repl._journal import SCHEMA_VERSION, read_journal
+from axio_repl._journal import LEGACY_SCHEMA_VERSION, SCHEMA_VERSION, read_journal
 
 
 class RecoveryError(ValueError):
@@ -55,6 +55,7 @@ class _TurnFragments:
     reasoning: list[str] = field(default_factory=list)
     tool_names: dict[str, str] = field(default_factory=dict)
     tool_arguments: dict[str, list[str]] = field(default_factory=dict)
+    tool_fields: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     tool_output: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -72,6 +73,9 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
     if not records:
         raise RecoveryError("session journal is empty")
     source_session_id = _string(records[0].get("session_id"), "session_id")
+    source_schema = records[0].get("schema_version")
+    if type(source_schema) is not int or source_schema not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+        raise RecoveryError("unsupported journal schema at storage sequence 1")
     messages: list[Message] = []
     pending: dict[str, RecoveredPendingInput] = {}
     input_status: dict[str, str] = {}
@@ -87,9 +91,10 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
     applied: set[str] = set()
 
     for expected_seq, record in enumerate(records, start=1):
-        if record.get("schema_version") != SCHEMA_VERSION:
+        if record.get("schema_version") != source_schema:
             raise RecoveryError(f"unsupported journal schema at storage sequence {expected_seq}")
-        if record.get("seq") != expected_seq:
+        record_seq = record.get("seq")
+        if type(record_seq) is not int or record_seq != expected_seq:
             raise RecoveryError(f"non-contiguous journal storage sequence at record {expected_seq}")
         if record.get("session_id") != source_session_id:
             raise RecoveryError(f"session_id changed at storage sequence {expected_seq}")
@@ -122,6 +127,18 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
                 child_committed_assistant_text.setdefault((record_agent_id, turn_id), []).append(
                     _message_text(message)
                 )
+            continue
+        if kind == "turn_checkpoint":
+            record_agent_id = _string(record.get("agent_id"), "turn_checkpoint.agent_id")
+            if turn_id is None:
+                raise RecoveryError("turn_checkpoint has no turn_id")
+            payload = _mapping(record.get("payload"), "turn_checkpoint.payload")
+            if record_agent_id == "main":
+                fragments = turns.get(turn_id)
+            else:
+                fragments = child_turns.get((record_agent_id, turn_id))
+            if fragments is not None:
+                _apply_turn_checkpoint(fragments, payload)
             continue
         if kind not in {
             "input_buffered",
@@ -382,6 +399,33 @@ def _apply_stream_event(fragments: _TurnFragments, event: dict[str, Any]) -> Non
         fragments.tool_output.setdefault(tool_use_id, []).append(_string(event.get("delta"), "ToolOutputDelta.delta"))
 
 
+def _apply_turn_checkpoint(fragments: _TurnFragments, payload: dict[str, Any]) -> None:
+    text = _string(payload.get("text"), "turn_checkpoint.text")
+    if text:
+        fragments.text.append(text)
+    for tool_use_id, name in _string_mapping(payload.get("tool_names"), "turn_checkpoint.tool_names").items():
+        fragments.tool_names[tool_use_id] = name
+        fragments.tool_arguments.setdefault(tool_use_id, [])
+    for tool_use_id, arguments in _string_mapping(
+        payload.get("tool_arguments"), "turn_checkpoint.tool_arguments"
+    ).items():
+        if arguments:
+            fragments.tool_arguments.setdefault(tool_use_id, []).append(arguments)
+    raw_fields = _mapping(payload.get("tool_fields"), "turn_checkpoint.tool_fields")
+    for raw_tool_use_id, raw_values in raw_fields.items():
+        tool_use_id = _string(raw_tool_use_id, "turn_checkpoint.tool_fields key")
+        values = _string_mapping(raw_values, f"turn_checkpoint.tool_fields.{tool_use_id}")
+        target = fragments.tool_fields.setdefault(tool_use_id, {})
+        for key, value in values.items():
+            if value:
+                target.setdefault(key, []).append(value)
+            else:
+                target.setdefault(key, [])
+    for tool_use_id, output in _string_mapping(payload.get("tool_output"), "turn_checkpoint.tool_output").items():
+        if output:
+            fragments.tool_output.setdefault(tool_use_id, []).append(output)
+
+
 def _interruption_notice(
     turn_id: str,
     fragments: _TurnFragments,
@@ -406,6 +450,9 @@ def _interruption_notice(
         tool_detail = [f"Available partial tool call: name={name}, call_id={tool_use_id}"]
         if arguments := "".join(fragments.tool_arguments.get(tool_use_id, ())):
             tool_detail.append("Arguments fragment:\n" + arguments)
+        if fields := fragments.tool_fields.get(tool_use_id):
+            field_lines = [f"{key}: {''.join(parts)}" for key, parts in fields.items()]
+            tool_detail.append("Argument fields:\n" + "\n".join(field_lines))
         if output := "".join(fragments.tool_output.get(tool_use_id, ())):
             tool_detail.append("Output fragment:\n" + output)
         sections.append("\n".join(tool_detail))
@@ -560,6 +607,16 @@ def _mapping(value: object, label: str, *, required: bool = True) -> dict[str, A
     if not isinstance(value, dict):
         raise RecoveryError(f"{label} is not an object")
     return cast(dict[str, Any], value)
+
+
+def _string_mapping(value: object, label: str) -> dict[str, str]:
+    mapping = _mapping(value, label)
+    result: dict[str, str] = {}
+    for key, item in mapping.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise RecoveryError(f"{label} is not a string mapping")
+        result[key] = item
+    return result
 
 
 def _string(value: object, label: str) -> str:

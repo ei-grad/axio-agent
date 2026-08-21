@@ -10,6 +10,7 @@ from enum import StrEnum
 from io import TextIOBase
 from typing import Any, TextIO, cast
 
+from axio_repl import _replay
 from axio_repl._prompt_terminal import PromptToolkitInlineOutput
 from axio_repl._terminal_ingress import (
     MAX_BATCH_CHARS,
@@ -213,11 +214,11 @@ class TerminalUI:
             fallback = self._fallback_stream_locked(frame.stream)
             active = self._phase in {TerminalPhase.RUNNING, TerminalPhase.FAILED, TerminalPhase.DRAINING}
         if not active or ingress is None or loop is None:
-            self._write_fallback(fallback, frame.content)
+            self._write_fallback(fallback, frame.content, frame.stream)
             return
         admission = ingress.submit(frame)
         if admission.destination is IngressDestination.FALLBACK:
-            self._write_fallback(fallback, frame.content)
+            self._write_fallback(fallback, frame.content, frame.stream)
             return
         if not admission.wake_consumer:
             return
@@ -388,22 +389,26 @@ class TerminalUI:
                 fallback = self._original_stderr if frame.stream == "stderr" else self._original_stdout
                 fallback.write(frame.content)
                 fallback.flush()
+                _replay.record_terminal_fallback(self._output, frame.content, frame.stream, "late")
             if late.dropped_frames:
-                self._original_stderr.write(
+                marker = (
                     f"{self._reset}\n[late terminal output skipped: {late.dropped_frames} frame(s), "
                     f"{late.dropped_chars} character(s)]\n"
                 )
+                self._original_stderr.write(marker)
                 self._original_stderr.flush()
+                _replay.record_terminal_fallback(self._output, marker, "stderr", "late")
 
     def _fallback_stream_locked(self, stream: OutputStream) -> TextIO:
         if stream == "stderr":
             return self._original_stderr or self._initial_stderr
         return self._original_stdout or self._initial_stdout
 
-    def _write_fallback(self, fallback: TextIO, content: str) -> None:
+    def _write_fallback(self, fallback: TextIO, content: str, stream: OutputStream) -> None:
         with self._fallback_lock:
             fallback.write(content)
             fallback.flush()
+            _replay.record_terminal_fallback(self._output, content, stream, "fallback")
 
     def _restore_terminal(self) -> None:
         self._output.reset_attributes()

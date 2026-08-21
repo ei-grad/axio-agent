@@ -3009,7 +3009,22 @@ _JOURNAL_EVENT_KINDS: dict[type[object], str] = {
     MessageCommitted: "message_committed",
     ContextForked: "context_forked",
     ContextCleared: "context_cleared",
+    ToolResult: "tool_result",
+    IterationEnd: "iteration_end",
+    SessionEndEvent: "agent_run_end",
+    Error: "stream_error",
 }
+
+_CHECKPOINT_STREAM_EVENTS = (
+    ReasoningDelta,
+    TextDelta,
+    ToolUseStart,
+    ToolInputDelta,
+    ToolFieldStart,
+    ToolFieldDelta,
+    ToolFieldEnd,
+    ToolOutputDelta,
+)
 
 _DURABLE_JOURNAL_EVENTS = (
     MessageCommitted,
@@ -3047,6 +3062,35 @@ async def _write_runtime_event(journal: _journal.SessionJournal, envelope: Agent
             "run_id": envelope.run_id,
             "event": event,
         }
+    if not isinstance(event, _CHECKPOINT_STREAM_EVENTS):
+        journal.record_replay(
+            "runtime_event",
+            {
+                "hub_seq": envelope.seq,
+                "run_id": envelope.run_id,
+                "agent_id": envelope.agent_id,
+                "parent_agent_id": envelope.parent_agent_id,
+                "turn_id": envelope.turn_id,
+                "context_id": envelope.context_id,
+                "execution_mode": envelope.execution_mode.value,
+                "parent_tool_use_id": envelope.parent_tool_use_id,
+                "kind": kind,
+                "payload": payload,
+            },
+        )
+    if isinstance(event, _CHECKPOINT_STREAM_EVENTS):
+        journal.observe_stream_event(
+            event,
+            agent_id=envelope.agent_id,
+            parent_agent_id=envelope.parent_agent_id,
+            turn_id=envelope.turn_id,
+            context_id=envelope.context_id,
+            execution_mode=envelope.execution_mode.value,
+            parent_tool_use_id=envelope.parent_tool_use_id,
+        )
+        return
+    if isinstance(event, _DURABLE_JOURNAL_EVENTS):
+        journal.flush_checkpoints()
     accepted = await journal.publish(
         kind,
         payload,
@@ -3059,6 +3103,8 @@ async def _write_runtime_event(journal: _journal.SessionJournal, envelope: Agent
     )
     if accepted and isinstance(event, _DURABLE_JOURNAL_EVENTS):
         await journal.sync()
+    if isinstance(event, TurnFinished):
+        journal.finish_turn_checkpoint(envelope.agent_id, envelope.turn_id)
 
 
 @asynccontextmanager
@@ -3069,6 +3115,7 @@ async def _session_journal(
     root: Path | None,
     one_shot: bool,
     cwd: Path,
+    replay: bool = False,
 ) -> AsyncIterator[_journal.SessionJournal | None]:
     if disabled:
         yield None
@@ -3086,6 +3133,18 @@ async def _session_journal(
             file=sys.stderr,
         )
 
+    replay_warning_emitted = False
+
+    def warn_replay_degraded(error: BaseException) -> None:
+        nonlocal replay_warning_emitted
+        if replay_warning_emitted:
+            return
+        replay_warning_emitted = True
+        print(
+            f"Session replay degraded; subsequent frames may be missing: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+
     try:
         journal = await _journal.SessionJournal.open(
             session_id=event_hub.session_id,
@@ -3097,6 +3156,8 @@ async def _session_journal(
                 "mode": "one-shot" if one_shot else "interactive",
             },
             on_degraded=warn_degraded,
+            replay=replay,
+            on_replay_degraded=warn_replay_degraded,
         )
     except OSError as error:
         warn_degraded(error)
@@ -3104,7 +3165,7 @@ async def _session_journal(
         return
 
     if one_shot:
-        print(f"Session log: {journal.events_path}", file=sys.stderr)
+        print(f"Semantic log: {journal.semantic_path}", file=sys.stderr)
 
     async def record(envelope: AgentEventEnvelope) -> None:
         await _write_runtime_event(journal, envelope)
@@ -3204,12 +3265,26 @@ def _build_argument_parser() -> Any:
         "--no-session-log", dest="no_session_log", action="store_true", help="Do not write the session JSONL journal"
     )
     parser.set_defaults(no_session_log=False)
+    session_replay_group = parser.add_mutually_exclusive_group()
+    session_replay_group.add_argument(
+        "--session-replay",
+        dest="session_replay",
+        action="store_true",
+        help="Record an exact binary terminal/input replay (contains raw keystrokes)",
+    )
+    session_replay_group.add_argument(
+        "--no-session-replay",
+        dest="session_replay",
+        action="store_false",
+        help="Do not record terminal/input replay",
+    )
+    parser.set_defaults(session_replay=False)
     parser.add_argument(
         "--resume",
         type=Path,
         default=None,
-        metavar="EVENTS_JSONL",
-        help="Recover context, pending input, and editor state from a stopped session journal",
+        metavar="SESSION_JSONL",
+        help="Recover context, pending input, and editor state from a stopped semantic journal",
     )
     parser.add_argument(
         "--session-log-dir",
@@ -3319,6 +3394,10 @@ async def main() -> None:
             recovery = materialize_recovery(args.resume.expanduser().resolve())
         except (OSError, RecoveryError) as error:
             parser.error(f"cannot recover session: {error}")
+    if args.session_replay and args.no_session_log:
+        parser.error("--session-replay requires session journaling; enable runtime.session_log or pass --session-log")
+    if args.session_replay and args.prompt is not None:
+        parser.error("--session-replay is interactive-only")
 
     try:
         sandbox_options = _sandbox.SandboxOptions(
@@ -3354,6 +3433,7 @@ async def main() -> None:
             root=journal_root,
             one_shot=args.prompt is not None,
             cwd=root,
+            replay=args.session_replay,
         ) as session_journal,
         aiohttp.ClientSession() as session,
         AsyncExitStack() as stack,
@@ -3771,6 +3851,10 @@ async def main() -> None:
                 renderer.show_panel("Press Ctrl-D again within 2 seconds to exit.")
             return should_exit
 
+        prompt_replay = session_journal.replay_log if session_journal is not None else None
+        prompt_session_options: dict[str, Any] = {"theme": theme}
+        if prompt_replay is not None:
+            prompt_session_options["replay"] = prompt_replay
         prompt_session = _panel.make_session(
             lambda: _panel.status_line(
                 transport.model,
@@ -3785,7 +3869,7 @@ async def main() -> None:
             on_empty_eof=_handle_empty_eof,
             capture_target=lambda: renderer.focused_agent,
             reserve_sequence=event_hub.reserve_sequence,
-            theme=theme,
+            **prompt_session_options,
         )
         setattr(prompt_session, "_axio_terminal_reset", theme.reset)
         input_prompt_factory = _panel.make_prompt_factory(
@@ -4096,7 +4180,9 @@ async def main() -> None:
                 f"Commands: {commands_list}",
             ]
             if session_journal is not None:
-                startup_panel.append(f"Session log: {session_journal.events_path}")
+                startup_panel.append(f"Semantic log: {session_journal.semantic_path}")
+                if session_journal.replay_path is not None:
+                    startup_panel.append(f"Replay log: {session_journal.replay_path}")
             startup_panel.extend(startup_notices)
             renderer.show_panel("\n".join(startup_panel))
 
@@ -4227,36 +4313,56 @@ async def main() -> None:
                 target_agent_id: str,
                 reserved_seq: int | None,
             ) -> InputSubmitted:
+                def record_submission(submitted: InputSubmitted) -> InputSubmitted:
+                    if session_journal is not None:
+                        session_journal.record_replay(
+                            "input_submission",
+                            {
+                                "text": submitted.text,
+                                "target_agent_id": submitted.target_agent_id,
+                                "disposition": submitted.disposition.value,
+                                "input_id": submitted.input_id,
+                                "arrival_seq": submitted.arrival_seq,
+                            },
+                        )
+                    return submitted
+
                 renderer.clear_panel()
                 if _is_known_command(text):
                     if reserved_seq is not None:
                         await event_hub.discard_reserved_sequence(reserved_seq)
-                    return InputSubmitted(
-                        text=text,
-                        target_agent_id=target_agent_id,
-                        disposition=SubmissionDisposition.COMMAND,
-                        arrival_seq=reserved_seq,
+                    return record_submission(
+                        InputSubmitted(
+                            text=text,
+                            target_agent_id=target_agent_id,
+                            disposition=SubmissionDisposition.COMMAND,
+                            arrival_seq=reserved_seq,
+                        )
                     )
                 if pending_input.pending_count >= MAX_PENDING_INPUTS:
                     await _publish_main_event(
                         InputReceived(text=text, source="interactive-retained"),
                         reserved_seq=reserved_seq,
                     )
-                    return InputSubmitted(
-                        text=text,
-                        target_agent_id=target_agent_id,
-                        disposition=SubmissionDisposition.RETAINED,
+                    return record_submission(
+                        InputSubmitted(
+                            text=text,
+                            target_agent_id=target_agent_id,
+                            disposition=SubmissionDisposition.RETAINED,
+                        )
                     )
                 entry = await pending_input.admit(text, target_agent_id, reserved_seq=reserved_seq)
                 child_turn_to_interrupt = _request_target_tool_preemption(target_agent_id)
                 if child_turn_to_interrupt is not None:
                     interrupt_local_agent_turn(target_agent_id, child_turn_to_interrupt)
-                return InputSubmitted(
-                    text=text,
-                    target_agent_id=target_agent_id,
-                    disposition=SubmissionDisposition.PENDING,
-                    input_id=entry.id,
-                    arrival_seq=entry.arrival_seq,
+                return record_submission(
+                    InputSubmitted(
+                        text=text,
+                        target_agent_id=target_agent_id,
+                        disposition=SubmissionDisposition.PENDING,
+                        input_id=entry.id,
+                        arrival_seq=entry.arrival_seq,
+                    )
                 )
 
             async def _run_targeted_claim(ready: _ReadyClaim) -> None:

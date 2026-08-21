@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from axio_tools_agents.runtime import (
     TurnStatus,
 )
 
-from axio_repl._journal import SessionJournal
+from axio_repl._journal import LEGACY_SCHEMA_VERSION, SessionJournal, read_journal
 from axio_repl._recovery import RecoveryError, materialize_recovery
 
 
@@ -61,6 +62,30 @@ async def _publish_message(
         context_id="context",
         execution_mode="foreground",
     )
+
+
+async def test_resume_accepts_legacy_events_jsonl_schema_v1(tmp_path: Path) -> None:
+    source = await SessionJournal.open(session_id="legacy-source", root=tmp_path / "source")
+    message = Message(role="user", content=[TextBlock(text="legacy context")])
+    await _publish_message(source, message, 1, "legacy-turn")
+    await source.close()
+
+    legacy_path = tmp_path / "legacy" / "events.jsonl"
+    legacy_path.parent.mkdir()
+    records = []
+    for record in read_journal(source.semantic_path).records:
+        converted = dict(record)
+        converted["schema_version"] = LEGACY_SCHEMA_VERSION
+        records.append(converted)
+    legacy_path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    recovered = materialize_recovery(legacy_path)
+
+    assert recovered.source_session_id == "legacy-source"
+    assert recovered.messages == (message,)
 
 
 async def test_recovery_restores_messages_pending_editor_and_partial_turn(tmp_path: Path) -> None:

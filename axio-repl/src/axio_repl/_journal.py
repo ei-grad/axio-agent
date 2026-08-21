@@ -19,8 +19,24 @@ from pathlib import Path
 from types import TracebackType
 from typing import cast
 
-SCHEMA_VERSION = 1
+from axio.events import (
+    TextDelta,
+    ToolFieldDelta,
+    ToolFieldEnd,
+    ToolFieldStart,
+    ToolInputDelta,
+    ToolOutputDelta,
+    ToolUseStart,
+)
+
+from axio_repl._replay import ReplayLog
+
+LEGACY_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SEMANTIC_FILENAME = "session.jsonl"
 REDACTED = "[REDACTED]"
+CHECKPOINT_INTERVAL_NS = 2_000_000_000
+CHECKPOINT_CHARS = 16 * 1024
 
 _LOGGER = logging.getLogger(__name__)
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -87,6 +103,27 @@ class _CloseRequest:
 
 
 type _QueueItem = _PendingRecord | _SyncRequest | _CloseRequest
+
+
+@dataclass(slots=True)
+class _TurnCheckpoint:
+    agent_id: str
+    parent_agent_id: str | None
+    turn_id: str
+    context_id: str | None
+    execution_mode: str | None
+    parent_tool_use_id: str | None
+    text: list[str]
+    tool_names: dict[str, str]
+    tool_arguments: dict[str, list[str]]
+    tool_fields: dict[str, dict[str, list[str]]]
+    tool_output: dict[str, list[str]]
+    pending_chars: int = 0
+    last_flush_ns: int | None = None
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.text or self.tool_names or self.tool_arguments or self.tool_fields or self.tool_output)
 
 
 def default_journal_root(
@@ -261,14 +298,14 @@ def _open_storage(directory: Path) -> tuple[int, Path, Path]:
         existing_ancestor = parent
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory.chmod(0o700)
-    events_path = directory / "events.jsonl"
-    file_descriptor = os.open(events_path, os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    semantic_path = directory / SEMANTIC_FILENAME
+    file_descriptor = os.open(semantic_path, os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
         os.fchmod(file_descriptor, 0o600)
     except OSError:
         os.close(file_descriptor)
         raise
-    return file_descriptor, events_path, existing_ancestor
+    return file_descriptor, semantic_path, existing_ancestor
 
 
 class _AttachmentStore:
@@ -375,7 +412,7 @@ class SessionJournal:
         *,
         session_id: str,
         session_dir: Path,
-        events_path: Path,
+        semantic_path: Path,
         file_descriptor: int,
         metadata_sync_root: Path,
         queue_size: int,
@@ -383,7 +420,10 @@ class SessionJournal:
     ) -> None:
         self.session_id = session_id
         self.session_dir = session_dir
-        self.events_path = events_path
+        self.semantic_path = semantic_path
+        # Kept as a source-compatible alias for journal consumers. New paths use
+        # ``session.jsonl`` and old ``events.jsonl`` files remain readable.
+        self.events_path = semantic_path
         self.attachments_dir = session_dir / "attachments"
         self._file_descriptor = file_descriptor
         self._metadata_sync_root = metadata_sync_root
@@ -396,6 +436,9 @@ class SessionJournal:
         self._closed = False
         self._storage_metadata_synced = False
         self._close_lock = asyncio.Lock()
+        self._checkpoints: dict[tuple[str, str], _TurnCheckpoint] = {}
+        self._replay: ReplayLog | None = None
+        self._replay_start_error: BaseException | None = None
         self._writer_task = asyncio.create_task(self._writer_loop(), name=f"axio-journal-{session_id}")
 
     @classmethod
@@ -408,19 +451,21 @@ class SessionJournal:
         start_payload: object = None,
         queue_size: int = 4096,
         on_degraded: DegradedCallback | None = None,
+        replay: bool = False,
+        on_replay_degraded: DegradedCallback | None = None,
     ) -> SessionJournal:
-        """Create a journal whose ``session_start`` is already durable."""
+        """Create a semantic journal whose ``session_start`` is durable."""
 
         if queue_size < 1:
             raise ValueError("queue_size must be at least 1")
         resolved_session_id = uuid.uuid4().hex if session_id is None else session_id
         resolved_started_at = datetime.now(UTC) if started_at is None else started_at
         directory = session_directory(resolved_session_id, root=root, started_at=resolved_started_at)
-        file_descriptor, events_path, metadata_sync_root = await asyncio.to_thread(_open_storage, directory)
+        file_descriptor, semantic_path, metadata_sync_root = await asyncio.to_thread(_open_storage, directory)
         journal = cls(
             session_id=resolved_session_id,
             session_dir=directory,
-            events_path=events_path,
+            semantic_path=semantic_path,
             file_descriptor=file_descriptor,
             metadata_sync_root=metadata_sync_root,
             queue_size=queue_size,
@@ -436,6 +481,25 @@ class SessionJournal:
             if reason is not None:
                 raise JournalStartError(f"{message}: {type(reason).__name__}: {reason}") from reason
             raise JournalStartError(message)
+        if replay:
+            try:
+                journal._replay = await ReplayLog.open(
+                    session_dir=directory,
+                    session_id=resolved_session_id,
+                    start_payload=start_payload,
+                    on_degraded=on_replay_degraded,
+                )
+            except Exception as error:
+                # Replay is an auxiliary opt-in artifact; semantic durability
+                # and resume remain available when its storage cannot start.
+                journal._replay_start_error = error
+                if on_replay_degraded is not None:
+                    try:
+                        on_replay_degraded(error)
+                    except Exception:
+                        # Notification is arbitrary UI code and must not leak
+                        # the already-running semantic writer task.
+                        _LOGGER.error("session replay degraded callback failed")
         return journal
 
     @property
@@ -449,6 +513,27 @@ class SessionJournal:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def replay_path(self) -> Path | None:
+        return self._replay.replay_path if self._replay is not None else None
+
+    @property
+    def replay_log(self) -> ReplayLog | None:
+        """Return the optional recorder for frontend adapters."""
+
+        return self._replay
+
+    @property
+    def replay_degraded_reason(self) -> BaseException | None:
+        if self._replay is not None:
+            return self._replay.degraded_reason
+        return self._replay_start_error
+
+    def record_replay(self, kind: str, payload: object = None) -> bool:
+        """Record one replay-only event when exact replay was enabled."""
+
+        return self._replay is not None and self._replay.record(kind, payload)
 
     async def publish(
         self,
@@ -481,12 +566,101 @@ class SessionJournal:
             parent_tool_use_id=parent_tool_use_id,
         )
 
+    def observe_stream_event(
+        self,
+        event: object,
+        *,
+        agent_id: str,
+        parent_agent_id: str | None,
+        turn_id: str | None,
+        context_id: str | None,
+        execution_mode: str | None,
+        parent_tool_use_id: str | None,
+    ) -> bool:
+        """Fold resumable stream fragments into sparse semantic checkpoints.
+
+        Reasoning deltas are intentionally absent: they dominate journal size,
+        are not canonical conversation state, and are available in opt-in exact
+        replay through the terminal frames the user actually saw.
+        """
+
+        if turn_id is None or not isinstance(
+            event,
+            (TextDelta, ToolUseStart, ToolInputDelta, ToolFieldStart, ToolFieldDelta, ToolFieldEnd, ToolOutputDelta),
+        ):
+            return True
+        key = (agent_id, turn_id)
+        checkpoint = self._checkpoints.get(key)
+        if checkpoint is None:
+            checkpoint = _TurnCheckpoint(
+                agent_id=agent_id,
+                parent_agent_id=parent_agent_id,
+                turn_id=turn_id,
+                context_id=context_id,
+                execution_mode=execution_mode,
+                parent_tool_use_id=parent_tool_use_id,
+                text=[],
+                tool_names={},
+                tool_arguments={},
+                tool_fields={},
+                tool_output={},
+            )
+            self._checkpoints[key] = checkpoint
+        if isinstance(event, TextDelta):
+            checkpoint.text.append(event.delta)
+            checkpoint.pending_chars += len(event.delta)
+        elif isinstance(event, ToolUseStart):
+            checkpoint.tool_names[event.tool_use_id] = event.name
+            checkpoint.tool_arguments.setdefault(event.tool_use_id, [])
+            checkpoint.pending_chars += len(event.tool_use_id) + len(event.name)
+        elif isinstance(event, ToolInputDelta):
+            checkpoint.tool_arguments.setdefault(event.tool_use_id, []).append(event.partial_json)
+            checkpoint.pending_chars += len(event.partial_json)
+        elif isinstance(event, ToolFieldStart):
+            checkpoint.tool_fields.setdefault(event.tool_use_id, {}).setdefault(event.key, [])
+            checkpoint.pending_chars += len(event.key)
+        elif isinstance(event, ToolFieldDelta):
+            checkpoint.tool_fields.setdefault(event.tool_use_id, {}).setdefault(event.key, []).append(event.text)
+            checkpoint.pending_chars += len(event.text)
+        elif isinstance(event, ToolFieldEnd):
+            checkpoint.tool_fields.setdefault(event.tool_use_id, {}).setdefault(event.key, [])
+        else:
+            checkpoint.tool_output.setdefault(event.tool_use_id, []).append(event.delta)
+            checkpoint.pending_chars += len(event.delta)
+
+        now = time.monotonic_ns()
+        first_fragment = checkpoint.last_flush_ns is None
+        interval_elapsed = (
+            checkpoint.last_flush_ns is not None and now - checkpoint.last_flush_ns >= CHECKPOINT_INTERVAL_NS
+        )
+        if first_fragment or interval_elapsed or checkpoint.pending_chars >= CHECKPOINT_CHARS:
+            return self._flush_checkpoint_nowait(key, now=now)
+        return True
+
+    def flush_checkpoints(self) -> bool:
+        """Queue every pending resumable fragment before a durability barrier."""
+
+        accepted = True
+        now = time.monotonic_ns()
+        for key in tuple(self._checkpoints):
+            if not self._flush_checkpoint_nowait(key, now=now):
+                accepted = False
+        return accepted
+
+    def finish_turn_checkpoint(self, agent_id: str, turn_id: str | None) -> None:
+        """Forget accumulator metadata after a completed/cancelled turn."""
+
+        if turn_id is not None:
+            self._checkpoints.pop((agent_id, turn_id), None)
+
     async def sync(self) -> bool:
         """Drain prior accepted records and make their valid JSONL prefix durable."""
 
         async with self._close_lock:
             if self._closed or not self._accepting:
                 return False
+            if not self.degraded:
+                self.flush_checkpoints()
             result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             await self._queue.put(_SyncRequest(result))
             return await result
@@ -497,6 +671,8 @@ class SessionJournal:
         async with self._close_lock:
             if self._closed:
                 return
+            if not self.degraded:
+                self.flush_checkpoints()
             self._accepting = False
             if not self.degraded:
                 record = self._make_record("session_end", end_payload)
@@ -504,7 +680,11 @@ class SessionJournal:
                 self._next_seq += 1
             await self._queue.put(_CloseRequest())
             await self._writer_task
-            self._closed = True
+            try:
+                if self._replay is not None:
+                    await self._replay.close(end_payload)
+            finally:
+                self._closed = True
 
     async def __aenter__(self) -> SessionJournal:
         return self
@@ -578,6 +758,42 @@ class SessionJournal:
             execution_mode=execution_mode,
             parent_tool_use_id=parent_tool_use_id,
         )
+
+    def _flush_checkpoint_nowait(self, key: tuple[str, str], *, now: int) -> bool:
+        checkpoint = self._checkpoints.get(key)
+        if checkpoint is None or not checkpoint.dirty:
+            return True
+        payload = {
+            "text": "".join(checkpoint.text),
+            "tool_names": checkpoint.tool_names,
+            "tool_arguments": {
+                tool_use_id: "".join(parts) for tool_use_id, parts in checkpoint.tool_arguments.items()
+            },
+            "tool_fields": {
+                tool_use_id: {field: "".join(parts) for field, parts in values.items()}
+                for tool_use_id, values in checkpoint.tool_fields.items()
+            },
+            "tool_output": {tool_use_id: "".join(parts) for tool_use_id, parts in checkpoint.tool_output.items()},
+        }
+        accepted = self._enqueue_nowait(
+            "turn_checkpoint",
+            payload,
+            agent_id=checkpoint.agent_id,
+            parent_agent_id=checkpoint.parent_agent_id,
+            turn_id=checkpoint.turn_id,
+            context_id=checkpoint.context_id,
+            execution_mode=checkpoint.execution_mode,
+            parent_tool_use_id=checkpoint.parent_tool_use_id,
+        )
+        if accepted:
+            checkpoint.text.clear()
+            checkpoint.tool_names = {}
+            checkpoint.tool_arguments = {}
+            checkpoint.tool_fields = {}
+            checkpoint.tool_output = {}
+            checkpoint.pending_chars = 0
+            checkpoint.last_flush_ns = now
+        return accepted
 
     def _encode_record(self, pending: _PendingRecord) -> bytes:
         record: dict[str, JsonValue] = {

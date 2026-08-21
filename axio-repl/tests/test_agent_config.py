@@ -131,6 +131,36 @@ def test_powerline_is_resolved_from_yaml_and_environment(tmp_path: Path) -> None
     assert args.powerline is False
 
 
+def test_session_replay_is_opt_in_and_obeys_config_environment_and_cli_precedence(tmp_path: Path) -> None:
+    from argparse import Namespace
+
+    write_config(
+        tmp_path / "config.yaml",
+        "version: 1\ndefaults:\n  runtime:\n    session_replay: true\n",
+    )
+    profile = load_agent_profile(tmp_path, None, {})
+    assert profile.settings.runtime.session_replay is True
+    environment = load_agent_profile(tmp_path, None, {"AXIO_REPL_SESSION_REPLAY": "false"})
+    assert environment.settings.runtime.session_replay is False
+
+    args = Namespace(session_replay=False, no_session_log=False)
+    apply_profile_to_args(args, profile, explicit_cli_destinations([]))
+    assert args.session_replay is True
+
+    args = Namespace(session_replay=False, no_session_log=False)
+    apply_profile_to_args(args, profile, explicit_cli_destinations(["--no-session-replay"]))
+    assert args.session_replay is False
+
+
+def test_session_replay_config_environment_and_cli_surface_is_documented() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    guide = (repository / "docs" / "guides" / "axio-repl.md").read_text(encoding="utf-8")
+
+    assert "session_replay: false" in guide
+    assert "AXIO_REPL_SESSION_REPLAY" in guide
+    assert "`--session-replay`" in guide
+
+
 def test_theme_uses_global_agent_environment_and_explicit_cli_precedence(tmp_path: Path) -> None:
     from argparse import Namespace
 
@@ -251,8 +281,8 @@ def test_list_agent_names_uses_valid_direct_child_bundles(tmp_path: Path) -> Non
 
 def test_explicit_cli_destinations_accept_equals_and_stop_at_separator() -> None:
     assert explicit_cli_destinations(
-        ["--model=cli", "--no-debug", "--session-log", "--", "--sandbox", "docker"]
-    ) == frozenset({"model", "debug", "no_session_log"})
+        ["--model=cli", "--no-debug", "--session-log", "--session-replay", "--", "--sandbox", "docker"]
+    ) == frozenset({"model", "debug", "no_session_log", "session_replay"})
 
 
 def test_apply_profile_preserves_explicit_cli_values(tmp_path: Path) -> None:

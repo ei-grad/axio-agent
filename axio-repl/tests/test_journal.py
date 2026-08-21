@@ -23,6 +23,8 @@ from axio.events import (
     ReasoningDelta,
     StreamEvent,
     TextDelta,
+    ToolFieldDelta,
+    ToolFieldStart,
     ToolInputDelta,
     ToolUseStart,
 )
@@ -33,6 +35,7 @@ from axio.tool import Tool
 from axio.types import CostSource, StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
+    ConfigurationChanged,
     EditorSnapshot,
     ExecutionMode,
     ObservedContextStore,
@@ -42,6 +45,7 @@ from axio_tools_agents.runtime import (
     SessionEventHub,
     ShutdownRecorded,
     TurnFinished,
+    TurnStarted,
     TurnStatus,
     new_turn_identity,
 )
@@ -57,6 +61,8 @@ from axio_repl._journal import (
     recover_journal_tail,
     session_directory,
 )
+from axio_repl._recovery import materialize_recovery
+from axio_repl._replay import ReplayLog, ReplaySchemaError, read_replay
 
 
 def _read_records(events_path: Path) -> list[dict[str, Any]]:
@@ -68,7 +74,7 @@ def _read_records(events_path: Path) -> list[dict[str, Any]]:
 
 
 def _only_events_path(root: Path) -> Path:
-    paths = list(root.glob("*/*/*/*/events.jsonl"))
+    paths = list(root.glob(f"*/*/*/*/{journal_module.SEMANTIC_FILENAME}"))
     assert len(paths) == 1
     return paths[0]
 
@@ -604,7 +610,8 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     assert "agent_started" in kinds
     assert "input_received" in kinds
     assert "turn_started" in kinds
-    assert "stream_event" in kinds
+    assert "turn_checkpoint" in kinds
+    assert "iteration_end" in kinds
     assert "turn_finished" in kinds
     assert "agent_stopped" in kinds
     input_record = next(record for record in records if record["kind"] == "input_received")
@@ -629,8 +636,168 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     assert committed[1]["payload"]["message"]["content"][0]["text"] == "stub answer"
 
     captured = capsys.readouterr()
-    assert "Session log:" not in captured.out
+    assert "Semantic log:" not in captured.out
     assert str(events_path) in captured.err
+
+
+async def test_session_journal_can_add_an_independent_opt_in_replay(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(
+        session_id="with-replay",
+        root=tmp_path,
+        start_payload={
+            "application": "axio-repl",
+            "version": "test",
+            "cwd": tmp_path,
+            "mode": "interactive",
+        },
+        replay=True,
+    )
+    assert journal.semantic_path.name == journal_module.SEMANTIC_FILENAME
+    assert journal.replay_path is not None
+    assert journal.record_replay("terminal_geometry", {"rows": 24, "columns": 80, "source": "initial"})
+    assert journal.record_replay("editor_state", {"text": "draft", "cursor_position": 5})
+    await journal.close({"status": "complete"})
+
+    assert [record["kind"] for record in read_journal(journal.semantic_path).records] == [
+        "session_start",
+        "session_end",
+    ]
+    assert journal.replay_path is not None
+    assert [record["kind"] for record in read_replay(journal.replay_path).records] == [
+        "session_start",
+        "terminal_geometry",
+        "editor_state",
+        "session_end",
+    ]
+
+
+async def test_replay_start_failure_does_not_disable_semantic_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failures: list[BaseException] = []
+
+    async def fail_replay_open(**kwargs: object) -> object:
+        del kwargs
+        raise OSError("replay storage unavailable")
+
+    monkeypatch.setattr(ReplayLog, "open", fail_replay_open)
+    journal = await SessionJournal.open(
+        session_id="semantic-survives",
+        root=tmp_path,
+        replay=True,
+        on_replay_degraded=failures.append,
+    )
+    assert journal.replay_path is None
+    assert isinstance(journal.replay_degraded_reason, OSError)
+    assert await journal.publish("configuration_changed", {"name": "model", "value": "stub"})
+    await journal.close()
+
+    assert len(failures) == 1
+    assert [record["kind"] for record in read_journal(journal.semantic_path).records] == [
+        "session_start",
+        "configuration_changed",
+        "session_end",
+    ]
+
+
+async def test_replay_start_notification_failure_does_not_leak_semantic_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_replay_open(**kwargs: object) -> object:
+        del kwargs
+        raise OSError("replay storage unavailable")
+
+    def fail_notification(error: BaseException) -> None:
+        del error
+        raise RuntimeError("notification failed")
+
+    monkeypatch.setattr(ReplayLog, "open", fail_replay_open)
+    journal = await SessionJournal.open(
+        session_id="callback-failure",
+        root=tmp_path,
+        replay=True,
+        on_replay_degraded=fail_notification,
+    )
+    assert await journal.publish("configuration_changed", {"name": "model", "value": "stub"})
+    await journal.close()
+    await asyncio.sleep(0)
+
+    assert [record["kind"] for record in read_journal(journal.semantic_path).records] == [
+        "session_start",
+        "configuration_changed",
+        "session_end",
+    ]
+    assert not any(task.get_name() == "axio-journal-callback-failure" for task in asyncio.all_tasks())
+
+
+async def test_arbitrary_semantic_close_payload_only_degrades_replay(
+    tmp_path: Path,
+) -> None:
+    journal = await SessionJournal.open(
+        session_id="arbitrary-close-payload",
+        root=tmp_path,
+        start_payload={
+            "application": "axio-repl",
+            "version": "test",
+            "cwd": tmp_path,
+            "mode": "interactive",
+        },
+        replay=True,
+    )
+    assert journal.record_replay("terminal_geometry", {"rows": 24, "columns": 80, "source": "initial"})
+
+    await journal.close("done")
+    await asyncio.sleep(0)
+
+    assert journal.closed
+    assert isinstance(journal.replay_degraded_reason, ReplaySchemaError)
+    assert [record["kind"] for record in read_journal(journal.semantic_path).records] == [
+        "session_start",
+        "session_end",
+    ]
+    assert not any(task.get_name() == "axio-replay-arbitrary-close-payload" for task in asyncio.all_tasks())
+
+
+async def test_replay_accepts_real_runtime_envelopes_before_and_after_frontend_start(tmp_path: Path) -> None:
+    hub = SessionEventHub(session_id="runtime-replay")
+    async with _session_journal(
+        hub,
+        disabled=False,
+        root=tmp_path,
+        one_shot=False,
+        cwd=tmp_path,
+        replay=True,
+    ) as journal:
+        assert journal is not None
+        await hub.publish(
+            ConfigurationChanged(name="model", value="stub/model", source="startup"),
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            context_id="context-1",
+        )
+        assert journal.record_replay("terminal_geometry", {"rows": 24, "columns": 80, "source": "initial"})
+        await hub.publish(
+            TurnStarted("inspect"),
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="turn-1",
+            execution_mode=ExecutionMode.FOREGROUND,
+            context_id="context-1",
+        )
+        replay_path = journal.replay_path
+
+    assert replay_path is not None
+    runtime = [record for record in read_replay(replay_path).records if record["kind"] == "runtime_event"]
+    assert [record["payload"]["kind"] for record in runtime if isinstance(record["payload"], dict)] == [
+        "configuration_changed",
+        "turn_started",
+    ]
 
 
 async def test_cli_effort_is_recorded_as_configuration_without_extra_history_message(
@@ -666,7 +833,15 @@ async def test_one_shot_session_log_can_be_disabled(
     await _run_stub_one_shot(monkeypatch, tmp_path, "--no-session-log")
 
     assert not (state_home / "axio" / "sessions").exists()
-    assert "Session log:" not in capsys.readouterr().err
+    assert "Semantic log:" not in capsys.readouterr().err
+
+
+async def test_exact_replay_rejects_one_shot_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(SystemExit):
+        await _run_stub_one_shot(monkeypatch, tmp_path, "--session-replay")
 
 
 async def test_one_shot_session_log_honours_custom_root(
@@ -793,8 +968,9 @@ async def test_journal_records_hidden_agents_and_delivery_before_display_filteri
         events_path = journal.events_path
 
     records = _read_records(events_path)
-    stream_records = [record for record in records if record["kind"] == "stream_event"]
-    assert [record["agent_id"] for record in stream_records] == ["hidden-child", "foreground-child"]
+    checkpoints = [record for record in records if record["kind"] == "turn_checkpoint"]
+    assert [record["agent_id"] for record in checkpoints] == ["hidden-child", "foreground-child"]
+    assert [record["payload"]["text"] for record in checkpoints] == ["hidden output", "visible output"]
     assert displayed == ["foreground-child", "foreground-child"]
     delivered = next(record for record in records if record["kind"] == "outcome_delivered")
     assert delivered["parent_agent_id"] == "main"
@@ -854,10 +1030,88 @@ async def test_completed_turn_is_a_durable_boundary_without_syncing_stream_delta
     durable = read_journal(journal.events_path)
     assert [record["kind"] for record in durable.records] == [
         "session_start",
-        "stream_event",
+        "turn_checkpoint",
         "turn_finished",
     ]
     await journal.close()
+
+
+async def test_semantic_journal_omits_reasoning_and_resumes_sparse_turn_checkpoints(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(session_id="semantic", root=tmp_path)
+    identity = AgentEventEnvelope(
+        seq=1,
+        session_id="semantic",
+        run_id="main-run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id="unfinished",
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id=None,
+        event=TurnStarted("inspect"),
+        context_id="context-1",
+    )
+    await _write_runtime_event(journal, identity)
+    events: tuple[RuntimeEvent, ...] = (
+        ReasoningDelta(index=0, delta="private reasoning that must not enter semantic JSONL"),
+        TextDelta(index=0, delta="available partial"),
+        ToolUseStart(index=1, tool_use_id="call-1", name="write_file"),
+        ToolFieldStart(index=1, tool_use_id="call-1", key="path"),
+        ToolFieldDelta(index=1, tool_use_id="call-1", key="path", text="demo.py"),
+    )
+    for seq, event in enumerate(events, start=2):
+        await _write_runtime_event(
+            journal,
+            AgentEventEnvelope(
+                seq=seq,
+                session_id="semantic",
+                run_id="main-run",
+                agent_id="main",
+                parent_agent_id=None,
+                turn_id="unfinished",
+                execution_mode=ExecutionMode.FOREGROUND,
+                parent_tool_use_id=None,
+                event=event,
+                context_id="context-1",
+            ),
+        )
+    await _write_runtime_event(
+        journal,
+        AgentEventEnvelope(
+            seq=7,
+            session_id="semantic",
+            run_id="main-run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id="unfinished",
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=ShutdownRecorded(reason="sigterm", pending_input_ids=(), deferred_tool_use_ids=()),
+            context_id="context-1",
+        ),
+    )
+    await journal.close()
+
+    raw = journal.semantic_path.read_text(encoding="utf-8")
+    assert "private reasoning" not in raw
+    records = read_journal(journal.semantic_path).records
+    assert not any(record["kind"] == "stream_event" for record in records)
+    checkpoints = [record for record in records if record["kind"] == "turn_checkpoint"]
+    checkpoint_text: list[str] = []
+    for record in checkpoints:
+        payload = record["payload"]
+        assert isinstance(payload, dict)
+        checkpoint_text.append(str(payload["text"]))
+    assert "".join(checkpoint_text) == "available partial"
+
+    recovered = materialize_recovery(journal.semantic_path)
+    notice = recovered.messages[-1].content[0]
+    partial = recovered.messages[-2].content[0]
+    assert isinstance(notice, TextBlock)
+    assert isinstance(partial, TextBlock)
+    assert "available partial" in partial.text
+    assert "write_file" in notice.text
+    assert "path: demo.py" in notice.text
+    assert "private reasoning" not in notice.text
 
 
 @pytest.mark.parametrize(
@@ -933,7 +1187,7 @@ async def test_one_shot_journal_captures_actual_local_subagent_session(
     assert child_records
     assert all(record["execution_mode"] == execution_mode for record in child_records)
     assert all(record["parent_tool_use_id"] == f"{tool_name}-call" for record in child_records)
-    assert any(record["kind"] == "stream_event" for record in child_records)
+    assert any(record["kind"] == "turn_checkpoint" for record in child_records)
     committed = [record for record in child_records if record["kind"] == "message_committed"]
     assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
     assert len({record["context_id"] for record in child_records if record["context_id"]}) == 1
@@ -1023,7 +1277,7 @@ async def test_concurrent_publishers_keep_one_strict_global_order(tmp_path: Path
     assert records[0]["kind"] == "session_start"
     assert records[-1]["kind"] == "session_end"
     for record in records:
-        assert record["schema_version"] == 1
+        assert record["schema_version"] == journal_module.SCHEMA_VERSION
         assert record["session_id"] == "concurrent"
         assert record["timestamp"].endswith("Z")
         assert isinstance(record["monotonic_ns"], int)

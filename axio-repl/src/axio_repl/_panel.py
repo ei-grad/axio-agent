@@ -26,6 +26,7 @@ from axio.types import CostSource, Usage
 from axio_tools_agents.peers import background_agent_state, local_background_agent_records
 from prompt_toolkit.formatted_text import FormattedText
 
+from axio_repl import _replay
 from axio_repl._multiplexer import sanitize_identity_component, sanitize_terminal_text
 from axio_repl._powerline import prompt_badge, submitted_prompt_badge
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
@@ -354,6 +355,7 @@ def make_session(
     capture_target: Callable[[], str] | None = None,
     reserve_sequence: Callable[[], int] | None = None,
     accepted_at_provider: Callable[[], datetime] | None = None,
+    replay: _replay.ReplayLog | None = None,
     *,
     theme: TerminalTheme = DEFAULT_THEME,
 ) -> Any:
@@ -367,6 +369,7 @@ def make_session(
     pending input before walking through persistent prompt history.
     """
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.application.current import get_app_session
     from prompt_toolkit.filters import to_filter
     from prompt_toolkit.history import FileHistory, History
     from prompt_toolkit.styles import Style
@@ -394,6 +397,7 @@ def make_session(
         return None
 
     history = ClaimedHistory(HISTORY_PATH)
+    app_session = get_app_session()
     session: Any = PromptSession(
         history=history,
         bottom_toolbar=status or (lambda: agent_summary() or None),
@@ -412,7 +416,22 @@ def make_session(
         # Redraw while idle so finished agents show up without a keypress.
         refresh_interval=0.5,
         erase_when_done=True,
+        input=_replay.recording_input(app_session.input, replay),
+        output=_replay.recording_output(app_session.output, replay),
     )
+    if replay is not None:
+
+        def record_editor_state(buffer: Any) -> None:
+            replay.record(
+                "editor_state",
+                {
+                    "text": str(buffer.text),
+                    "cursor_position": int(buffer.cursor_position),
+                },
+            )
+
+        session.default_buffer.on_text_changed += record_editor_state
+        record_editor_state(session.default_buffer)
     input_window = session.app.layout.current_window
     if input_window is None or input_window.content is not session.app.layout.current_control:
         raise RuntimeError("prompt session does not expose its input window")

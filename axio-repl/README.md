@@ -54,8 +54,9 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   `~/.axio_repl_history` after input has been claimed by an agent.
 - **Terminal scrollback** — interactive output stays on the primary screen
   buffer; only the editor and status line are temporary redrawable UI.
-- **Session journals** — every main, foreground, and background agent event is
-  written to a private JSONL journal for later inspection.
+- **Session logs** — a private semantic JSONL records resumable conversation
+  state without token-level reasoning noise; exact terminal/input replay is a
+  separate explicit opt-in.
 - **Single-prompt mode** — pass a prompt as argument for scripting and non-interactive use.
 
 ## Interactive controls
@@ -185,8 +186,11 @@ axio-repl --effort high
 axio-repl --session-log-dir ./axio-session-logs
 axio-repl --no-session-log
 
+# Opt in to an exact binary terminal/input replay (records raw keystrokes)
+axio-repl --session-replay
+
 # Resume an interrupted interactive session into a new journal
-axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.jsonl
+axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/session.jsonl
 
 # Show framed tool and lifecycle actions from background agents
 axio-repl --agent-actions on
@@ -254,38 +258,56 @@ manifest only. It is passed unchanged to the main and local child agents as
 descriptive context; it does not enforce the policy it describes. Do not place
 credentials or untrusted external content there.
 
-## Session journals and privacy
+## Session logs, replay, and privacy
 
-Session journaling is enabled by default. Each invocation creates one journal at:
+Semantic journaling is enabled by default. Each invocation creates:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/events.jsonl
+${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/session.jsonl
 ```
 
-The REPL prints the exact path when the session starts. In single-prompt mode it
-prints the path to stderr, leaving the streamed answer on stdout. Use
+The semantic log contains submitted input, committed context messages (including
+complete tool calls and results), configuration and lifecycle changes, delivery
+correlation, and sparse checkpoints for unfinished text/tool fragments. Raw
+token-level text, tool, and reasoning deltas are not copied into it; reasoning
+is not resumable state. The result is readable and greppable while still being
+the sole input to `--resume`.
+
+The REPL prints the semantic path when the session starts. In single-prompt mode
+it prints the path to stderr, leaving the streamed answer on stdout. Use
 `--session-log-dir <directory>` to select another root or `--no-session-log` to
 disable journaling.
 
-`--resume <events.jsonl>` validates a stopped session's journal, replays its
+`--resume <session.jsonl>` validates a stopped semantic journal, replays its
 main-agent context, restores pending input and the last durable editor snapshot,
-and materializes available partial text, reasoning, tool arguments, and tool
-output from unfinished main and background-agent turns. Unavailable background
+and materializes available partial text, tool arguments, and tool output from
+unfinished main and background-agent turns. Unavailable background
 contexts and cancelled deferred tools become labelled notices in the restored
 main context with their original identities. Resume creates a new journal and
 records which recovery artifacts were applied. Continue a recovery chain from
 that new journal; `--resume` cannot be combined with `--no-session-log` or
-one-shot mode.
+one-shot mode. Legacy schema-v1 `events.jsonl` files remain accepted.
 
-The append-only journal contains user input, model stream events, committed
-context messages, configuration changes, agent lifecycle events, subagent
-output, and outcome-delivery correlation. Binary media is stored by hash under
-the session's `attachments/` directory. Directories are created with mode
-`0700` and files with `0600`.
+`--session-replay` additionally creates `replay.axrp` for interactive sessions.
+It is a versioned binary stream of individually zlib-compressed records with a
+monotonic nanosecond offset. Records include ordered terminal output operations,
+parsed keypresses, editor states, accepted submissions, and runtime events. It
+is intended for deterministic UI diagnostics and fixtures; `--resume` never
+depends on it.
 
-The initial `session_start` record is fsynced before the REPL starts normal
-session work. Streaming records are admitted to a bounded memory queue without
-an fsync per token. Successfully committed context mutations, completed turns,
+Replay is off by default because it deliberately records raw keystrokes and
+editor contents. Those frames are not secret-redacted: redaction would make an
+exact replay dishonest and still could not reliably identify arbitrary pasted
+credentials. Replay files have no automatic expiry; enable them only for a
+bounded diagnostic session and apply an explicit retention policy.
+
+Binary media referenced by semantic messages is stored by hash under the
+session's `attachments/` directory. Directories are created with mode `0700`
+and semantic, replay, and attachment files with `0600`.
+
+The initial semantic `session_start` record is fsynced before the REPL starts
+normal session work. Semantic records are admitted to a bounded memory queue
+without an fsync per event. Successfully committed context mutations, completed turns,
 outcome deliveries, pending-input transitions, interruption barriers, editor
 snapshots, recovery application, and stopped agents are durability boundaries:
 each drains and fsyncs every earlier accepted record. A clean shutdown also
@@ -303,10 +325,9 @@ record is not treated as a crash tail.
 Storage-media corruption and filesystem failures outside this interrupted-tail
 model are reported as corruption; the reader does not silently skip them.
 
-Known secret-shaped fields and common token formats are redacted before writing,
+Known secret-shaped fields and common token formats are redacted before writing the semantic log,
 but arbitrary secrets embedded in prose or tool output cannot be identified
-reliably. Treat the journal as sensitive local session data and apply an
-appropriate retention policy.
+reliably. Treat both artifacts as sensitive local session data.
 
 ## REPL Commands
 

@@ -165,6 +165,7 @@ defaults:
     max_iterations: 100
     theme: default
     session_log: true
+    session_replay: false
   sandbox:
     backend: docker
     image: axio-agent-sandbox:standard
@@ -199,6 +200,7 @@ runtime:
   theme: default
   powerline: false
   session_log: true
+  session_replay: false
 
 sandbox:
   backend: docker
@@ -300,7 +302,7 @@ The environment layer maps directly to manifest fields:
 | Area | Variables |
 |---|---|
 | Agent/transport | `AXIO_REPL_AGENT`, `AXIO_REPL_TRANSPORT`, `AXIO_REPL_TRANSPORT_BASE_URL`, `AXIO_REPL_TRANSPORT_API_KEY_ENV`, `AXIO_REPL_MODEL` |
-| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_THEME`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_LOG_DIR` |
+| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_THEME`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_REPLAY`, `AXIO_REPL_SESSION_LOG_DIR` |
 | Sandbox | `AXIO_REPL_SANDBOX`, `AXIO_REPL_SANDBOX_IMAGE`, `AXIO_REPL_SANDBOX_NETWORK`, `AXIO_REPL_SANDBOX_MEMORY`, `AXIO_REPL_SANDBOX_CPUS`, `AXIO_REPL_SANDBOX_PROXY`, `AXIO_REPL_SANDBOX_NO_PROXY`, `AXIO_REPL_SANDBOX_DATASETS`, `AXIO_REPL_SANDBOX_CA_CERT` |
 | Registries | `AXIO_REPL_SANDBOX_PYPI_INDEX`, `AXIO_REPL_SANDBOX_NPM_REGISTRY`, `AXIO_REPL_SANDBOX_CARGO_INDEX`, `AXIO_REPL_SANDBOX_GO_PROXY`, `AXIO_REPL_SANDBOX_GO_SUMDB` |
 | Tools | `AXIO_REPL_TOOLS` as a comma-separated list, `all`, or `none` |
@@ -347,10 +349,12 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--theme` | `default` | Terminal palette: `default` or `monochrome` |
 | `--powerline` | off | Use Powerline segments for the prompt, tool names, and agent frames |
 | `--no-powerline` | — | Explicitly disable Powerline presentation after config resolution |
-| `--session-log-dir` | XDG state directory | Root for session JSONL journals |
-| `--no-session-log` | off | Disable the default session journal |
-| `--session-log` | on | Explicitly enable the journal after config resolution |
-| `--resume EVENTS_JSONL` | none | Resume a stopped interactive session into a new journal |
+| `--session-log-dir` | XDG state directory | Root for semantic journals and optional replay files |
+| `--no-session-log` | off | Disable the default semantic journal |
+| `--session-log` | on | Explicitly enable semantic journaling after config resolution |
+| `--session-replay` | off | Record exact binary terminal/input replay, including raw keystrokes |
+| `--no-session-replay` | — | Explicitly disable replay after config resolution |
+| `--resume SESSION_JSONL` | none | Resume a stopped interactive session from its semantic journal |
 | `--sandbox` | auto | Run file and shell tools in a container: `auto`, `docker`, `none` |
 | `--sandbox-image` | `axio-agent-sandbox:standard` | Locally built image for `--sandbox docker` |
 | `--sandbox-network` | none | User-defined internal Docker network for restricted service access |
@@ -393,28 +397,32 @@ resolved launcher, imported module source, Python interpreter, and the short Git
 revision when the module is inside a checkout. Installed wheels without checkout
 metadata report the revision as unavailable.
 
-## Session journals
+## Semantic journals and exact replay
 
-The REPL writes an append-only JSONL journal by default. Each invocation creates:
+The REPL writes an append-only semantic JSONL journal by default. Each invocation creates:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/events.jsonl
+${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/session.jsonl
 ```
 
-The printed `Session log:` line gives the exact path. It is sent to stderr in
+The printed `Semantic log:` line gives the exact path. It is sent to stderr in
 single-prompt mode so stdout remains the agent's streamed answer. Choose another
 root with `--session-log-dir <directory>`, or disable the journal explicitly
 with `--no-session-log`.
 
 The log is independent of terminal focus and display filtering. It includes the
-main agent and hidden foreground/background subagents: user input, stream
-events, successfully committed context messages, lifecycle events, configuration
-changes, and the correlation between child outcomes and their delivery routes.
-Media bytes are stored by content hash in an adjacent `attachments/` directory.
+main agent and hidden foreground/background subagents: user input, successfully
+committed context messages (including complete tool calls and results),
+lifecycle events, configuration changes, and the correlation between child
+outcomes and their delivery routes. It also contains sparse resumable
+checkpoints for text and tool fragments from a turn that may end before its
+context commit. Token-level text/tool deltas and provider reasoning are not
+semantic records. Media bytes are stored by content hash in an adjacent
+`attachments/` directory.
 
 `session_start` is written and fsynced before normal session work begins. The
-hot streaming path only admits records to a bounded in-memory queue; admission
-does not claim that an individual record is durable. The journal drains and
+hot path only admits records to a bounded in-memory queue; admission does not
+claim that an individual record is durable. The journal drains and
 fsyncs at successfully committed context mutations, completed turns, outcome
 delivery, pending-input buffer/recall/claim/delivery transitions, interruption
 barriers, editor snapshots, recovery application, agent shutdown, and clean
@@ -436,23 +444,77 @@ failures; those remain hard errors.
 To resume, pass the stopped session's exact journal path:
 
 ```bash
-axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/events.jsonl
+axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/session.jsonl
 ```
 
 The new session replays main-agent context as distinct messages, restores
 pending Enter submissions and the last durable editor snapshot, and
-materializes available partial text, reasoning, tool arguments, and tool output
+materializes available partial text, tool arguments, and tool output
 from unfinished main or background-agent turns. A background agent cannot be
 recreated after process death, so its available partial output becomes a
 labelled user notice in the restored main context. Cancelled deferred tools are
 also materialized with their original agent, turn, and call IDs. The new session
 writes `RecoveryApplied` records; use that new journal for a later resume.
 Recovery is interactive-only and cannot be combined with `--no-session-log`.
+Legacy schema-v1 `events.jsonl` journals remain valid resume inputs.
 
-Session directories use mode `0700` and journal or attachment files use `0600`.
-Known secret-shaped fields and common token formats are redacted recursively,
+For exact UI diagnostics, `--session-replay` adds this opt-in artifact:
+
+```text
+${XDG_STATE_HOME:-~/.local/state}/axio/sessions/YYYY/MM/DD/<session-id>/replay.axrp
+```
+
+The file starts with the versioned `AXIOREPLAY` magic header. Each subsequent
+frame has big-endian compressed and uncompressed lengths followed by one
+zlib-compressed JSON object. A schema-v1 object carries a contiguous sequence,
+a monotonic `offset_ns`, a kind, and a payload. Current kinds cover terminal
+output operation batches at physical flush boundaries, parsed keypresses,
+editor states, accepted input submissions, and non-streaming runtime events.
+This representation records both what the frontend displayed and the granular
+input needed for timing-sensitive regression fixtures. It is not an input to
+`--resume`.
+
+Schema v1 accepts only these payloads; unknown kinds, fields, operation names,
+or value types degrade the replay instead of being stringified ambiguously:
+
+| Kind | Payload |
+|---|---|
+| `session_start` | `application`, `version`, `cwd`, `mode=interactive` |
+| `session_end` | `status`, optional `exception` |
+| `terminal_geometry` | positive `rows`, positive `columns`, `source=initial\|resize` |
+| `terminal_frame` | ordered non-empty `operations`; each has a supported `op` and optional `args`/`kwargs` |
+| `terminal_fallback` | physical `content`, `stream=stdout\|stderr`, `destination=fallback\|late` |
+| `key_press` | parsed `key` and raw `data` |
+| `editor_state` | complete `text` and non-negative `cursor_position` |
+| `input_submission` | `text`, target, disposition, optional input ID and arrival sequence |
+| `runtime_event` | hub/run/agent/turn/context identity, execution mode, semantic kind, and payload |
+
+The first frontend event is initial terminal geometry. Later geometry records
+capture size changes before frames rendered for the new dimensions. A reader
+rejects UI frames or resize records that precede that initial size, so replay
+does not silently inherit the playback terminal's geometry.
+
+Binary values nested in supplemental `runtime_event` payloads are represented
+by SHA-256 and byte size rather than inline bytes. Their user-visible terminal
+projection is already present in terminal frames; duplicating multi-megabyte
+media in the replay queue would make ordinary image/audio context disable later
+frame capture.
+
+The semantic and replay writers subscribe to the same session but persist
+independently. Replay failure therefore cannot disable semantic durability or
+resume, and the semantic log is not reconstructed from replay during shutdown.
+
+Exact replay is disabled by default and rejected in one-shot mode. It records
+raw key data and editor contents without semantic-log redaction: filtering those
+values would destroy exactness while still missing arbitrary pasted secrets.
+There is no automatic retention or expiry. Use it only for bounded diagnostics
+and delete it according to the local data-retention policy.
+
+Session directories use mode `0700`; semantic, replay, and attachment files use
+`0600`. Known secret-shaped fields and common token formats are redacted recursively
+in the semantic journal,
 but a secret embedded in arbitrary prose or tool output cannot always be
-recognized. Treat journals as sensitive local data.
+recognized. Treat every session artifact as sensitive local data.
 
 ## REPL commands
 

@@ -9,6 +9,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from io import TextIOWrapper
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -23,6 +24,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 
 from axio_repl import ReplRenderer, _panel, _read_input_async
 from axio_repl._input import InputSubmitted, SubmissionDisposition
+from axio_repl._replay import ReplayLog, read_replay, recording_output
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
 from axio_repl._terminal_sanitizer import sanitize_terminal_text
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, TerminalTheme
@@ -46,7 +48,7 @@ class _RecordingOutput(DummyOutput):
 
 
 class _Session:
-    def __init__(self, output: _RecordingOutput, *, reset: str = RESET) -> None:
+    def __init__(self, output: Any, *, reset: str = RESET) -> None:
         self.app = type("App", (), {"output": output, "is_running": False})()
         self._axio_terminal_reset = reset
 
@@ -343,6 +345,57 @@ async def test_submit_before_start_and_retained_wrapper_after_close_use_fallback
 
     captured = capsys.readouterr().out
     assert "before start\n" in captured
+    assert "after close\n" in captured
+
+
+async def test_replay_records_fallback_and_late_output_in_physical_order(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = await ReplayLog.open(
+        session_dir=tmp_path,
+        session_id="terminal-fallback",
+        start_payload={
+            "application": "axio-repl",
+            "version": "test",
+            "cwd": tmp_path,
+            "mode": "interactive",
+        },
+    )
+    output = recording_output(_RecordingOutput(), replay)
+    terminal = TerminalUI(_Session(output))
+    terminal.submit(OutputFrame("before start\n"))
+
+    await terminal.start()
+    retained = terminal.stdout
+    assert retained is not None
+    restore = terminal._restore_terminal
+
+    def write_during_restore() -> None:
+        retained.write("late during close\n")
+        retained.flush()
+        restore()
+
+    monkeypatch.setattr(terminal, "_restore_terminal", write_during_restore)
+    await terminal.close()
+    retained.write("after close\n")
+    retained.flush()
+    await replay.close()
+
+    fallback_payloads = [
+        record["payload"]
+        for record in read_replay(replay.replay_path).records
+        if record["kind"] == "terminal_fallback"
+    ]
+    assert fallback_payloads == [
+        {"content": "before start\n", "stream": "stdout", "destination": "fallback"},
+        {"content": "late during close\n", "stream": "stdout", "destination": "late"},
+        {"content": "after close\n", "stream": "stdout", "destination": "fallback"},
+    ]
+    captured = capsys.readouterr().out
+    assert "before start\n" in captured
+    assert "late during close\n" in captured
     assert "after close\n" in captured
 
 
