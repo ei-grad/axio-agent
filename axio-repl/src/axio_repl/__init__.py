@@ -1178,12 +1178,18 @@ class ReplRenderer:
         prompt_toolkit holds a line until its newline arrives, so that a partial
         line and the prompt drawn below it never end up on the same row.
         Flushing defeats that, and the output loses its first characters to the
-        next redraw. While the prompt is up the half-line therefore waits: text
-        appears by the line rather than by the token, which is what it costs to
-        be able to type at any moment.
+        next redraw. Ordinary text therefore appears by the line while the
+        prompt is up. Reasoning uses its dedicated live flush because otherwise
+        a provider can look frozen for an arbitrarily long thought line.
         """
         if not self._input_active:
             sys.stdout.flush()
+
+    @staticmethod
+    def _flush_reasoning() -> None:
+        """Keep an unfinished reasoning line live while the editor is visible."""
+
+        sys.stdout.flush()
 
     async def render(
         self,
@@ -1678,7 +1684,7 @@ class ReplRenderer:
                     delta = f"> {delta}"
                     state.mode = _ReasoningMode()
                 sys.stdout.write(_styled(self._theme.reasoning.ansi, delta.replace("\n", "\n> ")))
-                self._flush()
+                self._flush_reasoning()
 
             case TextDelta(delta=delta):
                 safe_delta = state.text_sanitizer.feed(delta)

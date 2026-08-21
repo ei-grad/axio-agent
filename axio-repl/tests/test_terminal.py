@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from axio.events import Error, SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
+from axio.events import Error, ReasoningDelta, SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import ExecutionMode, TurnStarted
 from prompt_toolkit.application import create_app_session
@@ -649,6 +649,78 @@ async def test_terminal_ui_preserves_primary_buffer_and_restores_termios_in_both
         assert after[1] == before[1]
         assert termios.ICANON & after[3] == termios.ICANON & before[3]
         assert termios.ECHO & after[3] == termios.ECHO & before[3]
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal reasoning streaming test")
+async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=12, columns=80),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+    os.set_blocking(master_fd, False)
+
+    async def read_stage() -> str:
+        await asyncio.sleep(0.02)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "status", theme=DEFAULT_THEME)
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(theme=DEFAULT_THEME, effective_username="tester")
+            await terminal.start()
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("tester")))
+            try:
+                await asyncio.sleep(0.05)
+                await read_stage()
+                renderer.set_input_active(True)
+
+                await renderer.render("main", ReasoningDelta(index=0, delta="first reasoning fragment"))
+                await terminal.drain()
+                first_stage = await read_stage()
+
+                await renderer.render("main", ReasoningDelta(index=0, delta=" and its tail"))
+                await terminal.drain()
+                second_stage = await read_stage()
+
+                os.write(master_fd, b"typed input\r")
+                assert await asyncio.wait_for(prompt, timeout=2) == "typed input"
+            finally:
+                renderer.set_input_active(False)
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
+                await terminal.close()
+
+        assert "first reasoning fragment" in sanitize_terminal_text(first_stage)
+        assert "and its tail" in sanitize_terminal_text(second_stage)
+        assert "\x1b[?1049h" not in first_stage + second_stage
     finally:
         terminal_input.close()
         reader.close()

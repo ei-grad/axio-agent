@@ -23,6 +23,7 @@ from .events import (
     Error,
     ImageOutput,
     IterationEnd,
+    ReasoningDelta,
     SessionEndEvent,
     StreamEvent,
     TextDelta,
@@ -481,8 +482,9 @@ class Agent:
                         async for event in self.transport.stream(effective_history, active_tools, self.system):
                             yield event
                             match event:
-                                case TextDelta(delta=delta):
-                                    self._accumulate_text(content, delta)
+                                case TextDelta(delta=delta) | ReasoningDelta(delta=delta):
+                                    if isinstance(event, TextDelta):
+                                        self._accumulate_text(content, delta)
                                     if rep_detector.feed(delta):
                                         note = "\n\n[Output truncated: repetitive content detected]"
                                         self._accumulate_text(content, note)

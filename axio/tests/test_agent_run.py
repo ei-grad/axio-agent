@@ -379,6 +379,41 @@ class TestReasoningPassthrough:
         assert len(text_blocks) == 1
         assert text_blocks[0].text == "answer"
 
+    async def test_repetitive_reasoning_is_truncated_before_provider_completion(self) -> None:
+        repeated_chunk = "— " * 100
+        provider_events: list[StreamEvent] = [ReasoningDelta(0, repeated_chunk) for _ in range(10)]
+        provider_events.append(IterationEnd(1, StopReason.end_turn, Usage(10, 5)))
+        agent = Agent(system="test", tools=[], transport=StubTransport([provider_events]))
+        context = MemoryContextStore()
+
+        events = [event async for event in agent.run_stream("hi", context)]
+
+        reasoning = [event for event in events if isinstance(event, ReasoningDelta)]
+        notices = [event for event in events if isinstance(event, TextDelta)]
+        assert len(reasoning) < 10
+        assert [event.delta for event in notices] == ["\n\n[Output truncated: repetitive content detected]"]
+        assert isinstance(events[-1], SessionEndEvent)
+        history = await context.get_history()
+        assistant = next(message for message in history if message.role == "assistant")
+        assert assistant.content == [TextBlock(text="\n\n[Output truncated: repetitive content detected]")]
+
+    async def test_short_repeated_reasoning_does_not_trigger_loop_detection(self) -> None:
+        transport = StubTransport(
+            [
+                [
+                    ReasoningDelta(0, "checking " * 30),
+                    TextDelta(0, "answer"),
+                    IterationEnd(1, StopReason.end_turn, Usage(10, 5)),
+                ]
+            ]
+        )
+        agent = Agent(system="test", tools=[], transport=transport)
+
+        events = [event async for event in agent.run_stream("hi", MemoryContextStore())]
+
+        assert not any(isinstance(event, TextDelta) and "Output truncated" in event.delta for event in events)
+        assert any(isinstance(event, TextDelta) and event.delta == "answer" for event in events)
+
 
 class TestMaxIterations:
     async def test_max_iterations_reached(self) -> None:
