@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from axio.agent import ToolDispatch
-from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, VideoBlock
+from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from axio_tools_agents.runtime import current_turn_identity
 
 
@@ -23,6 +23,7 @@ class DeferredToolPhase(StrEnum):
 class DeferredToolNotification:
     agent_id: str
     run_id: str
+    turn_id: str | None
     tool_use_id: str
     tool_name: str
     text: str
@@ -56,6 +57,7 @@ class _OwnedDispatch:
 
 NotificationHandler = Callable[[DeferredToolNotification], Awaitable[None]]
 DispatchStartedHandler = Callable[[str, str | None], None]
+DispatchDeferredHandler = Callable[[str, str, str | None, tuple[ToolUseBlock, ...]], None]
 
 
 class DeferredToolRegistry:
@@ -66,13 +68,18 @@ class DeferredToolRegistry:
         deliver: NotificationHandler,
         *,
         on_dispatch_started: DispatchStartedHandler | None = None,
+        on_dispatch_deferred: DispatchDeferredHandler | None = None,
     ) -> None:
         self._deliver = deliver
         self._on_dispatch_started = on_dispatch_started
+        self._on_dispatch_deferred = on_dispatch_deferred
         self._records: dict[asyncio.Task[list[ToolResultBlock]], _OwnedDispatch] = {}
 
     def set_dispatch_started_handler(self, handler: DispatchStartedHandler | None) -> None:
         self._on_dispatch_started = handler
+
+    def set_dispatch_deferred_handler(self, handler: DispatchDeferredHandler | None) -> None:
+        self._on_dispatch_deferred = handler
 
     def dispatch_started(self, dispatch: ToolDispatch) -> None:
         if dispatch.task in self._records:
@@ -103,6 +110,13 @@ class DeferredToolRegistry:
         record = self._require(dispatch)
         if record.phase is not DeferredToolPhase.ACTIVE:
             raise RuntimeError(f"cannot defer dispatch from {record.phase.value} state")
+        if self._on_dispatch_deferred is not None:
+            self._on_dispatch_deferred(
+                record.agent_id,
+                record.run_id,
+                record.turn_id,
+                record.dispatch.blocks,
+            )
         record.phase = DeferredToolPhase.DEFERRED
         record.watcher = asyncio.create_task(
             self._watch(record),
@@ -198,6 +212,7 @@ class DeferredToolRegistry:
                     DeferredToolNotification(
                         agent_id=record.agent_id,
                         run_id=record.run_id,
+                        turn_id=record.turn_id,
                         tool_use_id=block.id,
                         tool_name=block.name,
                         text=_result_text(result),

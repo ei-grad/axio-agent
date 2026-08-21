@@ -7,6 +7,8 @@ import pytest
 from axio.agent import Agent, ToolDispatch
 from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
+from axio.events import ToolUseStart
+from axio.exceptions import HandlerError
 from axio.testing import StubTransport, make_tool_use_response
 from axio.tool import Tool
 from axio_tools_agents.runtime import (
@@ -19,11 +21,14 @@ from axio_tools_agents.runtime import (
     observe_agent_turn,
 )
 
+from axio_repl import ReplRenderer, render_runtime_event
 from axio_repl._deferred_tools import (
     DeferredToolNotification,
     DeferredToolPhase,
     DeferredToolRegistry,
 )
+from axio_repl._multiplexer import sanitize_terminal_text
+from axio_repl._theme import NO_COLOR_THEME
 
 
 async def test_result_waits_for_protocol_placeholder_before_delivery() -> None:
@@ -281,3 +286,125 @@ async def test_repeat_cancel_cannot_tear_deferred_tool_protocol_finalization() -
     assert delivered[0].tool_use_id == "call-1"
     assert delivered[0].text == "actual result"
     assert registry.snapshots() == ()
+
+
+@pytest.mark.parametrize(("is_error", "glyph"), [(False, "✓"), (True, "✗")])
+async def test_deferred_result_keeps_original_badge_and_renders_once(
+    capsys: pytest.CaptureFixture[str],
+    is_error: bool,
+    glyph: str,
+) -> None:
+    tool_started = asyncio.Event()
+    release = asyncio.Event()
+    dispatch_started = asyncio.Event()
+    delivered: list[DeferredToolNotification] = []
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    async def slow_tool() -> str:
+        tool_started.set()
+        await release.wait()
+        if is_error:
+            raise HandlerError("deferred failed")
+        return "deferred succeeded"
+
+    async def deliver(notification: DeferredToolNotification) -> None:
+        delivered.append(notification)
+        assert await renderer.render_deferred_tool_result(notification)
+        await renderer.incoming(notification.as_user_text(), suppress_display=True)
+
+    def on_dispatch_started(_agent_id: str, _turn_id: str | None) -> None:
+        dispatch_started.set()
+
+    registry = DeferredToolRegistry(
+        deliver,
+        on_dispatch_started=on_dispatch_started,
+        on_dispatch_deferred=renderer.defer_tool_calls,
+    )
+    hub = SessionEventHub()
+
+    async def render(envelope: AgentEventEnvelope) -> None:
+        await render_runtime_event(renderer, envelope)
+
+    hub.subscribe(render)
+    context = MemoryContextStore()
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="main-run",
+        context_id=context.session_id,
+    )
+    agent = Agent(
+        system="main",
+        transport=StubTransport([make_tool_use_response("slow", "provider-call-1", {})]),
+        tools=[Tool[Any](name="slow", handler=slow_tool)],
+        deferred_tool_sink=registry,
+    )
+    turn = asyncio.create_task(
+        observe_agent_turn(
+            agent=agent,
+            context=context,
+            prompt="run",
+            identity=identity,
+            hub=hub,
+        )
+    )
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+    await asyncio.wait_for(dispatch_started.wait(), timeout=1)
+    assert "▶ slow #001" in sanitize_terminal_text(capsys.readouterr().out)
+
+    assert registry.request_preemption(identity.turn_id)
+    turn.cancel("defer")
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert renderer.active_tool_call_count == 1
+
+    release.set()
+    for _ in range(20):
+        if delivered:
+            break
+        await asyncio.sleep(0)
+
+    assert len(delivered) == 1
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    expected_body = "deferred failed" if is_error else "deferred succeeded"
+    assert output.count(f"{glyph} slow #001") == 1
+    assert output.count(expected_body) == 1
+    assert "provider-call-1" not in output
+    assert "provider-call-1" in delivered[0].as_user_text()
+    assert renderer.active_tool_call_count == 0
+
+    history = await context.get_history()
+    placeholders = [
+        block
+        for message in history
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.tool_use_id == "provider-call-1"
+    ]
+    assert len(placeholders) == 1
+    assert "continues after interruption" in str(placeholders[0].content)
+
+    assert not await renderer.render_deferred_tool_result(delivered[0])
+    assert capsys.readouterr().out == ""
+
+
+async def test_shutdown_releases_deferred_badge_ownership() -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+    await renderer.render(
+        "main",
+        ToolUseStart(index=0, tool_use_id="call", name="shell"),
+        run_id="run",
+        turn_id="turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    renderer.defer_tool_calls(
+        "main",
+        "run",
+        "turn",
+        (ToolUseBlock(id="call", name="shell", input={}),),
+    )
+    assert renderer.active_tool_call_count == 1
+
+    await renderer.discard_deferred_tool_calls()
+
+    assert renderer.active_tool_call_count == 0

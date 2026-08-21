@@ -3,9 +3,16 @@ from __future__ import annotations
 import pytest
 from axio.events import ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason
-from axio_tools_agents.runtime import ExecutionMode, TurnFinished, TurnStarted, TurnStatus
+from axio_tools_agents.runtime import (
+    AgentEventEnvelope,
+    ExecutionMode,
+    RuntimeEvent,
+    TurnFinished,
+    TurnStarted,
+    TurnStatus,
+)
 
-from axio_repl import ReplRenderer
+from axio_repl import ReplRenderer, render_runtime_event
 from axio_repl._multiplexer import DisplayMode, sanitize_terminal_text
 from axio_repl._theme import NO_COLOR_THEME
 
@@ -102,6 +109,33 @@ async def test_turn_cleanup_releases_unfinished_call_without_reusing_ordinal() -
     assert renderer.next_tool_ordinal == 2
 
 
+async def test_direct_api_uses_distinct_synthetic_scopes_for_reused_active_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="same", name="shell"))
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="same", name="shell"))
+    starts = capsys.readouterr().out
+    assert "▶ shell #001" in starts
+    assert "▶ shell #002" in starts
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="same", name="shell", is_error=False, content="first"),
+    )
+    first = capsys.readouterr().out
+    assert "✓ shell #001" in first
+    assert renderer.active_tool_call_count == 1
+
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="same", name="shell", is_error=False, content="second"),
+    )
+    second = capsys.readouterr().out
+    assert "✓ shell #002" in second
+    assert renderer.active_tool_call_count == 0
+
+
 async def test_mismatch_and_orphan_results_fail_open_with_explicit_correlation_notice(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -132,6 +166,31 @@ async def test_mismatch_and_orphan_results_fail_open_with_explicit_correlation_n
     assert "[orphan tool result]" in orphan
     assert "full body" in orphan
     assert renderer.active_tool_call_count == 0
+
+
+async def test_mismatch_badge_and_notice_share_bounded_safe_tool_names(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+    await renderer.render(
+        "main",
+        ToolUseStart(index=0, tool_use_id="call", name=("λ" * 10_000) + "\nowned\udcff"),
+    )
+    await renderer.render(
+        "main",
+        ToolResult(
+            tool_use_id="call",
+            name=("μ" * 10_000) + "\033[2J",
+            is_error=False,
+            content="",
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert "\udcff" not in output
+    assert "\033[2J" not in output
+    assert output.count("name mismatch") == 1
+    assert max(len(line.encode("utf-8")) for line in output.splitlines()) <= 256
 
 
 async def test_suppressed_write_and_streamed_shell_still_render_response_badge_only(
@@ -206,4 +265,140 @@ async def test_background_actions_share_live_allocator_across_agents(
         "main",
         ToolResult(tool_use_id="same", name="shell", is_error=False, content="done"),
     )
+    assert renderer.active_tool_call_count == 0
+
+
+async def test_late_old_turn_result_cannot_consume_reused_live_call_ordinal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    def envelope(run_id: str, turn_id: str, event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id=run_id,
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=turn_id,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope("old-run", "old-turn", TurnStarted(prompt="old")))
+    await render_runtime_event(
+        renderer,
+        envelope("old-run", "old-turn", ToolUseStart(index=0, tool_use_id="same", name="shell")),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "old-run",
+            "old-turn",
+            TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="cancelled"),
+        ),
+    )
+    await render_runtime_event(renderer, envelope("new-run", "new-turn", TurnStarted(prompt="new")))
+    await render_runtime_event(
+        renderer,
+        envelope("new-run", "new-turn", ToolUseStart(index=0, tool_use_id="same", name="shell")),
+    )
+    capsys.readouterr()
+
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "old-run",
+            "old-turn",
+            ToolResult(tool_use_id="same", name="shell", is_error=False, content="late old"),
+        ),
+    )
+    late = capsys.readouterr().out
+    assert "✓ shell #003" in late
+    assert "[orphan tool result]" in late
+    assert renderer.active_tool_call_count == 1
+
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "new-run",
+            "new-turn",
+            ToolResult(tool_use_id="same", name="shell", is_error=False, content="current"),
+        ),
+    )
+    current = capsys.readouterr().out
+    assert "✓ shell #002" in current
+    assert "current" in current
+    assert renderer.active_tool_call_count == 0
+
+
+async def test_late_suspended_result_uses_old_full_key_without_consuming_current_call(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    def envelope(run_id: str, turn_id: str, event: RuntimeEvent) -> AgentEventEnvelope:
+        return AgentEventEnvelope(
+            seq=1,
+            session_id="session",
+            run_id=run_id,
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=turn_id,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    await render_runtime_event(renderer, envelope("old-run", "old-turn", TurnStarted(prompt="old")))
+    await render_runtime_event(
+        renderer,
+        envelope("old-run", "old-turn", ToolUseStart(index=0, tool_use_id="parent", name="run_agent")),
+    )
+    await render_runtime_event(
+        renderer,
+        envelope("old-run", "old-turn", ToolUseStart(index=1, tool_use_id="same", name="shell")),
+    )
+    await renderer.enter_foreground("child", "parent", "main")
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "old-run",
+            "old-turn",
+            TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="cancelled"),
+        ),
+    )
+    await renderer.exit_foreground("child", TurnStatus.CANCELLED)
+    await render_runtime_event(renderer, envelope("new-run", "new-turn", TurnStarted(prompt="new")))
+    await render_runtime_event(
+        renderer,
+        envelope("new-run", "new-turn", ToolUseStart(index=0, tool_use_id="same", name="shell")),
+    )
+    capsys.readouterr()
+
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "old-run",
+            "old-turn",
+            ToolResult(tool_use_id="same", name="shell", is_error=False, content="late sibling"),
+        ),
+    )
+    await renderer.mark_idle()
+    late = capsys.readouterr().out
+    assert "✓ shell #004" in late
+    assert "late sibling" in late
+    assert renderer.active_tool_call_count == 1
+
+    await render_runtime_event(
+        renderer,
+        envelope(
+            "new-run",
+            "new-turn",
+            ToolResult(tool_use_id="same", name="shell", is_error=False, content="current"),
+        ),
+    )
+    current = capsys.readouterr().out
+    assert "✓ shell #003" in current
     assert renderer.active_tool_call_count == 0

@@ -3,10 +3,11 @@ from __future__ import annotations
 import pytest
 from axio.events import SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
-from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnStarted, TurnStatus
+from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnFinished, TurnStarted, TurnStatus
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME
+from axio_repl._tool_calls import ToolCallRegistry
 
 
 def test_display_mode_accepts_cli_and_descriptive_names() -> None:
@@ -14,6 +15,42 @@ def test_display_mode_accepts_cli_and_descriptive_names() -> None:
     assert DisplayMode.parse("active-only") is DisplayMode.ACTIVE_ONLY
     assert DisplayMode.parse("on") is DisplayMode.ALL_ACTIONS
     assert DisplayMode.parse("all-actions") is DisplayMode.ALL_ACTIONS
+
+
+def test_tool_registry_binding_requires_a_strictly_fresh_multiplexer() -> None:
+    registry = ToolCallRegistry()
+    fresh = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    fresh.bind_tool_calls(registry)
+    assert fresh.tool_calls is registry
+
+    queued_lifecycle = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    queued_lifecycle.observe("child", TurnStarted(prompt="run"))
+    with pytest.raises(RuntimeError, match="observed activity"):
+        queued_lifecycle.bind_tool_calls(registry)
+
+    queued_tool = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    queued_tool.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    queued_tool.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    with pytest.raises(RuntimeError, match="observed activity"):
+        queued_tool.bind_tool_calls(registry)
+
+    completed = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    completed.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    completed.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    completed.observe(
+        "child",
+        ToolResult(tool_use_id="call", name="shell", is_error=False, content="done"),
+    )
+    completed.drain(max_frames=10)
+    with pytest.raises(RuntimeError, match="observed activity"):
+        completed.bind_tool_calls(registry)
+
+    suppressed = ActionMultiplexer(DisplayMode.ALL_ACTIONS, max_tools=1)
+    suppressed.observe("child", ToolUseStart(index=0, tool_use_id="one", name="shell"))
+    suppressed.observe("child", ToolUseStart(index=1, tool_use_id="two", name="shell"))
+    assert suppressed.retained_suppression_bytes > 0
+    with pytest.raises(RuntimeError, match="observed activity"):
+        suppressed.bind_tool_calls(registry)
 
 
 def test_no_color_action_frames_emit_no_ansi() -> None:
@@ -35,6 +72,21 @@ def test_tool_badge_name_and_frame_accounting_remain_bounded() -> None:
 
     assert len(frame.encode("utf-8")) <= 180
     assert "▶ " in frame and "… #001" in frame
+
+
+def test_background_tool_name_controls_surrogates_and_multibyte_text_are_safe() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+    name = ("λ" * 10_000) + "\nowned\udcff\033[2J"
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name=name))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    mux.observe("child", ToolResult(tool_use_id="call", name=name, is_error=False, content="done"))
+
+    call, result = mux.drain(max_frames=2)
+    combined = call + result
+    assert "\udcff" not in combined
+    assert "\033[2J" not in combined
+    assert "owned" not in combined
+    assert max(len(line.encode("utf-8")) for line in combined.splitlines()) <= 100
 
 
 def test_tool_arguments_are_framed_only_after_complete_json() -> None:
@@ -279,6 +331,64 @@ def test_background_mismatch_uses_remembered_name_and_fails_open() -> None:
     assert "name mismatch" in result
     assert "Wrote 5 bytes to app.py" in result
     assert "\x1b[" not in result
+
+
+def test_late_old_turn_result_does_not_consume_reused_background_call() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+    mux.observe(
+        "child",
+        ToolUseStart(index=0, tool_use_id="same", name="shell"),
+        run_id="old-run",
+        turn_id="old-turn",
+    )
+    mux.observe(
+        "child",
+        ToolInputDelta(index=0, tool_use_id="same", partial_json="{}"),
+        run_id="old-run",
+        turn_id="old-turn",
+    )
+    mux.drain()
+    mux.observe(
+        "child",
+        TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="cancelled"),
+        run_id="old-run",
+        turn_id="old-turn",
+    )
+    mux.drain()
+    mux.observe(
+        "child",
+        ToolUseStart(index=0, tool_use_id="same", name="shell"),
+        run_id="new-run",
+        turn_id="new-turn",
+    )
+    mux.observe(
+        "child",
+        ToolInputDelta(index=0, tool_use_id="same", partial_json="{}"),
+        run_id="new-run",
+        turn_id="new-turn",
+    )
+    [current_call] = mux.drain()
+    assert "▶ shell #002" in current_call
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="same", name="shell", is_error=False, content="late old"),
+        run_id="old-run",
+        turn_id="old-turn",
+    )
+    [late] = mux.drain()
+    assert "✓ shell #003" in late
+    assert "[orphan tool result]" in late
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="same", name="shell", is_error=False, content="current"),
+        run_id="new-run",
+        turn_id="new-turn",
+    )
+    [current] = mux.drain()
+    assert "✓ shell #002" in current
+    assert "[orphan tool result]" not in current
 
 
 def test_partial_output_segments_flush_in_executor_observed_order() -> None:

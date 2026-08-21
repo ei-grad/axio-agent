@@ -35,7 +35,7 @@ import aiohttp
 from axio import notify
 from axio._asyncio import cancel_task_once
 from axio.agent import Agent
-from axio.blocks import TextBlock
+from axio.blocks import TextBlock, ToolUseBlock
 from axio.context import ContextStore, MemoryContextStore
 from axio.effort import EFFORT_LEVELS, EffortRuntime, EffortState
 from axio.events import (
@@ -168,6 +168,7 @@ from axio_repl._tool_calls import (
     ToolCallKey,
     ToolCallRegistry,
     tool_badge,
+    tool_display_name,
 )
 from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
 
@@ -560,7 +561,7 @@ class _ReasoningMode:
 
 @dataclasses.dataclass(slots=True)
 class _ToolFieldMode:
-    tool_use_id: str
+    tool_call_key: ToolCallKey
     key: str
     multiline: bool = False
     pending: StringIO = dataclasses.field(default_factory=StringIO)
@@ -572,20 +573,20 @@ type _StructuralMode = _BoundaryMode | _TextMode | _ReasoningMode | _ToolFieldMo
 class _AgentRenderState:
     def __init__(self) -> None:
         self.mode: _StructuralMode = _BoundaryMode()
-        self.arg_streams: dict[str, ToolArgStream] = {}
-        self.active_tool_ids: set[str] = set()
-        self.streamed_tool_ids: set[str] = set()
-        self.tool_names: dict[str, str] = {}
-        self.tool_calls: dict[str, ToolCallDisplay] = {}
+        self.arg_streams: dict[ToolCallKey, ToolArgStream] = {}
+        self.active_tool_ids: set[ToolCallKey] = set()
+        self.streamed_tool_ids: set[ToolCallKey] = set()
+        self.tool_names: dict[ToolCallKey, str] = {}
+        self.tool_calls: dict[ToolCallKey, ToolCallDisplay] = {}
         self.background_text: list[str] = []
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
         self.text_sanitizer = IncrementalTerminalSanitizer()
         self.reasoning_sanitizer = IncrementalTerminalSanitizer()
-        self.tool_output_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
-        self.tool_field_sanitizers: dict[tuple[str, str], IncrementalTerminalSanitizer] = {}
-        self.tool_field_modes: dict[str, _ToolFieldMode] = {}
+        self.tool_output_sanitizers: dict[tuple[ToolCallKey, str], IncrementalTerminalSanitizer] = {}
+        self.tool_field_sanitizers: dict[tuple[ToolCallKey, str], IncrementalTerminalSanitizer] = {}
+        self.tool_field_modes: dict[ToolCallKey, _ToolFieldMode] = {}
         self.tool_arg_at_line_start = False
 
 
@@ -788,7 +789,9 @@ class ReplRenderer:
         )
         if self._suspended_actions.tool_calls is not self._tool_calls:
             self._suspended_actions.bind_tool_calls(self._tool_calls)
-        self._suspended_tool_calls: set[tuple[str, str]] = set()
+        self._suspended_tool_calls: set[ToolCallKey] = set()
+        self._direct_tool_keys: dict[tuple[str, str], deque[ToolCallKey]] = {}
+        self._next_direct_tool_scope = 1
         self._action_boundary_frames = action_boundary_frames
         self._action_boundary_bytes = action_boundary_bytes
 
@@ -915,6 +918,7 @@ class ReplRenderer:
             self._turns[key] = presentation
             self._current_turn_by_agent[agent_id] = key
             state = self._state(agent_id)
+            self._discard_direct_agent_tool_keys_locked(agent_id)
             self._reset_state_for_turn_locked(state)
             if live:
                 self._foreground_streaming = True
@@ -943,7 +947,8 @@ class ReplRenderer:
         async with self._lock:
             key = _TurnKey(agent_id, run_id, turn_id or "")
             presentation = self._turns.pop(key, None)
-            if self._current_turn_by_agent.get(agent_id) == key:
+            is_current_turn = self._current_turn_by_agent.get(agent_id) == key
+            if is_current_turn:
                 self._current_turn_by_agent.pop(agent_id, None)
             if presentation is None:
                 presentation = _TurnPresentation(
@@ -963,7 +968,16 @@ class ReplRenderer:
                         run_id=key.run_id,
                         turn_id=key.turn_id,
                     )
-                    summary = self._background_summary_locked(agent_id, presentation, event)
+                    summary = (
+                        self._background_summary_locked(agent_id, presentation, event)
+                        if is_current_turn
+                        else _BackgroundSummary(
+                            identity=format_agent_identity(agent_id, presentation.agent_name),
+                            reported_chars=0,
+                            tools=(),
+                            failed=event.status is not TurnStatus.SUCCEEDED,
+                        )
+                    )
                     self._background_summaries[key] = summary
                     while len(self._background_summaries) > 1024:
                         self._background_summaries.popitem(last=False)
@@ -977,7 +991,9 @@ class ReplRenderer:
                     self._flush_background_summaries_locked()
             self._purge_parent_turn_locked(key)
             self._tool_calls.discard_turn(agent_id=agent_id, run_id=key.run_id, turn_id=key.turn_id)
-            self._cleanup_turn_state_locked(agent_id)
+            if is_current_turn:
+                self._discard_direct_agent_tool_keys_locked(agent_id)
+                self._cleanup_turn_state_locked(agent_id)
 
     async def take_background_outcome_presentation(
         self,
@@ -991,6 +1007,60 @@ class ReplRenderer:
                 return self._agent_name(agent_id), False
             return completed.agent_name, completed.suppress_display
 
+    def defer_tool_calls(
+        self,
+        agent_id: str,
+        run_id: str,
+        turn_id: str | None,
+        blocks: tuple[ToolUseBlock, ...],
+    ) -> None:
+        """Move live call ordinals beyond their interrupted turn's cleanup."""
+
+        for block in blocks:
+            self._tool_calls.defer(ToolCallKey(agent_id, run_id, turn_id or "", block.id))
+
+    async def render_deferred_tool_result(self, notification: DeferredToolNotification) -> bool:
+        """Render one deferred result without changing its model-facing notification."""
+
+        async with self._lock:
+            key = ToolCallKey(
+                notification.agent_id,
+                notification.run_id,
+                notification.turn_id or "",
+                notification.tool_use_id,
+            )
+            result = self._tool_calls.take_deferred(key, notification.tool_name)
+            if result is None:
+                return False
+            badge_kind = (
+                ToolBadgeKind.ERROR if notification.is_error or result.name_mismatch else ToolBadgeKind.SUCCESS
+            )
+            badge = tool_badge(
+                badge_kind,
+                tool_display_name(result.call.name),
+                result.call.marker,
+                powerline=self._powerline,
+                theme=self._theme,
+            )
+            body = sanitize_terminal_text(notification.text)
+            with self._persistent_insertion_locked():
+                sys.stdout.write(f"{self._theme.reset}\n{badge}\n")
+                if result.name_mismatch:
+                    expected = tool_display_name(result.call.name)
+                    received = tool_display_name(result.event_name)
+                    notice = f"[tool result name mismatch: expected {expected!r}, received {received!r}]"
+                    sys.stdout.write(f"{_styled(self._theme.error.ansi, notice)}\n")
+                if body:
+                    style = self._theme.error.ansi if notification.is_error else self._theme.success.ansi
+                    sys.stdout.write(f"{_styled(style, body)}\n")
+                self._flush()
+                self._drain_safe_boundary_locked()
+            return True
+
+    async def discard_deferred_tool_calls(self) -> None:
+        async with self._lock:
+            self._tool_calls.discard_deferred()
+
     async def enter_foreground(
         self,
         agent_id: str,
@@ -1001,27 +1071,34 @@ class ReplRenderer:
             owner = parent_agent_id or self.foreground_agent
             owner_state = self._state(owner)
             parent_turn = self._current_turn_by_agent.get(owner)
-            for tool_use_id in owner_state.active_tool_ids:
-                if tool_use_id == parent_tool_use_id:
+            parent_call_key = next(
+                (key for key in owner_state.active_tool_ids if key.tool_use_id == parent_tool_use_id),
+                None,
+            )
+            for tool_key in owner_state.active_tool_ids:
+                if tool_key.tool_use_id == parent_tool_use_id:
                     continue
-                name = owner_state.tool_names.get(tool_use_id, "tool")
-                self._suspended_tool_calls.add((owner, tool_use_id))
+                name = owner_state.tool_names.get(tool_key, "tool")
+                self._suspended_tool_calls.add(tool_key)
                 self._suspended_actions.adopt_tool(
                     owner,
-                    tool_use_id,
+                    tool_key.tool_use_id,
                     name,
                     agent_name=self._agent_name(owner),
-                    run_id=parent_turn.run_id if parent_turn is not None else "",
-                    turn_id=parent_turn.turn_id if parent_turn is not None else "",
+                    tool_call_key=tool_key,
                 )
             self._foreground_stack.append(agent_id)
             self._actions.discard_agent(agent_id)
             if parent_tool_use_id is not None:
-                parent_key = _ParentToolKey(
-                    parent_agent_id=owner,
-                    parent_run_id=parent_turn.run_id if parent_turn is not None else "",
-                    parent_turn_id=parent_turn.turn_id if parent_turn is not None else "",
-                    tool_use_id=parent_tool_use_id,
+                parent_key = (
+                    self._parent_tool_key(parent_call_key)
+                    if parent_call_key is not None
+                    else _ParentToolKey(
+                        parent_agent_id=owner,
+                        parent_run_id=parent_turn.run_id if parent_turn is not None else "",
+                        parent_turn_id=parent_turn.turn_id if parent_turn is not None else "",
+                        tool_use_id=parent_tool_use_id,
+                    )
                 )
                 self._foreground_parent_calls[agent_id] = _ForegroundCall(
                     parent_key=parent_key,
@@ -1039,10 +1116,14 @@ class ReplRenderer:
             call = self._foreground_parent_calls.pop(agent_id, None)
             if call is not None:
                 current_parent_turn = self._current_turn_by_agent.get(call.parent_key.parent_agent_id)
-                parent_still_matches = not call.parent_key.parent_turn_id or (
-                    current_parent_turn is not None
-                    and current_parent_turn.run_id == call.parent_key.parent_run_id
-                    and current_parent_turn.turn_id == call.parent_key.parent_turn_id
+                parent_still_matches = (
+                    call.parent_key.parent_run_id == "direct"
+                    or not call.parent_key.parent_turn_id
+                    or (
+                        current_parent_turn is not None
+                        and current_parent_turn.run_id == call.parent_key.parent_run_id
+                        and current_parent_turn.turn_id == call.parent_key.parent_turn_id
+                    )
                 )
                 if parent_still_matches:
                     self._streamed_foreground_calls[call.parent_key] = _ForegroundResult(
@@ -1102,6 +1183,10 @@ class ReplRenderer:
         execution_mode: ExecutionMode | None = None,
     ) -> None:
         async with self._lock:
+            tool_key = self._event_tool_key_locked(agent_id, event, run_id=run_id, turn_id=turn_id)
+            event_turn_key = (
+                _TurnKey(agent_id, run_id or "", turn_id or "") if run_id is not None or turn_id is not None else None
+            )
             presentation = self._presentation(agent_id, run_id, turn_id)
             live = (
                 presentation.live
@@ -1111,32 +1196,38 @@ class ReplRenderer:
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
                 self._stats.record(agent_id, event.usage, model)
-            if self._is_suspended_tool_event(agent_id, event):
-                self._observe_suspended_tool_event_locked(agent_id, event, presentation)
-                if self._safe_boundary_is_open_locked():
-                    self._drain_safe_boundary_locked()
-            elif live:
-                self._render_locked(agent_id, event, presentation)
-                if isinstance(event, Error | SessionEndEvent):
-                    self._foreground_streaming = False
-                    if self.display_mode is DisplayMode.ACTIVE_ONLY:
+            try:
+                if self._is_suspended_tool_event(tool_key):
+                    assert tool_key is not None
+                    self._observe_suspended_tool_event_locked(agent_id, event, presentation, tool_key)
+                    if self._safe_boundary_is_open_locked():
+                        self._drain_safe_boundary_locked()
+                elif live:
+                    self._render_locked(agent_id, event, presentation, event_turn_key, tool_key)
+                    if isinstance(event, Error | SessionEndEvent):
+                        self._foreground_streaming = False
+                        if self.display_mode is DisplayMode.ACTIVE_ONLY:
+                            self._flush_background_summaries_locked()
+                    elif not isinstance(event, IterationEnd):
+                        self._foreground_streaming = True
+                else:
+                    agent_name = presentation.agent_name if presentation is not None else self._agent_name(agent_id)
+                    self._actions.observe(
+                        agent_id,
+                        event,
+                        agent_name=agent_name,
+                        run_id=run_id or "",
+                        turn_id=turn_id or "",
+                        tool_call_key=tool_key,
+                    )
+                    self._record_background_event_locked(agent_id, event)
+                    if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
+                        self._drain_safe_boundary_locked(max_frames=1)
+                    elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
                         self._flush_background_summaries_locked()
-                elif not isinstance(event, IterationEnd):
-                    self._foreground_streaming = True
-            else:
-                agent_name = presentation.agent_name if presentation is not None else self._agent_name(agent_id)
-                self._actions.observe(
-                    agent_id,
-                    event,
-                    agent_name=agent_name,
-                    run_id=presentation.key.run_id if presentation is not None else "",
-                    turn_id=presentation.key.turn_id if presentation is not None else "",
-                )
-                self._record_background_event_locked(agent_id, event)
-                if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
-                    self._drain_safe_boundary_locked(max_frames=1)
-                elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
-                    self._flush_background_summaries_locked()
+            finally:
+                if isinstance(event, ToolResult):
+                    self._release_direct_tool_key_locked(agent_id, event.tool_use_id, tool_key)
 
     async def observe_runtime_event(self, agent_id: str, event: RuntimeEvent) -> None:
         async with self._lock:
@@ -1321,9 +1412,62 @@ class ReplRenderer:
         run_id: str | None,
         turn_id: str | None,
     ) -> _TurnPresentation | None:
-        if run_id is not None and turn_id is not None:
-            return self._turns.get(_TurnKey(agent_id, run_id, turn_id))
+        if run_id is not None or turn_id is not None:
+            return self._turns.get(_TurnKey(agent_id, run_id or "", turn_id or ""))
         return self._current_presentation(agent_id)
+
+    def _event_tool_key_locked(
+        self,
+        agent_id: str,
+        event: StreamEvent,
+        *,
+        run_id: str | None,
+        turn_id: str | None,
+    ) -> ToolCallKey | None:
+        match event:
+            case (
+                ToolUseStart(tool_use_id=tool_use_id)
+                | ToolInputDelta(tool_use_id=tool_use_id)
+                | ToolOutputDelta(tool_use_id=tool_use_id)
+                | ToolResult(tool_use_id=tool_use_id)
+            ):
+                pass
+            case _:
+                return None
+        if run_id is not None or turn_id is not None:
+            return ToolCallKey(agent_id, run_id or "", turn_id or "", tool_use_id)
+        direct_key = (agent_id, tool_use_id)
+        known = self._direct_tool_keys.get(direct_key)
+        if isinstance(event, ToolUseStart) or not known:
+            scope = self._next_direct_tool_scope
+            self._next_direct_tool_scope += 1
+            tool_key = ToolCallKey(agent_id, "direct", f"scope-{scope}", tool_use_id)
+            self._direct_tool_keys.setdefault(direct_key, deque()).append(tool_key)
+            return tool_key
+        return known[0] if isinstance(event, ToolResult) else known[-1]
+
+    def _release_direct_tool_key_locked(
+        self,
+        agent_id: str,
+        tool_use_id: str,
+        tool_key: ToolCallKey | None,
+    ) -> None:
+        if tool_key is None or tool_key.run_id != "direct":
+            return
+        direct_key = (agent_id, tool_use_id)
+        known = self._direct_tool_keys.get(direct_key)
+        if known is None:
+            return
+        with suppress(ValueError):
+            known.remove(tool_key)
+        if not known:
+            self._direct_tool_keys.pop(direct_key, None)
+
+    def _discard_direct_agent_tool_keys_locked(self, agent_id: str) -> None:
+        direct_keys = [key for key in self._direct_tool_keys if key[0] == agent_id]
+        for direct_key in direct_keys:
+            for tool_key in self._direct_tool_keys.pop(direct_key):
+                self._tool_calls.complete(tool_key)
 
     def _current_presentation(self, agent_id: str) -> _TurnPresentation | None:
         key = self._current_turn_by_agent.get(agent_id)
@@ -1367,30 +1511,13 @@ class ReplRenderer:
         else:
             print(f"\n{self._theme.agent.ansi}── agent {identity} ──{self._theme.reset}")
 
-    def _parent_tool_key(
-        self,
-        agent_id: str,
-        tool_use_id: str,
-        presentation: _TurnPresentation | None,
-    ) -> _ParentToolKey:
-        return _ParentToolKey(
-            parent_agent_id=agent_id,
-            parent_run_id=presentation.key.run_id if presentation is not None else "",
-            parent_turn_id=presentation.key.turn_id if presentation is not None else "",
-            tool_use_id=tool_use_id,
-        )
-
     @staticmethod
-    def _tool_call_key(
-        agent_id: str,
-        tool_use_id: str,
-        presentation: _TurnPresentation | None,
-    ) -> ToolCallKey:
-        return ToolCallKey(
-            agent_id=agent_id,
-            run_id=presentation.key.run_id if presentation is not None else "",
-            turn_id=presentation.key.turn_id if presentation is not None else "",
-            tool_use_id=tool_use_id,
+    def _parent_tool_key(tool_key: ToolCallKey) -> _ParentToolKey:
+        return _ParentToolKey(
+            parent_agent_id=tool_key.agent_id,
+            parent_run_id=tool_key.run_id,
+            parent_turn_id=tool_key.turn_id,
+            tool_use_id=tool_key.tool_use_id,
         )
 
     def _purge_parent_turn_locked(self, key: _TurnKey) -> None:
@@ -1441,6 +1568,8 @@ class ReplRenderer:
 
     def _cleanup_agent_locked(self, agent_id: str) -> None:
         self._cleanup_turn_state_locked(agent_id)
+        self._discard_suspended_owner_locked(agent_id, None)
+        self._discard_direct_agent_tool_keys_locked(agent_id)
         self._tool_calls.discard_agent(agent_id)
         self._current_turn_by_agent.pop(agent_id, None)
         self._turns = {key: value for key, value in self._turns.items() if key.agent_id != agent_id}
@@ -1477,6 +1606,8 @@ class ReplRenderer:
         agent_id: str,
         event: StreamEvent,
         presentation: _TurnPresentation | None,
+        event_turn_key: _TurnKey | None,
+        tool_key: ToolCallKey | None,
     ) -> None:  # noqa: C901
         state, _ = self._switch_agent(agent_id)
         if self._event_starts_stdout(event, presentation):
@@ -1544,14 +1675,15 @@ class ReplRenderer:
                 self._drain_safe_boundary_locked()
 
             case ToolUseStart(index=index, tool_use_id=tid, name=name):
+                assert tool_key is not None
                 if isinstance(state.mode, _TextMode):
                     print()
                     state.mode = _BoundaryMode()
                 elif isinstance(state.mode, _ToolFieldMode):
                     self._force_tool_field_boundary_locked(state)
                     state.mode = _BoundaryMode()
-                call = self._tool_calls.start(self._tool_call_key(agent_id, tid, presentation), name)
-                safe_name = sanitize_identity_component(call.name) or "tool"
+                call = self._tool_calls.start(tool_key, name)
+                safe_name = tool_display_name(call.name)
                 badge = tool_badge(
                     ToolBadgeKind.CALL,
                     safe_name,
@@ -1561,60 +1693,63 @@ class ReplRenderer:
                 )
                 sys.stdout.write(f"\n{badge}")
                 self._flush()
-                state.arg_streams[tid] = ToolArgStream(tid, index)
-                state.active_tool_ids.add(tid)
-                state.tool_names[tid] = name
-                state.tool_calls[tid] = call
+                state.arg_streams[tool_key] = ToolArgStream(tid, index)
+                state.active_tool_ids.add(tool_key)
+                state.tool_names[tool_key] = name
+                state.tool_calls[tool_key] = call
                 state.tool_arg_at_line_start = False
 
             case ToolInputDelta(tool_use_id=tid, partial_json=pj):
-                self._activate_tool_field_locked(state, tid)
-                stream = state.arg_streams.get(tid)
+                assert tool_key is not None
+                self._activate_tool_field_locked(state, tool_key)
+                stream = state.arg_streams.get(tool_key)
                 if stream:
                     for fe in stream.feed(pj):
-                        self._render_field_event(state, tid, fe)
+                        self._render_field_event(state, tool_key, fe)
                     if stream.done:
                         if not state.tool_arg_at_line_start:
                             sys.stdout.write("\n")
                         state.tool_arg_at_line_start = True
                         self._flush()
-                        del state.arg_streams[tid]
+                        del state.arg_streams[tool_key]
                         if self._only_passive_tools_active(state):
                             self._drain_safe_boundary_locked()
 
             case ToolOutputDelta(tool_use_id=tid, key=key, delta=delta):
-                if tid not in state.streamed_tool_ids:
+                assert tool_key is not None
+                if tool_key not in state.streamed_tool_ids:
                     sys.stdout.write("\n")
-                state.streamed_tool_ids.add(tid)
+                state.streamed_tool_ids.add(tool_key)
                 color = self._theme.stderr.ansi if key == "stderr" else self._theme.stdout.ansi
-                sanitizer = state.tool_output_sanitizers.setdefault((tid, key), IncrementalTerminalSanitizer())
+                sanitizer = state.tool_output_sanitizers.setdefault((tool_key, key), IncrementalTerminalSanitizer())
                 sys.stdout.write(_styled(color, sanitizer.feed(delta)))
                 self._flush()
 
             case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
-                self._finish_tool_arg_stream_locked(state, tid)
-                self._activate_tool_field_locked(state, tid)
+                assert tool_key is not None
+                self._finish_tool_arg_stream_locked(state, tool_key)
+                self._activate_tool_field_locked(state, tool_key)
                 if isinstance(state.mode, _ToolFieldMode):
                     self._close_tool_field_locked(state)
                 content = sanitize_terminal_text(content)
-                remembered_call = state.tool_calls.get(tid)
+                remembered_call = state.tool_calls.get(tool_key)
                 result_display = self._tool_calls.result(
-                    remembered_call.key
-                    if remembered_call is not None
-                    else self._tool_call_key(agent_id, tid, presentation),
+                    remembered_call.key if remembered_call is not None else tool_key,
                     name,
                 )
-                known_call = tid in state.active_tool_ids and remembered_call is not None and not result_display.orphan
+                known_call = (
+                    tool_key in state.active_tool_ids and remembered_call is not None and not result_display.orphan
+                )
                 name_matches_call = known_call and not result_display.name_mismatch
                 patch_display = (
                     parse_patch_result(content, include_legacy_path=False)
                     if result_display.call.name == "patch_file" and name_matches_call and not is_error
                     else None
                 )
-                parent_key = self._parent_tool_key(agent_id, tid, presentation)
+                parent_key = self._parent_tool_key(tool_key)
                 foreground_result = self._streamed_foreground_calls.pop(parent_key, None)
                 badge_kind = ToolBadgeKind.ERROR if is_error or result_display.name_mismatch else ToolBadgeKind.SUCCESS
-                badge_name = sanitize_identity_component(result_display.call.name) or "tool"
+                badge_name = tool_display_name(result_display.call.name)
                 badge = tool_badge(
                     badge_kind,
                     badge_name,
@@ -1626,8 +1761,8 @@ class ReplRenderer:
                 if result_display.orphan:
                     sys.stdout.write(_styled(self._theme.error.ansi, "[orphan tool result]") + "\n")
                 elif result_display.name_mismatch:
-                    expected = sanitize_identity_component(result_display.call.name) or "tool"
-                    received = sanitize_identity_component(result_display.event_name) or "tool"
+                    expected = tool_display_name(result_display.call.name)
+                    received = tool_display_name(result_display.event_name)
                     notice = f"[tool result name mismatch: expected {expected!r}, received {received!r}]"
                     sys.stdout.write(_styled(self._theme.error.ansi, notice) + "\n")
                 if foreground_result is not None and name_matches_call:
@@ -1661,25 +1796,25 @@ class ReplRenderer:
                     sys.stdout.write(f"{patch_display.styled_text(self._theme)}\n")
                 elif result_display.call.name == "write_file" and name_matches_call and is_write_file_result(content):
                     pass
-                elif tid in state.streamed_tool_ids and name_matches_call:
+                elif tool_key in state.streamed_tool_ids and name_matches_call:
                     pass
                 else:
                     if content:
                         sys.stdout.write(f"{_styled(self._theme.success.ansi, content)}\n")
                 self._flush()
                 self._tool_calls.complete(result_display.call.key)
-                state.active_tool_ids.discard(tid)
-                state.arg_streams.pop(tid, None)
-                state.tool_names.pop(tid, None)
-                state.tool_calls.pop(tid, None)
-                if mode := state.tool_field_modes.pop(tid, None):
+                state.active_tool_ids.discard(tool_key)
+                state.arg_streams.pop(tool_key, None)
+                state.tool_names.pop(tool_key, None)
+                state.tool_calls.pop(tool_key, None)
+                if mode := state.tool_field_modes.pop(tool_key, None):
                     mode.pending.close()
                 state.tool_arg_at_line_start = False
                 for sanitizer_key in tuple(state.tool_output_sanitizers):
-                    if sanitizer_key[0] == tid:
+                    if sanitizer_key[0] == tool_key:
                         state.tool_output_sanitizers.pop(sanitizer_key).reset()
                 for sanitizer_key in tuple(state.tool_field_sanitizers):
-                    if sanitizer_key[0] == tid:
+                    if sanitizer_key[0] == tool_key:
                         state.tool_field_sanitizers.pop(sanitizer_key).reset()
                 if (not state.active_tool_ids and not state.arg_streams) or self._only_passive_tools_active(state):
                     self._drain_safe_boundary_locked()
@@ -1713,16 +1848,17 @@ class ReplRenderer:
 
             case SessionEndEvent():
                 self._purge_legacy_foreground_parent_locked(agent_id)
-                if presentation is not None:
+                cleanup_key = presentation.key if presentation is not None else event_turn_key
+                if cleanup_key is not None:
                     self._tool_calls.discard_turn(
                         agent_id=agent_id,
-                        run_id=presentation.key.run_id,
-                        turn_id=presentation.key.turn_id,
+                        run_id=cleanup_key.run_id,
+                        turn_id=cleanup_key.turn_id,
                     )
                 else:
                     self._tool_calls.discard_agent(agent_id)
                 if presentation is not None and presentation.error_seen and not presentation.stdout_started:
-                    self._discard_suspended_owner_locked(agent_id)
+                    self._discard_suspended_owner_locked(agent_id, cleanup_key)
                     self._drain_safe_boundary_locked()
                     return
                 self._finish_all_tool_arg_streams_locked(state)
@@ -1732,7 +1868,7 @@ class ReplRenderer:
                 else:
                     self._close_all_tool_fields_locked(state)
                 state.mode = _BoundaryMode()
-                self._discard_suspended_owner_locked(agent_id)
+                self._discard_suspended_owner_locked(agent_id, cleanup_key)
                 self._drain_safe_boundary_locked()
 
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
@@ -1835,74 +1971,76 @@ class ReplRenderer:
             if self.queued_action_count >= before:
                 break
 
-    def _is_suspended_tool_event(self, agent_id: str, event: StreamEvent) -> bool:
-        match event:
-            case (
-                ToolInputDelta(tool_use_id=tool_use_id)
-                | ToolOutputDelta(tool_use_id=tool_use_id)
-                | ToolResult(tool_use_id=tool_use_id)
-            ):
-                return (agent_id, tool_use_id) in self._suspended_tool_calls
-            case _:
-                return False
+    def _is_suspended_tool_event(self, tool_key: ToolCallKey | None) -> bool:
+        return tool_key in self._suspended_tool_calls if tool_key is not None else False
 
     def _observe_suspended_tool_event_locked(
         self,
         agent_id: str,
         event: StreamEvent,
         presentation: _TurnPresentation | None,
+        tool_key: ToolCallKey,
     ) -> None:
         state = self._state(agent_id)
         if isinstance(event, ToolResult):
-            self._finish_suspended_tool_field_locked(state, event.tool_use_id)
+            self._finish_suspended_tool_field_locked(state, tool_key)
         self._suspended_actions.observe(
             agent_id,
             event,
             agent_name=self._agent_name(agent_id),
-            run_id=presentation.key.run_id if presentation is not None else "",
-            turn_id=presentation.key.turn_id if presentation is not None else "",
+            tool_call_key=tool_key,
         )
         match event:
-            case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
-                stream = state.arg_streams.get(tool_use_id)
+            case ToolInputDelta(partial_json=partial_json):
+                stream = state.arg_streams.get(tool_key)
                 if stream is not None:
                     tuple(stream.feed(partial_json))
                     if stream.done:
-                        state.arg_streams.pop(tool_use_id, None)
-                        if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                        state.arg_streams.pop(tool_key, None)
+                        if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_call_key == tool_key:
                             state.mode = _BoundaryMode()
-                        if mode := state.tool_field_modes.pop(tool_use_id, None):
+                        if mode := state.tool_field_modes.pop(tool_key, None):
                             mode.pending.close()
-            case ToolOutputDelta(tool_use_id=tool_use_id):
-                state.streamed_tool_ids.add(tool_use_id)
-            case ToolResult(tool_use_id=tool_use_id):
-                state.active_tool_ids.discard(tool_use_id)
-                state.arg_streams.pop(tool_use_id, None)
-                state.tool_names.pop(tool_use_id, None)
-                state.tool_calls.pop(tool_use_id, None)
-                if mode := state.tool_field_modes.pop(tool_use_id, None):
+            case ToolOutputDelta():
+                state.streamed_tool_ids.add(tool_key)
+            case ToolResult():
+                state.active_tool_ids.discard(tool_key)
+                state.arg_streams.pop(tool_key, None)
+                state.tool_names.pop(tool_key, None)
+                state.tool_calls.pop(tool_key, None)
+                if mode := state.tool_field_modes.pop(tool_key, None):
                     mode.pending.close()
-                self._suspended_tool_calls.discard((agent_id, tool_use_id))
+                self._suspended_tool_calls.discard(tool_key)
             case _:
                 pass
 
-    def _finish_suspended_tool_field_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
-        stream = state.arg_streams.get(tool_use_id)
-        mode = state.tool_field_modes.get(tool_use_id)
+    def _finish_suspended_tool_field_locked(self, state: _AgentRenderState, tool_key: ToolCallKey) -> None:
+        stream = state.arg_streams.get(tool_key)
+        mode = state.tool_field_modes.get(tool_key)
         if stream is None and mode is None:
             return
         with self._persistent_insertion_locked():
-            self._activate_tool_field_locked(state, tool_use_id)
+            self._activate_tool_field_locked(state, tool_key)
             if stream is not None:
                 for event in stream.finish():
-                    self._render_field_event(state, tool_use_id, event)
-            if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_use_id == tool_use_id:
+                    self._render_field_event(state, tool_key, event)
+            if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_call_key == tool_key:
                 self._close_tool_field_locked(state)
 
-    def _discard_suspended_owner_locked(self, agent_id: str) -> None:
-        self._suspended_actions.discard_agent(agent_id)
+    def _discard_suspended_owner_locked(self, agent_id: str, turn_key: _TurnKey | None) -> None:
+        if turn_key is None:
+            self._suspended_actions.discard_agent(agent_id)
+            self._suspended_tool_calls = {key for key in self._suspended_tool_calls if key.agent_id != agent_id}
+            return
+        self._suspended_actions.discard_turn(
+            agent_id,
+            run_id=turn_key.run_id,
+            turn_id=turn_key.turn_id,
+        )
         self._suspended_tool_calls = {
-            (owner, tool_use_id) for owner, tool_use_id in self._suspended_tool_calls if owner != agent_id
+            key
+            for key in self._suspended_tool_calls
+            if not (key.agent_id == agent_id and key.run_id == turn_key.run_id and key.turn_id == turn_key.turn_id)
         }
 
     def _render_text_delta_locked(self, state: _AgentRenderState, delta: str) -> None:
@@ -1941,30 +2079,30 @@ class ReplRenderer:
     def _render_field_event(
         self,
         state: _AgentRenderState,
-        tool_use_id: str,
+        tool_key: ToolCallKey,
         event: ToolFieldStart | ToolFieldDelta | ToolFieldEnd,
     ) -> None:
         match event:
             case ToolFieldStart(key=key):
                 key = sanitize_terminal_text(key).replace("\n", " ")
-                started_mode = _ToolFieldMode(tool_use_id=tool_use_id, key=key)
-                state.tool_field_modes[tool_use_id] = started_mode
+                started_mode = _ToolFieldMode(tool_call_key=tool_key, key=key)
+                state.tool_field_modes[tool_key] = started_mode
                 state.mode = started_mode
-                state.tool_field_sanitizers[(tool_use_id, key)] = IncrementalTerminalSanitizer()
+                state.tool_field_sanitizers[(tool_key, key)] = IncrementalTerminalSanitizer()
             case ToolFieldDelta(text=text):
-                delta_mode = state.tool_field_modes.get(tool_use_id)
+                delta_mode = state.tool_field_modes.get(tool_key)
                 if delta_mode is None:
-                    raise RuntimeError(f"tool field delta for inactive stream {tool_use_id}")
+                    raise RuntimeError(f"tool field delta for inactive stream {tool_key.tool_use_id}")
                 state.mode = delta_mode
                 sanitizer = state.tool_field_sanitizers.setdefault(
-                    (tool_use_id, delta_mode.key), IncrementalTerminalSanitizer()
+                    (tool_key, delta_mode.key), IncrementalTerminalSanitizer()
                 )
                 text = sanitizer.feed(text)
                 if not text:
                     return
                 self._append_tool_field_text_locked(state, text)
             case ToolFieldEnd():
-                ended_mode = state.tool_field_modes.get(tool_use_id)
+                ended_mode = state.tool_field_modes.get(tool_key)
                 if ended_mode is not None:
                     state.mode = ended_mode
                     self._close_tool_field_locked(state)
@@ -1989,25 +2127,25 @@ class ReplRenderer:
             sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, line)}\n")
         state.tool_arg_at_line_start = True
 
-    def _activate_tool_field_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
+    def _activate_tool_field_locked(self, state: _AgentRenderState, tool_key: ToolCallKey) -> None:
         current = state.mode
-        if isinstance(current, _ToolFieldMode) and current.tool_use_id != tool_use_id:
+        if isinstance(current, _ToolFieldMode) and current.tool_call_key != tool_key:
             self._force_tool_field_boundary_locked(state)
             state.mode = _BoundaryMode()
-        if mode := state.tool_field_modes.get(tool_use_id):
+        if mode := state.tool_field_modes.get(tool_key):
             state.mode = mode
 
-    def _finish_tool_arg_stream_locked(self, state: _AgentRenderState, tool_use_id: str) -> None:
-        stream = state.arg_streams.get(tool_use_id)
+    def _finish_tool_arg_stream_locked(self, state: _AgentRenderState, tool_key: ToolCallKey) -> None:
+        stream = state.arg_streams.get(tool_key)
         if stream is None:
             return
-        self._activate_tool_field_locked(state, tool_use_id)
+        self._activate_tool_field_locked(state, tool_key)
         for event in stream.finish():
-            self._render_field_event(state, tool_use_id, event)
+            self._render_field_event(state, tool_key, event)
 
     def _finish_all_tool_arg_streams_locked(self, state: _AgentRenderState) -> None:
-        for tool_use_id in tuple(state.arg_streams):
-            self._finish_tool_arg_stream_locked(state, tool_use_id)
+        for tool_key in tuple(state.arg_streams):
+            self._finish_tool_arg_stream_locked(state, tool_key)
 
     def _append_tool_field_text_locked(self, state: _AgentRenderState, text: str) -> None:
         mode = state.mode
@@ -2057,11 +2195,11 @@ class ReplRenderer:
             self._write_tool_field_header_locked(state, mode.key)
             sys.stdout.write(f" {_styled(self._theme.reasoning.ansi, pending)}\n")
         state.tool_arg_at_line_start = True
-        sanitizer = state.tool_field_sanitizers.pop((mode.tool_use_id, mode.key), None)
+        sanitizer = state.tool_field_sanitizers.pop((mode.tool_call_key, mode.key), None)
         if sanitizer is not None:
             sanitizer.reset()
         mode.pending.close()
-        state.tool_field_modes.pop(mode.tool_use_id, None)
+        state.tool_field_modes.pop(mode.tool_call_key, None)
         state.mode = _BoundaryMode()
         self._flush()
 
@@ -3443,6 +3581,7 @@ async def main() -> None:
                     turn_id=None,
                     execution_mode=ExecutionMode.BACKGROUND,
                 )
+                await renderer.render_deferred_tool_result(notification)
                 delivered = await enqueue_local_agent_messages(
                     notification.agent_id,
                     (
@@ -3461,9 +3600,16 @@ async def main() -> None:
                     return
                 text = f"[Deferred result from stopped agent {notification.agent_id}]\n\n{text}"
             await _admit_incoming(
-                _IncomingPrompt(text=text, display_text=text, author=notification.tool_name),
+                _IncomingPrompt(
+                    text=text,
+                    display_text=text,
+                    author=notification.tool_name,
+                    suppress_display=True,
+                ),
                 source="deferred-tool",
             )
+            if notification.agent_id == "main" or not is_local_background_agent(notification.agent_id):
+                await renderer.render_deferred_tool_result(notification)
 
         deferred_tools = DeferredToolRegistry(_deliver_deferred_tool)
         agent.deferred_tool_sink = deferred_tools
@@ -3510,6 +3656,7 @@ async def main() -> None:
             theme=theme,
             effective_username=effective_username,
         )
+        deferred_tools.set_dispatch_deferred_handler(renderer.defer_tool_calls)
         startup_notices: list[str] = []
 
         async def _render_envelope(envelope: AgentEventEnvelope) -> None:
@@ -4531,6 +4678,7 @@ async def main() -> None:
                     )
                 await stop_local_background_agents()
                 await deferred_tools.close()
+                await renderer.discard_deferred_tool_calls()
                 await ctx.close()
                 await _publish_main_event(AgentStopped(status=main_status))
                 notify.remove_listener(peer_server.id if peer_server is not None else None)

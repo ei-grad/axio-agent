@@ -19,6 +19,7 @@ from axio_repl._tool_calls import (
     ToolCallRegistry,
     ToolResultDisplay,
     tool_badge,
+    tool_display_name,
 )
 from axio_repl._tool_result_display import (
     DiffLineKind,
@@ -127,7 +128,7 @@ class _ToolAction:
     def retained_bytes(self) -> int:
         agent_name_bytes = len(self.agent_name.encode("utf-8")) if self.agent_name is not None else 0
         return (
-            len(self.name.encode("utf-8"))
+            len(tool_display_name(self.name).encode("utf-8"))
             + len(self.call.marker.encode("utf-8"))
             + agent_name_bytes
             + self.arguments_bytes
@@ -138,7 +139,7 @@ class _ToolAction:
 @dataclass(slots=True)
 class _AgentCollector:
     identity_bytes: int
-    tools: OrderedDict[str, _ToolAction] = field(default_factory=OrderedDict)
+    tools: OrderedDict[ToolCallKey, _ToolAction] = field(default_factory=OrderedDict)
 
 
 def sanitize_terminal_text(value: object) -> str:
@@ -237,8 +238,8 @@ def _result_notices(result: ToolResultDisplay) -> tuple[str, ...]:
     if result.orphan:
         return ("[orphan tool result]",)
     if result.name_mismatch:
-        expected = sanitize_identity_component(result.call.name) or "tool"
-        received = sanitize_identity_component(result.event_name) or "tool"
+        expected = tool_display_name(result.call.name)
+        received = tool_display_name(result.event_name)
         return (f"[tool result name mismatch: expected {expected!r}, received {received!r}]",)
     return ()
 
@@ -336,7 +337,7 @@ class ActionMultiplexer:
         self._max_retained_bytes = max_retained_bytes
         self._tool_calls = tool_calls or ToolCallRegistry()
         self._collectors: OrderedDict[str, _AgentCollector] = OrderedDict()
-        self._tool_order: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._tool_order: OrderedDict[ToolCallKey, None] = OrderedDict()
         self._queues: dict[str, deque[ActionFrame]] = {}
         self._round_robin: deque[str] = deque()
         self._scheduled: set[str] = set()
@@ -345,13 +346,29 @@ class ActionMultiplexer:
         self._sequence = 0
         self._suppressed_frames = 0
         self._suppressed_state = 0
+        self._observed_activity = False
 
     def bind_tool_calls(self, tool_calls: ToolCallRegistry) -> None:
         """Use the session allocator before any tool collector is active."""
 
-        if self._collectors or self._tool_order:
-            raise RuntimeError("cannot replace the tool-call registry while actions are active")
+        if not self._is_fresh():
+            raise RuntimeError("cannot replace the tool-call registry after the multiplexer has observed activity")
         self._tool_calls = tool_calls
+
+    def _is_fresh(self) -> bool:
+        return not (
+            self._observed_activity
+            or self._collectors
+            or self._tool_order
+            or self._queues
+            or self._round_robin
+            or self._scheduled
+            or self._queued_bytes
+            or self._collector_bytes
+            or self._sequence
+            or self._suppressed_frames
+            or self._suppressed_state
+        )
 
     @property
     def mode(self) -> DisplayMode:
@@ -428,6 +445,14 @@ class ActionMultiplexer:
         self._unschedule(queue_agent_id)
         return frames, byte_count
 
+    def discard_turn(self, agent_id: str, *, run_id: str, turn_id: str) -> None:
+        self._remove_turn_collector(
+            agent_id,
+            run_id=run_id,
+            turn_id=turn_id,
+            suppress_incomplete=False,
+        )
+
     def observe(
         self,
         agent_id: str,
@@ -436,15 +461,19 @@ class ActionMultiplexer:
         agent_name: str | None = None,
         run_id: str = "",
         turn_id: str = "",
+        tool_call_key: ToolCallKey | None = None,
     ) -> None:  # noqa: C901
+        self._observed_activity = True
         call_key: ToolCallKey | None = None
         started_call: ToolCallDisplay | None = None
         match event:
             case ToolUseStart(tool_use_id=tool_use_id, name=name):
-                call_key = ToolCallKey(agent_id, run_id, turn_id, tool_use_id)
+                call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
                 started_call = self._tool_calls.start(call_key, name)
             case ToolResult(tool_use_id=tool_use_id):
-                call_key = ToolCallKey(agent_id, run_id, turn_id, tool_use_id)
+                call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
+            case ToolInputDelta(tool_use_id=tool_use_id) | ToolOutputDelta(tool_use_id=tool_use_id):
+                call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
             case _:
                 pass
         if self._mode is not DisplayMode.ALL_ACTIONS:
@@ -463,7 +492,12 @@ class ActionMultiplexer:
                 case TurnFinished(status=status):
                     detail = f"turn {status.value}"
                     self._enqueue(agent_id, "lifecycle", detail, critical=True, agent_name=agent_name)
-                    self._remove_collector(agent_id, suppress_incomplete=True)
+                    self._remove_turn_collector(
+                        agent_id,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        suppress_incomplete=True,
+                    )
                 case AgentStopped(status=status):
                     self._enqueue(
                         agent_id,
@@ -477,11 +511,12 @@ class ActionMultiplexer:
                     assert started_call is not None
                     self._remember_tool(
                         agent_id,
-                        tool_use_id,
+                        started_call.key,
                         _ToolAction(name=name, call=started_call, agent_name=agent_name),
                     )
                 case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
-                    action = self._touch_tool(agent_id, tool_use_id)
+                    assert call_key is not None
+                    action = self._touch_tool(call_key)
                     if action is None or action.call_emitted or not partial_json:
                         return
                     action.arguments.append(partial_json)
@@ -490,7 +525,8 @@ class ActionMultiplexer:
                     self._collector_bytes += fragment_bytes
                     self._emit_call_if_complete(agent_id, action)
                 case ToolOutputDelta(tool_use_id=tool_use_id, key=key, delta=delta):
-                    action = self._touch_tool(agent_id, tool_use_id)
+                    assert call_key is not None
+                    action = self._touch_tool(call_key)
                     if action is None:
                         return
                     self._emit_call(agent_id, action, retained=True)
@@ -498,8 +534,8 @@ class ActionMultiplexer:
                     self._append_output_buffer(action, key, delta)
                     self._emit_complete_output(agent_id, action)
                 case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
-                    action = self._pop_tool(agent_id, tool_use_id)
                     assert call_key is not None
+                    action = self._pop_tool(call_key)
                     call_key = action.call.key if action is not None else call_key
                     result_display = self._tool_calls.result(call_key, name)
                     safe_content = sanitize_terminal_text(content)
@@ -594,7 +630,12 @@ class ActionMultiplexer:
                         critical=True,
                         agent_name=agent_name,
                     )
-                    self._remove_collector(agent_id, suppress_incomplete=True)
+                    self._remove_turn_collector(
+                        agent_id,
+                        run_id=run_id,
+                        turn_id=turn_id,
+                        suppress_incomplete=True,
+                    )
                 case _:
                     return
         finally:
@@ -610,18 +651,35 @@ class ActionMultiplexer:
         agent_name: str | None = None,
         run_id: str = "",
         turn_id: str = "",
+        tool_call_key: ToolCallKey | None = None,
     ) -> None:
         """Collect continuation events for a tool call already shown live."""
+        self._observed_activity = True
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
         agent_name = normalize_agent_name(agent_name)
-        call = self._tool_calls.start(ToolCallKey(agent_id, run_id, turn_id, tool_use_id), name)
+        key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
+        call = self._tool_calls.start(key, name)
         self._remember_tool(
             agent_id,
-            tool_use_id,
+            key,
             _ToolAction(name=name, call=call, agent_name=agent_name, call_emitted=True),
         )
         self._enforce_retained_limit()
+
+    @staticmethod
+    def _resolve_tool_key(
+        agent_id: str,
+        tool_use_id: str,
+        run_id: str,
+        turn_id: str,
+        tool_call_key: ToolCallKey | None,
+    ) -> ToolCallKey:
+        if tool_call_key is None:
+            return ToolCallKey(agent_id, run_id, turn_id, tool_use_id)
+        if tool_call_key.agent_id != agent_id or tool_call_key.tool_use_id != tool_use_id:
+            raise ValueError("tool call key does not match the observed event")
+        return tool_call_key
 
     def _finish_tool_event_identity(
         self,
@@ -729,7 +787,12 @@ class ActionMultiplexer:
                 end = self._output_chunk_chars
             else:
                 break
-            self._enqueue(agent_id, f"{action.name} {key}", buffer[:end], agent_name=action.agent_name)
+            self._enqueue(
+                agent_id,
+                f"{tool_display_name(action.name)} {key}",
+                buffer[:end],
+                agent_name=action.agent_name,
+            )
             old_bytes = len(key.encode("utf-8")) + len(buffer.encode("utf-8"))
             remainder = buffer[end:]
             if remainder:
@@ -745,7 +808,12 @@ class ActionMultiplexer:
     def _flush_output(self, agent_id: str, action: _ToolAction) -> None:
         while action.output:
             key, buffer = action.output.popleft()
-            self._enqueue(agent_id, f"{action.name} {key}", buffer, agent_name=action.agent_name)
+            self._enqueue(
+                agent_id,
+                f"{tool_display_name(action.name)} {key}",
+                buffer,
+                agent_name=action.agent_name,
+            )
         action.output_bytes = 0
 
     def _append_output_buffer(self, action: _ToolAction, key: str, delta: str) -> None:
@@ -777,7 +845,7 @@ class ActionMultiplexer:
         agent_name = normalize_agent_name(agent_name)
         kind = _fit_utf8(sanitize_terminal_text(kind).replace("\n", " "), 40, suffix="…") or "action"
         clean_body = sanitize_terminal_text(body)
-        tool_name = sanitize_identity_component(tool_call.name) if tool_call is not None else None
+        tool_name = tool_display_name(tool_call.name) if tool_call is not None else None
         tool_marker = tool_call.marker if tool_call is not None else None
         frame = ActionFrame(
             agent_id=agent_id,
@@ -922,18 +990,18 @@ class ActionMultiplexer:
     def _has_pending(self, agent_id: str) -> bool:
         return bool(self._queues.get(agent_id))
 
-    def _remember_tool(self, agent_id: str, tool_use_id: str, action: _ToolAction) -> None:
+    def _remember_tool(self, agent_id: str, tool_key: ToolCallKey, action: _ToolAction) -> None:
         # Eviction can remove the agent's last tool and collector, so make room
         # before resolving the collector that will receive the new action.
-        self._discard_tool(agent_id, tool_use_id, suppress_incomplete=False)
+        self._discard_tool(tool_key, suppress_incomplete=False)
         while len(self._tool_order) >= self._max_tools:
-            oldest_agent, oldest_tool_id = next(iter(self._tool_order))
-            self._discard_tool(oldest_agent, oldest_tool_id, suppress_incomplete=True)
+            oldest_key = next(iter(self._tool_order))
+            self._discard_tool(oldest_key, suppress_incomplete=True)
 
         collector = self._collectors.get(agent_id)
         while collector is not None and len(collector.tools) >= self._max_tools_per_agent:
-            oldest_tool_id = next(iter(collector.tools))
-            self._discard_tool(agent_id, oldest_tool_id, suppress_incomplete=True)
+            oldest_key = next(iter(collector.tools))
+            self._discard_tool(oldest_key, suppress_incomplete=True)
             collector = self._collectors.get(agent_id)
 
         if collector is None:
@@ -946,56 +1014,73 @@ class ActionMultiplexer:
         else:
             self._collectors.move_to_end(agent_id)
 
-        collector.tools[tool_use_id] = action
-        self._tool_order[(agent_id, tool_use_id)] = None
-        self._collector_bytes += len(tool_use_id.encode("utf-8")) + action.retained_bytes
+        collector.tools[tool_key] = action
+        self._tool_order[tool_key] = None
+        self._collector_bytes += len(tool_key.tool_use_id.encode("utf-8")) + action.retained_bytes
 
-    def _touch_tool(self, agent_id: str, tool_use_id: str) -> _ToolAction | None:
-        collector = self._collectors.get(agent_id)
+    def _touch_tool(self, tool_key: ToolCallKey) -> _ToolAction | None:
+        collector = self._collectors.get(tool_key.agent_id)
         if collector is None:
             return None
-        action = collector.tools.get(tool_use_id)
+        action = collector.tools.get(tool_key)
         if action is None:
             return None
-        collector.tools.move_to_end(tool_use_id)
-        self._collectors.move_to_end(agent_id)
-        self._tool_order.move_to_end((agent_id, tool_use_id))
+        collector.tools.move_to_end(tool_key)
+        self._collectors.move_to_end(tool_key.agent_id)
+        self._tool_order.move_to_end(tool_key)
         return action
 
-    def _pop_tool(self, agent_id: str, tool_use_id: str) -> _ToolAction | None:
-        collector = self._collectors.get(agent_id)
+    def _pop_tool(self, tool_key: ToolCallKey) -> _ToolAction | None:
+        collector = self._collectors.get(tool_key.agent_id)
         if collector is None:
-            self._tool_order.pop((agent_id, tool_use_id), None)
+            self._tool_order.pop(tool_key, None)
             return None
-        action = collector.tools.pop(tool_use_id, None)
-        self._tool_order.pop((agent_id, tool_use_id), None)
+        action = collector.tools.pop(tool_key, None)
+        self._tool_order.pop(tool_key, None)
         if action is None:
             return None
-        self._collector_bytes -= len(tool_use_id.encode("utf-8")) + action.retained_bytes
+        self._collector_bytes -= len(tool_key.tool_use_id.encode("utf-8")) + action.retained_bytes
         if not collector.tools:
-            self._collectors.pop(agent_id, None)
+            self._collectors.pop(tool_key.agent_id, None)
             self._collector_bytes -= collector.identity_bytes
         return action
 
-    def _discard_tool(self, agent_id: str, tool_use_id: str, *, suppress_incomplete: bool) -> None:
-        action = self._pop_tool(agent_id, tool_use_id)
+    def _discard_tool(self, tool_key: ToolCallKey, *, suppress_incomplete: bool) -> None:
+        action = self._pop_tool(tool_key)
         if action is not None and suppress_incomplete:
             self._suppressed_state += 1
 
     def _remove_collector(self, agent_id: str, *, suppress_incomplete: bool) -> None:
         collector = self._collectors.pop(agent_id, None)
-        stale_tool_ids = [tool_use_id for owner, tool_use_id in self._tool_order if owner == agent_id]
+        stale_tool_keys = [tool_key for tool_key in self._tool_order if tool_key.agent_id == agent_id]
         if collector is not None:
             self._collector_bytes -= collector.identity_bytes
             self._collector_bytes -= sum(
-                len(tool_use_id.encode("utf-8")) + action.retained_bytes
-                for tool_use_id, action in collector.tools.items()
+                len(tool_key.tool_use_id.encode("utf-8")) + action.retained_bytes
+                for tool_key, action in collector.tools.items()
             )
-            stale_tool_ids.extend(tool_use_id for tool_use_id in collector.tools if tool_use_id not in stale_tool_ids)
-        for tool_use_id in stale_tool_ids:
-            self._tool_order.pop((agent_id, tool_use_id), None)
+            stale_tool_keys.extend(tool_key for tool_key in collector.tools if tool_key not in stale_tool_keys)
+        for tool_key in stale_tool_keys:
+            self._tool_order.pop(tool_key, None)
         if suppress_incomplete:
-            self._suppressed_state += len(stale_tool_ids)
+            self._suppressed_state += len(stale_tool_keys)
+
+    def _remove_turn_collector(
+        self,
+        agent_id: str,
+        *,
+        run_id: str,
+        turn_id: str,
+        suppress_incomplete: bool,
+    ) -> None:
+        collector = self._collectors.get(agent_id)
+        if collector is None:
+            return
+        stale_keys = [
+            tool_key for tool_key in collector.tools if tool_key.run_id == run_id and tool_key.turn_id == turn_id
+        ]
+        for tool_key in stale_keys:
+            self._discard_tool(tool_key, suppress_incomplete=suppress_incomplete)
 
     def _suppression_body(self) -> str:
         parts: list[str] = []
@@ -1029,8 +1114,8 @@ class ActionMultiplexer:
             # Incomplete collector payload has no durable presentation value;
             # shed it before queued frames, where critical results are preferred.
             if self._tool_order:
-                agent_id, tool_use_id = next(iter(self._tool_order))
-                self._discard_tool(agent_id, tool_use_id, suppress_incomplete=True)
+                tool_key = next(iter(self._tool_order))
+                self._discard_tool(tool_key, suppress_incomplete=True)
                 continue
             oldest_agent = self._oldest_agent()
             if oldest_agent is not None:

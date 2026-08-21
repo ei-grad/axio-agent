@@ -67,10 +67,11 @@ class ToolCallRegistry:
     def __init__(self) -> None:
         self._next_ordinal = 1
         self._active: OrderedDict[ToolCallKey, ToolCallDisplay] = OrderedDict()
+        self._deferred: OrderedDict[ToolCallKey, ToolCallDisplay] = OrderedDict()
 
     @property
     def active_count(self) -> int:
-        return len(self._active)
+        return len(self._active) + len(self._deferred)
 
     @property
     def next_ordinal(self) -> int:
@@ -94,6 +95,21 @@ class ToolCallRegistry:
 
     def complete(self, key: ToolCallKey) -> None:
         self._active.pop(key, None)
+
+    def defer(self, key: ToolCallKey) -> ToolCallDisplay | None:
+        call = self._active.pop(key, None)
+        if call is not None:
+            self._deferred[key] = call
+        return call
+
+    def take_deferred(self, key: ToolCallKey, event_name: str) -> ToolResultDisplay | None:
+        call = self._deferred.pop(key, None)
+        if call is None:
+            return None
+        return ToolResultDisplay(call=call, event_name=event_name, orphan=False)
+
+    def discard_deferred(self) -> None:
+        self._deferred.clear()
 
     def discard_turn(self, *, agent_id: str, run_id: str, turn_id: str) -> None:
         self._active = OrderedDict(
@@ -121,14 +137,20 @@ def tool_badge(
 ) -> str:
     """Render one reset-safe call or response badge."""
 
-    clean_name = " ".join(sanitize_terminal_text(name).split()) or "tool"
-    safe_name = _fit_utf8(_replace_surrogates(clean_name), 80)
+    safe_name = tool_display_name(name)
     label = f"{kind.glyph} {safe_name} {marker}"
     if powerline and theme.reset:
         badge_style = _powerline_style(kind, theme)
         return PowerlineBadge((PowerlineSegment(f" {label} ", badge_style.foreground, badge_style.background),)).ansi()
     text_style = _text_style(kind, theme)
     return f"{text_style.ansi}{label}{theme.reset}"
+
+
+def tool_display_name(value: object) -> str:
+    """Return one bounded, valid-Unicode terminal-safe tool name."""
+
+    clean_name = " ".join(sanitize_terminal_text(value).split()) or "tool"
+    return _fit_utf8(_replace_surrogates(clean_name), 80)
 
 
 def _text_style(kind: ToolBadgeKind, theme: TerminalTheme) -> TextStyle:

@@ -6,6 +6,7 @@ from axio_repl._tool_calls import (
     ToolCallKey,
     ToolCallRegistry,
     tool_badge,
+    tool_display_name,
 )
 
 
@@ -43,6 +44,22 @@ def test_registry_labels_orphans_and_bounds_cleanup_without_reusing_numbers() ->
     registry.discard_turn(agent_id="child", run_id="run", turn_id="turn")
     assert registry.active_count == 0
     assert registry.next_ordinal == 4
+
+
+def test_deferred_registry_ownership_survives_turn_cleanup_until_delivery() -> None:
+    registry = ToolCallRegistry()
+    key = ToolCallKey("main", "run", "turn", "provider")
+    call = registry.start(key, "shell")
+
+    assert registry.defer(key) == call
+    registry.discard_turn(agent_id="main", run_id="run", turn_id="turn")
+    assert registry.active_count == 1
+
+    result = registry.take_deferred(key, "shell")
+    assert result is not None
+    assert result.call.marker == "#001"
+    assert registry.active_count == 0
+    assert registry.take_deferred(key, "shell") is None
 
 
 def test_registry_markers_expand_after_999() -> None:
@@ -138,3 +155,12 @@ def test_badge_replaces_lone_surrogates_with_valid_unicode() -> None:
 
     assert badge == "✗ bad�name #001"
     assert badge.encode("utf-8")
+
+
+def test_shared_tool_display_name_is_one_safe_bounded_utf8_line() -> None:
+    name = tool_display_name(("λ" * 10_000) + "\nowned\033[2J\udcff")
+
+    assert "\n" not in name
+    assert "\033" not in name
+    assert len(name.encode("utf-8")) <= 80
+    assert name.endswith("…")
