@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
-from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolOutputDelta, ToolUseStart
+from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
 from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
@@ -730,6 +730,8 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
     final_response_started = asyncio.Event()
     inputs: asyncio.Queue[str] = asyncio.Queue()
     calls: list[list[Message]] = []
+    rendered_tool_results: list[ToolResult] = []
+    observed_renderer: ReplRenderer | None = None
     shell_stream_invocations = 0
 
     async def shell_handler() -> str:
@@ -772,8 +774,10 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
             calls.append(list(messages))
             call_number = len(calls)
             if call_number == 1:
-                yield ToolUseStart(index=0, tool_use_id="cancelled-shell", name="shell")
-                yield ToolInputDelta(index=0, tool_use_id="cancelled-shell", partial_json="{}")
+                yield ToolUseStart(index=0, tool_use_id="cancelled-shell-a", name="shell")
+                yield ToolInputDelta(index=0, tool_use_id="cancelled-shell-a", partial_json="{}")
+                yield ToolUseStart(index=1, tool_use_id="cancelled-shell-b", name="shell")
+                yield ToolInputDelta(index=1, tool_use_id="cancelled-shell-b", partial_json="{}")
                 first_tool_ready.set()
                 await allow_first_iteration_end.wait()
                 yield IterationEnd(
@@ -857,8 +861,12 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
     original_render_runtime_event = axio_repl.render_runtime_event
 
     async def tracked_render_runtime_event(renderer: ReplRenderer, envelope: object) -> None:
+        nonlocal observed_renderer
+        observed_renderer = renderer
         await original_render_runtime_event(renderer, cast(Any, envelope))
         event = cast(Any, envelope).event
+        if isinstance(event, ToolResult):
+            rendered_tool_results.append(event)
         if isinstance(event, ToolOutputDelta) and event.tool_use_id == "reissued-shell":
             shell_output_rendered.set()
 
@@ -883,16 +891,37 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
         await asyncio.wait_for(shell_stream_started.wait(), timeout=1)
         await asyncio.wait_for(shell_output_rendered.wait(), timeout=1)
         assert shell_stream_invocations == 1
-        assert "early shell output" in capsys.readouterr().out
+        first_output = capsys.readouterr().out
+        assert "early shell output" in first_output
+        assert first_output.count("▶ shell #001") == 1
+        assert first_output.count("✗ shell #001") == 1
+        assert first_output.count("▶ shell #002") == 1
+        assert first_output.count("✗ shell #002") == 1
+        assert first_output.index("▶ shell #001") < first_output.index("✗ shell #001")
+        assert first_output.index("▶ shell #002") < first_output.index("✗ shell #002")
+        assert first_output.count("[interrupted by user]") == 2
+        assert observed_renderer is not None
+        assert observed_renderer.active_tool_call_count == 1
 
-        first_cancelled_result = next(
+        first_cancelled_results = [
             block
             for message in calls[1]
             for block in message.content
-            if isinstance(block, ToolResultBlock) and block.tool_use_id == "cancelled-shell"
-        )
-        assert "[interrupted by user]" == first_cancelled_result.content
-        assert "continues after interruption" not in str(first_cancelled_result.content)
+            if isinstance(block, ToolResultBlock) and block.tool_use_id.startswith("cancelled-shell-")
+        ]
+        assert [(block.tool_use_id, block.content, block.is_error) for block in first_cancelled_results] == [
+            ("cancelled-shell-a", "[interrupted by user]", True),
+            ("cancelled-shell-b", "[interrupted by user]", True),
+        ]
+        assert [
+            (event.tool_use_id, event.name, event.content, event.is_error)
+            for event in rendered_tool_results
+            if event.tool_use_id.startswith("cancelled-shell-")
+        ] == [
+            ("cancelled-shell-a", "shell", "[interrupted by user]", True),
+            ("cancelled-shell-b", "shell", "[interrupted by user]", True),
+        ]
+        assert not any("continues after interruption" in str(block.content) for block in first_cancelled_results)
         assert any(
             isinstance(block, TextBlock) and block.text == "queued while model is generating"
             for message in calls[1]
@@ -901,6 +930,12 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
 
         release_shell.set()
         await asyncio.wait_for(final_response_started.wait(), timeout=1)
+        final_output = capsys.readouterr().out
+        assert final_output.count("✓ shell #003") == 1
+        assert observed_renderer.active_tool_call_count == 0
+        assert shell_stream_invocations == 1
+        assert [event.tool_use_id for event in rendered_tool_results].count("cancelled-shell-a") == 1
+        assert [event.tool_use_id for event in rendered_tool_results].count("cancelled-shell-b") == 1
         assert not any(
             isinstance(block, TextBlock) and "Deferred tool completed" in block.text
             for call in calls

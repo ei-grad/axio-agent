@@ -379,6 +379,30 @@ class Agent:
             content.append(TextBlock(text=delta))
 
     @staticmethod
+    def _result_events(
+        result: ToolResultBlock,
+        block: ToolUseBlock | None,
+    ) -> Iterator[StreamEvent]:
+        if isinstance(result.content, str):
+            result_content = result.content
+        else:
+            result_content = "\n".join(item.text for item in result.content if isinstance(item, TextBlock))
+            for media_block in result.content:
+                if isinstance(media_block, ImageBlock):
+                    yield ImageOutput(index=0, data=media_block.data, media_type=media_block.media_type)
+                elif isinstance(media_block, AudioBlock):
+                    yield AudioOutput(index=0, data=media_block.data, media_type=media_block.media_type)
+                elif isinstance(media_block, VideoBlock):
+                    yield VideoOutput(index=0, data=media_block.data, media_type=media_block.media_type)
+        yield ToolResult(
+            tool_use_id=result.tool_use_id,
+            name=block.name if block else "",
+            is_error=result.is_error,
+            content=result_content,
+            input=block.input if block else {},
+        )
+
+    @staticmethod
     def _finalize_pending_tools(
         pending: dict[str, dict[str, Any]],
         usage: Usage,
@@ -595,7 +619,7 @@ class Agent:
                             results = dispatched + error_results
                         except asyncio.CancelledError:
 
-                            async def finalize_interrupted_dispatch() -> None:
+                            async def finalize_interrupted_dispatch() -> list[tuple[ToolUseBlock, ToolResultBlock]]:
                                 completed_results: dict[str, ToolResultBlock] = {}
                                 deferred = False
                                 if dispatch is not None and dispatch_task is not None:
@@ -622,10 +646,12 @@ class Agent:
                                         if self.deferred_tool_sink is not None:
                                             self.deferred_tool_sink.dispatch_finished(dispatch)
                                 interrupted_results: list[ToolResultBlock] = []
+                                visible_results: list[tuple[ToolUseBlock, ToolResultBlock]] = []
                                 for b in tool_blocks:
                                     completed = completed_results.get(b.id)
                                     if completed is not None:
                                         interrupted_results.append(completed)
+                                        visible_results.append((b, completed))
                                         continue
                                     if deferred and b.id not in malformed:
                                         interrupted_results.append(
@@ -644,6 +670,7 @@ class Agent:
                                     )
                                     if malformed_result is not None:
                                         interrupted_results.append(malformed_result)
+                                        visible_results.append((b, malformed_result))
                                         continue
                                     chunks = partial_output.get(b.id, [])
                                     tool = self._find_tool(b.name)
@@ -653,9 +680,9 @@ class Agent:
                                         msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
                                     else:
                                         msg = "[interrupted by user]"
-                                    interrupted_results.append(
-                                        ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
-                                    )
+                                    interrupted = ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
+                                    interrupted_results.append(interrupted)
+                                    visible_results.append((b, interrupted))
                                 await context.append_many(
                                     [
                                         Message(role="assistant", content=list(content)),
@@ -672,8 +699,12 @@ class Agent:
                                 )
                                 if deferred and dispatch is not None and self.deferred_tool_sink is not None:
                                     self.deferred_tool_sink.protocol_closed(dispatch)
+                                return visible_results
 
-                            await shield_until_done(finalize_interrupted_dispatch())
+                            visible_results, _ = await shield_until_done(finalize_interrupted_dispatch())
+                            for visible_block, result in visible_results:
+                                for result_event in self._result_events(result, visible_block):
+                                    yield result_event
                             raise
                         except BaseException:
                             if dispatch_task is not None and not dispatch_task.done():
@@ -735,30 +766,8 @@ class Agent:
                         by_id = {b.id: b for b in tool_blocks}
                         for r in results:
                             block = by_id.get(r.tool_use_id)
-                            if isinstance(r.content, str):
-                                result_content = r.content
-                            else:
-                                result_content = "\n".join(b.text for b in r.content if isinstance(b, TextBlock))
-                                for media_block in r.content:
-                                    if isinstance(media_block, ImageBlock):
-                                        yield ImageOutput(
-                                            index=0, data=media_block.data, media_type=media_block.media_type
-                                        )
-                                    elif isinstance(media_block, AudioBlock):
-                                        yield AudioOutput(
-                                            index=0, data=media_block.data, media_type=media_block.media_type
-                                        )
-                                    elif isinstance(media_block, VideoBlock):
-                                        yield VideoOutput(
-                                            index=0, data=media_block.data, media_type=media_block.media_type
-                                        )
-                            yield ToolResult(
-                                tool_use_id=r.tool_use_id,
-                                name=block.name if block else "",
-                                is_error=r.is_error,
-                                content=result_content,
-                                input=block.input if block else {},
-                            )
+                            for result_event in self._result_events(r, block):
+                                yield result_event
                         continue
 
                     await self._append(context, Message(role="assistant", content=list(content)))

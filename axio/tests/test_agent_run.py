@@ -191,10 +191,11 @@ async def test_cancelled_tool_dispatch_can_be_deferred_after_protocol_placeholde
         transport=StubTransport([make_tool_use_response("slow", "call-1", {})]),
         deferred_tool_sink=sink,
     )
+    events: list[StreamEvent] = []
 
     async def consume() -> None:
-        async for _event in agent.run_stream("run", context):
-            pass
+        async for event in agent.run_stream("run", context):
+            events.append(event)
 
     turn = asyncio.create_task(consume())
     await asyncio.wait_for(sink.started.wait(), timeout=1)
@@ -213,6 +214,7 @@ async def test_cancelled_tool_dispatch_can_be_deferred_after_protocol_placeholde
     assert len(placeholders) == 1
     assert placeholders[0].tool_use_id == "call-1"
     assert "continues after interruption" in str(placeholders[0].content)
+    assert not any(isinstance(event, ToolResult) for event in events)
 
     release.set()
     results = await asyncio.wait_for(sink.dispatch.task, timeout=1)
@@ -244,7 +246,13 @@ async def test_cancelled_tool_dispatch_stops_when_sink_does_not_authorize_deferr
         deferred_tool_sink=sink,
     )
 
-    turn = asyncio.create_task(agent.run("run", context))
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in agent.run_stream("run", context):
+            events.append(event)
+
+    turn = asyncio.create_task(consume())
     await asyncio.wait_for(sink.started.wait(), timeout=1)
     turn.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -257,6 +265,11 @@ async def test_cancelled_tool_dispatch_stops_when_sink_does_not_authorize_deferr
     assert len(results) == 1
     assert results[0].is_error
     assert results[0].content == "[interrupted by user]"
+    assert [
+        (event.tool_use_id, event.name, event.is_error, event.content)
+        for event in events
+        if isinstance(event, ToolResult)
+    ] == [("call-1", "slow", True, "[interrupted by user]")]
 
 
 class TestMultiIteration:
