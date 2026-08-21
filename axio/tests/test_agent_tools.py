@@ -440,6 +440,54 @@ class TestToolResultCarriesData:
         assert r.content != ""
         assert not r.is_error
 
+    async def test_streamed_string_whitespace_reaches_context_handler_and_result_exactly(self) -> None:
+        expected = "        first line\n\tsecond line"
+        received: list[str] = []
+
+        async def capture(content: str) -> str:
+            received.append(content)
+            return content
+
+        raw = json.dumps({"content": expected})
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "c1", "patch_file"),
+                    ToolInputDelta(0, "c1", raw[:17]),
+                    ToolInputDelta(0, "c1", raw[17:25]),
+                    ToolInputDelta(0, "c1", raw[25:]),
+                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
+                ],
+                make_text_response("Done"),
+            ]
+        )
+        context = MemoryContextStore()
+        agent = Agent(system="test", tools=[Tool(name="patch_file", handler=capture)], transport=transport)
+        events = [event async for event in agent.run_stream("go", context)]
+
+        result = next(event for event in events if isinstance(event, ToolResult))
+        assert result.input == {"content": expected}
+        assert result.content == expected
+        assert received == [expected]
+
+        history = await context.get_history()
+        tool_use = next(
+            block
+            for message in history
+            if message.role == "assistant"
+            for block in message.content
+            if isinstance(block, ToolUseBlock)
+        )
+        tool_result = next(
+            block
+            for message in history
+            if message.role == "user"
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        )
+        assert tool_use.input == {"content": expected}
+        assert tool_result.content == expected
+
     async def test_error_result_has_content(self) -> None:
         """Error ToolResult events carry the error message as content."""
         tool: Tool[Any] = Tool(name="bad", description="bad", handler=_bad)

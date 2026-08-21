@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1112,6 +1112,54 @@ async def test_semantic_journal_omits_reasoning_and_resumes_sparse_turn_checkpoi
     assert "write_file" in notice.text
     assert "path: demo.py" in notice.text
     assert "private reasoning" not in notice.text
+
+
+async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(session_id="tool-whitespace", root=tmp_path)
+    base = AgentEventEnvelope(
+        seq=1,
+        session_id="tool-whitespace",
+        run_id="main-run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id="turn-1",
+        execution_mode=ExecutionMode.FOREGROUND,
+        parent_tool_use_id=None,
+        event=TurnStarted("patch"),
+        context_id="context-1",
+    )
+    await _write_runtime_event(journal, base)
+    raw_parts = ('{"content":"        first line\\n', '\\tsecond line"}')
+    events: tuple[RuntimeEvent, ...] = (
+        ToolUseStart(index=0, tool_use_id="call-1", name="patch_file"),
+        ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[0]),
+        ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[1]),
+    )
+    for seq, event in enumerate(events, start=2):
+        await _write_runtime_event(journal, replace(base, seq=seq, event=event))
+    await _write_runtime_event(
+        journal,
+        replace(
+            base,
+            seq=5,
+            event=TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.tool_use),
+        ),
+    )
+    await journal.close()
+
+    records = read_journal(journal.semantic_path).records
+    fragments: list[str] = []
+    for record in records:
+        if record["kind"] != "turn_checkpoint":
+            continue
+        payload = record["payload"]
+        assert isinstance(payload, dict)
+        tool_arguments = payload["tool_arguments"]
+        assert isinstance(tool_arguments, dict)
+        fragment = tool_arguments.get("call-1", "")
+        assert isinstance(fragment, str)
+        fragments.append(fragment)
+    assert "".join(fragments) == "".join(raw_parts)
 
 
 @pytest.mark.parametrize(

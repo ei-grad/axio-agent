@@ -215,6 +215,18 @@ def _styled(style: str, text: str) -> str:
     return style + text.replace("\n", line_break) + RESET
 
 
+def _visible_patch_content_fragment(text: str, *, line_start: bool) -> str:
+    """Mark source column zero and leading whitespace without changing tool input."""
+
+    if not line_start:
+        return text
+    prefix_end = 0
+    while prefix_end < len(text) and text[prefix_end] in {" ", "\t"}:
+        prefix_end += 1
+    visible_prefix = text[:prefix_end].replace(" ", "·").replace("\t", "→")
+    return f"│{visible_prefix}{text[prefix_end:]}"
+
+
 # ── Custom search tool ───────────────────────────────────────────────
 
 
@@ -564,6 +576,7 @@ class _ToolFieldMode:
     tool_call_key: ToolCallKey
     key: str
     multiline: bool = False
+    value_line_start: bool = True
     pending: StringIO = dataclasses.field(default_factory=StringIO)
 
 
@@ -2178,9 +2191,20 @@ class ReplRenderer:
     def _write_tool_field_block_lines_locked(self, state: _AgentRenderState, text: str) -> None:
         if not text.endswith("\n"):
             raise ValueError("tool field block fragments must end at a natural line boundary")
+        mode = state.mode
+        if not isinstance(mode, _ToolFieldMode):
+            raise RuntimeError("tool field block lines require tool field render mode")
         for line in text.split("\n")[:-1]:
-            sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, line)}\n")
+            rendered = self._tool_field_text(state, mode, line)
+            sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, rendered)}\n")
+            mode.value_line_start = True
         state.tool_arg_at_line_start = True
+
+    @staticmethod
+    def _tool_field_text(state: _AgentRenderState, mode: _ToolFieldMode, text: str) -> str:
+        if mode.key == "content" and state.tool_names.get(mode.tool_call_key) == "patch_file":
+            return _visible_patch_content_fragment(text, line_start=mode.value_line_start)
+        return text
 
     def _activate_tool_field_locked(self, state: _AgentRenderState, tool_key: ToolCallKey) -> None:
         current = state.mode
@@ -2232,7 +2256,9 @@ class ReplRenderer:
             self._write_tool_field_header_locked(state, mode.key)
             sys.stdout.write("\n")
             mode.multiline = True
-        sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, mode.pending.getvalue())}\n")
+        pending = self._tool_field_text(state, mode, mode.pending.getvalue())
+        sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, pending)}\n")
+        mode.value_line_start = False
         state.tool_arg_at_line_start = True
         mode.pending.seek(0)
         mode.pending.truncate(0)
@@ -2245,10 +2271,12 @@ class ReplRenderer:
         pending = mode.pending.getvalue()
         if mode.multiline:
             if pending:
-                sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, pending)}\n")
+                rendered = self._tool_field_text(state, mode, pending)
+                sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, rendered)}\n")
         else:
             self._write_tool_field_header_locked(state, mode.key)
-            sys.stdout.write(f" {_styled(self._theme.reasoning.ansi, pending)}\n")
+            rendered = self._tool_field_text(state, mode, pending)
+            sys.stdout.write(f" {_styled(self._theme.reasoning.ansi, rendered)}\n")
         state.tool_arg_at_line_start = True
         sanitizer = state.tool_field_sanitizers.pop((mode.tool_call_key, mode.key), None)
         if sanitizer is not None:

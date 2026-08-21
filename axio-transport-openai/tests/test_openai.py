@@ -330,6 +330,21 @@ async def test_tool_call_streaming(
     assert ends[0].stop_reason == StopReason.tool_use
 
 
+async def test_tool_call_streaming_preserves_leading_whitespace_in_string_arguments(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
+    server, _ = fake_server
+    content = "        first line\n\tsecond line"
+    args = json.dumps({"content": content})
+    server.responses.append(_tool_call_chunks("call_whitespace", "patch_file", args))
+
+    events = await _collect(transport.stream([], [], ""))
+
+    deltas = [event for event in events if isinstance(event, ToolInputDelta)]
+    assert "".join(event.partial_json for event in deltas) == args
+    assert json.loads("".join(event.partial_json for event in deltas))["content"] == content
+
+
 async def test_chat_completions_never_routes_to_responses(
     fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
 ) -> None:

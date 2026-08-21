@@ -620,6 +620,18 @@ async def test_shell_tool_streams_and_preserves_final_format() -> None:
     assert result == "first\n\n[stderr]\nwarning\n\n[stdout]\nsecond\n\n[exit code: 7]"
 
 
+def test_shell_final_format_preserves_leading_whitespace_and_only_trims_final_newlines() -> None:
+    result = sandbox_module._format_shell_records(
+        [
+            (0.0, "stdout", "        first\n"),
+            (0.1, "stderr", "  warning  \n"),
+        ]
+    )
+
+    assert result == "        first\n\n[stderr]\n  warning  "
+    assert sandbox_module._format_shell_records([(0.0, "stdout", " \t\n")]) == "(no output)"
+
+
 async def test_exec_stdin_writes_temp_file() -> None:
     """When stdin is provided, a temp file is written before the command."""
     cls, client, container = mock_docker_factory()
@@ -896,6 +908,25 @@ async def test_read_file_handler_negative_max_chars_raises_handler_error() -> No
                 CONTEXT.reset(token)
 
 
+async def test_read_file_line_metadata_is_distinct_from_exact_selected_source() -> None:
+    tar_file = make_tar_file("lines.txt", b"one\n    two\n\tthree\nfour\n")
+    cls, client, container = mock_docker_factory(archive_content=tar_file)
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                result = await sandbox_module.read_file(
+                    path="lines.txt",
+                    start_line=2,
+                    end_line=3,
+                    line_numbers=True,
+                )
+            finally:
+                CONTEXT.reset(token)
+
+    assert result == "L2│    two\nL3│\tthree\n"
+
+
 async def test_read_file_handler_non_utf8_without_hex_raises_handler_error() -> None:
     tar_file = make_tar_file("bin.dat", b"\x80\x81\xff")
     cls, client, container = mock_docker_factory(archive_content=tar_file)
@@ -949,6 +980,30 @@ async def test_patch_file_handler_reports_compact_path_free_diff() -> None:
     member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
     assert member is not None
     assert member.read() == b"line1\nREPLACED\nline3\n"
+
+
+async def test_patch_file_handler_preserves_leading_spaces_and_tabs_exactly() -> None:
+    cls, client, container = mock_docker_factory(
+        archive_content=make_tar_file("patch_me.txt", b"before\nold one\nold two\nafter\n")
+    )
+    replacement = "        first\n\tsecond"
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                await sandbox_module.patch_file(
+                    path="patch_me.txt",
+                    from_line=2,
+                    to_line=3,
+                    content=replacement,
+                )
+            finally:
+                CONTEXT.reset(token)
+
+    written = container.put_archive.call_args.kwargs["data"]
+    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
+    assert member is not None
+    assert member.read() == b"before\n        first\n\tsecond\nafter\n"
 
 
 @pytest.mark.parametrize(

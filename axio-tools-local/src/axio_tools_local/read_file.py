@@ -122,7 +122,7 @@ def _read_text(
     end = len(all_lines) if end_line is None else end_line
     lines = all_lines[start:end]
     if line_numbers:
-        result = "".join(f"{start + 1 + i}\t{line}" for i, line in enumerate(lines))
+        result = "".join(f"L{start + 1 + i}│{line}" for i, line in enumerate(lines))
     else:
         result = "".join(lines)
     if len(result) > limit:
@@ -148,12 +148,13 @@ async def read_file(
     Audio files (mp3/wav/ogg/flac/etc.), image files (jpg/png/gif/webp) and
     video files (mp4/webm/etc.) are returned as multimodal content blocks for
     capable models. Lines are 1-indexed: start_line=1 is the first line,
-    end_line=3 includes line 3. Pass line_numbers=True to prefix each line with
-    its 1-based line number (tab-separated) — required before calling
-    patch_file. Without max_chars, text and binary reads larger than 32768 chars
-    fail with an explanation. With max_chars, large reads are truncated to that
-    explicit limit. Always read the file before editing it with write_file or
-    patch_file."""
+    end_line=3 includes line 3. Pass line_numbers=True to prefix each line as
+    ``L<number>│<source>`` — required before calling patch_file. Everything
+    after ``│`` is exact file content; the prefix is metadata and must not be
+    copied into patch_file content. Without max_chars, text and binary reads
+    larger than 32768 chars fail with an explanation. With max_chars, large
+    reads are truncated to that explicit limit. Always read the file before
+    editing it with write_file or patch_file."""
 
     def _blocking() -> ReadFileResult:
         resolved = os.path.join(os.getcwd(), path)

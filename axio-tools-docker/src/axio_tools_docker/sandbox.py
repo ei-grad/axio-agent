@@ -138,7 +138,9 @@ def _format_shell_records(records: list[_ShellRecord]) -> str:
                 output += ("\n" if output else "") + f"[{key}]\n"
             current_key = key
         output += text
-    return output.strip() or "(no output)"
+    if not output.strip():
+        return "(no output)"
+    return output.rstrip("\n")
 
 
 async def _shell_stream(
@@ -225,10 +227,11 @@ async def read_file(
 ) -> str:
     """Read file contents. Returns text for text files, hex for binaries.
     Lines are 1-indexed: start_line=1 is the first line, end_line=3 includes
-    line 3. Pass line_numbers=True to prefix each line with its 1-based line
-    number (tab-separated) - required before calling patch_file. Large files
-    are truncated to max_chars. Always read the file before editing it with
-    write_file or patch_file."""
+    line 3. Pass line_numbers=True to prefix each line as
+    ``L<number>│<source>`` — required before calling patch_file. Everything
+    after ``│`` is exact file content; the prefix is metadata and must not be
+    copied into patch_file content. Large files are truncated to max_chars.
+    Always read the file before editing it with write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     if max_chars < 0:
@@ -248,7 +251,7 @@ async def read_file(
     end = len(all_lines) if end_line is None else end_line
     selected = all_lines[start:end]
     if line_numbers:
-        result = "".join(f"{start + 1 + i}\t{line}" for i, line in enumerate(selected))
+        result = "".join(f"L{start + 1 + i}│{line}" for i, line in enumerate(selected))
     else:
         result = "".join(selected)
     if len(result) > max_chars:
@@ -375,10 +378,12 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. Use this for surgical edits instead of
-    rewriting the whole file with write_file. The result reports a compact diff
-    fragment with function context when it can be inferred. Binary files cannot
-    be patched."""
+    to get correct line numbers. content is applied literally: include exact
+    leading whitespace on the first and every following line, and do not copy
+    read_file's ``L<number>│`` metadata prefix. Use this for surgical edits
+    instead of rewriting the whole file with write_file. The result reports a
+    compact diff fragment with function context when it can be inferred. Binary
+    files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:

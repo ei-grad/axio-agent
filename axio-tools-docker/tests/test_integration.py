@@ -152,8 +152,8 @@ async def test_read_file_line_numbers(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/numbered.txt", "foo\nbar\n")
     tool = next(t for t in sandbox.tools if t.name == "read_file")
     result = await tool(path="numbered.txt", line_numbers=True)
-    assert "1\tfoo" in result
-    assert "2\tbar" in result
+    assert "L1│foo" in result
+    assert "L2│bar" in result
 
 
 async def test_read_file_truncation(sandbox: DockerSandbox) -> None:

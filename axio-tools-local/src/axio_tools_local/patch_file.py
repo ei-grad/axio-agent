@@ -20,10 +20,12 @@ async def patch_file(
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. Use this for surgical edits instead of
-    rewriting the whole file with write_file. The result reports a compact diff
-    fragment with function context when it can be inferred. Binary files cannot
-    be patched."""
+    to get correct line numbers. content is applied literally: include exact
+    leading whitespace on the first and every following line, and do not copy
+    read_file's ``L<number>│`` metadata prefix. Use this for surgical edits
+    instead of rewriting the whole file with write_file. The result reports a
+    compact diff fragment with function context when it can be inferred. Binary
+    files cannot be patched."""
 
     def _blocking() -> str:
         resolved = Path(os.getcwd()) / path

@@ -65,15 +65,15 @@ class TestReadFileIndexed:
     async def test_first_line_is_1(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("hello\n")
         result = await read(tmp_cwd, "f.txt", line_numbers=True)
-        assert result.startswith("1\t")
+        assert result.startswith("L1│")
 
     async def test_numbers_are_one_indexed(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("a\nb\nc\n")
         result = await read(tmp_cwd, "f.txt", line_numbers=True)
         lines = result.splitlines()
-        assert lines[0] == "1\ta"
-        assert lines[1] == "2\tb"
-        assert lines[2] == "3\tc"
+        assert lines[0] == "L1│a"
+        assert lines[1] == "L2│b"
+        assert lines[2] == "L3│c"
 
     async def test_no_line_numbers_without_indexed(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("a\nb\n")
@@ -83,12 +83,12 @@ class TestReadFileIndexed:
     async def test_single_line_no_trailing_newline(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("only")
         result = await read(tmp_cwd, "f.txt", line_numbers=True)
-        assert result == "1\tonly"
+        assert result == "L1│only"
 
     async def test_indentation_preserved_with_index(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.py").write_text("def f():\n    pass\n")
         result = await read(tmp_cwd, "f.py", line_numbers=True)
-        assert "2\t    pass" in result
+        assert "L2│    pass" in result
 
 
 class TestReadFileRange:
@@ -128,9 +128,9 @@ class TestReadFileRange:
         (tmp_cwd / "f.txt").write_text("".join(lines))
         result = await read(tmp_cwd, "f.txt", start_line=5, end_line=7, line_numbers=True)
         out = result.splitlines()
-        assert out[0] == "5\tline5"
-        assert out[1] == "6\tline6"
-        assert out[2] == "7\tline7"
+        assert out[0] == "L5│line5"
+        assert out[1] == "L6│line6"
+        assert out[2] == "L7│line7"
 
     async def test_single_line_range(self, tmp_cwd: Path) -> None:
         (tmp_cwd / "f.txt").write_text("a\nb\nc\n")

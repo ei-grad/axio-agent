@@ -783,6 +783,63 @@ async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.Ca
     assert "\x1b[" not in output
 
 
+async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="indented", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="indented",
+            partial_json='{"content":"        first line\\n\\tsecond line"}',
+        ),
+    )
+    await renderer.render("main", ToolUseStart(index=1, tool_use_id="column-zero", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=1, tool_use_id="column-zero", partial_json='{"content":"// no indent"}'),
+    )
+
+    output = capsys.readouterr().out
+    assert "content:\n│········first line\n│→second line\n" in output
+    assert "content: │// no indent\n" in output
+
+
+@pytest.mark.parametrize("interruption", ["tool", "incoming"])
+async def test_patch_file_content_marks_only_real_source_line_starts_across_interruption(
+    capsys: pytest.CaptureFixture[str],
+    interruption: str,
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="patch", partial_json='{"content":"    alpha'),
+    )
+    if interruption == "tool":
+        await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell", name="shell"))
+        await renderer.render(
+            "main",
+            ToolInputDelta(index=1, tool_use_id="shell", partial_json='{"command":"echo interleaved"}'),
+        )
+    else:
+        await renderer.incoming("peer body", agent_id="child", agent_name="peer")
+    await renderer.render(
+        "main",
+        ToolInputDelta(index=0, tool_use_id="patch", partial_json=' beta"}'),
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("│") == 1
+    assert "│····alpha\n" in output
+    assert "\n beta\n" in output
+    assert "│·beta" not in output
+
+
 @pytest.mark.parametrize("input_active", [False, True])
 async def test_tool_field_waits_for_first_newline_then_streams_complete_block_lines(
     capsys: pytest.CaptureFixture[str],
