@@ -337,8 +337,8 @@ class _StubSandbox:
 
 @pytest.mark.asyncio
 async def test_environment_note_splits_present_from_missing() -> None:
-    note = await _sandbox.describe_environment(_StubSandbox(["python3", "grep"]), "img", networking=False)
-    assert "Available: python3, grep" in note
+    note = await _sandbox.describe_environment(_StubSandbox(["python3", "xxd", "grep"]), "img", networking=False)
+    assert "Available: python3, xxd, grep" in note
     assert "git" in note.split("Not installed:")[1]
     assert "python3" not in note.split("Not installed:")[1]
 

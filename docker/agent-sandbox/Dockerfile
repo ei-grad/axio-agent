@@ -96,6 +96,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         unzip \
         vim-tiny \
         wget \
+        xxd \
         xz-utils \
         zip \
         zstd
@@ -165,7 +166,7 @@ RUN chmod 0755 /usr/local/bin/browser-smoke /usr/local/bin/python-data \
     && ln -sf /opt/agent-python/.venv/bin/ipython /usr/local/bin/ipython \
     && ln -sf /opt/agent-python/.venv/bin/jupyter /usr/local/bin/jupyter \
     && command -v git gh glab python3 python-data uv node npm go rustc cargo java javac mvn \
-        chromium chromedriver pdftotext qpdf tesseract jq rg ast-grep kaggle hf >/dev/null \
+        chromium chromedriver pdftotext qpdf tesseract jq rg xxd ast-grep kaggle hf >/dev/null \
     && test -u /usr/lib/chromium/chrome-sandbox \
     && chromium --version \
     && chromedriver --version \

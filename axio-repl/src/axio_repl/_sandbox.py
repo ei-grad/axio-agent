@@ -297,6 +297,7 @@ PROBED_COMMANDS = (
     "rg",
     AST_GREP,
     "jq",
+    "xxd",
     "pdftotext",
     "qpdf",
     "tesseract",

@@ -121,10 +121,12 @@ async def test_standard_image_defaults_to_bash(docker: str) -> None:
         listing = await list_tool(path="/tmp")
         tool = next(item for item in sandbox.tools if item.name == "shell")
         result = await tool(command='test -n "$BASH_VERSION" && printf bash')
+        hex_dump = await tool(command="printf axio | xxd -p")
 
     assert ".bash_profile" in listing
     assert "login-profile-noise" not in result
     assert result == "bash"
+    assert hex_dump == "6178696f"
 
 
 async def test_write_and_read_file(sandbox: DockerSandbox) -> None:
