@@ -7,12 +7,20 @@ All line numbers are 1-indexed, both inclusive:
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
+from axio.agent import Agent
+from axio.context import MemoryContextStore
+from axio.events import IterationEnd, ToolInputDelta, ToolResult, ToolUseStart
 from axio.exceptions import HandlerError
+from axio.testing import StubTransport, make_text_response
+from axio.tool import Tool
+from axio.types import StopReason, Usage
 
 from axio_tools_local.patch_file import patch_file
 
@@ -102,6 +110,142 @@ class TestPatchInsertDelete:
         f.write_text("a\nb\nc\nd\n")
         await patch(f, 2, 3, "")
         assert f.read_text() == "a\nd\n"
+
+
+class TestFirstLineIndent:
+    async def test_prefixes_only_first_line_and_preserves_following_whitespace(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("before\nold one\nold two\nafter\n")
+
+        await patch_file(
+            path=f.name,
+            from_line=2,
+            to_line=3,
+            content="first\n\t second",
+            first_line_indent=6,
+        )
+
+        assert f.read_text() == "before\n      first\n\t second\nafter\n"
+
+    async def test_zero_preserves_content_byte_for_byte(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("old\n")
+        content = " \tfirst\n\t second\n"
+
+        await patch_file(path=f.name, from_line=1, to_line=1, content=content, first_line_indent=0)
+
+        assert f.read_bytes() == content.encode()
+
+    @pytest.mark.parametrize("content", [" already indented", "\talready indented"])
+    async def test_rejects_ambiguous_existing_first_line_indent(self, tmp_cwd: Path, content: str) -> None:
+        f = tmp_cwd / "f.txt"
+        original = "old\n"
+        f.write_text(original)
+
+        with pytest.raises(HandlerError, match="already begins with whitespace"):
+            await patch_file(path=f.name, from_line=1, to_line=1, content=content, first_line_indent=4)
+
+        assert f.read_text() == original
+
+    async def test_rejects_indent_for_empty_deletion_without_writing(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        original = "keep\ndelete\n"
+        f.write_text(original)
+
+        with pytest.raises(HandlerError, match="empty content"):
+            await patch_file(path=f.name, from_line=2, to_line=2, content="", first_line_indent=4)
+
+        assert f.read_text() == original
+
+    async def test_indents_inserted_first_line(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("after\n")
+
+        await patch_file(path=f.name, from_line=1, to_line=0, content="inserted", first_line_indent=3)
+
+        assert f.read_text() == "   inserted\nafter\n"
+
+    async def test_reproduces_counter_indent_repair_with_nonempty_diff(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "index.html"
+        f.write_text("          const activeCount = 1;\n$counter.textContent =\n            `${activeCount}`;\n")
+
+        result = await patch_file(
+            path=f.name,
+            from_line=2,
+            to_line=2,
+            content="$counter.textContent =",
+            first_line_indent=10,
+        )
+
+        assert result != "No changes"
+        assert "-$counter.textContent =\n" in result
+        assert "+          $counter.textContent =\n" in result
+        assert f.read_text().splitlines()[1] == "          $counter.textContent ="
+
+    async def test_schema_exposes_bounded_optional_integer(self) -> None:
+        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+
+        prop = tool.schema["properties"]["first_line_indent"]
+        assert prop["type"] == "integer"
+        assert prop["minimum"] == 0
+        assert prop["maximum"] == 256
+        assert prop["default"] == 0
+        assert "never inferred" in prop["description"]
+        assert "first_line_indent" not in tool.schema["required"]
+
+    @pytest.mark.parametrize("first_line_indent", [-1, 257])
+    async def test_tool_rejects_out_of_range_indent_without_writing(
+        self,
+        tmp_cwd: Path,
+        first_line_indent: int,
+    ) -> None:
+        f = tmp_cwd / "f.txt"
+        original = "old\n"
+        f.write_text(original)
+        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+
+        with pytest.raises(HandlerError, match="first_line_indent"):
+            await tool(
+                path=f.name,
+                from_line=1,
+                to_line=1,
+                content="new",
+                first_line_indent=first_line_indent,
+            )
+
+        assert f.read_text() == original
+
+    async def test_fragmented_tool_input_preserves_numeric_argument_in_handler_and_result(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "index.html"
+        f.write_text("$counter.textContent =\n")
+        arguments = {
+            "path": f.name,
+            "from_line": 1,
+            "to_line": 1,
+            "content": "$counter.textContent =",
+            "first_line_indent": 10,
+        }
+        raw = json.dumps(arguments)
+        indent_at = raw.index("10")
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "patch-1", "patch_file"),
+                    ToolInputDelta(0, "patch-1", raw[: indent_at + 1]),
+                    ToolInputDelta(0, "patch-1", raw[indent_at + 1 :]),
+                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
+                ],
+                make_text_response("Done"),
+            ]
+        )
+        agent = Agent(system="test", tools=[Tool(name="patch_file", handler=patch_file)], transport=transport)
+
+        events = [event async for event in agent.run_stream("repair", MemoryContextStore())]
+
+        result = next(event for event in events if isinstance(event, ToolResult))
+        assert result.input == arguments
+        assert not result.is_error
+        assert f.read_text() == "          $counter.textContent ="
 
 
 class TestNewlineHandling:

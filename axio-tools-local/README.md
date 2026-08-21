@@ -117,7 +117,16 @@ asyncio.run(patch_file(path=name, from_line=2, to_line=2, content="replaced\n"))
 os.unlink(name)
 ```
 
-Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`
+Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`,
+`first_line_indent: int = 0`
+
+`content` remains literal by default. If a model provider cannot reliably carry
+leading spaces at the start of the JSON string, set `first_line_indent` to the
+exact number of ASCII spaces to add to its first line. The value is bounded to
+0..256 and is never inferred from surrounding source. Do not combine a positive
+value with content that already begins with a space or tab; the tool rejects the
+ambiguous request without writing. An empty `content` still deletes the selected
+range when `first_line_indent` is left at zero.
 
 ### Text encoding and edit reports
 

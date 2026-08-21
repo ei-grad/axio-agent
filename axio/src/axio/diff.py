@@ -23,6 +23,7 @@ CONTEXT_LINES = 3
 MAX_DIFF_LINES = 400
 MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
+MAX_FIRST_LINE_INDENT = 256
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
 _NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
@@ -34,6 +35,21 @@ class _AmbiguousContext:
 
 
 _AMBIGUOUS = _AmbiguousContext()
+
+
+def apply_first_line_indent(content: str, count: int) -> str:
+    """Prefix the first patch content line with an explicit number of spaces."""
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise ValueError("first_line_indent must be an integer")
+    if not 0 <= count <= MAX_FIRST_LINE_INDENT:
+        raise ValueError(f"first_line_indent must be between 0 and {MAX_FIRST_LINE_INDENT}")
+    if count == 0:
+        return content
+    if not content:
+        raise ValueError("first_line_indent cannot be used with empty content")
+    if content.startswith((" ", "\t")):
+        raise ValueError("content already begins with whitespace; use first_line_indent=0 or remove that whitespace")
+    return " " * count + content
 
 
 def describe_write(path: str, written: int, before: str | None, after: str) -> str:

@@ -808,6 +808,26 @@ async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
     assert "content: │// no indent\n" in output
 
 
+async def test_patch_file_renders_explicit_first_line_indent_alongside_visible_content(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
+    await renderer.render(
+        "main",
+        ToolInputDelta(
+            index=0,
+            tool_use_id="patch",
+            partial_json='{"first_line_indent":10,"content":"$counter.textContent ="}',
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert "first_line_indent: 10\n" in output
+    assert "content: │$counter.textContent =\n" in output
+
+
 @pytest.mark.parametrize("interruption", ["tool", "incoming"])
 async def test_patch_file_content_marks_only_real_source_line_starts_across_interruption(
     capsys: pytest.CaptureFixture[str],

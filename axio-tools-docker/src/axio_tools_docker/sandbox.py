@@ -17,13 +17,20 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import aiodocker
 from aiodocker.exceptions import DockerError
 from axio._asyncio import shield_until_done
-from axio.diff import MAX_DIFF_SOURCE_BYTES, describe_patch, describe_write
+from axio.diff import (
+    MAX_DIFF_SOURCE_BYTES,
+    MAX_FIRST_LINE_INDENT,
+    apply_first_line_indent,
+    describe_patch,
+    describe_write,
+)
 from axio.exceptions import HandlerError
+from axio.field import Field
 from axio.schema import build_tool_schema
 from axio.tool import CONTEXT, Tool
 
@@ -373,17 +380,38 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
     return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
 
 
-async def patch_file(path: str, from_line: int, to_line: int, content: str, mode: int = 0o644) -> str:
+async def patch_file(
+    path: str,
+    from_line: int,
+    to_line: int,
+    content: str,
+    mode: int = 0o644,
+    first_line_indent: Annotated[
+        int,
+        Field(
+            description=(
+                "Number of ASCII spaces to prefix to the first content line. Use this when the model provider "
+                "cannot reliably preserve leading spaces in the first JSON string line; indentation is explicit "
+                "and is never inferred from surrounding code. Leave at 0 when content already starts with whitespace."
+            ),
+            ge=0,
+            le=MAX_FIRST_LINE_INDENT,
+        ),
+    ] = 0,
+) -> str:
     """Replace a range of lines in an existing UTF-8 text file. Lines are
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
     to get correct line numbers. content is applied literally: include exact
     leading whitespace on the first and every following line, and do not copy
-    read_file's ``L<number>│`` metadata prefix. Use this for surgical edits
-    instead of rewriting the whole file with write_file. The result reports a
-    compact diff fragment with function context when it can be inferred. Binary
-    files cannot be patched."""
+    read_file's ``L<number>│`` metadata prefix. If the provider cannot preserve
+    leading spaces in the first JSON string line, set first_line_indent to the
+    exact number of ASCII spaces to add; it is never inferred from surrounding
+    code and must not be combined with existing first-line whitespace. Use this
+    for surgical edits instead of rewriting the whole file with write_file. The
+    result reports a compact diff fragment with function context when it can be
+    inferred. Binary files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:
@@ -395,7 +423,11 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
         lines = before.splitlines(keepends=True)
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
-    content_lines = content.splitlines(keepends=True)
+    try:
+        applied_content = apply_first_line_indent(content, first_line_indent)
+    except ValueError as exc:
+        raise HandlerError(str(exc)) from exc
+    content_lines = applied_content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
         content_lines[-1] += "\n"
     after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])
