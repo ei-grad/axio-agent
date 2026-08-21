@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from prompt_toolkit.data_structures import Size
 
 from axio_repl._prompt_terminal import PromptToolkitCompatibilityError, PromptToolkitInlineOutput
 
@@ -22,6 +23,21 @@ class _Output:
 
     def flush(self) -> None:
         self._operations.append("flush")
+
+    def enable_autowrap(self) -> None:
+        self._operations.append("autowrap")
+
+    def write_raw(self, content: str) -> None:
+        self._operations.append(f"raw:{content}")
+
+    def cursor_up(self, amount: int) -> None:
+        self._operations.append(f"up:{amount}")
+
+    def erase_down(self) -> None:
+        self._operations.append("erase-down")
+
+    def get_size(self) -> Size:
+        return Size(rows=12, columns=10)
 
 
 class _Renderer:
@@ -83,6 +99,42 @@ async def test_inline_output_waits_for_cpr_before_erasing() -> None:
     await PromptToolkitInlineOutput(_Session(app)).write(lambda: operations.append("write"))
 
     assert operations[:3] == ["cpr", "hide", "erase"]
+
+
+async def test_live_output_replaces_wrapped_snapshot_and_finalizes_once() -> None:
+    operations: list[str] = []
+    app = _App(operations)
+    adapter = PromptToolkitInlineOutput(_Session(app))
+
+    await adapter.write_live("abcdefgh", key=("stdout", 1), is_live=True)
+    operations.clear()
+    await adapter.write_live("abcdefghijkl", key=("stdout", 1), is_live=True)
+
+    assert operations.index("up:1") < operations.index("erase-down")
+    assert "raw:abcdefghijkl" in operations
+    assert operations.count("raw:\r\n") == 1
+
+    operations.clear()
+    await adapter.write_live("abcdefghijkl\n", key=("stdout", 1), is_live=False)
+
+    assert operations.index("up:2") < operations.index("erase-down")
+    assert "raw:abcdefghijkl\n" in operations
+    assert "raw:\r\n" not in operations
+
+
+async def test_suppression_marker_discards_live_snapshot_instead_of_redrawing_it() -> None:
+    operations: list[str] = []
+    app = _App(operations)
+    adapter = PromptToolkitInlineOutput(_Session(app))
+    await adapter.write_live("partial", key=("stdout", 1), is_live=True)
+    operations.clear()
+
+    await adapter.write(lambda: operations.append("marker"), preserve_live=False)
+
+    assert "up:1" in operations
+    assert "erase-down" in operations
+    assert "marker" in operations
+    assert "raw:partial" not in operations
 
 
 async def test_application_stopping_during_cpr_writes_without_redraw() -> None:

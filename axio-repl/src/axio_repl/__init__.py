@@ -1189,7 +1189,11 @@ class ReplRenderer:
     def _flush_reasoning() -> None:
         """Keep an unfinished reasoning line live while the editor is visible."""
 
-        sys.stdout.flush()
+        flush_live_line = getattr(sys.stdout, "flush_live_line", None)
+        if callable(flush_live_line):
+            flush_live_line()
+        else:
+            sys.stdout.flush()
 
     async def render(
         self,

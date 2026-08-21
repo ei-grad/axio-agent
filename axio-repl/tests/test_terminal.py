@@ -21,6 +21,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.utils import get_cwidth
 
 from axio_repl import ReplRenderer, _panel, _read_input_async
 from axio_repl._input import InputSubmitted, SubmissionDisposition
@@ -56,6 +57,150 @@ class _Session:
 class _FailingOutput(_RecordingOutput):
     def write_raw(self, data: str) -> None:
         raise OSError("terminal disconnected")
+
+
+class _VirtualTerminal:
+    """Small VT100 screen model for the control sequences used by prompt_toolkit."""
+
+    def __init__(self, columns: int, rows: int) -> None:
+        self.columns = columns
+        self.rows = rows
+        self.x = 0
+        self.y = 0
+        self._saved = (0, 0)
+        self._cells = [[" " for _ in range(columns)] for _ in range(rows)]
+
+    @property
+    def lines(self) -> list[str]:
+        return ["".join(row).rstrip() for row in self._cells]
+
+    def feed(self, data: str) -> None:  # noqa: C901
+        index = 0
+        while index < len(data):
+            character = data[index]
+            if character == "\x1b":
+                index = self._escape(data, index)
+                continue
+            if character == "\r":
+                self.x = 0
+            elif character == "\n":
+                self._line_feed()
+            elif character == "\b":
+                self.x = max(0, self.x - 1)
+            elif character == "\t":
+                self.x = min(self.columns - 1, ((self.x // 8) + 1) * 8)
+            elif ord(character) >= 32 and character != "\x7f":
+                self._put(character)
+            index += 1
+
+    def _escape(self, data: str, index: int) -> int:
+        if index + 1 >= len(data):
+            return len(data)
+        introducer = data[index + 1]
+        if introducer == "[":
+            end = index + 2
+            while end < len(data) and not 0x40 <= ord(data[end]) <= 0x7E:
+                end += 1
+            if end >= len(data):
+                return len(data)
+            self._csi(data[index + 2 : end], data[end])
+            return end + 1
+        if introducer == "]":
+            end = index + 2
+            while end < len(data):
+                if data[end] == "\x07":
+                    return end + 1
+                if data[end : end + 2] == "\x1b\\":
+                    return end + 2
+                end += 1
+            return len(data)
+        if introducer == "7":
+            self._saved = (self.x, self.y)
+        elif introducer == "8":
+            self.x, self.y = self._saved
+        elif introducer in {"D", "E"}:
+            if introducer == "E":
+                self.x = 0
+            self._line_feed()
+        elif introducer == "M":
+            self.y = max(0, self.y - 1)
+        return index + 2
+
+    def _csi(self, raw_parameters: str, command: str) -> None:  # noqa: C901
+        private = raw_parameters.startswith(("?", ">", "!"))
+        cleaned = raw_parameters.lstrip("?>!")
+        values = [int(value) if value else 0 for value in cleaned.replace(":", ";").split(";")]
+        first = values[0] if values else 0
+        amount = first or 1
+        if private or command in {"m", "n", "c", "q", "r", "t"}:
+            return
+        if command == "A":
+            self.y = max(0, self.y - amount)
+        elif command == "B":
+            self.y = min(self.rows - 1, self.y + amount)
+        elif command == "C":
+            self.x = min(self.columns - 1, self.x + amount)
+        elif command == "D":
+            self.x = max(0, self.x - amount)
+        elif command in {"E", "F"}:
+            self.y = max(0, min(self.rows - 1, self.y + (amount if command == "E" else -amount)))
+            self.x = 0
+        elif command in {"G", "`"}:
+            self.x = max(0, min(self.columns - 1, amount - 1))
+        elif command in {"H", "f"}:
+            row = (values[0] or 1) if values else 1
+            column = (values[1] or 1) if len(values) > 1 else 1
+            self.y = max(0, min(self.rows - 1, row - 1))
+            self.x = max(0, min(self.columns - 1, column - 1))
+        elif command == "d":
+            self.y = max(0, min(self.rows - 1, amount - 1))
+        elif command == "J":
+            if first in {2, 3}:
+                self._cells = [[" " for _ in range(self.columns)] for _ in range(self.rows)]
+            else:
+                self._clear_line(self.y, self.x, self.columns)
+                for row in range(self.y + 1, self.rows):
+                    self._clear_line(row, 0, self.columns)
+        elif command == "K":
+            if first == 1:
+                self._clear_line(self.y, 0, self.x + 1)
+            elif first == 2:
+                self._clear_line(self.y, 0, self.columns)
+            else:
+                self._clear_line(self.y, self.x, self.columns)
+        elif command == "X":
+            self._clear_line(self.y, self.x, min(self.columns, self.x + amount))
+        elif command == "s":
+            self._saved = (self.x, self.y)
+        elif command == "u":
+            self.x, self.y = self._saved
+
+    def _put(self, character: str) -> None:
+        width = max(0, get_cwidth(character))
+        if width == 0:
+            return
+        if self.x + width > self.columns:
+            self.x = 0
+            self._line_feed()
+        self._cells[self.y][self.x] = character
+        for offset in range(1, width):
+            if self.x + offset < self.columns:
+                self._cells[self.y][self.x + offset] = " "
+        self.x += width
+        if self.x >= self.columns:
+            self.x = 0
+            self._line_feed()
+
+    def _line_feed(self) -> None:
+        if self.y == self.rows - 1:
+            self._cells.pop(0)
+            self._cells.append([" " for _ in range(self.columns)])
+        else:
+            self.y += 1
+
+    def _clear_line(self, row: int, start: int, end: int) -> None:
+        for column in range(start, end):
+            self._cells[row][column] = " "
 
 
 async def test_terminal_ui_serializes_prints_and_logging_through_one_sink() -> None:
@@ -308,6 +453,30 @@ async def test_terminal_stream_facade_validates_writes_and_flushes_partial_text(
     rendered = "".join(output.raw)
     assert "line\n" in rendered
     assert "partial" in rendered
+
+
+async def test_live_line_snapshots_preserve_one_logical_stream_outside_prompt() -> None:
+    output = _RecordingOutput()
+    terminal = TerminalUI(_Session(output))
+    await terminal.start()
+    try:
+        stream = terminal.stdout
+        assert stream is not None
+        stream.write("first")
+        stream.flush_live_line()
+        await terminal.drain()
+        stream.write("-tail")
+        stream.flush_live_line()
+        await terminal.drain()
+        stream.write("\n")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    rendered = sanitize_terminal_text("".join(output.raw))
+    assert rendered.count("first") == 1
+    assert rendered.count("-tail") == 1
+    assert "first-tail\n" in rendered
 
 
 async def test_drain_and_failure_wait_before_start_have_explicit_contracts() -> None:
@@ -668,12 +837,13 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
     terminal_input = create_input(reader)
     terminal_output = Vt100_Output(
         writer,
-        get_size=lambda: Size(rows=12, columns=80),
+        get_size=lambda: Size(rows=16, columns=32),
         term="xterm-256color",
         enable_bell=False,
         enable_cpr=False,
     )
     os.set_blocking(master_fd, False)
+    screen = _VirtualTerminal(columns=32, rows=16)
 
     async def read_stage() -> str:
         await asyncio.sleep(0.02)
@@ -698,19 +868,48 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
             prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("tester")))
             try:
                 await asyncio.sleep(0.05)
-                await read_stage()
+                screen.feed(await read_stage())
+                os.write(master_fd, b"draft")
+                await asyncio.sleep(0.05)
+                screen.feed(await read_stage())
                 renderer.set_input_active(True)
 
-                await renderer.render("main", ReasoningDelta(index=0, delta="first reasoning fragment"))
+                first_fragment = "first-fragment"
+                await renderer.render("main", ReasoningDelta(index=0, delta=first_fragment))
                 await terminal.drain()
                 first_stage = await read_stage()
+                screen.feed(first_stage)
 
-                await renderer.render("main", ReasoningDelta(index=0, delta=" and its tail"))
+                first_reasoning_row = next(
+                    index for index, line in enumerate(screen.lines) if "> first-fragment" in line
+                )
+                first_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                assert first_prompt_row == first_reasoning_row + 1
+
+                tail = "-0123456789-0123456789-0123456789-0123456789"
+                await renderer.render("main", ReasoningDelta(index=0, delta=tail))
                 await terminal.drain()
                 second_stage = await read_stage()
+                screen.feed(second_stage)
 
-                os.write(master_fd, b"typed input\r")
-                assert await asyncio.wait_for(prompt, timeout=2) == "typed input"
+                expected_reasoning = f"> {first_fragment}{tail}"
+                wrapped_reasoning_row = next(index for index, line in enumerate(screen.lines) if line.startswith("> "))
+                wrapped_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                assert "".join(screen.lines[wrapped_reasoning_row:wrapped_prompt_row]) == expected_reasoning
+                assert wrapped_prompt_row - wrapped_reasoning_row >= 2
+
+                await renderer.render("main", TextDelta(index=0, delta="answer\n"))
+                await terminal.drain()
+                boundary_stage = await read_stage()
+                screen.feed(boundary_stage)
+
+                final_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                persistent_output = "".join(screen.lines[:final_prompt_row])
+                assert persistent_output.count(expected_reasoning) == 1
+                assert persistent_output.endswith("answer")
+
+                os.write(master_fd, b" input\r")
+                assert await asyncio.wait_for(prompt, timeout=2) == "draft input"
             finally:
                 renderer.set_input_active(False)
                 if not prompt.done():
@@ -718,9 +917,8 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
                     await asyncio.gather(prompt, return_exceptions=True)
                 await terminal.close()
 
-        assert "first reasoning fragment" in sanitize_terminal_text(first_stage)
-        assert "and its tail" in sanitize_terminal_text(second_stage)
-        assert "\x1b[?1049h" not in first_stage + second_stage
+        combined = first_stage + second_stage + boundary_stage
+        assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()
         reader.close()

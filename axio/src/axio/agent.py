@@ -500,37 +500,53 @@ class Agent:
                     stop_reason = StopReason.end_turn
                     malformed: set[str] = set()
                     repetition_detected = False
-                    rep_detector = _RepetitionDetector()
+                    text_rep_detector = _RepetitionDetector()
+                    reasoning_rep_detector = _RepetitionDetector()
 
                     try:
-                        async for event in self.transport.stream(effective_history, active_tools, self.system):
-                            yield event
-                            match event:
-                                case TextDelta(delta=delta) | ReasoningDelta(delta=delta):
-                                    if isinstance(event, TextDelta):
+                        provider_stream = self.transport.stream(effective_history, active_tools, self.system)
+                        try:
+                            async for event in provider_stream:
+                                yield event
+                                match event:
+                                    case TextDelta(delta=delta):
                                         self._accumulate_text(content, delta)
-                                    if rep_detector.feed(delta):
-                                        note = "\n\n[Output truncated: repetitive content detected]"
-                                        self._accumulate_text(content, note)
-                                        yield TextDelta(index=0, delta=note)
-                                        repetition_detected = True
-                                        break
-                                case ImageOutput(data=data, media_type=mt):
-                                    content.append(ImageBlock(media_type=mt, data=data))
-                                case VideoOutput(data=data, media_type=mt):
-                                    content.append(VideoBlock(media_type=mt, data=data))
-                                case ToolUseStart(tool_use_id=tid, name=name):
-                                    pending[tid] = {"name": name, "json_parts": []}
-                                case ToolInputDelta(tool_use_id=tid, partial_json=pj):
-                                    if tid in pending:
-                                        pending[tid]["json_parts"].append(pj)
-                                case IterationEnd(usage=usage, stop_reason=sr):
-                                    blocks, malformed = self._finalize_pending_tools(pending, usage)
-                                    content.extend(blocks)
-                                    pending.clear()
-                                    total_usage = total_usage + usage
-                                    await context.add_context_tokens(usage.input_tokens, usage.output_tokens)
-                                    stop_reason = sr
+                                        if text_rep_detector.feed(delta):
+                                            note = "\n\n[Output truncated: repetitive content detected]"
+                                            self._accumulate_text(content, note)
+                                            repetition_detected = True
+                                            yield TextDelta(index=0, delta=note)
+                                            break
+                                    case ReasoningDelta(delta=delta):
+                                        if reasoning_rep_detector.feed(delta):
+                                            note = "\n\n[Output truncated: repetitive content detected]"
+                                            self._accumulate_text(content, note)
+                                            repetition_detected = True
+                                            yield TextDelta(index=0, delta=note)
+                                            break
+                                    case ImageOutput(data=data, media_type=mt):
+                                        content.append(ImageBlock(media_type=mt, data=data))
+                                    case VideoOutput(data=data, media_type=mt):
+                                        content.append(VideoBlock(media_type=mt, data=data))
+                                    case ToolUseStart(tool_use_id=tid, name=name):
+                                        pending[tid] = {"name": name, "json_parts": []}
+                                    case ToolInputDelta(tool_use_id=tid, partial_json=pj):
+                                        if tid in pending:
+                                            pending[tid]["json_parts"].append(pj)
+                                    case IterationEnd(usage=usage, stop_reason=sr):
+                                        blocks, malformed = self._finalize_pending_tools(pending, usage)
+                                        content.extend(blocks)
+                                        pending.clear()
+                                        total_usage = total_usage + usage
+                                        await context.add_context_tokens(usage.input_tokens, usage.output_tokens)
+                                        stop_reason = sr
+                        finally:
+                            if repetition_detected:
+                                close_provider_stream = getattr(provider_stream, "aclose", None)
+                                if close_provider_stream is not None:
+                                    _, cancellation = await shield_until_done(close_provider_stream())
+                                    if cancellation is not None:
+                                        raise cancellation
                     except Exception as exc:
                         logger.error("Transport error: %s", exc, exc_info=True)
                         yield Error(exception=exc)
@@ -540,10 +556,9 @@ class Agent:
 
                     if repetition_detected:
                         await self._append(context, Message(role="assistant", content=list(content)))
-                        partial = getattr(self.transport, "last_usage", None)
-                        if partial:
-                            total_usage = total_usage + partial
-                        yield SessionEndEvent(stop_reason=StopReason.end_turn, total_usage=total_usage)
+                        # The provider did not emit IterationEnd, so this call has no
+                        # trustworthy usage or provider stop reason to account.
+                        yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
                         session_end_emitted = True
                         return
 

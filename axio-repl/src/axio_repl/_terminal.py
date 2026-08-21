@@ -42,6 +42,8 @@ class _TerminalStream(TextIOBase):
         self._fallback = fallback
         self._lock = threading.RLock()
         self._buffers: dict[object, list[str]] = {}
+        self._live_ids: dict[object, int] = {}
+        self._next_live_id = 1
 
     @property
     def encoding(self) -> str:
@@ -83,13 +85,34 @@ class _TerminalStream(TextIOBase):
                     self._buffers[writer] = [after]
                 else:
                     self._buffers.pop(writer, None)
-                self._owner.submit(OutputFrame(content, self._stream))
+                self._owner.submit(
+                    OutputFrame(
+                        content,
+                        self._stream,
+                        live_id=self._live_ids.pop(writer, None),
+                    )
+                )
             else:
                 buffered.append(data)
         return len(data)
 
     def flush(self) -> None:
         self._flush_writers((self._writer_key(),))
+
+    def flush_live_line(self) -> None:
+        """Publish a replaceable snapshot without consuming the logical line."""
+
+        writer = self._writer_key()
+        with self._lock:
+            content = "".join(self._buffers.get(writer, ()))
+            if not content:
+                return
+            live_id = self._live_ids.get(writer)
+            if live_id is None:
+                live_id = self._next_live_id
+                self._next_live_id += 1
+                self._live_ids[writer] = live_id
+            self._owner.submit(OutputFrame(content, self._stream, live_id=live_id, is_live=True))
 
     def flush_all(self) -> None:
         with self._lock:
@@ -110,7 +133,15 @@ class _TerminalStream(TextIOBase):
             for writer in writers:
                 content = "".join(self._buffers.pop(writer, ()))
                 if content:
-                    self._owner.submit(OutputFrame(content, self._stream))
+                    self._owner.submit(
+                        OutputFrame(
+                            content,
+                            self._stream,
+                            live_id=self._live_ids.pop(writer, None),
+                        )
+                    )
+                else:
+                    self._live_ids.pop(writer, None)
 
 
 class TerminalUI:
@@ -337,14 +368,15 @@ class TerminalUI:
             self._wake.clear()
             self._ingress.wake_delivered()
             while True:
-                content = self._ingress.next_batch()
-                if content is None:
+                frames = self._ingress.next_batch()
+                if frames is None:
                     self._drained.set()
                     if self._ingress.consumer_should_stop:
                         return
                     break
                 try:
-                    await self._write(content)
+                    for frame in frames:
+                        await self._write(frame)
                 except BaseException as exc:
                     self._record_failure(exc)
                     return
@@ -372,13 +404,20 @@ class TerminalUI:
         self._failed.set()
         self._drained.set()
 
-    async def _write(self, content: str) -> None:
+    async def _write(self, frame: OutputFrame) -> None:
         def write_and_flush() -> None:
             self._output.enable_autowrap()
-            self._output.write_raw(content)
+            self._output.write_raw(frame.content)
             self._output.flush()
 
-        await self._inline_output.write(write_and_flush)
+        if frame.live_id is None:
+            await self._inline_output.write(write_and_flush, preserve_live=not frame.clear_live)
+            return
+        await self._inline_output.write_live(
+            frame.content,
+            key=(frame.stream, frame.live_id),
+            is_live=frame.is_live,
+        )
 
     def _flush_late_output(self, ingress: TerminalIngress) -> None:
         assert self._original_stdout is not None

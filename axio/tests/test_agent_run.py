@@ -406,6 +406,7 @@ class TestReasoningPassthrough:
         assert len(reasoning) < 10
         assert [event.delta for event in notices] == ["\n\n[Output truncated: repetitive content detected]"]
         assert isinstance(events[-1], SessionEndEvent)
+        assert events[-1].stop_reason is StopReason.error
         history = await context.get_history()
         assistant = next(message for message in history if message.role == "assistant")
         assert assistant.content == [TextBlock(text="\n\n[Output truncated: repetitive content detected]")]
@@ -426,6 +427,83 @@ class TestReasoningPassthrough:
 
         assert not any(isinstance(event, TextDelta) and "Output truncated" in event.delta for event in events)
         assert any(isinstance(event, TextDelta) and event.delta == "answer" for event in events)
+
+    async def test_repetition_detection_does_not_cross_reasoning_and_text_channels(self) -> None:
+        repeated = "abcde" * 100
+        transport = StubTransport(
+            [
+                [
+                    ReasoningDelta(0, repeated),
+                    TextDelta(0, repeated),
+                    TextDelta(0, " legitimate tail"),
+                    IterationEnd(1, StopReason.end_turn, Usage(10, 5)),
+                ]
+            ]
+        )
+        agent = Agent(system="test", tools=[], transport=transport)
+
+        events = [event async for event in agent.run_stream("hi", MemoryContextStore())]
+
+        assert not any(isinstance(event, TextDelta) and "Output truncated" in event.delta for event in events)
+        assert [event.delta for event in events if isinstance(event, TextDelta)] == [repeated, " legitimate tail"]
+        assert isinstance(events[-1], SessionEndEvent)
+        assert events[-1].stop_reason is StopReason.end_turn
+
+    async def test_repetition_stop_closes_provider_and_ignores_stale_partial_usage(self) -> None:
+        class ClosingTransport:
+            last_usage = Usage(900, 700)
+
+            def __init__(self) -> None:
+                self.closed = asyncio.Event()
+
+            def stream(
+                self,
+                messages: list[Message],
+                tools: list[Tool[Any]],
+                system: str,
+            ) -> AsyncIterator[StreamEvent]:
+                del messages, tools, system
+
+                async def generate() -> AsyncIterator[StreamEvent]:
+                    try:
+                        for _ in range(10):
+                            yield ReasoningDelta(0, "— " * 100)
+                        yield IterationEnd(1, StopReason.end_turn, Usage(10, 5))
+                    finally:
+                        self.closed.set()
+
+                return generate()
+
+        transport = ClosingTransport()
+        context = MemoryContextStore()
+        agent = Agent(system="test", tools=[], transport=transport)
+
+        events = [event async for event in agent.run_stream("hi", context)]
+
+        assert transport.closed.is_set()
+        assert isinstance(events[-1], SessionEndEvent)
+        assert events[-1].stop_reason is StopReason.error
+        assert events[-1].total_usage == Usage(0, 0)
+        assert await context.get_context_tokens() == (0, 0)
+
+    async def test_repetition_stop_retains_usage_from_completed_iterations_only(self) -> None:
+        repeated_events: list[StreamEvent] = [ReasoningDelta(0, "— " * 100) for _ in range(10)]
+        repeated_events.append(IterationEnd(2, StopReason.end_turn, Usage(90, 70)))
+        transport = StubTransport(
+            [
+                make_tool_use_response("echo", "call", {"msg": "hi"}, usage=Usage(10, 5)),
+                repeated_events,
+            ]
+        )
+        context = MemoryContextStore()
+        agent = Agent(system="test", tools=[make_echo_tool()], transport=transport)
+
+        events = [event async for event in agent.run_stream("hi", context)]
+
+        assert isinstance(events[-1], SessionEndEvent)
+        assert events[-1].stop_reason is StopReason.error
+        assert events[-1].total_usage == Usage(10, 5)
+        assert await context.get_context_tokens() == (10, 5)
 
 
 class TestMaxIterations:

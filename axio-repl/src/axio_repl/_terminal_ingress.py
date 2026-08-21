@@ -22,6 +22,15 @@ class OutputFrame:
 
     content: str
     stream: OutputStream = "stdout"
+    live_id: int | None = None
+    is_live: bool = False
+    clear_live: bool = False
+
+    def __post_init__(self) -> None:
+        if self.is_live and self.live_id is None:
+            raise ValueError("live terminal frames require a live_id")
+        if self.is_live and self.clear_live:
+            raise ValueError("live terminal frames cannot clear live output")
 
 
 class IngressPhase(StrEnum):
@@ -130,7 +139,7 @@ class TerminalIngress:
                 self._wake_scheduled = True
             return wake
 
-    def next_batch(self) -> str | None:
+    def next_batch(self) -> tuple[OutputFrame, ...] | None:
         with self._lock:
             if self._pending:
                 batch = [self._pending.popleft()]
@@ -141,7 +150,7 @@ class TerminalIngress:
                     size += len(frame.content)
                 self._pending_chars -= size
                 self._writing = True
-                return "".join(frame.content for frame in batch)
+                return tuple(batch)
             if self._dropped_frames:
                 dropped_frames = self._dropped_frames
                 dropped_chars = self._dropped_chars
@@ -149,8 +158,11 @@ class TerminalIngress:
                 self._dropped_chars = 0
                 self._writing = True
                 return (
-                    f"{self._reset}\n[terminal output skipped: {dropped_frames} frame(s), "
-                    f"{dropped_chars} character(s)]\n"
+                    OutputFrame(
+                        f"{self._reset}\n[terminal output skipped: {dropped_frames} frame(s), "
+                        f"{dropped_chars} character(s)]\n",
+                        clear_live=True,
+                    ),
                 )
             self._writing = False
             return None
@@ -195,13 +207,29 @@ class TerminalIngress:
 
     def _enqueue_active_locked(self, frame: OutputFrame) -> None:
         size = len(frame.content)
-        if self._dropped_frames or self._pending_chars + size > self._max_pending_chars:
+        replace_live = (
+            bool(self._pending)
+            and self._pending[-1].is_live
+            and self._pending[-1].stream == frame.stream
+            and self._pending[-1].live_id == frame.live_id
+        )
+        replaced_size = len(self._pending[-1].content) if replace_live else 0
+        projected_size = self._pending_chars - replaced_size + size
+        if self._dropped_frames or projected_size > self._max_pending_chars:
             self._dropped_frames += 1
             self._dropped_chars += size
+            return
+        if replace_live:
+            self._pending[-1] = frame
+            self._pending_chars = projected_size
             return
         if (
             self._pending
             and self._pending[-1].stream == frame.stream
+            and self._pending[-1].live_id is None
+            and frame.live_id is None
+            and not self._pending[-1].clear_live
+            and not frame.clear_live
             and len(self._pending[-1].content) + size <= self._max_batch_chars
         ):
             previous = self._pending[-1]

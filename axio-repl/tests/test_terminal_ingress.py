@@ -16,10 +16,36 @@ from axio_repl._terminal_ingress import (
 def _drain_active(ingress: TerminalIngress) -> str:
     chunks: list[str] = []
     ingress.wake_delivered()
-    while (chunk := ingress.next_batch()) is not None:
-        chunks.append(chunk)
+    while (batch := ingress.next_batch()) is not None:
+        chunks.extend(frame.content for frame in batch)
         ingress.finish_batch()
     return "".join(chunks)
+
+
+def test_live_frames_keep_snapshot_and_finalization_boundaries() -> None:
+    ingress = TerminalIngress()
+    live = OutputFrame("partial", live_id=1, is_live=True)
+    interleaved = OutputFrame("notice\n", "stderr")
+    final = OutputFrame("partial\n", live_id=1)
+
+    ingress.submit(live)
+    ingress.submit(interleaved)
+    ingress.submit(final)
+    ingress.wake_delivered()
+
+    assert ingress.next_batch() == (live, interleaved, final)
+    ingress.finish_batch()
+
+
+def test_consecutive_live_snapshots_collapse_to_the_latest_state() -> None:
+    ingress = TerminalIngress()
+    ingress.submit(OutputFrame("part", live_id=1, is_live=True))
+    latest = OutputFrame("partial", live_id=1, is_live=True)
+    ingress.submit(latest)
+    ingress.wake_delivered()
+
+    assert ingress.next_batch() == (latest,)
+    ingress.finish_batch()
 
 
 def test_ingress_separates_pre_barrier_late_and_post_close_output() -> None:
