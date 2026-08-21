@@ -240,6 +240,27 @@ def test_the_toolbar_is_not_reverse_video() -> None:
         assert attrs.bgcolor == "default", cls
 
 
+def test_session_fails_fast_when_prompt_toolkit_moves_the_bottom_toolbar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import prompt_toolkit
+    from prompt_toolkit.layout.containers import HSplit, Window
+
+    prompt_session = prompt_toolkit.PromptSession
+
+    def incompatible_session(*args: Any, **kwargs: Any) -> Any:
+        session: Any = prompt_session(*args, **kwargs)
+        root = session.app.layout.container
+        assert isinstance(root, HSplit)
+        root.children.append(Window())
+        return session
+
+    monkeypatch.setattr(prompt_toolkit, "PromptSession", incompatible_session)
+
+    with pytest.raises(RuntimeError, match="does not expose its bottom toolbar"):
+        _panel.make_session(lambda: "status")
+
+
 def test_prompt_is_named_and_visually_distinct_from_agent_text() -> None:
     from prompt_toolkit.formatted_text import to_formatted_text
     from prompt_toolkit.styles import default_ui_style, merge_styles

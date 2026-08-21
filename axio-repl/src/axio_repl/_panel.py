@@ -372,6 +372,7 @@ def make_session(
     from prompt_toolkit.application.current import get_app_session
     from prompt_toolkit.filters import to_filter
     from prompt_toolkit.history import FileHistory, History
+    from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
     from prompt_toolkit.styles import Style
 
     class ClaimedHistory(History):
@@ -436,6 +437,17 @@ def make_session(
     if input_window is None or input_window.content is not session.app.layout.current_control:
         raise RuntimeError("prompt session does not expose its input window")
     input_window.dont_extend_height = to_filter(True)
+    root_container = session.app.layout.container
+    if not isinstance(root_container, HSplit) or not root_container.children:
+        raise RuntimeError("prompt session does not expose its vertical layout")
+    toolbar = root_container.children[-1]
+    if (
+        not isinstance(toolbar, ConditionalContainer)
+        or not isinstance(toolbar.content, Window)
+        or toolbar.content.style != "class:bottom-toolbar"
+    ):
+        raise RuntimeError("prompt session does not expose its bottom toolbar")
+    root_container.children.insert(-1, Window(char=" ", style=""))
     session._axio_claimed_history = history
     original_accept = session.default_buffer.accept_handler
     if original_accept is None:

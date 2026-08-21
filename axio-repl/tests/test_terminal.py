@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import signal
 import sys
 import termios
 import threading
@@ -68,6 +70,7 @@ class _VirtualTerminal:
         self.x = 0
         self.y = 0
         self._saved = (0, 0)
+        self._autowrap_pending = False
         self._cells = [[" " for _ in range(columns)] for _ in range(rows)]
 
     @property
@@ -83,15 +86,32 @@ class _VirtualTerminal:
                 continue
             if character == "\r":
                 self.x = 0
+                self._autowrap_pending = False
             elif character == "\n":
+                self._autowrap_pending = False
                 self._line_feed()
             elif character == "\b":
                 self.x = max(0, self.x - 1)
+                self._autowrap_pending = False
             elif character == "\t":
                 self.x = min(self.columns, ((self.x // 8) + 1) * 8)
+                self._autowrap_pending = False
             elif ord(character) >= 32 and character != "\x7f":
                 self._put(character)
             index += 1
+
+    def resize(self, *, columns: int, rows: int) -> None:
+        cells = [[" " for _ in range(columns)] for _ in range(rows)]
+        for row in range(min(self.rows, rows)):
+            for column in range(min(self.columns, columns)):
+                cells[row][column] = self._cells[row][column]
+        self.columns = columns
+        self.rows = rows
+        self.x = min(self.x, columns - 1)
+        self.y = min(self.y, rows - 1)
+        self._saved = (min(self._saved[0], columns - 1), min(self._saved[1], rows - 1))
+        self._autowrap_pending = False
+        self._cells = cells
 
     def _escape(self, data: str, index: int) -> int:
         if index + 1 >= len(data):
@@ -124,6 +144,7 @@ class _VirtualTerminal:
             self._line_feed()
         elif introducer == "M":
             self.y = max(0, self.y - 1)
+        self._autowrap_pending = False
         return index + 2
 
     def _csi(self, raw_parameters: str, command: str) -> None:  # noqa: C901
@@ -134,6 +155,7 @@ class _VirtualTerminal:
         amount = first or 1
         if private or command in {"m", "n", "c", "q", "r", "t"}:
             return
+        self._autowrap_pending = False
         if command == "A":
             self.y = max(0, self.y - amount)
         elif command == "B":
@@ -179,6 +201,10 @@ class _VirtualTerminal:
         width = max(0, get_cwidth(character))
         if width == 0:
             return
+        if self._autowrap_pending:
+            self.x = 0
+            self._line_feed()
+            self._autowrap_pending = False
         if self.x + width > self.columns:
             self.x = 0
             self._line_feed()
@@ -186,10 +212,11 @@ class _VirtualTerminal:
         for offset in range(1, width):
             if self.x + offset < self.columns:
                 self._cells[self.y][self.x + offset] = " "
-        self.x += width
-        if self.x >= self.columns:
-            self.x = 0
-            self._line_feed()
+        if self.x + width == self.columns:
+            self.x = self.columns - 1
+            self._autowrap_pending = True
+        else:
+            self.x += width
 
     def _line_feed(self) -> None:
         if self.y == self.rows - 1:
@@ -957,6 +984,150 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
             (first_stage, second_stage, boundary_stage, tab_first_stage, tab_replacement_stage, tab_final_stage)
         )
         assert "\x1b[?1049h" not in combined
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal pinned-status test")
+async def test_status_stays_on_last_terminal_row_while_live_reasoning_changes_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    terminal_size = [Size(rows=8, columns=32)]
+    termios.tcsetwinsize(slave_fd, (terminal_size[0].rows, terminal_size[0].columns))
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: terminal_size[0],
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=True,
+    )
+    os.set_blocking(master_fd, False)
+    screen = _VirtualTerminal(columns=terminal_size[0].columns, rows=terminal_size[0].rows)
+    raw_output: list[str] = []
+
+    async def pump_terminal() -> None:
+        idle_cycles = 0
+        for _ in range(30):
+            await asyncio.sleep(0.01)
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    chunk = os.read(master_fd, 64 * 1024)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            if not chunks:
+                idle_cycles += 1
+                if idle_cycles >= 3:
+                    return
+                continue
+            idle_cycles = 0
+            rendered = b"".join(chunks).decode("utf-8", errors="replace")
+            raw_output.append(rendered)
+            parts = rendered.split("\x1b[6n")
+            for part in parts[:-1]:
+                screen.feed(part)
+                os.write(master_fd, f"\x1b[{screen.y + 1};{screen.x + 1}R".encode())
+            screen.feed(parts[-1])
+
+    def row_containing(text: str) -> int:
+        matches = [index for index, line in enumerate(screen.lines) if text in line]
+        assert len(matches) == 1, (text, screen.lines)
+        return matches[0]
+
+    def prompt_row() -> int:
+        matches = [index for index, line in enumerate(screen.lines) if "tester>" in line]
+        assert len(matches) == 1, screen.lines
+        return matches[0]
+
+    prior_output = ("SHELL BEFORE AXIO 1", "SHELL BEFORE AXIO 2")
+
+    def assert_prior_output_preserved() -> None:
+        assert tuple(screen.lines[: len(prior_output)]) == prior_output
+
+    try:
+        writer.write("\r\n".join(prior_output) + "\r\n")
+        writer.flush()
+        await pump_terminal()
+        assert_prior_output_preserved()
+
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "PINNED STATUS", theme=DEFAULT_THEME)
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(theme=DEFAULT_THEME, effective_username="tester")
+            await terminal.start()
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("tester")))
+            try:
+                await pump_terminal()
+                assert_prior_output_preserved()
+                assert prompt_row() == len(prior_output)
+                assert row_containing("PINNED STATUS") == terminal_size[0].rows - 1
+
+                os.write(master_fd, b"draft")
+                await pump_terminal()
+                renderer.set_input_active(True)
+
+                exact_row = "> " + ("x" * 30)
+                await renderer.render("main", ReasoningDelta(index=0, delta="x" * 30))
+                await terminal.drain()
+                await pump_terminal()
+
+                assert_prior_output_preserved()
+                reasoning_start = len(prior_output)
+                assert screen.lines[reasoning_start] == exact_row
+                assert prompt_row() == reasoning_start + 1
+                assert row_containing("PINNED STATUS") == terminal_size[0].rows - 1
+
+                await renderer.render("main", ReasoningDelta(index=0, delta="y"))
+                await terminal.drain()
+                await pump_terminal()
+
+                assert_prior_output_preserved()
+                assert "".join(screen.lines[reasoning_start : reasoning_start + 2]) == f"{exact_row}y", screen.lines
+                assert prompt_row() == reasoning_start + 2
+                assert row_containing("PINNED STATUS") == terminal_size[0].rows - 1
+
+                terminal_size[0] = Size(rows=7, columns=32)
+                termios.tcsetwinsize(slave_fd, (terminal_size[0].rows, terminal_size[0].columns))
+                screen.resize(columns=terminal_size[0].columns, rows=terminal_size[0].rows)
+                os.kill(os.getpid(), signal.SIGWINCH)
+                await pump_terminal()
+
+                assert_prior_output_preserved()
+                assert prompt_row() == reasoning_start + 2
+                assert row_containing("PINNED STATUS") == terminal_size[0].rows - 1
+
+                await renderer.render("main", TextDelta(index=0, delta="answer\n"))
+                await terminal.drain()
+                await pump_terminal()
+
+                assert_prior_output_preserved()
+                assert "".join(screen.lines[reasoning_start : reasoning_start + 2]) == f"{exact_row}y"
+                assert screen.lines[reasoning_start + 2] == "answer"
+                assert prompt_row() == reasoning_start + 3
+                assert row_containing("PINNED STATUS") == terminal_size[0].rows - 1
+            finally:
+                renderer.set_input_active(False)
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
+                await terminal.close()
+
+        combined = "".join(raw_output)
+        assert "\x1b[?1049h" not in combined
+        assert re.search(r"\x1b\[[0-9;]*r", combined) is None
     finally:
         terminal_input.close()
         reader.close()
