@@ -198,7 +198,7 @@ runtime:
   debug: false
   agent_actions: "off"
   theme: default
-  powerline: false
+  powerline: true
   session_log: true
   session_replay: false
 
@@ -347,7 +347,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--no-debug` | off | Explicitly disable debug logging after config resolution |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
 | `--theme` | `default` | Terminal palette: `default` or `monochrome` |
-| `--powerline` | off | Use Powerline segments for the prompt, tool names, and agent frames |
+| `--powerline` | interactive TTY | Explicitly use Powerline segments for the prompt, tool names, and agent frames |
 | `--no-powerline` | — | Explicitly disable Powerline presentation after config resolution |
 | `--session-log-dir` | XDG state directory | Root for semantic journals and optional replay files |
 | `--no-session-log` | off | Disable the default semantic journal |
@@ -371,8 +371,9 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--sandbox-ca-cert` | none | Full CA bundle (system roots plus interception CA) mounted read-only for common clients |
 | `--tools` | all | `all`, `none`, or a comma-separated tool whitelist |
 
-Powerline presentation uses filled colour segments with `U+E0B0` (``) separators. The terminal font must provide
-that glyph; the REPL does not substitute a plain-text fallback.
+Interactive TTY sessions use Powerline presentation by default. It uses filled colour segments with `U+E0B0` (``)
+separators. The terminal font must provide that glyph; the REPL does not substitute a plain-text fallback. Use
+`--no-powerline` or set `runtime.powerline: false` for the plain presentation.
 
 `NO_COLOR` disables application-owned ANSI styling and Powerline regardless of
 the selected `--theme`. A one-shot invocation also selects this plain

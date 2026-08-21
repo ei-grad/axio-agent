@@ -92,3 +92,42 @@ def test_only_non_tty_one_shot_implicitly_disables_colour() -> None:
 
     assert (one_shot_theme, one_shot_powerline) == (NO_COLOR_THEME, False)
     assert (interactive_theme, interactive_powerline) == (DEFAULT_THEME, True)
+
+
+@pytest.mark.parametrize(
+    ("one_shot", "stdout_is_tty", "expected"),
+    [
+        (False, True, True),
+        (False, False, False),
+        (True, True, False),
+        (True, False, False),
+    ],
+)
+def test_powerline_defaults_to_interactive_tty_only(
+    one_shot: bool,
+    stdout_is_tty: bool,
+    expected: bool,
+) -> None:
+    theme, powerline = resolve_terminal_presentation(
+        DEFAULT_THEME,
+        powerline=None,
+        one_shot=one_shot,
+        stdout_is_tty=stdout_is_tty,
+        no_color=False,
+    )
+
+    assert theme is (NO_COLOR_THEME if one_shot and not stdout_is_tty else DEFAULT_THEME)
+    assert powerline is expected
+
+
+def test_explicit_plain_mode_overrides_interactive_tty_default() -> None:
+    theme, powerline = resolve_terminal_presentation(
+        DEFAULT_THEME,
+        powerline=False,
+        one_shot=False,
+        stdout_is_tty=True,
+        no_color=False,
+    )
+
+    assert theme is DEFAULT_THEME
+    assert powerline is False

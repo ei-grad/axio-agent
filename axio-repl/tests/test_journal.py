@@ -353,7 +353,7 @@ async def test_one_shot_root_stdout_keeps_the_unlabelled_projection(
 
 
 @pytest.mark.parametrize("no_color", [False, True], ids=("non-tty", "no-color"))
-async def test_one_shot_pipe_emits_no_ansi_or_powerline_even_with_explicit_theme(
+async def test_one_shot_pipe_emits_no_ansi_or_default_powerline_even_with_explicit_theme(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -416,7 +416,6 @@ async def test_one_shot_pipe_emits_no_ansi_or_powerline_even_with_explicit_theme
             "--no-session-log",
             "--theme",
             "monochrome",
-            "--powerline",
         ],
     )
 

@@ -170,7 +170,7 @@ def resolve_theme(name: str) -> TerminalTheme:
 def resolve_terminal_presentation(
     theme: TerminalTheme,
     *,
-    powerline: bool,
+    powerline: bool | None,
     one_shot: bool,
     stdout_is_tty: bool,
     no_color: bool,
@@ -179,4 +179,6 @@ def resolve_terminal_presentation(
 
     if no_color or (one_shot and not stdout_is_tty):
         return NO_COLOR_THEME, False
+    if powerline is None:
+        return theme, not one_shot and stdout_is_tty
     return theme, powerline

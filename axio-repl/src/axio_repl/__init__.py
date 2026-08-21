@@ -3301,7 +3301,7 @@ def _build_argument_parser() -> Any:
         "--powerline",
         dest="powerline",
         action="store_true",
-        help="Use Powerline segments for the prompt, tool names, and agent frames",
+        help="Use Powerline segments for the prompt, tool names, and agent frames (default in an interactive TTY)",
     )
     powerline_group.add_argument(
         "--no-powerline",
@@ -3309,7 +3309,7 @@ def _build_argument_parser() -> Any:
         action="store_false",
         help="Use the plain terminal presentation",
     )
-    parser.set_defaults(powerline=False)
+    parser.set_defaults(powerline=None)
     session_log_group = parser.add_mutually_exclusive_group()
     session_log_group.add_argument(
         "--session-log", dest="no_session_log", action="store_false", help="Write the session JSONL journal"

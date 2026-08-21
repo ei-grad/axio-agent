@@ -195,14 +195,15 @@ axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/session.jso
 # Show framed tool and lifecycle actions from background agents
 axio-repl --agent-actions on
 
-# Use Powerline segments for the prompt, tool names, and agent frames
-axio-repl --powerline
+# Use the plain presentation instead of the interactive Powerline default
+axio-repl --no-powerline
 
 # Use the high-contrast monochrome terminal palette
 axio-repl --theme monochrome
 ```
 
-Powerline mode requires a terminal font that provides the `U+E0B0` (``) separator glyph.
+Interactive TTY sessions use Powerline by default. It requires a terminal font that provides the `U+E0B0` (``)
+separator glyph; use `--no-powerline` when that glyph is unavailable.
 The active editor prompt shows only the effective-UID username (`username>` in plain mode or a
 filled ` username ` Powerline segment). The default theme renders that label as black text on a
 white background; editor and submitted-message text after the label return to the terminal's normal

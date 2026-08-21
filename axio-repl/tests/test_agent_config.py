@@ -110,7 +110,7 @@ sandbox:
     assert profile.sources == (config_dir / "config.yaml", bundle / "agent.yaml")
 
 
-def test_powerline_is_resolved_from_yaml_and_environment(tmp_path: Path) -> None:
+def test_powerline_is_resolved_from_yaml_environment_and_cli(tmp_path: Path) -> None:
     from argparse import Namespace
 
     write_config(
@@ -122,13 +122,22 @@ def test_powerline_is_resolved_from_yaml_and_environment(tmp_path: Path) -> None
     assert profile.settings.runtime.powerline is True
     assert load_agent_profile(tmp_path, None, {"AXIO_REPL_POWERLINE": "false"}).settings.runtime.powerline is False
 
-    args = Namespace(powerline=False, no_session_log=False)
+    args = Namespace(powerline=None, no_session_log=False)
     apply_profile_to_args(args, profile, explicit_cli_destinations([]))
     assert args.powerline is True
 
     args = Namespace(powerline=False, no_session_log=False)
     apply_profile_to_args(args, profile, explicit_cli_destinations(["--no-powerline"]))
     assert args.powerline is False
+
+    disabled_profile = load_agent_profile(tmp_path, None, {"AXIO_REPL_POWERLINE": "false"})
+    args = Namespace(powerline=None, no_session_log=False)
+    apply_profile_to_args(args, disabled_profile, explicit_cli_destinations([]))
+    assert args.powerline is False
+
+    args = Namespace(powerline=True, no_session_log=False)
+    apply_profile_to_args(args, disabled_profile, explicit_cli_destinations(["--powerline"]))
+    assert args.powerline is True
 
 
 def test_session_replay_is_opt_in_and_obeys_config_environment_and_cli_precedence(tmp_path: Path) -> None:

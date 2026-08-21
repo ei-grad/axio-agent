@@ -54,10 +54,10 @@ def test_agent_actions_default_to_off() -> None:
     assert args.agent_actions == "off"
 
 
-def test_powerline_defaults_to_off_and_can_be_enabled() -> None:
+def test_powerline_uses_terminal_default_and_accepts_explicit_overrides() -> None:
     parser = _build_argument_parser()
 
-    assert parser.parse_args([]).powerline is False
+    assert parser.parse_args([]).powerline is None
     assert parser.parse_args(["--powerline", "inspect"]).powerline is True
     assert parser.parse_args(["--no-powerline"]).powerline is False
 
