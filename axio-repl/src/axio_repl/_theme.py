@@ -55,6 +55,8 @@ class TerminalTheme:
     warning: TextStyle
     prompt_badge: PowerlineStyle
     tool_badge: PowerlineStyle
+    success_badge: PowerlineStyle
+    error_badge: PowerlineStyle
     agent_badge: PowerlineStyle
     action_badge: PowerlineStyle
 
@@ -64,6 +66,8 @@ _GRAY = TerminalColor(37, 47, "ansigray")
 _BRIGHT_BLACK = TerminalColor(90, 100, "ansibrightblack")
 _WHITE = TerminalColor(97, 107, "ansiwhite")
 _CYAN = TerminalColor(36, 46, "ansicyan")
+_GREEN = TerminalColor(32, 42, "ansigreen")
+_RED = TerminalColor(31, 41, "ansired")
 _MAGENTA = TerminalColor(35, 45, "ansimagenta")
 _YELLOW = TerminalColor(33, 43, "ansiyellow")
 
@@ -85,6 +89,8 @@ DEFAULT_THEME = TerminalTheme(
     warning=TextStyle("\033[33m", "ansiyellow"),
     prompt_badge=PowerlineStyle(_BLACK, _WHITE),
     tool_badge=PowerlineStyle(_BLACK, _CYAN),
+    success_badge=PowerlineStyle(_BLACK, _GREEN),
+    error_badge=PowerlineStyle(_WHITE, _RED),
     agent_badge=PowerlineStyle(_WHITE, _MAGENTA),
     action_badge=PowerlineStyle(_BLACK, _YELLOW),
 )
@@ -107,6 +113,8 @@ MONOCHROME_THEME = TerminalTheme(
     warning=TextStyle("\033[4;97m", "underline ansiwhite"),
     prompt_badge=PowerlineStyle(_BLACK, _WHITE),
     tool_badge=PowerlineStyle(_BLACK, _WHITE),
+    success_badge=PowerlineStyle(_BLACK, _WHITE),
+    error_badge=PowerlineStyle(_BLACK, _WHITE),
     agent_badge=PowerlineStyle(_WHITE, _BRIGHT_BLACK),
     action_badge=PowerlineStyle(_BLACK, _GRAY),
 )
@@ -129,6 +137,8 @@ NO_COLOR_THEME = TerminalTheme(
     warning=TextStyle(),
     prompt_badge=DEFAULT_THEME.prompt_badge,
     tool_badge=DEFAULT_THEME.tool_badge,
+    success_badge=DEFAULT_THEME.success_badge,
+    error_badge=DEFAULT_THEME.error_badge,
     agent_badge=DEFAULT_THEME.agent_badge,
     action_badge=DEFAULT_THEME.action_badge,
 )

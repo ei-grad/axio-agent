@@ -26,6 +26,17 @@ def test_no_color_action_frames_emit_no_ansi() -> None:
     assert "\x1b[" not in frame
 
 
+def test_tool_badge_name_and_frame_accounting_remain_bounded() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME, max_frame_bytes=180)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="λ" * 10_000))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+
+    [frame] = mux.drain(max_bytes=180)
+
+    assert len(frame.encode("utf-8")) <= 180
+    assert "▶ " in frame and "… #001" in frame
+
+
 def test_tool_arguments_are_framed_only_after_complete_json() -> None:
     mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
     mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
@@ -59,7 +70,7 @@ def test_streaming_output_is_grouped_by_lines_and_flushed_at_result() -> None:
     mux.observe("child", ToolResult(tool_use_id="call", name="shell", is_error=False, content="ignored duplicate"))
     tail, result = mux.drain(max_frames=2)
     assert "partial" in tail
-    assert "shell completed" in result
+    assert "✓ shell #001" in result
     assert "ignored duplicate" not in result
 
 
@@ -86,7 +97,10 @@ def test_background_patch_result_has_owned_semantic_colors_and_reuses_argument_p
     call, result = mux.drain(max_frames=2)
     combined = call + result
     assert sanitize_terminal_text(combined).count("src/app.py") == 1
-    assert f"{DEFAULT_THEME.stdout.ansi}✓ patch_file{DEFAULT_THEME.reset}\n" in result
+    if powerline:
+        assert "\033[1;30;42m ✓ patch_file #001 \033[22;32;49m\ue0b0\033[0m\n" in result
+    else:
+        assert f"{DEFAULT_THEME.success.ansi}✓ patch_file #001{DEFAULT_THEME.reset}\n" in result
     assert f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}\n" in result
     assert f"{DEFAULT_THEME.tool.ansi}@@ -1 +1 @@ run{DEFAULT_THEME.reset}\n" in result
     assert f"{DEFAULT_THEME.error.ansi}-old{DEFAULT_THEME.reset}\n" in result
@@ -128,8 +142,8 @@ def test_background_malformed_hunk_fails_open_without_diff_styles() -> None:
 
     [result] = mux.drain()
     assert content.rstrip() in sanitize_terminal_text(result)
-    assert DEFAULT_THEME.success.ansi not in result
-    assert DEFAULT_THEME.error.ansi not in result
+    assert f"{DEFAULT_THEME.success.ansi}+new" not in result
+    assert f"{DEFAULT_THEME.error.ansi}-old" not in result
     assert event.content == content
 
 
@@ -227,7 +241,9 @@ def test_background_write_ack_suppression_is_structural_and_errors_remain_visibl
         "child",
         ToolResult(tool_use_id="write", name="write_file", is_error=False, content="Wrote 5 bytes to app.py"),
     )
-    assert mux.drain() == []
+    [response] = mux.drain()
+    assert "✓ write_file #001" in response
+    assert "Wrote" not in response
 
     mux.observe(
         "child",
@@ -240,6 +256,29 @@ def test_background_write_ack_suppression_is_structural_and_errors_remain_visibl
     error, unrelated = mux.drain(max_frames=2)
     assert "provider failed" in error
     assert "Wrote 5 bytes to app.py" in unrelated
+
+
+def test_background_mismatch_uses_remembered_name_and_fails_open() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS, theme=NO_COLOR_THEME)
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="call", name="write_file"))
+    mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    mux.drain()
+
+    mux.observe(
+        "child",
+        ToolResult(
+            tool_use_id="call",
+            name="patch_file",
+            is_error=False,
+            content="Wrote 5 bytes to app.py",
+        ),
+    )
+
+    [result] = mux.drain()
+    assert "✗ write_file #001" in result
+    assert "name mismatch" in result
+    assert "Wrote 5 bytes to app.py" in result
+    assert "\x1b[" not in result
 
 
 def test_partial_output_segments_flush_in_executor_observed_order() -> None:
@@ -262,7 +301,7 @@ def test_partial_output_segments_flush_in_executor_observed_order() -> None:
     assert "shell stdout" in first and "first" in first
     assert "shell stderr" in second and "second" in second
     assert "shell stdout" in third and "third" in third
-    assert "shell completed" in result
+    assert "✓ shell #001" in result
     assert "firstsecond" not in result
 
 

@@ -60,6 +60,25 @@ those styles are applied. CSI, OSC, DCS, APC, cursor, screen, scrollback, and
 clipboard controls are removed even when a sequence spans multiple chunks;
 ordinary text, newlines, and tabs remain.
 
+Tool calls and their responses carry a stable display badge for the lifetime of
+the REPL process:
+
+```text
+▶ write_file #001
+✓ write_file #001
+✗ shell #002
+```
+
+`#001` is a monotonic session-local ordinal correlated with the opaque provider
+tool-use ID; it is not a truncated form of that ID. It expands after `#999` and
+is never reused within the process, while a new REPL process starts again at
+`#001`. Provider events, model context, and journal records retain the original
+ID without this display metadata. Response badges are always written before the
+result presentation, including empty results, streamed results whose content is
+not replayed, and successful write acknowledgements whose redundant body is
+hidden. Powerline uses filled semantic badges. `NO_COLOR` retains the visible
+glyph, tool name, and ordinal without ANSI styling.
+
 Decoded tool argument fields are buffered until their first newline or field
 completion, whether the editor is open or idle. A completed single-line field
 is written inline. The first decoded newline instead writes the parameter header

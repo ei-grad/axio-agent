@@ -119,6 +119,16 @@ stream immediately and only the unfinished tail remains buffered. A long
 newline-free value is intentionally retained until completion, so display memory
 for that field grows with its sanitized length.
 
+Every tool call and response has a correlated session-local badge. Calls use
+`▶ write_file #001`; successful responses use `✓ write_file #001`, and errors
+use `✗ write_file #001`. The number is a monotonic REPL-process ordinal, not a
+shortened provider ID. It remains stable through arguments and streamed output,
+expands naturally after `#999`, and resets only when a new REPL process starts.
+The provider ID in events, context, and the session journal is unchanged. A
+response badge is still shown when the result body is empty, already streamed,
+or intentionally omitted as a redundant write acknowledgement. Powerline mode
+uses filled badges; `NO_COLOR` keeps the glyphs, names, and numbers without ANSI.
+
 Parameter headers carry a one-cell tool-coloured background margin followed by
 a normal separating space. Consecutive headers therefore form a narrow vertical
 stripe, while multiline value rows have no margin or indentation added by the

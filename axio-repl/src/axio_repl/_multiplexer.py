@@ -12,6 +12,14 @@ from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, 
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
+from axio_repl._tool_calls import (
+    ToolBadgeKind,
+    ToolCallDisplay,
+    ToolCallKey,
+    ToolCallRegistry,
+    ToolResultDisplay,
+    tool_badge,
+)
 from axio_repl._tool_result_display import (
     DiffLineKind,
     is_write_file_result,
@@ -64,6 +72,9 @@ class ActionFrame:
     powerline: bool = False
     theme: TerminalTheme = DEFAULT_THEME
     body_line_kinds: tuple[DiffLineKind, ...] | None = None
+    tool_name: str | None = None
+    tool_marker: str | None = None
+    tool_badge_kind: ToolBadgeKind | None = None
 
     def render(self) -> str:
         reset = self.theme.reset
@@ -72,23 +83,38 @@ class ActionFrame:
         body = sanitize_terminal_text(self.body).rstrip("\n")
         if self.body_line_kinds is not None:
             body = style_classified_text(body, self.body_line_kinds, self.theme)
+        parts: list[str] = []
+        if self.tool_name is not None and self.tool_marker is not None and self.tool_badge_kind is not None:
+            parts.append(
+                tool_badge(
+                    self.tool_badge_kind,
+                    self.tool_name,
+                    self.tool_marker,
+                    powerline=self.powerline,
+                    theme=self.theme,
+                )
+            )
+        if body:
+            parts.append(body)
+        content = "\n".join(parts)
         if self.powerline:
             return (
-                f"{reset}\n{action_frame_header(identity, kind, self.theme)}\n{body}\n"
+                f"{reset}\n{action_frame_header(identity, kind, self.theme)}\n{content}\n"
                 f"{action_frame_footer(identity, self.theme)}\n{reset}\n"
             )
         style = self.theme.action.ansi
         if style:
             return (
-                f"{reset}\n{style}── agent {identity} · {kind} ──{reset}\n{body}\n"
+                f"{reset}\n{style}── agent {identity} · {kind} ──{reset}\n{content}\n"
                 f"{style}── /agent {identity} ──{reset}\n{reset}\n"
             )
-        return f"{reset}\n── agent {identity} · {kind} ──\n{body}\n── /agent {identity} ──\n{reset}\n"
+        return f"{reset}\n── agent {identity} · {kind} ──\n{content}\n── /agent {identity} ──\n{reset}\n"
 
 
 @dataclass(slots=True)
 class _ToolAction:
     name: str
+    call: ToolCallDisplay
     agent_name: str | None = None
     arguments: list[str] = field(default_factory=list)
     arguments_bytes: int = 0
@@ -100,7 +126,13 @@ class _ToolAction:
     @property
     def retained_bytes(self) -> int:
         agent_name_bytes = len(self.agent_name.encode("utf-8")) if self.agent_name is not None else 0
-        return len(self.name.encode("utf-8")) + agent_name_bytes + self.arguments_bytes + self.output_bytes
+        return (
+            len(self.name.encode("utf-8"))
+            + len(self.call.marker.encode("utf-8"))
+            + agent_name_bytes
+            + self.arguments_bytes
+            + self.output_bytes
+        )
 
 
 @dataclass(slots=True)
@@ -201,6 +233,16 @@ def format_agent_identity(agent_id: str, agent_name: str | None = None) -> str:
     return f"{clean_name} ({clean_id})"
 
 
+def _result_notices(result: ToolResultDisplay) -> tuple[str, ...]:
+    if result.orphan:
+        return ("[orphan tool result]",)
+    if result.name_mismatch:
+        expected = sanitize_identity_component(result.call.name) or "tool"
+        received = sanitize_identity_component(result.event_name) or "tool"
+        return (f"[tool result name mismatch: expected {expected!r}, received {received!r}]",)
+    return ()
+
+
 def _fit_utf8(text: str, limit: int, *, suffix: str = _FRAME_TRUNCATION_SUFFIX) -> str:
     data = text.encode("utf-8")
     if limit <= 0:
@@ -251,6 +293,7 @@ class ActionMultiplexer:
         max_tools: int = 512,
         max_tools_per_agent: int = 64,
         max_retained_bytes: int = 512 * 1024,
+        tool_calls: ToolCallRegistry | None = None,
     ) -> None:
         if (
             min(
@@ -291,6 +334,7 @@ class ActionMultiplexer:
         self._max_tools = max_tools
         self._max_tools_per_agent = max_tools_per_agent
         self._max_retained_bytes = max_retained_bytes
+        self._tool_calls = tool_calls or ToolCallRegistry()
         self._collectors: OrderedDict[str, _AgentCollector] = OrderedDict()
         self._tool_order: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._queues: dict[str, deque[ActionFrame]] = {}
@@ -302,9 +346,20 @@ class ActionMultiplexer:
         self._suppressed_frames = 0
         self._suppressed_state = 0
 
+    def bind_tool_calls(self, tool_calls: ToolCallRegistry) -> None:
+        """Use the session allocator before any tool collector is active."""
+
+        if self._collectors or self._tool_order:
+            raise RuntimeError("cannot replace the tool-call registry while actions are active")
+        self._tool_calls = tool_calls
+
     @property
     def mode(self) -> DisplayMode:
         return self._mode
+
+    @property
+    def tool_calls(self) -> ToolCallRegistry:
+        return self._tool_calls
 
     @property
     def queued_count(self) -> int:
@@ -379,8 +434,24 @@ class ActionMultiplexer:
         event: RuntimeEvent,
         *,
         agent_name: str | None = None,
+        run_id: str = "",
+        turn_id: str = "",
     ) -> None:  # noqa: C901
+        call_key: ToolCallKey | None = None
+        started_call: ToolCallDisplay | None = None
+        match event:
+            case ToolUseStart(tool_use_id=tool_use_id, name=name):
+                call_key = ToolCallKey(agent_id, run_id, turn_id, tool_use_id)
+                started_call = self._tool_calls.start(call_key, name)
+            case ToolResult(tool_use_id=tool_use_id):
+                call_key = ToolCallKey(agent_id, run_id, turn_id, tool_use_id)
+            case _:
+                pass
         if self._mode is not DisplayMode.ALL_ACTIONS:
+            if isinstance(event, ToolResult):
+                assert call_key is not None
+                self._tool_calls.result(call_key, event.name)
+            self._finish_tool_event_identity(agent_id, event, call_key, run_id=run_id, turn_id=turn_id)
             return
         agent_name = normalize_agent_name(agent_name)
         try:
@@ -403,7 +474,12 @@ class ActionMultiplexer:
                     )
                     self._remove_collector(agent_id, suppress_incomplete=True)
                 case ToolUseStart(tool_use_id=tool_use_id, name=name):
-                    self._remember_tool(agent_id, tool_use_id, _ToolAction(name=name, agent_name=agent_name))
+                    assert started_call is not None
+                    self._remember_tool(
+                        agent_id,
+                        tool_use_id,
+                        _ToolAction(name=name, call=started_call, agent_name=agent_name),
+                    )
                 case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
                     action = self._touch_tool(agent_id, tool_use_id)
                     if action is None or action.call_emitted or not partial_json:
@@ -423,29 +499,30 @@ class ActionMultiplexer:
                     self._emit_complete_output(agent_id, action)
                 case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
                     action = self._pop_tool(agent_id, tool_use_id)
+                    assert call_key is not None
+                    call_key = action.call.key if action is not None else call_key
+                    result_display = self._tool_calls.result(call_key, name)
                     safe_content = sanitize_terminal_text(content)
+                    name_matches_call = not result_display.name_mismatch
                     patch_display = (
-                        parse_patch_result(safe_content, include_legacy_path=action is None)
-                        if name == "patch_file" and (action is None or action.name == name) and not is_error
+                        parse_patch_result(safe_content, include_legacy_path=result_display.orphan)
+                        if name == "patch_file" and not result_display.orphan and name_matches_call and not is_error
                         else None
                     )
-                    if action is None:
-                        patch_kinds = (
-                            (DiffLineKind.METADATA, *patch_display.line_kinds()) if patch_display is not None else None
-                        )
+                    badge_kind = (
+                        ToolBadgeKind.ERROR if is_error or result_display.name_mismatch else ToolBadgeKind.SUCCESS
+                    )
+                    notices = _result_notices(result_display)
+                    if action is None or result_display.orphan or result_display.name_mismatch:
+                        body = "\n".join((*notices, safe_content) if safe_content else notices)
                         self._enqueue(
                             agent_id,
                             "tool error" if is_error else "tool result",
-                            (
-                                f"✓ {name}\n{patch_display.plain_text()}"
-                                if patch_display is not None
-                                else f"{'✗' if is_error else '✓'} {name}\n{safe_content}"
-                                if safe_content
-                                else name
-                            ),
+                            body,
                             critical=True,
                             agent_name=agent_name,
-                            body_line_kinds=patch_kinds,
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
                         )
                         return
                     self._emit_call(agent_id, action, retained=False)
@@ -454,37 +531,52 @@ class ActionMultiplexer:
                         self._enqueue(
                             agent_id,
                             "tool error",
-                            f"✗ {action.name}\n{safe_content}",
+                            safe_content,
                             critical=True,
                             agent_name=action.agent_name,
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
                         )
                     elif patch_display is not None:
                         self._enqueue(
                             agent_id,
                             "tool result",
-                            f"✓ {action.name}\n{patch_display.plain_text()}",
+                            patch_display.plain_text(),
                             critical=True,
                             agent_name=action.agent_name,
-                            body_line_kinds=(DiffLineKind.METADATA, *patch_display.line_kinds()),
+                            body_line_kinds=patch_display.line_kinds(),
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
                         )
                     elif name == action.name == "write_file" and is_write_file_result(safe_content):
-                        pass
+                        self._enqueue(
+                            agent_id,
+                            "tool result",
+                            "",
+                            critical=True,
+                            agent_name=action.agent_name,
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
+                        )
                     elif action.saw_output:
                         self._enqueue(
                             agent_id,
                             "tool result",
-                            f"✓ {action.name} completed",
+                            "",
                             critical=True,
                             agent_name=action.agent_name,
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
                         )
                     else:
-                        suffix = f"\n{safe_content}" if safe_content else ""
                         self._enqueue(
                             agent_id,
                             "tool result",
-                            f"✓ {action.name}{suffix}",
+                            safe_content,
                             critical=True,
                             agent_name=action.agent_name,
+                            tool_call=result_display.call,
+                            tool_badge_kind=badge_kind,
                         )
                 case Error():
                     self._enqueue(
@@ -506,6 +598,7 @@ class ActionMultiplexer:
                 case _:
                     return
         finally:
+            self._finish_tool_event_identity(agent_id, event, call_key, run_id=run_id, turn_id=turn_id)
             self._enforce_retained_limit()
 
     def adopt_tool(
@@ -515,17 +608,36 @@ class ActionMultiplexer:
         name: str,
         *,
         agent_name: str | None = None,
+        run_id: str = "",
+        turn_id: str = "",
     ) -> None:
         """Collect continuation events for a tool call already shown live."""
         if self._mode is not DisplayMode.ALL_ACTIONS:
             return
         agent_name = normalize_agent_name(agent_name)
+        call = self._tool_calls.start(ToolCallKey(agent_id, run_id, turn_id, tool_use_id), name)
         self._remember_tool(
             agent_id,
             tool_use_id,
-            _ToolAction(name=name, agent_name=agent_name, call_emitted=True),
+            _ToolAction(name=name, call=call, agent_name=agent_name, call_emitted=True),
         )
         self._enforce_retained_limit()
+
+    def _finish_tool_event_identity(
+        self,
+        agent_id: str,
+        event: RuntimeEvent,
+        call_key: ToolCallKey | None,
+        *,
+        run_id: str,
+        turn_id: str,
+    ) -> None:
+        if isinstance(event, ToolResult) and call_key is not None:
+            self._tool_calls.complete(call_key)
+        elif isinstance(event, (TurnFinished, SessionEndEvent)):
+            self._tool_calls.discard_turn(agent_id=agent_id, run_id=run_id, turn_id=turn_id)
+        elif isinstance(event, AgentStopped):
+            self._tool_calls.discard_agent(agent_id)
 
     def drain(self, *, max_frames: int = 4, max_bytes: int = 16 * 1024) -> list[str]:
         if min(max_frames, max_bytes) <= 0:
@@ -589,12 +701,19 @@ class ActionMultiplexer:
             except json.JSONDecodeError:
                 arguments = raw
         if arguments is None:
-            body = f"▶ {action.name}"
+            body = ""
         elif isinstance(arguments, str):
-            body = f"▶ {action.name}\narguments: {arguments}"
+            body = f"arguments: {arguments}"
         else:
-            body = f"▶ {action.name}\narguments: {json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
-        self._enqueue(agent_id, "tool call", body, agent_name=action.agent_name)
+            body = f"arguments: {json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
+        self._enqueue(
+            agent_id,
+            "tool call",
+            body,
+            agent_name=action.agent_name,
+            tool_call=action.call,
+            tool_badge_kind=ToolBadgeKind.CALL,
+        )
         if retained:
             self._collector_bytes -= action.arguments_bytes
         action.arguments.clear()
@@ -651,11 +770,15 @@ class ActionMultiplexer:
         critical: bool = False,
         agent_name: str | None = None,
         body_line_kinds: tuple[DiffLineKind, ...] | None = None,
+        tool_call: ToolCallDisplay | None = None,
+        tool_badge_kind: ToolBadgeKind | None = None,
     ) -> None:
         agent_id = self._queue_agent_id(agent_id)
         agent_name = normalize_agent_name(agent_name)
         kind = _fit_utf8(sanitize_terminal_text(kind).replace("\n", " "), 40, suffix="…") or "action"
         clean_body = sanitize_terminal_text(body)
+        tool_name = sanitize_identity_component(tool_call.name) if tool_call is not None else None
+        tool_marker = tool_call.marker if tool_call is not None else None
         frame = ActionFrame(
             agent_id=agent_id,
             kind=kind,
@@ -665,6 +788,9 @@ class ActionMultiplexer:
             agent_name=agent_name,
             powerline=self._powerline,
             theme=self._theme,
+            tool_name=tool_name,
+            tool_marker=tool_marker,
+            tool_badge_kind=tool_badge_kind,
         )
         overhead = len(frame.render().encode("utf-8"))
         if overhead >= self._max_frame_bytes:
@@ -694,6 +820,9 @@ class ActionMultiplexer:
                     agent_name=agent_name,
                     powerline=self._powerline,
                     theme=self._theme,
+                    tool_name=tool_name,
+                    tool_marker=tool_marker,
+                    tool_badge_kind=tool_badge_kind,
                 )
                 overhead = len(frame.render().encode("utf-8"))
         unfitted_body = clean_body
@@ -715,6 +844,9 @@ class ActionMultiplexer:
             powerline=self._powerline,
             theme=self._theme,
             body_line_kinds=fitted_line_kinds,
+            tool_name=tool_name,
+            tool_marker=tool_marker,
+            tool_badge_kind=tool_badge_kind,
         )
         while self._frame_size(frame) > self._max_frame_bytes and clean_body:
             excess = self._frame_size(frame) - self._max_frame_bytes

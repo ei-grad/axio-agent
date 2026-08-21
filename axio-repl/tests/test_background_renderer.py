@@ -251,7 +251,7 @@ async def test_monochrome_theme_reaches_plain_and_powerline_renderers(
     await plain.render("main", Error(exception=RuntimeError("failure")))
 
     captured = capsys.readouterr()
-    assert "\033[1;97m▶ shell\033[0m" in captured.out
+    assert "\033[1;97m▶ shell #001\033[0m" in captured.out
     assert "\033[1;97mwarning\033[0m" in captured.out
     assert "\033[1;7mError from agent main: failure\033[0m" in captured.err
 
@@ -347,6 +347,8 @@ async def test_no_color_interactive_renderer_emits_no_ansi_or_powerline(
 
     captured = capsys.readouterr()
     assert "thinking" in captured.out
+    assert "▶ shell #001" in captured.out
+    assert "✗ shell #001" in captured.out
     assert "failed" in captured.out
     assert "broken" in captured.err
     assert "\x1b[" not in captured.out + captured.err
@@ -565,7 +567,9 @@ async def test_foreground_child_reasoning_and_tool_actions_keep_the_active_strea
             )
         ),
     )
-    assert "hi" not in capsys.readouterr().out
+    response = capsys.readouterr().out
+    assert "✓ shell #001" in response
+    assert "hi" not in response
 
 
 async def test_all_actions_preserves_active_bytes_and_inserts_only_after_a_paragraph(
@@ -775,7 +779,7 @@ async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.Ca
     )
 
     output = capsys.readouterr().out
-    assert output == "\n▶ write_file\npath: /tmp/demo\ncontent: value\n"
+    assert output == "\n▶ write_file #001\npath: /tmp/demo\ncontent: value\n"
     assert "\x1b[" not in output
 
 
@@ -928,7 +932,7 @@ async def test_incomplete_active_tool_argument_line_closes_before_error(
         ToolInputDelta(index=0, tool_use_id="call", partial_json='{"path":"/tmp/visible'),
     )
     visible = sanitize_terminal_text(capsys.readouterr().out)
-    assert visible.endswith("▶ write_file")
+    assert visible.endswith("▶ write_file #001")
 
     await renderer.render(
         "main",
@@ -1417,6 +1421,7 @@ async def test_foreground_result_is_correlated_and_not_printed_twice(capsys: pyt
 
     output = capsys.readouterr().out
     assert output.count("unique child answer") == 1
+    assert "✓ run_agent #001" in output
     assert "foreground agent researcher (child-id) returned its result to the parent" in output
     assert renderer.focused_agent == "main"
     assert renderer.foreground_agent == "main"
@@ -1441,6 +1446,7 @@ async def test_legacy_foreground_marker_is_consumed_before_a_parent_boundary(
     )
 
     output = capsys.readouterr().out
+    assert "✓ run_agent #001" in output
     assert "foreground agent child returned its result to the parent" in output
     assert "child result" not in output
 
@@ -1583,7 +1589,7 @@ async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exa
     output = capsys.readouterr().out
 
     assert output.index("\n\n") < output.index("agent main · shell stdout")
-    assert output.index("shell completed") < output.index("child continues")
+    assert output.index("✓ shell #002") < output.index("child continues")
     assert output.count("unique sibling line") == 1
 
 
@@ -1654,6 +1660,10 @@ async def test_suspended_tool_collector_obeys_the_total_retained_byte_cap(
         "main",
         ToolResult(tool_use_id="shell-call", name="shell", is_error=False, content="done"),
     )
+    await renderer.mark_idle()
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert "✓ shell #002" in output
+    assert "orphan tool result" not in output
     assert suspended.retained_tool_count == 0
     assert suspended.retained_agent_count == 0
 

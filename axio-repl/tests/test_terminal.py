@@ -973,7 +973,7 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
         assert dsml_streaming.count("path:") == 1
         assert "<|DSML|>\nsecond natural line\n" in dsml_streaming
         assert "unterminated-tail" not in dsml_streaming
-        assert sanitizer_only_stage == ""
+        assert sanitize_terminal_text(sanitizer_only_stage) == ""
         assert "unterminated-tail" in sanitize_terminal_text(error_stage)
         assert "provider stream failed" in error_stage
         assert "(continued)" not in error_stage
@@ -1003,6 +1003,11 @@ async def test_tool_arguments_reach_the_terminal_only_at_field_and_line_boundari
         assert sanitized.count("partial-before-result") == 1
         assert sanitized.count("<|DSML|>") == 1
         assert sanitized.count("src/service.py") == 1
+        assert sanitized.count("▶ write_file #001") == 1
+        assert sanitized.count("✓ write_file #001") == 1
+        assert sanitized.count("▶ patch_file #002") == 1
+        assert sanitized.count("✓ patch_file #002") == 1
+        assert sanitized.count("✓ list_files #003") == 1
         assert "(continued)" not in sanitized
         assert sanitized.index("/tmp/stream-demo.txt") < sanitized.index("alpha-one")
         assert sanitized.index("alpha-one") < sanitized.index("beta-two") < sanitized.index("gamma")
