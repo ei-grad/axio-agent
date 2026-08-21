@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 
@@ -21,6 +22,8 @@ class InputSubmitted:
     disposition: SubmissionDisposition
     input_id: str | None = None
     arrival_seq: int | None = None
+    submitted_at: datetime | None = None
+    author: str | None = None
 
     def __post_init__(self) -> None:
         if not self.text:
@@ -40,6 +43,12 @@ class InputSubmitted:
             raise ValueError("input_id must not be empty")
         if self.arrival_seq is not None and self.arrival_seq < 1:
             raise ValueError("arrival_seq must be positive")
+        if self.submitted_at is not None and (
+            self.submitted_at.tzinfo is None or self.submitted_at.utcoffset() is None
+        ):
+            raise ValueError("submitted_at must be timezone-aware")
+        if self.author == "":
+            raise ValueError("submission author must not be empty")
 
 
 @dataclass(frozen=True, slots=True)

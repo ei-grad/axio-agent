@@ -118,6 +118,7 @@ from axio_tools_agents.runtime import (
     TurnOutcome,
     TurnStarted,
     TurnStatus,
+    current_turn_identity,
     new_turn_identity,
     observe_agent_turn,
     observe_agent_turn_messages,
@@ -693,7 +694,6 @@ class _ReadyClaim:
 @dataclasses.dataclass(frozen=True, slots=True)
 class _ToolPreemption:
     reason: str
-    tools_continue: bool
 
 
 def _pending_prompt_count(
@@ -2485,7 +2485,7 @@ async def _read_input_async(
     session: Any,
     renderer: ReplRenderer,
     on_interrupt: Callable[[], None],
-    admit_submission: Callable[[str, str, int | None], Awaitable[InputSubmitted]],
+    admit_submission: Callable[[str, str, int | None, datetime | None], Awaitable[InputSubmitted]],
     initial_text: str = "",
     *,
     prompt_factory: Callable[[], object] = _panel.prompt_message,
@@ -2501,7 +2501,7 @@ async def _read_input_async(
         clear_editor = False
         try:
             admission: asyncio.Future[InputSubmitted] = asyncio.ensure_future(
-                admit_submission(editor_value.strip(), target_agent_id, reserved_seq)
+                admit_submission(editor_value.strip(), target_agent_id, reserved_seq, submitted_at)
             )
             while True:
                 try:
@@ -2514,8 +2514,9 @@ async def _read_input_async(
                         break
                     failure = failure or exc
             clear_editor = submitted.disposition is SubmissionDisposition.PENDING
-            if submitted.disposition is SubmissionDisposition.PENDING and submitted_at is not None:
-                rendering = asyncio.ensure_future(renderer.submitted(submitted.text, submitted_at))
+            rendered_at = submitted.submitted_at or submitted_at
+            if submitted.disposition is SubmissionDisposition.PENDING and rendered_at is not None:
+                rendering = asyncio.ensure_future(renderer.submitted(submitted.text, rendered_at))
                 while True:
                     try:
                         await asyncio.shield(rendering)
@@ -3668,6 +3669,7 @@ async def main() -> None:
                 max_iterations=agent.max_iterations,
                 last_iteration_message=LAST_ITERATION_HINT,
                 deferred_tool_sink=None if foreground else deferred_tools,
+                before_next_provider_request=None if foreground else agent.before_next_provider_request,
             ), child_ctx
 
         async def _make_spawn_agent(inherit_context: bool) -> tuple[Agent, ContextStore]:
@@ -3838,7 +3840,12 @@ async def main() -> None:
                 if target_agent_id != "main":
                     remapped_targets.add(target_agent_id)
                     target_agent_id = "main"
-                await pending_input.admit(recovered_input.text, target_agent_id)
+                await pending_input.admit(
+                    recovered_input.text,
+                    target_agent_id,
+                    submitted_at=recovered_input.submitted_at,
+                    author=recovered_input.author,
+                )
             application_ids = [*recovery.recovery_ids]
             application_ids.extend(
                 f"{recovery.source_session_id}:pending:{recovered_input.source_id}"
@@ -3881,6 +3888,24 @@ async def main() -> None:
             batch = await pending_input.recall_all()
             return batch.editor_text if batch is not None else None
 
+        def _prioritize_interruption(request: PromptInterruptRequested) -> None:
+            current = prompt_task
+            if (
+                request.target_agent_id == "main"
+                and request.captured_turn_id is not None
+                and request.captured_turn_id == foreground_state.active_turn_id("main")
+                and current is not None
+                and not current.done()
+            ):
+                pending_interrupt_turns.add(request.captured_turn_id)
+                deferred_tools.request_interruption(request.captured_turn_id)
+                tool_preemption_reasons.pop(request.captured_turn_id, None)
+                cancel_task_once(current)
+                return
+            if request.captured_turn_id is not None:
+                deferred_tools.request_interruption(request.captured_turn_id)
+                interrupt_local_agent_turn(request.target_agent_id, request.captured_turn_id)
+
         def _queue_escape() -> None:
             target_agent_id = renderer.focused_agent
             request = PromptInterruptRequested(
@@ -3889,6 +3914,7 @@ async def main() -> None:
                     foreground_state.active_turn_id("main") if target_agent_id == "main" else renderer.focused_turn_id
                 ),
             )
+            _prioritize_interruption(request)
             task = asyncio.create_task(
                 _admit_escape(request),
                 name="axio-repl-escape-admission",
@@ -3953,17 +3979,7 @@ async def main() -> None:
                     captured_turn_id=request.captured_turn_id,
                 )
             )
-            if (
-                request.target_agent_id == "main"
-                and request.captured_turn_id is not None
-                and request.captured_turn_id == foreground_state.active_turn_id("main")
-                and prompt_task is not None
-                and not prompt_task.done()
-                and prompt_task.cancelling() == 0
-            ):
-                pending_interrupt_turns.add(request.captured_turn_id)
-                deferred_tools.request_preemption(request.captured_turn_id)
-                cancel_task_once(prompt_task)
+            _prioritize_interruption(request)
             await interrupt_queue.put(_AcceptedInterrupt(envelope.seq, request))
 
         def _queue_notification(text: str) -> None:
@@ -4056,10 +4072,8 @@ async def main() -> None:
                 )
                 if preemption is None:
                     renderer.show_panel("Main turn interrupted.")
-                elif preemption.tools_continue:
-                    renderer.show_panel(f"Main turn preempted for {preemption.reason}; unfinished tools continue.")
                 else:
-                    renderer.show_panel(f"Main turn preempted for {preemption.reason} before tool execution.")
+                    renderer.show_panel(f"Main turn preempted for {preemption.reason}.")
             finally:
                 tool_preemption_reasons.pop(identity.turn_id, None)
                 prompt_task = None
@@ -4143,7 +4157,7 @@ async def main() -> None:
                 and deferred_tools.has_active_dispatch(active_turn_id)
             ):
                 if active_turn_id is not None:
-                    tool_preemption_reasons.setdefault(active_turn_id, _ToolPreemption(reason, tools_continue=True))
+                    tool_preemption_reasons.setdefault(active_turn_id, _ToolPreemption(reason))
                 deferred_tools.request_preemption(active_turn_id)
                 cancel_task_once(current)
 
@@ -4176,9 +4190,9 @@ async def main() -> None:
                     and current is not None
                     and not current.done()
                     and current.cancelling() == 0
-                    and deferred_tools.cancel_before_run(dispatch)
+                    and deferred_tools.request_preemption(turn_id)
                 ):
-                    tool_preemption_reasons.setdefault(turn_id, _ToolPreemption(reason, tools_continue=False))
+                    tool_preemption_reasons.setdefault(turn_id, _ToolPreemption(reason))
                     cancel_task_once(current)
                 return
             has_queued_input = any(
@@ -4190,7 +4204,28 @@ async def main() -> None:
                 if turn_id is not None:
                     interrupt_local_agent_turn(agent_id, turn_id)
 
+        async def _before_next_provider_request() -> None:
+            await event_hub.wait_through_current_sequence()
+            await pending_input.wait_for_transitions()
+            identity = current_turn_identity()
+            if identity is None:
+                return
+            reason = None
+            if pending_input.pending_count_for_target(identity.agent_id):
+                reason = "queued user input"
+            elif identity.agent_id == "main" and _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task):
+                reason = "incoming message"
+            if reason is None:
+                return
+            if identity.agent_id == "main":
+                tool_preemption_reasons.setdefault(identity.turn_id, _ToolPreemption(reason))
+            else:
+                interrupt_local_agent_turn(identity.agent_id, identity.turn_id)
+            raise asyncio.CancelledError
+
         deferred_tools.set_dispatch_started_handler(_on_tool_dispatch_started)
+        if args.prompt is None:
+            agent.before_next_provider_request = _before_next_provider_request
         set_background_input_admitted_handler(_preempt_background_tool_dispatch)
 
         loop.add_signal_handler(signal.SIGINT, _on_sigint)
@@ -4378,6 +4413,7 @@ async def main() -> None:
                 text: str,
                 target_agent_id: str,
                 reserved_seq: int | None,
+                submitted_at: datetime | None,
             ) -> InputSubmitted:
                 def record_submission(submitted: InputSubmitted) -> InputSubmitted:
                     if session_journal is not None:
@@ -4389,6 +4425,12 @@ async def main() -> None:
                                 "disposition": submitted.disposition.value,
                                 "input_id": submitted.input_id,
                                 "arrival_seq": submitted.arrival_seq,
+                                "submitted_at": (
+                                    submitted.submitted_at.isoformat(timespec="microseconds")
+                                    if submitted.submitted_at is not None
+                                    else None
+                                ),
+                                "author": submitted.author,
                             },
                         )
                     return submitted
@@ -4403,6 +4445,8 @@ async def main() -> None:
                             target_agent_id=target_agent_id,
                             disposition=SubmissionDisposition.COMMAND,
                             arrival_seq=reserved_seq,
+                            submitted_at=submitted_at,
+                            author=effective_username,
                         )
                     )
                 if pending_input.pending_count >= MAX_PENDING_INPUTS:
@@ -4415,9 +4459,17 @@ async def main() -> None:
                             text=text,
                             target_agent_id=target_agent_id,
                             disposition=SubmissionDisposition.RETAINED,
+                            submitted_at=submitted_at,
+                            author=effective_username,
                         )
                     )
-                entry = await pending_input.admit(text, target_agent_id, reserved_seq=reserved_seq)
+                entry = await pending_input.admit(
+                    text,
+                    target_agent_id,
+                    reserved_seq=reserved_seq,
+                    submitted_at=submitted_at,
+                    author=effective_username,
+                )
                 child_turn_to_interrupt = _request_target_tool_preemption(target_agent_id)
                 if child_turn_to_interrupt is not None:
                     interrupt_local_agent_turn(target_agent_id, child_turn_to_interrupt)
@@ -4428,6 +4480,8 @@ async def main() -> None:
                         disposition=SubmissionDisposition.PENDING,
                         input_id=entry.id,
                         arrival_seq=entry.arrival_seq,
+                        submitted_at=entry.submitted_at,
+                        author=entry.author,
                     )
                 )
 
@@ -4589,7 +4643,7 @@ async def main() -> None:
 
                 if request.target_agent_id != "main":
                     if request.captured_turn_id is not None:
-                        deferred_tools.request_preemption(request.captured_turn_id)
+                        deferred_tools.request_interruption(request.captured_turn_id)
                         await _interrupt_focused_agent(request.target_agent_id, request.captured_turn_id)
                     await _finalize_interrupt(transaction)
                     return
@@ -4602,6 +4656,9 @@ async def main() -> None:
                     and not foreground_task.done()
                 )
                 if current_matches:
+                    if request.captured_turn_id is not None:
+                        deferred_tools.request_interruption(request.captured_turn_id)
+                        tool_preemption_reasons.pop(request.captured_turn_id, None)
                     if current_prompt_task is not None:
                         cancel_task_once(current_prompt_task)
                     settling_interrupts.append(transaction)

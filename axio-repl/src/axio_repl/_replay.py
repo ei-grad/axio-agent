@@ -252,12 +252,15 @@ def _validate_payload(kind: str, payload: object) -> None:
             value,
             kind,
             required=frozenset({"text", "target_agent_id", "disposition", "input_id", "arrival_seq"}),
+            optional=frozenset({"submitted_at", "author"}),
         )
         _required_string(value, kind, "text")
         _required_string(value, kind, "target_agent_id")
         if _required_string(value, kind, "disposition") not in {"pending", "command", "retained"}:
             raise ReplaySchemaError("input_submission.disposition is invalid")
         _optional_string(value, kind, "input_id")
+        _optional_string(value, kind, "submitted_at")
+        _optional_string(value, kind, "author")
         arrival_seq = value.get("arrival_seq")
         if arrival_seq is not None and (type(arrival_seq) is not int or arrival_seq < 1):
             raise ReplaySchemaError("input_submission.arrival_seq must be null or positive")

@@ -399,7 +399,12 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     renderer = ReplRenderer()
     renderer.set_focus("child")
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         del reserved_seq
         return InputSubmitted(
             text=text,
@@ -443,7 +448,12 @@ async def test_initial_editor_text_survives_prompt_retry_but_not_a_completed_emp
                 raise answer
             return str(answer)
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         del reserved_seq
         return InputSubmitted(
             text=text,
@@ -478,10 +488,16 @@ async def test_enter_time_is_captured_before_delayed_admission_and_rendered_once
         provider_calls.append(submitted_at)
         return submitted_at
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        accepted_at: datetime | None,
+    ) -> InputSubmitted:
         assert text == "queued message"
         assert target_agent_id == "main"
         assert reserved_seq == 1
+        assert accepted_at == submitted_at
         admission_started.set()
         await release_admission.wait()
         return InputSubmitted(
@@ -490,6 +506,8 @@ async def test_enter_time_is_captured_before_delayed_admission_and_rendered_once
             disposition=SubmissionDisposition.PENDING,
             input_id="input-1",
             arrival_seq=reserved_seq,
+            submitted_at=accepted_at,
+            author="alice",
         )
 
     with create_pipe_input() as pipe:
@@ -519,6 +537,8 @@ async def test_enter_time_is_captured_before_delayed_admission_and_rendered_once
             submitted = await asyncio.wait_for(reader, timeout=1)
 
     assert submitted.text == "queued message"
+    assert submitted.submitted_at == submitted_at
+    assert submitted.author == "alice"
     output = capsys.readouterr().out
     assert output.count("12:41 alice>") == 1
     assert output.endswith("12:41 alice>\x1b[0m queued message\n")
@@ -549,7 +569,12 @@ async def test_admission_failure_clears_accept_metadata_without_retrying() -> No
             del prompt
             return self.default_buffer.text
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         nonlocal calls
         del text, target_agent_id, reserved_seq
         calls += 1
@@ -606,7 +631,12 @@ async def test_enter_admission_completes_before_editor_clear_even_when_reader_is
             assert prompt == _panel.PROMPT_MESSAGE
             return self.default_buffer.text
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
         return InputSubmitted(
             text=text,
@@ -684,7 +714,12 @@ async def test_reader_cancellation_after_accept_cannot_abandon_reserved_sequence
             await asyncio.Future()
             raise AssertionError("unreachable")
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
         return InputSubmitted(
             text=text,
@@ -761,7 +796,12 @@ async def test_prompt_failure_after_accept_completes_reservation_before_reraisin
             assert prompt == _panel.PROMPT_MESSAGE
             raise OSError("prompt teardown failed")
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
         return InputSubmitted(
             text=text,
@@ -1039,7 +1079,12 @@ async def test_enter_reservation_precedes_peer_published_after_accept_handler() 
         asyncio.get_running_loop().call_soon(publish_peer)
         return "main"
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         entry = await coordinator.admit(text, target_agent_id, reserved_seq=reserved_seq)
         return InputSubmitted(
             text=text,

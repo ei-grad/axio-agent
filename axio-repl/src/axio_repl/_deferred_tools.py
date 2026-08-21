@@ -16,6 +16,7 @@ class DeferredToolPhase(StrEnum):
     ACTIVE = "active"
     DEFERRED = "deferred"
     PROTOCOL_CLOSED = "protocol_closed"
+    DELIVERING = "delivering"
     DELIVERED = "delivered"
 
 
@@ -53,6 +54,7 @@ class _OwnedDispatch:
     phase: DeferredToolPhase = DeferredToolPhase.ACTIVE
     watcher: asyncio.Task[None] | None = None
     preemption_requested: bool = False
+    interruption_requested: bool = False
 
 
 NotificationHandler = Callable[[DeferredToolNotification], Awaitable[None]]
@@ -98,14 +100,6 @@ class DeferredToolRegistry:
         if self._on_dispatch_started is not None:
             self._on_dispatch_started(dispatch, agent_id, turn_id)
 
-    def cancel_before_run(self, dispatch: ToolDispatch) -> bool:
-        """Cancel a dispatch synchronously from its started callback before its first task step."""
-
-        record = self._require(dispatch)
-        if record.phase is not DeferredToolPhase.ACTIVE or dispatch.task.done():
-            return False
-        return dispatch.task.cancel()
-
     def dispatch_finished(self, dispatch: ToolDispatch) -> None:
         record = self._records.get(dispatch.task)
         if record is None:
@@ -146,6 +140,23 @@ class DeferredToolRegistry:
                 record.preemption_requested = True
                 requested = True
         return requested
+
+    def request_interruption(self, turn_id: str | None) -> bool:
+        """Give explicit interruption priority over ordinary input preemption."""
+
+        interrupted = False
+        for record in self._records.values():
+            if record.turn_id == turn_id and record.phase in {
+                DeferredToolPhase.ACTIVE,
+                DeferredToolPhase.DEFERRED,
+                DeferredToolPhase.PROTOCOL_CLOSED,
+            }:
+                record.preemption_requested = False
+                record.interruption_requested = True
+                if record.phase is not DeferredToolPhase.ACTIVE and not record.dispatch.task.done():
+                    record.dispatch.task.cancel()
+                interrupted = True
+        return interrupted
 
     def protocol_closed(self, dispatch: ToolDispatch) -> None:
         record = self._require(dispatch)
@@ -200,13 +211,26 @@ class DeferredToolRegistry:
                 results = await asyncio.shield(record.dispatch.task)
                 by_id = {result.tool_use_id: result for result in results}
             except asyncio.CancelledError:
-                raise
+                watcher = asyncio.current_task()
+                if not record.interruption_requested or (watcher is not None and watcher.cancelling() > 0):
+                    raise
+                by_id = {}
             except BaseException as exc:
                 by_id = {
                     block.id: ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                     for block in record.dispatch.blocks
                 }
             await record.protocol_closed.wait()
+            if record.interruption_requested:
+                by_id = {
+                    block.id: ToolResultBlock(
+                        tool_use_id=block.id,
+                        content="[interrupted by user]",
+                        is_error=True,
+                    )
+                    for block in record.dispatch.blocks
+                }
+            record.phase = DeferredToolPhase.DELIVERING
             for block in record.dispatch.blocks:
                 result = by_id.get(
                     block.id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from uuid import uuid4
 
@@ -157,6 +158,8 @@ class PendingUserEntry:
     arrival_seq: int
     text: str
     intended_target_agent_id: str
+    submitted_at: datetime | None = None
+    author: str | None = None
     status: PendingInputStatus = PendingInputStatus.PENDING
     claimed_target_agent_id: str | None = None
 
@@ -169,6 +172,12 @@ class PendingUserEntry:
             raise ValueError("pending input text must not be empty")
         if not self.intended_target_agent_id:
             raise ValueError("intended_target_agent_id must not be empty")
+        if self.submitted_at is not None and (
+            self.submitted_at.tzinfo is None or self.submitted_at.utcoffset() is None
+        ):
+            raise ValueError("pending input submitted_at must be timezone-aware")
+        if self.author == "":
+            raise ValueError("pending input author must not be empty")
         if self.status in {PendingInputStatus.CLAIMED, PendingInputStatus.DELIVERED}:
             if not self.claimed_target_agent_id:
                 raise ValueError("claimed entries require claimed_target_agent_id")
@@ -324,12 +333,23 @@ class PendingInputCoordinator:
     def pending_count(self) -> int:
         return len(self._state.pending)
 
+    def pending_count_for_target(self, target_agent_id: str) -> int:
+        return sum(entry.intended_target_agent_id == target_agent_id for entry in self._state.pending)
+
+    async def wait_for_transitions(self) -> None:
+        """Wait for a currently publishing input transition to update local state."""
+
+        async with self._lock:
+            pass
+
     async def admit(
         self,
         text: str,
         target_agent_id: str,
         *,
         reserved_seq: int | None = None,
+        submitted_at: datetime | None = None,
+        author: str | None = None,
     ) -> PendingUserEntry:
         input_id = uuid4().hex
         async with self._lock:
@@ -337,6 +357,8 @@ class PendingInputCoordinator:
                 input_id=input_id,
                 text=text,
                 intended_target_agent_id=target_agent_id,
+                submitted_at=submitted_at,
+                author=author,
             )
             if reserved_seq is None:
                 publication = self._publish(event)
@@ -350,6 +372,8 @@ class PendingInputCoordinator:
                 arrival_seq=envelope.seq,
                 text=text,
                 intended_target_agent_id=target_agent_id,
+                submitted_at=submitted_at,
+                author=author,
             )
             self._state = self._state.admit(entry)
             if cancellation is not None:
@@ -466,7 +490,8 @@ def claim_batch_arrivals(batch: ClaimBatch) -> tuple[ContextArrival, ...]:
                 provenance=InputProvenance(
                     human_authored=True,
                     source="interactive",
-                    author="human",
+                    author=entry.author or "human",
+                    submitted_at=entry.submitted_at,
                 ),
             ),
             source="interactive",

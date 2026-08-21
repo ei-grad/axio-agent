@@ -9,6 +9,7 @@ import logging
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from uuid import uuid4
 
@@ -84,6 +85,16 @@ class InputBuffered:
     input_id: str
     text: str
     intended_target_agent_id: str
+    submitted_at: datetime | None = None
+    author: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.submitted_at is not None and (
+            self.submitted_at.tzinfo is None or self.submitted_at.utcoffset() is None
+        ):
+            raise ValueError("buffered input submitted_at must be timezone-aware")
+        if self.author == "":
+            raise ValueError("buffered input author must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +285,7 @@ class SessionEventHub:
         self._discarded_sequences: set[int] = set()
         self._next_publication_seq = 1
         self._pending_publications: dict[int, _PendingPublication] = {}
+        self._sequence_waiters: dict[asyncio.Future[None], int] = {}
         self._subscribers: list[EventSubscriber] = []
         self._publish_lock = asyncio.Lock()
 
@@ -296,6 +308,23 @@ class SessionEventHub:
                 pass
 
         return unsubscribe
+
+    async def wait_through_current_sequence(self) -> int:
+        """Wait until every event already sequenced at this boundary is delivered."""
+
+        with self._sequence_lock:
+            target = self._seq
+        async with self._publish_lock:
+            await self._drain_publications()
+            if self._next_publication_seq > target:
+                return target
+            waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._sequence_waiters[waiter] = target
+        try:
+            await asyncio.shield(waiter)
+        finally:
+            self._sequence_waiters.pop(waiter, None)
+        return target
 
     async def discard_reserved_sequence(self, sequence: int) -> None:
         """Release a synchronous ingress slot that produced no runtime event."""
@@ -393,6 +422,9 @@ class SessionEventHub:
             if not publication.result.done():
                 publication.result.set_result(publication.envelope)
             self._next_publication_seq += 1
+        for waiter, target in tuple(self._sequence_waiters.items()):
+            if self._next_publication_seq > target and not waiter.done():
+                waiter.set_result(None)
         if failure is not None:
             raise failure
 

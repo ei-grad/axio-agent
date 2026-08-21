@@ -182,6 +182,7 @@ class Agent:
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
+    before_next_provider_request: Callable[[], Awaitable[None]] | None = field(default=None)
 
     def copy(self, **overrides: Any) -> Self:
         """Return a new Agent with *overrides* applied."""
@@ -642,10 +643,15 @@ class Agent:
                                         self.deferred_tool_sink is not None
                                         and self.deferred_tool_sink.should_defer(dispatch)
                                     )
-                                    if prefer_deferral and self.deferred_tool_sink is not None:
-                                        self.deferred_tool_sink.defer(dispatch)
-                                        deferred = True
-                                    elif dispatch_task.done() and not dispatch_task.cancelled():
+                                    if prefer_deferral and not dispatch_task.done():
+                                        # An immediate handler completes through its child task and the
+                                        # dispatch gather task on successive scheduler turns. Let runnable
+                                        # completion propagate before turning it into deferred work.
+                                        for _ in range(2):
+                                            await asyncio.sleep(0)
+                                            if dispatch_task.done():
+                                                break
+                                    if dispatch_task.done() and not dispatch_task.cancelled():
                                         try:
                                             completed_results = {
                                                 result.tool_use_id: result for result in dispatch_task.result()
@@ -654,6 +660,11 @@ class Agent:
                                             completed_results = {}
                                         if self.deferred_tool_sink is not None:
                                             self.deferred_tool_sink.dispatch_finished(dispatch)
+                                    elif self.deferred_tool_sink is not None and self.deferred_tool_sink.should_defer(
+                                        dispatch
+                                    ):
+                                        self.deferred_tool_sink.defer(dispatch)
+                                        deferred = True
                                     else:
                                         if not dispatch_task.done():
                                             dispatch_task.cancel()
@@ -673,7 +684,7 @@ class Agent:
                                             ToolResultBlock(
                                                 tool_use_id=b.id,
                                                 content=(
-                                                    f"Tool {b.name} continues after interruption. "
+                                                    f"Tool {b.name} continues after the model turn was preempted. "
                                                     "Its actual result will arrive as a later user message."
                                                 ),
                                             )
@@ -783,6 +794,8 @@ class Agent:
                             block = by_id.get(r.tool_use_id)
                             for result_event in self._result_events(r, block):
                                 yield result_event
+                        if self.before_next_provider_request is not None:
+                            await self.before_next_provider_request()
                         continue
 
                     await self._append(context, Message(role="assistant", content=list(content)))

@@ -4,17 +4,25 @@ import asyncio
 import sys
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason, Usage
-from axio_tools_agents.runtime import ConfigurationChanged, EditorSnapshot, RuntimeEvent
+from axio_tools_agents.runtime import (
+    AgentStarted,
+    ConfigurationChanged,
+    EditorSnapshot,
+    InterruptionRequested,
+    RuntimeEvent,
+    current_turn_identity,
+)
 from prompt_toolkit.formatted_text import to_plain_text
 
 from axio_repl import (
@@ -33,6 +41,7 @@ from axio_repl import (
     main,
 )
 from axio_repl._coordinator import PendingInputCoordinator
+from axio_repl._deferred_tools import DeferredToolRegistry
 from axio_repl._journal import SEMANTIC_FILENAME, SessionJournal, read_journal
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._recovery import materialize_recovery
@@ -548,6 +557,7 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
     inputs: asyncio.Queue[str] = asyncio.Queue()
     calls: list[list[Message]] = []
     status_callbacks: list[Callable[[], str]] = []
+    submitted_at = datetime(2026, 8, 21, 14, 3, 29, 654321, tzinfo=UTC)
 
     async def slow_tool() -> str:
         tool_started.set()
@@ -639,9 +649,11 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         return [Tool(name="slow", handler=slow_tool)], "test", tmp_path, ""
 
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "resolve_effective_username", lambda: "alice")
     monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (ToolTransport, ""))
     monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
     monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "accepted_at", lambda _session: submitted_at)
     monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
     monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
     monkeypatch.setattr(sys, "argv", ["axio-repl", "--sandbox", "none", "--no-session-log"])
@@ -672,7 +684,7 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         assert any(
             isinstance(block, ToolResultBlock)
             and block.tool_use_id == "slow-call"
-            and "continues after interruption" in str(block.content)
+            and "continues after the model turn was preempted" in str(block.content)
             for block in placeholder.content
         )
         assert any(
@@ -681,6 +693,20 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
                 for block in message.content
             )
             for message in calls[1][tool_use_index + 2 :]
+        )
+        queued_message = next(
+            message
+            for message in calls[1][tool_use_index + 2 :]
+            if any(
+                isinstance(block, TextBlock) and block.text == "message before tool result"
+                for block in message.content
+            )
+        )
+        assert queued_message.provenance == InputProvenance(
+            human_authored=True,
+            source="interactive",
+            author="alice",
+            submitted_at=submitted_at,
         )
 
         release_tool.set()
@@ -714,7 +740,7 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
             await asyncio.gather(repl_task, return_exceptions=True)
 
 
-async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_streams(
+async def test_queued_input_defers_unstarted_dispatch_then_reissued_shell_streams(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -847,12 +873,16 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
         target_agent_id: str,
         *,
         reserved_seq: int | None = None,
+        submitted_at: object = None,
+        author: str | None = None,
     ) -> object:
         entry = await original_admit(
             cast(Any, coordinator),
             text,
             target_agent_id,
             reserved_seq=reserved_seq,
+            submitted_at=cast(Any, submitted_at),
+            author=author,
         )
         if text == "queued while model is generating":
             queued_input_admitted.set()
@@ -890,38 +920,31 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
 
         await asyncio.wait_for(shell_stream_started.wait(), timeout=1)
         await asyncio.wait_for(shell_output_rendered.wait(), timeout=1)
-        assert shell_stream_invocations == 1
+        assert shell_stream_invocations == 3
         first_output = capsys.readouterr().out
         assert "early shell output" in first_output
         assert first_output.count("▶ shell #001") == 1
-        assert first_output.count("✗ shell #001") == 1
         assert first_output.count("▶ shell #002") == 1
-        assert first_output.count("✗ shell #002") == 1
-        assert first_output.index("▶ shell #001") < first_output.index("✗ shell #001")
-        assert first_output.index("▶ shell #002") < first_output.index("✗ shell #002")
-        assert first_output.count("[interrupted by user]") == 2
+        assert first_output.count("▶ shell #003") == 1
+        assert "✗ shell" not in first_output
+        assert "[interrupted by user]" not in first_output
         assert observed_renderer is not None
-        assert observed_renderer.active_tool_call_count == 1
+        assert observed_renderer.active_tool_call_count == 3
 
-        first_cancelled_results = [
+        deferred_placeholders = [
             block
             for message in calls[1]
             for block in message.content
             if isinstance(block, ToolResultBlock) and block.tool_use_id.startswith("cancelled-shell-")
         ]
-        assert [(block.tool_use_id, block.content, block.is_error) for block in first_cancelled_results] == [
-            ("cancelled-shell-a", "[interrupted by user]", True),
-            ("cancelled-shell-b", "[interrupted by user]", True),
+        assert [(block.tool_use_id, block.is_error) for block in deferred_placeholders] == [
+            ("cancelled-shell-a", False),
+            ("cancelled-shell-b", False),
         ]
-        assert [
-            (event.tool_use_id, event.name, event.content, event.is_error)
-            for event in rendered_tool_results
-            if event.tool_use_id.startswith("cancelled-shell-")
-        ] == [
-            ("cancelled-shell-a", "shell", "[interrupted by user]", True),
-            ("cancelled-shell-b", "shell", "[interrupted by user]", True),
-        ]
-        assert not any("continues after interruption" in str(block.content) for block in first_cancelled_results)
+        assert all(
+            "continues after the model turn was preempted" in str(block.content) for block in deferred_placeholders
+        )
+        assert not any(event.tool_use_id.startswith("cancelled-shell-") for event in rendered_tool_results)
         assert any(
             isinstance(block, TextBlock) and block.text == "queued while model is generating"
             for message in calls[1]
@@ -930,18 +953,14 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
 
         release_shell.set()
         await asyncio.wait_for(final_response_started.wait(), timeout=1)
+        await asyncio.sleep(0)
         final_output = capsys.readouterr().out
+        assert final_output.count("✓ shell #001") == 1
+        assert final_output.count("✓ shell #002") == 1
         assert final_output.count("✓ shell #003") == 1
         assert observed_renderer.active_tool_call_count == 0
-        assert shell_stream_invocations == 1
-        assert [event.tool_use_id for event in rendered_tool_results].count("cancelled-shell-a") == 1
-        assert [event.tool_use_id for event in rendered_tool_results].count("cancelled-shell-b") == 1
-        assert not any(
-            isinstance(block, TextBlock) and "Deferred tool completed" in block.text
-            for call in calls
-            for message in call
-            for block in message.content
-        )
+        assert shell_stream_invocations == 3
+        assert [event.tool_use_id for event in rendered_tool_results] == ["reissued-shell"]
 
         await inputs.put("/quit")
         await asyncio.wait_for(repl_task, timeout=1)
@@ -951,6 +970,880 @@ async def test_queued_input_cancels_unstarted_dispatch_then_reissued_shell_strea
         if not repl_task.done():
             repl_task.cancel()
             await asyncio.gather(repl_task, return_exceptions=True)
+
+
+async def test_queued_input_keeps_a_completed_tool_result_in_the_next_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import axio_repl
+
+    tool_call_ready = asyncio.Event()
+    queued_input_admitted = asyncio.Event()
+    allow_iteration_end = asyncio.Event()
+    second_provider_call = asyncio.Event()
+    inputs: asyncio.Queue[str] = asyncio.Queue()
+    calls: list[list[Message]] = []
+    submitted_at = datetime(2026, 8, 21, 13, 42, 17, 123456, tzinfo=UTC)
+
+    async def patch_handler() -> str:
+        return "patched instantly"
+
+    class ToolTransport:
+        name = "stub"
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.model = ModelSpec(
+                id="stub/model",
+                capabilities=frozenset({Capability.text, Capability.tool_use}),
+            )
+            self.models = ModelRegistry([self.model])
+            self.temperature: float | None = None
+            self.max_output_tokens: int | None = None
+            self.debug = False
+
+        async def fetch_models(self) -> None:
+            pass
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del tools, system
+            calls.append(list(messages))
+            if len(calls) == 1:
+                yield ToolUseStart(index=0, tool_use_id="patch-call", name="patch_file")
+                yield ToolInputDelta(index=0, tool_use_id="patch-call", partial_json="{}")
+                tool_call_ready.set()
+                await allow_iteration_end.wait()
+                yield IterationEnd(
+                    iteration=1,
+                    stop_reason=StopReason.tool_use,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            second_provider_call.set()
+            yield TextDelta(index=0, delta="done")
+            yield IterationEnd(
+                iteration=2,
+                stop_reason=StopReason.end_turn,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    class PromptSession:
+        async def prompt_async(self, prompt: object) -> str:
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
+            return await inputs.get()
+
+    class InertTerminal:
+        def __init__(self, session: PromptSession) -> None:
+            del session
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            pass
+
+    def make_prompt_session(
+        status: object,
+        *,
+        on_interrupt: Callable[[], None],
+        on_shutdown: Callable[[], None],
+        recall_pending: Callable[[], Awaitable[str | None]],
+        on_empty_eof: Callable[[float], bool],
+        capture_target: Callable[[], str],
+        reserve_sequence: Callable[[], int],
+        theme: object,
+    ) -> PromptSession:
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, status, theme
+        return PromptSession()
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [Tool(name="patch_file", handler=patch_handler)], "test", tmp_path, ""
+
+    original_admit = PendingInputCoordinator.admit
+
+    async def tracked_admit(
+        coordinator: object,
+        text: str,
+        target_agent_id: str,
+        *,
+        reserved_seq: int | None = None,
+        submitted_at: datetime | None = None,
+        author: str | None = None,
+    ) -> object:
+        entry = await original_admit(
+            cast(Any, coordinator),
+            text,
+            target_agent_id,
+            reserved_seq=reserved_seq,
+            submitted_at=submitted_at,
+            author=author,
+        )
+        if text == "queued while generating":
+            queued_input_admitted.set()
+        return entry
+
+    journal_root = tmp_path / "journals"
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "resolve_effective_username", lambda: "alice")
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (ToolTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "accepted_at", lambda _session: submitted_at)
+    monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
+    monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(PendingInputCoordinator, "admit", tracked_admit)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["axio-repl", "--sandbox", "none", "--session-log-dir", str(journal_root)],
+    )
+
+    await inputs.put("start")
+    repl_task = asyncio.create_task(main())
+    try:
+        await asyncio.wait_for(tool_call_ready.wait(), timeout=1)
+        await inputs.put("queued while generating")
+        await asyncio.wait_for(queued_input_admitted.wait(), timeout=1)
+        allow_iteration_end.set()
+        await asyncio.wait_for(second_provider_call.wait(), timeout=1)
+
+        result_index = next(
+            index
+            for index, message in enumerate(calls[1])
+            if any(
+                isinstance(block, ToolResultBlock) and block.tool_use_id == "patch-call" for block in message.content
+            )
+        )
+        result = next(
+            block
+            for block in calls[1][result_index].content
+            if isinstance(block, ToolResultBlock) and block.tool_use_id == "patch-call"
+        )
+        queued_index = next(
+            index
+            for index, message in enumerate(calls[1])
+            if any(
+                isinstance(block, TextBlock) and block.text == "queued while generating" for block in message.content
+            )
+        )
+        assert (result.content, result.is_error) == ("patched instantly", False)
+        assert result_index < queued_index
+        assert calls[1][queued_index].provenance == InputProvenance(
+            human_authored=True,
+            source="interactive",
+            author="alice",
+            submitted_at=submitted_at,
+        )
+
+        await inputs.put("/quit")
+        await asyncio.wait_for(repl_task, timeout=1)
+    finally:
+        allow_iteration_end.set()
+        if not repl_task.done():
+            repl_task.cancel()
+            await asyncio.gather(repl_task, return_exceptions=True)
+
+    output = capsys.readouterr().out
+    assert "13:42 alice> queued while generating" in output
+    assert output.count("▶ patch_file #001") == 1
+    assert output.count("✓ patch_file #001") == 1
+    assert "✗ patch_file #001" not in output
+    assert "[interrupted by user]" not in output
+
+    journal_paths = list(journal_root.rglob(SEMANTIC_FILENAME))
+    assert len(journal_paths) == 1
+    records = read_journal(journal_paths[0]).records
+    buffered = next(
+        record
+        for record in records
+        if record["kind"] == "input_buffered"
+        and isinstance(record.get("payload"), dict)
+        and cast(dict[str, Any], record["payload"])["event"]["text"] == "queued while generating"
+    )
+    event = cast(dict[str, Any], cast(dict[str, Any], buffered["payload"])["event"])
+    assert event["submitted_at"] == submitted_at.isoformat(timespec="microseconds")
+    assert event["author"] == "alice"
+
+
+@pytest.mark.parametrize("boundary", ["completed-result", "malformed-call", "foreign-target"])
+async def test_queued_input_is_injected_before_provider_after_any_tool_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    import axio_repl
+
+    queue_window_ready = asyncio.Event()
+    release_boundary = asyncio.Event()
+    input_reserved = asyncio.Event()
+    input_admitted = asyncio.Event()
+    second_provider_call = asyncio.Event()
+    inputs: asyncio.Queue[str] = asyncio.Queue()
+    calls: list[list[Message]] = []
+    submitted_at = datetime(2026, 8, 21, 15, 7, 11, 111222, tzinfo=UTC)
+
+    async def instant_tool() -> str:
+        return "completed result"
+
+    class ToolTransport:
+        name = "stub"
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.model = ModelSpec(
+                id="stub/model",
+                capabilities=frozenset({Capability.text, Capability.tool_use}),
+            )
+            self.models = ModelRegistry([self.model])
+            self.temperature: float | None = None
+            self.max_output_tokens: int | None = None
+            self.debug = False
+
+        async def fetch_models(self) -> None:
+            pass
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del tools, system
+            calls.append(list(messages))
+            if len(calls) > 1:
+                second_provider_call.set()
+                yield TextDelta(index=0, delta="done")
+                yield IterationEnd(
+                    iteration=2,
+                    stop_reason=StopReason.end_turn,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            yield ToolUseStart(index=0, tool_use_id="boundary-call", name="instant")
+            partial_json = '{"value":' if boundary == "malformed-call" else "{}"
+            yield ToolInputDelta(index=0, tool_use_id="boundary-call", partial_json=partial_json)
+            if boundary == "malformed-call":
+                queue_window_ready.set()
+                await release_boundary.wait()
+            yield IterationEnd(
+                iteration=1,
+                stop_reason=StopReason.tool_use,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    class PromptSession:
+        def __init__(self, reserve_sequence: Callable[[], int]) -> None:
+            self.reserve_sequence = reserve_sequence
+            self.accepted_sequence: int | None = None
+            self.accepted_target = "main"
+
+        async def prompt_async(self, prompt: object) -> str:
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
+            result = await inputs.get()
+            self.accepted_sequence = self.reserve_sequence()
+            self.accepted_target = (
+                "child" if result == "queued at boundary" and boundary == "foreign-target" else "main"
+            )
+            if result == "queued at boundary":
+                input_reserved.set()
+            return result
+
+    class InertTerminal:
+        def __init__(self, session: PromptSession) -> None:
+            del session
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            pass
+
+    def make_prompt_session(
+        status: object,
+        *,
+        on_interrupt: Callable[[], None],
+        on_shutdown: Callable[[], None],
+        recall_pending: Callable[[], Awaitable[str | None]],
+        on_empty_eof: Callable[[float], bool],
+        capture_target: Callable[[], str],
+        reserve_sequence: Callable[[], int],
+        theme: object,
+    ) -> PromptSession:
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        return PromptSession(reserve_sequence)
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [Tool(name="instant", handler=instant_tool)], "test", tmp_path, ""
+
+    original_admit = PendingInputCoordinator.admit
+
+    async def tracked_admit(
+        coordinator: object,
+        text: str,
+        target_agent_id: str,
+        *,
+        reserved_seq: int | None = None,
+        submitted_at: datetime | None = None,
+        author: str | None = None,
+    ) -> object:
+        entry = await original_admit(
+            cast(Any, coordinator),
+            text,
+            target_agent_id,
+            reserved_seq=reserved_seq,
+            submitted_at=submitted_at,
+            author=author,
+        )
+        if text == "queued at boundary":
+            input_admitted.set()
+        return entry
+
+    original_render_runtime_event = axio_repl.render_runtime_event
+
+    async def tracked_render_runtime_event(renderer: ReplRenderer, envelope: object) -> None:
+        event = cast(Any, envelope).event
+        if (
+            boundary in {"completed-result", "foreign-target"}
+            and isinstance(event, ToolResult)
+            and event.tool_use_id == "boundary-call"
+        ):
+            queue_window_ready.set()
+            await release_boundary.wait()
+        await original_render_runtime_event(renderer, cast(Any, envelope))
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "resolve_effective_username", lambda: "alice")
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (ToolTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "accepted_at", lambda _session: submitted_at)
+    monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
+    monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(axio_repl, "render_runtime_event", tracked_render_runtime_event)
+    monkeypatch.setattr(PendingInputCoordinator, "admit", tracked_admit)
+    monkeypatch.setattr(axio_repl._panel, "accepted_sequence", lambda session: session.accepted_sequence)
+    monkeypatch.setattr(axio_repl._panel, "accepted_target", lambda session, _fallback: session.accepted_target)
+    monkeypatch.setattr(sys, "argv", ["axio-repl", "--sandbox", "none", "--no-session-log"])
+
+    await inputs.put("start")
+    repl_task = asyncio.create_task(main())
+    try:
+        await asyncio.wait_for(queue_window_ready.wait(), timeout=1)
+        await inputs.put("queued at boundary")
+        await asyncio.wait_for(input_reserved.wait(), timeout=1)
+        release_boundary.set()
+        await asyncio.wait_for(second_provider_call.wait(), timeout=1)
+        assert input_admitted.is_set()
+
+        result_index = next(
+            index
+            for index, message in enumerate(calls[1])
+            if any(
+                isinstance(block, ToolResultBlock) and block.tool_use_id == "boundary-call"
+                for block in message.content
+            )
+        )
+        result = next(
+            block
+            for block in calls[1][result_index].content
+            if isinstance(block, ToolResultBlock) and block.tool_use_id == "boundary-call"
+        )
+        if boundary == "foreign-target":
+            assert not any(
+                isinstance(block, TextBlock) and block.text == "queued at boundary"
+                for message in calls[1]
+                for block in message.content
+            )
+        else:
+            queued_index = next(
+                index
+                for index, message in enumerate(calls[1])
+                if any(
+                    isinstance(block, TextBlock) and block.text == "queued at boundary" for block in message.content
+                )
+            )
+            assert result_index < queued_index
+            assert calls[1][queued_index].provenance == InputProvenance(
+                human_authored=True,
+                source="interactive",
+                author="alice",
+                submitted_at=submitted_at,
+            )
+        if boundary != "malformed-call":
+            assert (result.content, result.is_error) == ("completed result", False)
+        else:
+            assert result.is_error
+            assert "Malformed JSON arguments" in str(result.content)
+        assert "[interrupted by user]" not in str(result.content)
+
+        await inputs.put("/quit")
+        await asyncio.wait_for(repl_task, timeout=1)
+    finally:
+        release_boundary.set()
+        if not repl_task.done():
+            repl_task.cancel()
+            await asyncio.gather(repl_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("boundary", ["completed-result", "malformed-call"])
+async def test_background_child_injects_targeted_input_at_its_next_provider_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    import axio_repl
+
+    child_boundary_ready = asyncio.Event()
+    release_child_boundary = asyncio.Event()
+    child_input_reserved = asyncio.Event()
+    child_input_admitted = asyncio.Event()
+    release_main = asyncio.Event()
+    child_second_provider_call = asyncio.Event()
+    inputs: asyncio.Queue[str] = asyncio.Queue()
+    child_id: str | None = None
+    main_calls: list[list[Message]] = []
+    child_calls: list[list[Message]] = []
+
+    async def instant_tool() -> str:
+        return "child completed result"
+
+    class ToolTransport:
+        name = "stub"
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.model = ModelSpec(
+                id="stub/model",
+                capabilities=frozenset({Capability.text, Capability.tool_use}),
+            )
+            self.models = ModelRegistry([self.model])
+            self.temperature: float | None = None
+            self.max_output_tokens: int | None = None
+            self.debug = False
+
+        async def fetch_models(self) -> None:
+            pass
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del tools, system
+            identity = current_turn_identity()
+            assert identity is not None
+            if identity.agent_id == "main":
+                main_calls.append(list(messages))
+                if len(main_calls) == 1:
+                    yield ToolUseStart(index=0, tool_use_id="spawn-call", name="spawn_agent")
+                    yield ToolInputDelta(
+                        index=0,
+                        tool_use_id="spawn-call",
+                        partial_json='{"task":"inspect","name":"boundary-child"}',
+                    )
+                    yield IterationEnd(
+                        iteration=1,
+                        stop_reason=StopReason.tool_use,
+                        usage=Usage(input_tokens=1, output_tokens=1),
+                    )
+                    return
+                if len(main_calls) == 2:
+                    await release_main.wait()
+                yield TextDelta(index=0, delta="main done")
+                yield IterationEnd(
+                    iteration=len(main_calls),
+                    stop_reason=StopReason.end_turn,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+
+            child_calls.append(list(messages))
+            if len(child_calls) > 1:
+                child_second_provider_call.set()
+                yield TextDelta(index=0, delta="child done")
+                yield IterationEnd(
+                    iteration=2,
+                    stop_reason=StopReason.end_turn,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            yield ToolUseStart(index=0, tool_use_id="child-boundary-call", name="instant")
+            partial_json = '{"value":' if boundary == "malformed-call" else "{}"
+            yield ToolInputDelta(index=0, tool_use_id="child-boundary-call", partial_json=partial_json)
+            if boundary == "malformed-call":
+                child_boundary_ready.set()
+                await release_child_boundary.wait()
+            yield IterationEnd(
+                iteration=1,
+                stop_reason=StopReason.tool_use,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    class PromptSession:
+        def __init__(self, reserve_sequence: Callable[[], int]) -> None:
+            self.reserve_sequence = reserve_sequence
+            self.accepted_sequence: int | None = None
+
+        async def prompt_async(self, prompt: object) -> str:
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
+            result = await inputs.get()
+            self.accepted_sequence = self.reserve_sequence()
+            if result == "child queued input":
+                child_input_reserved.set()
+            return result
+
+    class InertTerminal:
+        def __init__(self, session: PromptSession) -> None:
+            del session
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            pass
+
+    def make_prompt_session(
+        status: object,
+        *,
+        on_interrupt: Callable[[], None],
+        on_shutdown: Callable[[], None],
+        recall_pending: Callable[[], Awaitable[str | None]],
+        on_empty_eof: Callable[[float], bool],
+        capture_target: Callable[[], str],
+        reserve_sequence: Callable[[], int],
+        theme: object,
+    ) -> PromptSession:
+        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        return PromptSession(reserve_sequence)
+
+    spawn_tool = next(tool for tool in TOOLS if tool.name == "spawn_agent")
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [spawn_tool, Tool(name="instant", handler=instant_tool)], "test", tmp_path, ""
+
+    original_admit = PendingInputCoordinator.admit
+
+    async def tracked_admit(
+        coordinator: object,
+        text: str,
+        target_agent_id: str,
+        *,
+        reserved_seq: int | None = None,
+        submitted_at: datetime | None = None,
+        author: str | None = None,
+    ) -> object:
+        entry = await original_admit(
+            cast(Any, coordinator),
+            text,
+            target_agent_id,
+            reserved_seq=reserved_seq,
+            submitted_at=submitted_at,
+            author=author,
+        )
+        if text == "child queued input":
+            child_input_admitted.set()
+        return entry
+
+    original_render_runtime_event = axio_repl.render_runtime_event
+
+    async def tracked_render_runtime_event(renderer: ReplRenderer, envelope: object) -> None:
+        nonlocal child_id
+        event = cast(Any, envelope).event
+        agent_id = cast(Any, envelope).agent_id
+        if isinstance(event, AgentStarted) and agent_id != "main":
+            child_id = agent_id
+            renderer.set_focus(agent_id)
+        if (
+            boundary == "completed-result"
+            and agent_id != "main"
+            and isinstance(event, ToolResult)
+            and event.tool_use_id == "child-boundary-call"
+        ):
+            child_boundary_ready.set()
+            await release_child_boundary.wait()
+        await original_render_runtime_event(renderer, cast(Any, envelope))
+
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (ToolTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "accepted_sequence", lambda session: session.accepted_sequence)
+    monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
+    monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(axio_repl, "render_runtime_event", tracked_render_runtime_event)
+    monkeypatch.setattr(PendingInputCoordinator, "admit", tracked_admit)
+    monkeypatch.setattr(sys, "argv", ["axio-repl", "--sandbox", "none", "--no-session-log"])
+
+    await inputs.put("spawn child")
+    repl_task = asyncio.create_task(main())
+    try:
+        await asyncio.wait_for(child_boundary_ready.wait(), timeout=1)
+        assert child_id is not None
+        await inputs.put("child queued input")
+        await asyncio.wait_for(child_input_reserved.wait(), timeout=1)
+        release_child_boundary.set()
+        await asyncio.wait_for(child_input_admitted.wait(), timeout=1)
+        release_main.set()
+        await asyncio.wait_for(child_second_provider_call.wait(), timeout=1)
+
+        result_index = next(
+            index
+            for index, message in enumerate(child_calls[1])
+            if any(
+                isinstance(block, ToolResultBlock) and block.tool_use_id == "child-boundary-call"
+                for block in message.content
+            )
+        )
+        input_index = next(
+            index
+            for index, message in enumerate(child_calls[1])
+            if any(isinstance(block, TextBlock) and block.text == "child queued input" for block in message.content)
+        )
+        assert result_index < input_index
+        result = next(
+            block
+            for block in child_calls[1][result_index].content
+            if isinstance(block, ToolResultBlock) and block.tool_use_id == "child-boundary-call"
+        )
+        if boundary == "completed-result":
+            assert (result.content, result.is_error) == ("child completed result", False)
+        else:
+            assert result.is_error
+            assert "Malformed JSON arguments" in str(result.content)
+        assert not any(
+            isinstance(block, TextBlock) and block.text == "child queued input"
+            for message in main_calls[1]
+            for block in message.content
+        )
+
+        await inputs.put("/quit")
+        await asyncio.wait_for(repl_task, timeout=2)
+    finally:
+        release_child_boundary.set()
+        release_main.set()
+        if not repl_task.done():
+            repl_task.cancel()
+            await asyncio.gather(repl_task, return_exceptions=True)
+
+
+async def test_escape_cancels_an_active_tool_without_deferring_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import axio_repl
+
+    tool_started = asyncio.Event()
+    tool_cancelled = asyncio.Event()
+    result_rendered = asyncio.Event()
+    preemption_latched = asyncio.Event()
+    second_provider_call = asyncio.Event()
+    inputs: asyncio.Queue[str] = asyncio.Queue()
+    interrupt_callbacks: list[Callable[[], None]] = []
+    observed_events: list[RuntimeEvent] = []
+    calls: list[list[Message]] = []
+
+    async def slow_tool() -> str:
+        tool_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            tool_cancelled.set()
+            raise
+        return "unreachable"
+
+    class ToolTransport:
+        name = "stub"
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.model = ModelSpec(
+                id="stub/model",
+                capabilities=frozenset({Capability.text, Capability.tool_use}),
+            )
+            self.models = ModelRegistry([self.model])
+            self.temperature: float | None = None
+            self.max_output_tokens: int | None = None
+            self.debug = False
+
+        async def fetch_models(self) -> None:
+            pass
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del tools, system
+            calls.append(list(messages))
+            if len(calls) > 1:
+                second_provider_call.set()
+                yield TextDelta(index=0, delta="done")
+                yield IterationEnd(
+                    iteration=2,
+                    stop_reason=StopReason.end_turn,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+                return
+            yield ToolUseStart(index=0, tool_use_id="slow-call", name="slow")
+            yield ToolInputDelta(index=0, tool_use_id="slow-call", partial_json="{}")
+            yield IterationEnd(
+                iteration=1,
+                stop_reason=StopReason.tool_use,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+
+    class PromptSession:
+        async def prompt_async(self, prompt: object) -> str:
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
+            return await inputs.get()
+
+    class InertTerminal:
+        def __init__(self, session: PromptSession) -> None:
+            del session
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            pass
+
+    def make_prompt_session(
+        status: object,
+        *,
+        on_interrupt: Callable[[], None],
+        on_shutdown: Callable[[], None],
+        recall_pending: Callable[[], Awaitable[str | None]],
+        on_empty_eof: Callable[[float], bool],
+        capture_target: Callable[[], str],
+        reserve_sequence: Callable[[], int],
+        theme: object,
+    ) -> PromptSession:
+        del capture_target, on_empty_eof, on_shutdown, recall_pending, reserve_sequence, status, theme
+        interrupt_callbacks.append(on_interrupt)
+        return PromptSession()
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [Tool(name="slow", handler=slow_tool)], "test", tmp_path, ""
+
+    original_render_runtime_event = axio_repl.render_runtime_event
+    original_request_preemption = DeferredToolRegistry.request_preemption
+
+    def tracked_request_preemption(registry: DeferredToolRegistry, turn_id: str | None) -> bool:
+        result = original_request_preemption(registry, turn_id)
+        if result:
+            preemption_latched.set()
+        return result
+
+    async def tracked_render_runtime_event(renderer: ReplRenderer, envelope: object) -> None:
+        event = cast(Any, envelope).event
+        observed_events.append(event)
+        await original_render_runtime_event(renderer, cast(Any, envelope))
+        if isinstance(event, ToolResult) and event.tool_use_id == "slow-call":
+            result_rendered.set()
+
+    journal_root = tmp_path / "journals"
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (ToolTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
+    monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(axio_repl, "render_runtime_event", tracked_render_runtime_event)
+    monkeypatch.setattr(DeferredToolRegistry, "request_preemption", tracked_request_preemption)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["axio-repl", "--sandbox", "none", "--session-log-dir", str(journal_root)],
+    )
+
+    await inputs.put("start")
+    repl_task = asyncio.create_task(main())
+    try:
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        assert len(interrupt_callbacks) == 1
+        await inputs.put("queued before escape")
+        await asyncio.wait_for(preemption_latched.wait(), timeout=1)
+        interrupt_callbacks[0]()
+        await asyncio.wait_for(tool_cancelled.wait(), timeout=1)
+        await asyncio.wait_for(result_rendered.wait(), timeout=1)
+        await asyncio.wait_for(second_provider_call.wait(), timeout=1)
+        await inputs.put("/quit")
+        await asyncio.wait_for(repl_task, timeout=1)
+    finally:
+        if not repl_task.done():
+            repl_task.cancel()
+            await asyncio.gather(repl_task, return_exceptions=True)
+
+    result = next(event for event in observed_events if isinstance(event, ToolResult))
+    assert (result.tool_use_id, result.content, result.is_error) == (
+        "slow-call",
+        "[interrupted by user]",
+        True,
+    )
+    assert any(isinstance(event, InterruptionRequested) for event in observed_events)
+    assert any(
+        isinstance(block, TextBlock) and block.text == "queued before escape"
+        for message in calls[1]
+        for block in message.content
+    )
+    assert not any(
+        isinstance(block, ToolResultBlock) and "continues after the model turn was preempted" in str(block.content)
+        for message in calls[1]
+        for block in message.content
+    )
+    output = capsys.readouterr().out
+    assert output.count("▶ slow #001") == 1
+    assert output.count("✗ slow #001") == 1
+    assert output.count("[interrupted by user]") == 1
+    assert "continues after the model turn was preempted" not in output
+    assert "Deferred tool" not in output
+
+    journal_paths = list(journal_root.rglob(SEMANTIC_FILENAME))
+    assert len(journal_paths) == 1
+    records = read_journal(journal_paths[0]).records
+    interruption_index = next(
+        index for index, record in enumerate(records) if record["kind"] == "interruption_requested"
+    )
+    result_index = next(
+        index
+        for index, record in enumerate(records)
+        if record["kind"] == "tool_result"
+        and isinstance(record.get("payload"), dict)
+        and cast(dict[str, Any], record["payload"])["event"].get("record_type") == "ToolResult"
+    )
+    assert interruption_index < result_index
+    assert not any(
+        record["kind"] == "input_received"
+        and isinstance(record.get("payload"), dict)
+        and cast(dict[str, Any], record["payload"])["event"].get("source") == "deferred-tool"
+        for record in records
+    )
 
 
 async def test_double_eof_drains_active_and_pending_turns_before_shutdown(

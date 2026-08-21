@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -297,6 +298,25 @@ async def test_claimed_input_is_recovered_until_delivery_is_durable(tmp_path: Pa
     await delivered.close()
 
     assert materialize_recovery(delivered.events_path).pending_inputs == ()
+
+
+async def test_pending_input_recovery_preserves_submission_identity_and_time(tmp_path: Path) -> None:
+    submitted_at = datetime(2026, 8, 21, 13, 42, 17, 123456, tzinfo=UTC)
+    journal = await SessionJournal.open(session_id="source", root=tmp_path)
+    await _publish_event(
+        journal,
+        "input_buffered",
+        InputBuffered("one", "pending", "main", submitted_at, "alice"),
+        1,
+    )
+    await journal.close()
+
+    recovered = materialize_recovery(journal.events_path)
+
+    assert len(recovered.pending_inputs) == 1
+    assert recovered.pending_inputs[0].source_id == "one"
+    assert recovered.pending_inputs[0].submitted_at == submitted_at
+    assert recovered.pending_inputs[0].author == "alice"
 
 
 async def test_committed_claimed_input_is_not_requeued_after_crash_before_delivery_event(tmp_path: Path) -> None:

@@ -65,14 +65,11 @@ async def test_result_waits_for_protocol_placeholder_before_delivery() -> None:
     assert registry.snapshots() == ()
 
 
-async def test_just_started_dispatch_can_be_cancelled_without_running_handler() -> None:
-    handler_started = asyncio.Event()
-
+async def test_explicit_interruption_revokes_a_pending_deferral_request() -> None:
     async def deliver(_notification: object) -> None:
-        raise AssertionError("cancelled dispatch must not be delivered as deferred")
+        raise AssertionError("interrupted dispatch must not be delivered as deferred")
 
     async def result() -> list[ToolResultBlock]:
-        handler_started.set()
         await asyncio.Future()
         return []
 
@@ -81,12 +78,108 @@ async def test_just_started_dispatch_can_be_cancelled_without_running_handler() 
     dispatch = ToolDispatch((ToolUseBlock(id="call", name="shell", input={}),), task, "main")
     registry.dispatch_started(dispatch)
 
-    assert registry.cancel_before_run(dispatch)
+    assert registry.request_preemption(None)
+    assert registry.should_defer(dispatch)
+    assert registry.request_interruption(None)
+    assert not registry.should_defer(dispatch)
+
+    task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     registry.dispatch_finished(dispatch)
+    assert registry.snapshots() == ()
 
-    assert task.cancelled()
-    assert not handler_started.is_set()
+
+async def test_explicit_interruption_cancels_an_already_deferred_dispatch() -> None:
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    delivered: list[DeferredToolNotification] = []
+
+    async def deliver(notification: DeferredToolNotification) -> None:
+        delivered.append(notification)
+
+    async def result() -> list[ToolResultBlock]:
+        handler_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+        return []
+
+    registry = DeferredToolRegistry(deliver)
+    task = asyncio.create_task(result())
+    dispatch = ToolDispatch((ToolUseBlock(id="call", name="shell", input={}),), task, "main")
+    registry.dispatch_started(dispatch)
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    assert registry.request_preemption(None)
+    registry.defer(dispatch)
+
+    assert registry.request_interruption(None)
+    await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+    registry.protocol_closed(dispatch)
+    for _ in range(10):
+        if delivered:
+            break
+        await asyncio.sleep(0)
+
+    assert [(item.tool_use_id, item.text, item.is_error) for item in delivered] == [
+        ("call", "[interrupted by user]", True)
+    ]
+    assert registry.snapshots() == ()
+
+
+async def test_close_does_not_wait_for_protocol_after_interrupting_a_deferred_dispatch() -> None:
+    async def deliver(_notification: DeferredToolNotification) -> None:
+        raise AssertionError("shutdown must not deliver an interrupted result")
+
+    async def result() -> list[ToolResultBlock]:
+        await asyncio.Future()
+        return []
+
+    registry = DeferredToolRegistry(deliver)
+    task = asyncio.create_task(result())
+    dispatch = ToolDispatch((ToolUseBlock(id="call", name="shell", input={}),), task, "main")
+    registry.dispatch_started(dispatch)
+    registry.defer(dispatch)
+    assert registry.request_interruption(None)
+
+    snapshots = await asyncio.wait_for(registry.close(), timeout=1)
+
+    assert snapshots[0].phase is DeferredToolPhase.DEFERRED
+    assert registry.snapshots() == ()
+
+
+async def test_delivery_start_is_the_linearization_point_for_interruption() -> None:
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+    delivered: list[DeferredToolNotification] = []
+
+    async def deliver(notification: DeferredToolNotification) -> None:
+        delivery_started.set()
+        await release_delivery.wait()
+        delivered.append(notification)
+
+    async def result() -> list[ToolResultBlock]:
+        return [ToolResultBlock(tool_use_id="call", content="successful result")]
+
+    registry = DeferredToolRegistry(deliver)
+    task = asyncio.create_task(result())
+    dispatch = ToolDispatch((ToolUseBlock(id="call", name="shell", input={}),), task, "main")
+    registry.dispatch_started(dispatch)
+    registry.defer(dispatch)
+    registry.protocol_closed(dispatch)
+    await asyncio.wait_for(delivery_started.wait(), timeout=1)
+
+    assert registry.snapshots()[0].phase is DeferredToolPhase.DELIVERING
+    assert not registry.request_interruption(None)
+
+    release_delivery.set()
+    for _ in range(10):
+        if delivered:
+            break
+        await asyncio.sleep(0)
+
+    assert [(item.text, item.is_error) for item in delivered] == [("successful result", False)]
     assert registry.snapshots() == ()
 
 
@@ -210,7 +303,7 @@ async def test_background_turn_deferral_retains_owner_and_closes_protocol_once()
         if isinstance(block, ToolResultBlock) and block.tool_use_id == "call-1"
     ]
     assert len(protocol_results) == 1
-    assert "continues after interruption" in str(protocol_results[0].content)
+    assert "continues after the model turn was preempted" in str(protocol_results[0].content)
 
     release.set()
     for _ in range(10):
@@ -407,7 +500,7 @@ async def test_deferred_result_keeps_original_badge_and_renders_once(
         if isinstance(block, ToolResultBlock) and block.tool_use_id == "provider-call-1"
     ]
     assert len(placeholders) == 1
-    assert "continues after interruption" in str(placeholders[0].content)
+    assert "continues after the model turn was preempted" in str(placeholders[0].content)
 
     assert not await renderer.render_deferred_tool_result(delivered[0])
     assert capsys.readouterr().out == ""

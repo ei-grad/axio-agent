@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -33,10 +34,18 @@ class RecoveredPendingInput:
     source_id: str
     text: str
     target_agent_id: str
+    submitted_at: datetime | None = None
+    author: str = "human"
 
     def __post_init__(self) -> None:
         if not self.source_id or not self.text or not self.target_agent_id:
             raise RecoveryError("recovered pending input fields must not be empty")
+        if self.submitted_at is not None and (
+            self.submitted_at.tzinfo is None or self.submitted_at.utcoffset() is None
+        ):
+            raise RecoveryError("recovered pending input submitted_at must be timezone-aware")
+        if not self.author:
+            raise RecoveryError("recovered pending input author must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +188,11 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
             source_id = _string(event.get("input_id"), "input_buffered.input_id")
             if source_id in input_status:
                 raise RecoveryError(f"duplicate input id: {source_id}")
+            raw_submitted_at = event.get("submitted_at")
+            submitted_at = (
+                _timestamp(raw_submitted_at, "input_buffered.submitted_at") if raw_submitted_at is not None else None
+            )
+            raw_author = event.get("author")
             pending[source_id] = RecoveredPendingInput(
                 source_id=source_id,
                 text=_string(event.get("text"), "input_buffered.text"),
@@ -186,6 +200,8 @@ def materialize_recovery(events_path: Path) -> RecoveryMaterialization:
                     event.get("intended_target_agent_id"),
                     "input_buffered.intended_target_agent_id",
                 ),
+                submitted_at=submitted_at,
+                author=_string(raw_author, "input_buffered.author") if raw_author is not None else "human",
             )
             input_status[source_id] = "pending"
             editor_text = ""
@@ -623,6 +639,17 @@ def _string(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise RecoveryError(f"{label} is not a string")
     return value
+
+
+def _timestamp(value: object, label: str) -> datetime:
+    raw = _string(value, label)
+    try:
+        result = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise RecoveryError(f"{label} is not an ISO 8601 timestamp") from exc
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise RecoveryError(f"{label} must be timezone-aware")
+    return result
 
 
 def _string_tuple(value: object, label: str, *, unique: bool = True) -> tuple[str, ...]:

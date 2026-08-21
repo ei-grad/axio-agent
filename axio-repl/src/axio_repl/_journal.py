@@ -356,6 +356,10 @@ class _JournalSerializer:
             return value
         if isinstance(value, float):
             return value if math.isfinite(value) else str(value)
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("journal timestamps must be timezone-aware")
+            return value.isoformat(timespec="microseconds")
         if isinstance(value, str):
             return _redact_string(value)
         if isinstance(value, Enum):

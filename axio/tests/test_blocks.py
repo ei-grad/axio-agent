@@ -1,5 +1,7 @@
 """Tests for axio.blocks: all content block types."""
 
+from datetime import UTC, datetime
+
 import pytest
 
 from axio.blocks import (
@@ -219,6 +221,23 @@ class TestMessageSerialization:
             "human_authored": False,
             "source": "peer",
             "author": "agent-7",
+        }
+
+    def test_human_input_provenance_roundtrips_submission_identity_and_time(self) -> None:
+        submitted_at = datetime(2026, 8, 21, 13, 42, 17, 123456, tzinfo=UTC)
+        provenance = InputProvenance(
+            human_authored=True,
+            source="interactive",
+            author="alice",
+            submitted_at=submitted_at,
+        )
+
+        assert InputProvenance.from_dict(provenance.to_dict()) == provenance
+        assert provenance.to_dict() == {
+            "human_authored": True,
+            "source": "interactive",
+            "author": "alice",
+            "submitted_at": "2026-08-21T13:42:17.123456+00:00",
         }
 
     def test_old_serialized_message_without_provenance_remains_supported(self) -> None:

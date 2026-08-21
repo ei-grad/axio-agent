@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import fields, replace
+from datetime import UTC, datetime
 
 import pytest
 from axio.blocks import TextBlock
@@ -380,6 +381,44 @@ async def test_pending_coordinator_journals_each_transition_before_exposing_it()
         editor_text="first\n\nsecond",
     )
     assert coordinator.pending_count == 0
+
+
+async def test_pending_input_preserves_submission_identity_and_time_into_model_provenance() -> None:
+    events: list[RuntimeEvent] = []
+    submitted_at = datetime(2026, 8, 21, 13, 42, 17, 123456, tzinfo=UTC)
+
+    async def publish(event: RuntimeEvent) -> AgentEventEnvelope:
+        events.append(event)
+        return AgentEventEnvelope(
+            seq=len(events),
+            session_id="session",
+            run_id="run",
+            agent_id="main",
+            parent_agent_id=None,
+            turn_id=None,
+            execution_mode=ExecutionMode.FOREGROUND,
+            parent_tool_use_id=None,
+            event=event,
+        )
+
+    coordinator = PendingInputCoordinator(publish)
+    entry = await coordinator.admit(
+        "queued",
+        "main",
+        submitted_at=submitted_at,
+        author="alice",
+    )
+    batch = await coordinator.claim_for_target("main", reason="boundary")
+
+    assert events[0] == InputBuffered(entry.id, "queued", "main", submitted_at, "alice")
+    assert batch is not None
+    message = claim_batch_arrivals(batch)[0].message
+    assert message.provenance == InputProvenance(
+        human_authored=True,
+        source="interactive",
+        author="alice",
+        submitted_at=submitted_at,
+    )
 
 
 async def test_cancelled_recall_finishes_published_transition_before_propagating_cancellation() -> None:

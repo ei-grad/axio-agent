@@ -213,12 +213,92 @@ async def test_cancelled_tool_dispatch_can_be_deferred_after_protocol_placeholde
     placeholders = [block for block in placeholder_message.content if isinstance(block, ToolResultBlock)]
     assert len(placeholders) == 1
     assert placeholders[0].tool_use_id == "call-1"
-    assert "continues after interruption" in str(placeholders[0].content)
+    assert "continues after the model turn was preempted" in str(placeholders[0].content)
     assert not any(isinstance(event, ToolResult) for event in events)
 
     release.set()
     results = await asyncio.wait_for(sink.dispatch.task, timeout=1)
     assert results[0].content == "actual result"
+
+
+async def test_cancelled_turn_commits_a_dispatch_that_won_the_completion_race() -> None:
+    async def instant_tool() -> str:
+        return "actual result"
+
+    class CancelWhenDispatchCompletesSink(_RecordingDeferredSink):
+        def dispatch_started(self, dispatch: ToolDispatch) -> None:
+            super().dispatch_started(dispatch)
+            turn = asyncio.current_task()
+            assert turn is not None
+            dispatch.task.add_done_callback(lambda _task: turn.cancel())
+
+    sink = CancelWhenDispatchCompletesSink()
+    context = MemoryContextStore()
+    agent = Agent(
+        system="test",
+        tools=[Tool[Any](name="instant", handler=instant_tool)],
+        transport=StubTransport([make_tool_use_response("instant", "call-1", {})]),
+        deferred_tool_sink=sink,
+    )
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in agent.run_stream("run", context):
+            events.append(event)
+
+    turn = asyncio.create_task(consume())
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert sink.events == ["started", "finished"]
+    history = await context.get_history()
+    results = [block for block in history[-1].content if isinstance(block, ToolResultBlock)]
+    assert [(result.tool_use_id, result.content, result.is_error) for result in results] == [
+        ("call-1", "actual result", False)
+    ]
+    assert [
+        (event.tool_use_id, event.name, event.is_error, event.content)
+        for event in events
+        if isinstance(event, ToolResult)
+    ] == [("call-1", "instant", False, "actual result")]
+
+
+async def test_host_can_stop_before_the_next_provider_request_after_tool_result_commit() -> None:
+    async def instant_tool() -> str:
+        return "actual result"
+
+    async def stop_before_provider() -> None:
+        raise asyncio.CancelledError
+
+    transport = CapturingTransport(
+        [
+            make_tool_use_response("instant", "call-1", {}),
+            make_text_response("must not run"),
+        ]
+    )
+    context = MemoryContextStore()
+    agent = Agent(
+        system="test",
+        tools=[Tool[Any](name="instant", handler=instant_tool)],
+        transport=transport,
+        before_next_provider_request=stop_before_provider,
+    )
+    events: list[StreamEvent] = []
+
+    async def consume() -> None:
+        async for event in agent.run_stream("run", context):
+            events.append(event)
+
+    with pytest.raises(asyncio.CancelledError):
+        await consume()
+
+    assert len(transport.calls) == 1
+    history = await context.get_history()
+    results = [block for block in history[-1].content if isinstance(block, ToolResultBlock)]
+    assert [(result.tool_use_id, result.content, result.is_error) for result in results] == [
+        ("call-1", "actual result", False)
+    ]
+    assert [event.tool_use_id for event in events if isinstance(event, ToolResult)] == ["call-1"]
 
 
 async def test_cancelled_tool_dispatch_stops_when_sink_does_not_authorize_deferral() -> None:

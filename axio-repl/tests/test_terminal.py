@@ -1161,7 +1161,12 @@ async def test_enter_replaces_the_temporary_prompt_with_one_timestamped_powerlin
         clock_calls.append(accepted_time)
         return accepted_time
 
-    async def admit(text: str, target_agent_id: str, reserved_seq: int | None) -> InputSubmitted:
+    async def admit(
+        text: str,
+        target_agent_id: str,
+        reserved_seq: int | None,
+        submitted_at: datetime | None,
+    ) -> InputSubmitted:
         admission_started.set()
         await release_admission.wait()
         return InputSubmitted(

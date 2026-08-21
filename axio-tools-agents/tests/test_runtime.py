@@ -111,6 +111,27 @@ async def test_event_hub_holds_later_publication_until_reserved_ingress_arrives(
     assert observed == [(1, "enter"), (2, "peer-after-enter")]
 
 
+async def test_event_hub_boundary_waits_for_an_already_reserved_ingress() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    accepted_enter_seq = hub.reserve_sequence()
+    boundary = asyncio.create_task(hub.wait_through_current_sequence())
+    await asyncio.sleep(0)
+
+    assert not boundary.done()
+
+    await hub.publish(
+        TextDelta(index=0, delta="enter"),
+        run_id="run",
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        reserved_seq=accepted_enter_seq,
+    )
+
+    assert await asyncio.wait_for(boundary, timeout=1) == accepted_enter_seq
+
+
 async def test_event_hub_discarded_ingress_slot_releases_later_publication() -> None:
     hub = SessionEventHub(session_id="session-1")
     observed: list[tuple[int, str]] = []
