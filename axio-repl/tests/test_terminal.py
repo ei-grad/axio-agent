@@ -88,7 +88,7 @@ class _VirtualTerminal:
             elif character == "\b":
                 self.x = max(0, self.x - 1)
             elif character == "\t":
-                self.x = min(self.columns - 1, ((self.x // 8) + 1) * 8)
+                self.x = min(self.columns, ((self.x // 8) + 1) * 8)
             elif ord(character) >= 32 and character != "\x7f":
                 self._put(character)
             index += 1
@@ -908,6 +908,42 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
                 assert persistent_output.count(expected_reasoning) == 1
                 assert persistent_output.endswith("answer")
 
+                tab_fragment = ("x" * 22) + "\tTAIL"
+                await renderer.render("main", ReasoningDelta(index=0, delta=tab_fragment))
+                await terminal.drain()
+                tab_first_stage = await read_stage()
+                screen.feed(tab_first_stage)
+
+                tab_reasoning_row = next(
+                    index for index, line in enumerate(screen.lines) if line.startswith("> " + ("x" * 22))
+                )
+                tab_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                assert "".join(screen.lines[tab_reasoning_row:tab_prompt_row]) == "> " + ("x" * 22) + "TAIL"
+                assert tab_prompt_row - tab_reasoning_row == 2
+
+                await renderer.render("main", ReasoningDelta(index=0, delta="-MORE"))
+                await terminal.drain()
+                tab_replacement_stage = await read_stage()
+                screen.feed(tab_replacement_stage)
+
+                tab_reasoning_row = next(
+                    index for index, line in enumerate(screen.lines) if line.startswith("> " + ("x" * 22))
+                )
+                tab_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                expected_tab_reasoning = "> " + ("x" * 22) + "TAIL-MORE"
+                assert "".join(screen.lines[tab_reasoning_row:tab_prompt_row]) == expected_tab_reasoning
+                assert tab_prompt_row - tab_reasoning_row == 2
+
+                await renderer.render("main", TextDelta(index=0, delta="done\n"))
+                await terminal.drain()
+                tab_final_stage = await read_stage()
+                screen.feed(tab_final_stage)
+
+                final_prompt_row = next(index for index, line in enumerate(screen.lines) if "tester> draft" in line)
+                persistent_output = "".join(screen.lines[:final_prompt_row])
+                assert persistent_output.count(expected_tab_reasoning) == 1
+                assert persistent_output.endswith("done")
+
                 os.write(master_fd, b" input\r")
                 assert await asyncio.wait_for(prompt, timeout=2) == "draft input"
             finally:
@@ -917,7 +953,9 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
                     await asyncio.gather(prompt, return_exceptions=True)
                 await terminal.close()
 
-        combined = first_stage + second_stage + boundary_stage
+        combined = "".join(
+            (first_stage, second_stage, boundary_stage, tab_first_stage, tab_replacement_stage, tab_final_stage)
+        )
         assert "\x1b[?1049h" not in combined
     finally:
         terminal_input.close()

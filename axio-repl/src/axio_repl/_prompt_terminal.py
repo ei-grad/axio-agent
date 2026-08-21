@@ -159,8 +159,28 @@ class PromptToolkitInlineOutput:
     @staticmethod
     def _display_rows(content: str, columns: int) -> int:
         plain = fragment_list_to_text(to_formatted_text(ANSI(content)))
-        width = get_cwidth(plain)
-        return max(1, (width + columns - 1) // columns)
+        rows = 1
+        column = 0
+        for character in plain:
+            if character == "\t":
+                column = min(columns, ((column // 8) + 1) * 8)
+                continue
+            if character == "\r":
+                column = 0
+                continue
+            if character == "\n":
+                rows += 1
+                column = 0
+                continue
+            width = get_cwidth(character)
+            if width <= 0:
+                continue
+            width = min(width, columns)
+            if column >= columns or column + width > columns:
+                rows += 1
+                column = 0
+            column += width
+        return rows
 
     @staticmethod
     async def _claim_transaction(app: Any, completed: asyncio.Future[None]) -> None:

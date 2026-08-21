@@ -12,8 +12,9 @@ from axio_repl._prompt_terminal import PromptToolkitCompatibilityError, PromptTo
 class _Output:
     responds_to_cpr = False
 
-    def __init__(self, operations: list[str]) -> None:
+    def __init__(self, operations: list[str], *, columns: int = 10) -> None:
         self._operations = operations
+        self._columns = columns
 
     def hide_cursor(self) -> None:
         self._operations.append("hide")
@@ -37,7 +38,7 @@ class _Output:
         self._operations.append("erase-down")
 
     def get_size(self) -> Size:
-        return Size(rows=12, columns=10)
+        return Size(rows=12, columns=self._columns)
 
 
 class _Renderer:
@@ -58,9 +59,9 @@ class _Renderer:
 
 
 class _App:
-    def __init__(self, operations: list[str], *, fail_reset: bool = False) -> None:
+    def __init__(self, operations: list[str], *, fail_reset: bool = False, columns: int = 10) -> None:
         self.is_running = True
-        self.output = _Output(operations)
+        self.output = _Output(operations, columns=columns)
         self.renderer = _Renderer(operations, fail_reset=fail_reset)
         self._running_in_terminal_f: asyncio.Future[None] | None = None
         self._running_in_terminal = False
@@ -120,6 +121,34 @@ async def test_live_output_replaces_wrapped_snapshot_and_finalizes_once() -> Non
     assert operations.index("up:2") < operations.index("erase-down")
     assert "raw:abcdefghijkl\n" in operations
     assert "raw:\r\n" not in operations
+
+
+async def test_live_output_counts_tab_stops_when_replacing_and_finalizing_wrapped_line() -> None:
+    operations: list[str] = []
+    app = _App(operations, columns=32)
+    adapter = PromptToolkitInlineOutput(_Session(app))
+    first = "> " + ("x" * 22) + "\tTAIL"
+
+    await adapter.write_live(first, key=("stdout", 1), is_live=True)
+    operations.clear()
+    await adapter.write_live(first + "-MORE", key=("stdout", 1), is_live=True)
+
+    assert operations.index("up:2") < operations.index("erase-down")
+    assert f"raw:{first}-MORE" in operations
+
+    operations.clear()
+    await adapter.write_live(first + "-MORE\n", key=("stdout", 1), is_live=False)
+
+    assert operations.index("up:2") < operations.index("erase-down")
+    assert f"raw:{first}-MORE\n" in operations
+    assert "raw:\r\n" not in operations
+
+
+def test_live_row_measurement_keeps_ansi_wide_characters_and_tabs_consistent() -> None:
+    assert PromptToolkitInlineOutput._display_rows("\033[2m> " + ("界" * 15) + "\033[0m", 32) == 1
+    assert PromptToolkitInlineOutput._display_rows("\033[2m> " + ("界" * 16) + "\033[0m", 32) == 2
+    assert PromptToolkitInlineOutput._display_rows("> " + ("x" * 22) + "\tTAIL", 32) == 2
+    assert PromptToolkitInlineOutput._display_rows("\033[2m> " + ("界" * 11) + "\tTAIL\033[0m", 32) == 2
 
 
 async def test_suppression_marker_discards_live_snapshot_instead_of_redrawing_it() -> None:
