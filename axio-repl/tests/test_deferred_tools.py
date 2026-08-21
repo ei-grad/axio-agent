@@ -28,7 +28,7 @@ from axio_repl._deferred_tools import (
     DeferredToolRegistry,
 )
 from axio_repl._multiplexer import sanitize_terminal_text
-from axio_repl._theme import NO_COLOR_THEME
+from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
 
 
 async def test_result_waits_for_protocol_placeholder_before_delivery() -> None:
@@ -62,6 +62,31 @@ async def test_result_waits_for_protocol_placeholder_before_delivery() -> None:
     assert len(delivered) == 1
     assert "name=shell, call_id=call-1" in delivered[0]
     assert delivered[0].endswith("done")
+    assert registry.snapshots() == ()
+
+
+async def test_just_started_dispatch_can_be_cancelled_without_running_handler() -> None:
+    handler_started = asyncio.Event()
+
+    async def deliver(_notification: object) -> None:
+        raise AssertionError("cancelled dispatch must not be delivered as deferred")
+
+    async def result() -> list[ToolResultBlock]:
+        handler_started.set()
+        await asyncio.Future()
+        return []
+
+    registry = DeferredToolRegistry(deliver)
+    task = asyncio.create_task(result())
+    dispatch = ToolDispatch((ToolUseBlock(id="call", name="shell", input={}),), task, "main")
+    registry.dispatch_started(dispatch)
+
+    assert registry.cancel_before_run(dispatch)
+    await asyncio.gather(task, return_exceptions=True)
+    registry.dispatch_finished(dispatch)
+
+    assert task.cancelled()
+    assert not handler_started.is_set()
     assert registry.snapshots() == ()
 
 
@@ -137,7 +162,7 @@ async def test_background_turn_deferral_retains_owner_and_closes_protocol_once()
     async def deliver(notification: DeferredToolNotification) -> None:
         delivered.append(notification)
 
-    def dispatch_started(agent_id: str, turn_id: str | None) -> None:
+    def dispatch_started(_dispatch: ToolDispatch, agent_id: str, turn_id: str | None) -> None:
         dispatch_owner.append((agent_id, turn_id))
         started.set()
 
@@ -312,7 +337,7 @@ async def test_deferred_result_keeps_original_badge_and_renders_once(
         assert await renderer.render_deferred_tool_result(notification)
         await renderer.incoming(notification.as_user_text(), suppress_display=True)
 
-    def on_dispatch_started(_agent_id: str, _turn_id: str | None) -> None:
+    def on_dispatch_started(_dispatch: ToolDispatch, _agent_id: str, _turn_id: str | None) -> None:
         dispatch_started.set()
 
     registry = DeferredToolRegistry(
@@ -386,6 +411,47 @@ async def test_deferred_result_keeps_original_badge_and_renders_once(
 
     assert not await renderer.render_deferred_tool_result(delivered[0])
     assert capsys.readouterr().out == ""
+
+
+async def test_deferred_patch_result_uses_semantic_diff_styles(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=DEFAULT_THEME)
+    content = "+1 -1\n@@ -42,2 +42,2 @@ render\n unchanged\n-old\n+new"
+    await renderer.render(
+        "main",
+        ToolUseStart(index=0, tool_use_id="patch-call", name="patch_file"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    renderer.defer_tool_calls(
+        "main",
+        "main-run",
+        "main-turn",
+        (ToolUseBlock(id="patch-call", name="patch_file", input={}),),
+    )
+    capsys.readouterr()
+    notification = DeferredToolNotification(
+        agent_id="main",
+        run_id="main-run",
+        turn_id="main-turn",
+        tool_use_id="patch-call",
+        tool_name="patch_file",
+        text=content,
+        is_error=False,
+    )
+
+    assert await renderer.render_deferred_tool_result(notification)
+
+    output = capsys.readouterr().out
+    assert f"{DEFAULT_THEME.stdout.ansi}+1 -1{DEFAULT_THEME.reset}" in output
+    assert f"{DEFAULT_THEME.tool.ansi}@@ -42,2 +42,2 @@ render{DEFAULT_THEME.reset}" in output
+    assert f"{DEFAULT_THEME.reasoning.ansi} unchanged{DEFAULT_THEME.reset}" in output
+    assert f"{DEFAULT_THEME.error.ansi}-old{DEFAULT_THEME.reset}" in output
+    assert f"{DEFAULT_THEME.success.ansi}+new{DEFAULT_THEME.reset}" in output
+    assert sanitize_terminal_text(output).count("✓ patch_file #001") == 1
+    assert notification.text == content
 
 
 async def test_shutdown_releases_deferred_badge_ownership() -> None:

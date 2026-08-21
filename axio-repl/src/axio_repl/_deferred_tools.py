@@ -56,7 +56,7 @@ class _OwnedDispatch:
 
 
 NotificationHandler = Callable[[DeferredToolNotification], Awaitable[None]]
-DispatchStartedHandler = Callable[[str, str | None], None]
+DispatchStartedHandler = Callable[[ToolDispatch, str, str | None], None]
 DispatchDeferredHandler = Callable[[str, str, str | None, tuple[ToolUseBlock, ...]], None]
 
 
@@ -96,7 +96,15 @@ class DeferredToolRegistry:
             protocol_closed=asyncio.Event(),
         )
         if self._on_dispatch_started is not None:
-            self._on_dispatch_started(agent_id, turn_id)
+            self._on_dispatch_started(dispatch, agent_id, turn_id)
+
+    def cancel_before_run(self, dispatch: ToolDispatch) -> bool:
+        """Cancel a dispatch synchronously from its started callback before its first task step."""
+
+        record = self._require(dispatch)
+        if record.phase is not DeferredToolPhase.ACTIVE or dispatch.task.done():
+            return False
+        return dispatch.task.cancel()
 
     def dispatch_finished(self, dispatch: ToolDispatch) -> None:
         record = self._records.get(dispatch.task)

@@ -34,7 +34,7 @@ from uuid import uuid4
 import aiohttp
 from axio import notify
 from axio._asyncio import cancel_task_once
-from axio.agent import Agent
+from axio.agent import Agent, ToolDispatch
 from axio.blocks import TextBlock, ToolUseBlock
 from axio.context import ContextStore, MemoryContextStore
 from axio.effort import EFFORT_LEVELS, EffortRuntime, EffortState
@@ -677,6 +677,12 @@ class _ReadyClaim:
     source: str
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ToolPreemption:
+    reason: str
+    tools_continue: bool
+
+
 def _pending_prompt_count(
     peer_queue: asyncio.Queue[_IncomingPrompt],
     buffered_prompts: deque[_IncomingPrompt],
@@ -1041,6 +1047,11 @@ class ReplRenderer:
                 theme=self._theme,
             )
             body = sanitize_terminal_text(notification.text)
+            patch_display = (
+                parse_patch_result(body, include_legacy_path=False)
+                if result.call.name == "patch_file" and not result.name_mismatch and not notification.is_error
+                else None
+            )
             with self._persistent_insertion_locked():
                 sys.stdout.write(f"{self._theme.reset}\n{badge}\n")
                 if result.name_mismatch:
@@ -1049,8 +1060,11 @@ class ReplRenderer:
                     notice = f"[tool result name mismatch: expected {expected!r}, received {received!r}]"
                     sys.stdout.write(f"{_styled(self._theme.error.ansi, notice)}\n")
                 if body:
-                    style = self._theme.error.ansi if notification.is_error else self._theme.success.ansi
-                    sys.stdout.write(f"{_styled(style, body)}\n")
+                    if patch_display is not None:
+                        sys.stdout.write(f"{patch_display.styled_text(self._theme)}\n")
+                    else:
+                        style = self._theme.error.ansi if notification.is_error else self._theme.success.ansi
+                        sys.stdout.write(f"{_styled(style, body)}\n")
                 self._flush()
                 self._drain_safe_boundary_locked()
             return True
@@ -3927,7 +3941,7 @@ async def main() -> None:
 
         interrupted_partials: dict[str, str] = {}
         pending_interrupt_turns: set[str] = set()
-        tool_preemption_reasons: dict[str, str] = {}
+        tool_preemption_reasons: dict[str, _ToolPreemption] = {}
 
         async def _run_turn(
             prompt: str | None = None,
@@ -3994,18 +4008,20 @@ async def main() -> None:
                     cancel_task_once(prompt_task)
                     await asyncio.gather(prompt_task, return_exceptions=True)
                 partial = renderer.take_pending_text("main")
-                reason = tool_preemption_reasons.pop(identity.turn_id, None)
+                preemption = tool_preemption_reasons.pop(identity.turn_id, None)
                 _retain_interrupted_partial(
                     interrupted_partials,
                     pending_interrupt_turns,
                     turn_id=identity.turn_id,
                     partial=partial,
-                    preemption_reason=reason,
+                    preemption_reason=preemption.reason if preemption is not None else None,
                 )
-                if reason is None:
+                if preemption is None:
                     renderer.show_panel("Main turn interrupted.")
+                elif preemption.tools_continue:
+                    renderer.show_panel(f"Main turn preempted for {preemption.reason}; unfinished tools continue.")
                 else:
-                    renderer.show_panel(f"Main turn preempted for {reason}; unfinished tools continue.")
+                    renderer.show_panel(f"Main turn preempted for {preemption.reason} before tool execution.")
             finally:
                 tool_preemption_reasons.pop(identity.turn_id, None)
                 prompt_task = None
@@ -4089,7 +4105,7 @@ async def main() -> None:
                 and deferred_tools.has_active_dispatch(active_turn_id)
             ):
                 if active_turn_id is not None:
-                    tool_preemption_reasons.setdefault(active_turn_id, reason)
+                    tool_preemption_reasons.setdefault(active_turn_id, _ToolPreemption(reason, tools_continue=True))
                 deferred_tools.request_preemption(active_turn_id)
                 cancel_task_once(current)
 
@@ -4106,14 +4122,26 @@ async def main() -> None:
             if turn_id is not None and deferred_tools.request_preemption(turn_id):
                 interrupt_local_agent_turn(agent_id, turn_id)
 
-        def _on_tool_dispatch_started(agent_id: str, turn_id: str | None) -> None:
+        def _on_tool_dispatch_started(dispatch: ToolDispatch, agent_id: str, turn_id: str | None) -> None:
             if agent_id == "main":
                 if turn_id != foreground_state.active_turn_id("main"):
                     return
+                reason = None
                 if pending_input.pending_count:
-                    _preempt_active_tool_dispatch("queued user input")
-                elif pending_peer_prompts or not peer_queue.empty():
-                    _preempt_active_tool_dispatch("incoming message")
+                    reason = "queued user input"
+                elif _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task):
+                    reason = "incoming message"
+                current = prompt_task
+                if (
+                    reason is not None
+                    and turn_id is not None
+                    and current is not None
+                    and not current.done()
+                    and current.cancelling() == 0
+                    and deferred_tools.cancel_before_run(dispatch)
+                ):
+                    tool_preemption_reasons.setdefault(turn_id, _ToolPreemption(reason, tools_continue=False))
+                    cancel_task_once(current)
                 return
             has_queued_input = any(
                 (entry.status is PendingInputStatus.PENDING and entry.intended_target_agent_id == agent_id)
