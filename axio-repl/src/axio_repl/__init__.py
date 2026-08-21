@@ -918,7 +918,6 @@ class ReplRenderer:
             self._turns[key] = presentation
             self._current_turn_by_agent[agent_id] = key
             state = self._state(agent_id)
-            self._discard_direct_agent_tool_keys_locked(agent_id)
             self._reset_state_for_turn_locked(state)
             if live:
                 self._foreground_streaming = True
@@ -992,7 +991,6 @@ class ReplRenderer:
             self._purge_parent_turn_locked(key)
             self._tool_calls.discard_turn(agent_id=agent_id, run_id=key.run_id, turn_id=key.turn_id)
             if is_current_turn:
-                self._discard_direct_agent_tool_keys_locked(agent_id)
                 self._cleanup_turn_state_locked(agent_id)
 
     async def take_background_outcome_presentation(
@@ -1424,6 +1422,13 @@ class ReplRenderer:
         run_id: str | None,
         turn_id: str | None,
     ) -> ToolCallKey | None:
+        """Resolve exact envelope keys or FIFO synthetic scopes for raw events.
+
+        Raw duplicate IDs receive distinct scopes. Their deltas target the most
+        recent scope, results close scopes FIFO, and only a terminal session or
+        agent boundary clears every remaining direct scope.
+        """
+
         match event:
             case (
                 ToolUseStart(tool_use_id=tool_use_id)
@@ -1465,9 +1470,32 @@ class ReplRenderer:
 
     def _discard_direct_agent_tool_keys_locked(self, agent_id: str) -> None:
         direct_keys = [key for key in self._direct_tool_keys if key[0] == agent_id]
+        discarded: set[ToolCallKey] = set()
         for direct_key in direct_keys:
             for tool_key in self._direct_tool_keys.pop(direct_key):
                 self._tool_calls.complete(tool_key)
+                discarded.add(tool_key)
+        state = self._states.get(agent_id)
+        if state is None:
+            return
+        discarded.update(key for key in state.active_tool_ids if key.run_id == "direct")
+        for tool_key in discarded:
+            self._tool_calls.complete(tool_key)
+            state.active_tool_ids.discard(tool_key)
+            state.streamed_tool_ids.discard(tool_key)
+            state.arg_streams.pop(tool_key, None)
+            state.tool_names.pop(tool_key, None)
+            state.tool_calls.pop(tool_key, None)
+            if mode := state.tool_field_modes.pop(tool_key, None):
+                mode.pending.close()
+            for sanitizer_key in tuple(state.tool_output_sanitizers):
+                if sanitizer_key[0] == tool_key:
+                    state.tool_output_sanitizers.pop(sanitizer_key).reset()
+            for sanitizer_key in tuple(state.tool_field_sanitizers):
+                if sanitizer_key[0] == tool_key:
+                    state.tool_field_sanitizers.pop(sanitizer_key).reset()
+        if isinstance(state.mode, _ToolFieldMode) and state.mode.tool_call_key in discarded:
+            state.mode = _BoundaryMode()
 
     def _current_presentation(self, agent_id: str) -> _TurnPresentation | None:
         key = self._current_turn_by_agent.get(agent_id)
@@ -1695,7 +1723,7 @@ class ReplRenderer:
                 self._flush()
                 state.arg_streams[tool_key] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tool_key)
-                state.tool_names[tool_key] = name
+                state.tool_names[tool_key] = call.name
                 state.tool_calls[tool_key] = call
                 state.tool_arg_at_line_start = False
 
@@ -1859,6 +1887,7 @@ class ReplRenderer:
                     self._tool_calls.discard_agent(agent_id)
                 if presentation is not None and presentation.error_seen and not presentation.stdout_started:
                     self._discard_suspended_owner_locked(agent_id, cleanup_key)
+                    self._discard_direct_agent_tool_keys_locked(agent_id)
                     self._drain_safe_boundary_locked()
                     return
                 self._finish_all_tool_arg_streams_locked(state)
@@ -1869,6 +1898,7 @@ class ReplRenderer:
                     self._close_all_tool_fields_locked(state)
                 state.mode = _BoundaryMode()
                 self._discard_suspended_owner_locked(agent_id, cleanup_key)
+                self._discard_direct_agent_tool_keys_locked(agent_id)
                 self._drain_safe_boundary_locked()
 
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
@@ -1877,8 +1907,9 @@ class ReplRenderer:
             case TextDelta(delta=delta):
                 state.background_text.append(delta)
             case ToolUseStart(name=name):
-                if name not in state.background_tools:
-                    state.background_tools.append(name)
+                display_name = tool_display_name(name)
+                if display_name not in state.background_tools:
+                    state.background_tools.append(display_name)
             case Error(exception=exc):
                 state.background_errors.append(str(exc))
             case _:

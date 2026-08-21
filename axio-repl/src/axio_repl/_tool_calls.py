@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import StrEnum
@@ -28,10 +29,14 @@ class ToolCallDisplay:
     key: ToolCallKey
     ordinal: int
     name: str
+    name_identity: bytes
 
     @property
     def marker(self) -> str:
         return f"#{self.ordinal:03d}"
+
+    def name_matches(self, value: str) -> bool:
+        return self.name_identity == _tool_name_identity(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,10 +46,7 @@ class ToolResultDisplay:
     call: ToolCallDisplay
     event_name: str
     orphan: bool
-
-    @property
-    def name_mismatch(self) -> bool:
-        return not self.orphan and self.call.name != self.event_name
+    name_mismatch: bool
 
 
 class ToolBadgeKind(StrEnum):
@@ -90,8 +92,18 @@ class ToolCallRegistry:
         if call is None:
             call = self._allocate(key, event_name)
             self._active[key] = call
-            return ToolResultDisplay(call=call, event_name=event_name, orphan=True)
-        return ToolResultDisplay(call=call, event_name=event_name, orphan=False)
+            return ToolResultDisplay(
+                call=call,
+                event_name=call.name,
+                orphan=True,
+                name_mismatch=False,
+            )
+        return ToolResultDisplay(
+            call=call,
+            event_name=tool_display_name(event_name),
+            orphan=False,
+            name_mismatch=not call.name_matches(event_name),
+        )
 
     def complete(self, key: ToolCallKey) -> None:
         self._active.pop(key, None)
@@ -106,7 +118,12 @@ class ToolCallRegistry:
         call = self._deferred.pop(key, None)
         if call is None:
             return None
-        return ToolResultDisplay(call=call, event_name=event_name, orphan=False)
+        return ToolResultDisplay(
+            call=call,
+            event_name=tool_display_name(event_name),
+            orphan=False,
+            name_mismatch=not call.name_matches(event_name),
+        )
 
     def discard_deferred(self) -> None:
         self._deferred.clear()
@@ -124,7 +141,12 @@ class ToolCallRegistry:
     def _allocate(self, key: ToolCallKey, name: str) -> ToolCallDisplay:
         ordinal = self._next_ordinal
         self._next_ordinal += 1
-        return ToolCallDisplay(key=key, ordinal=ordinal, name=name)
+        return ToolCallDisplay(
+            key=key,
+            ordinal=ordinal,
+            name=tool_display_name(name),
+            name_identity=_tool_name_identity(name),
+        )
 
 
 def tool_badge(
@@ -180,3 +202,7 @@ def _fit_utf8(value: str, limit: int) -> str:
 
 def _replace_surrogates(value: str) -> str:
     return "".join("\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character for character in value)
+
+
+def _tool_name_identity(value: str) -> bytes:
+    return hashlib.blake2b(value.encode("utf-8", errors="surrogatepass"), digest_size=16).digest()

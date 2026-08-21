@@ -164,3 +164,16 @@ def test_shared_tool_display_name_is_one_safe_bounded_utf8_line() -> None:
     assert "\033" not in name
     assert len(name.encode("utf-8")) <= 80
     assert name.endswith("…")
+
+
+def test_bounded_name_identity_detects_mismatch_after_identical_display_prefix() -> None:
+    registry = ToolCallRegistry()
+    key = ToolCallKey("main", "run", "turn", "call")
+    prefix = "λ" * 100
+    call = registry.start(key, prefix + "first")
+
+    result = registry.result(key, prefix + "second")
+
+    assert call.name == result.event_name
+    assert len(call.name_identity) == 16
+    assert result.name_mismatch

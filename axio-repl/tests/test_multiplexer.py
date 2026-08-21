@@ -7,7 +7,7 @@ from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnFinished, 
 
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode, sanitize_terminal_text
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME
-from axio_repl._tool_calls import ToolCallRegistry
+from axio_repl._tool_calls import ToolCallRegistry, tool_display_name
 
 
 def test_display_mode_accepts_cli_and_descriptive_names() -> None:
@@ -87,6 +87,42 @@ def test_background_tool_name_controls_surrogates_and_multibyte_text_are_safe() 
     assert "\033[2J" not in combined
     assert "owned" not in combined
     assert max(len(line.encode("utf-8")) for line in combined.splitlines()) <= 100
+
+
+def test_megabyte_tool_names_are_bounded_in_collector_and_evict_under_cap() -> None:
+    mux = ActionMultiplexer(
+        DisplayMode.ALL_ACTIONS,
+        theme=NO_COLOR_THEME,
+        max_tools=1,
+        max_frame_bytes=512,
+        max_retained_bytes=4096,
+    )
+    first_name = ("λ" * 500_000) + "\nfirst\udcff\033[2J"
+    second_name = ("μ" * 500_000) + "\nsecond\udcff\033[2J"
+
+    mux.observe("child", ToolUseStart(index=0, tool_use_id="one", name=first_name))
+    first_expected = len("child") + len("one") + len(tool_display_name(first_name).encode()) + 16 + len("#001")
+    assert mux.retained_collector_bytes == first_expected
+    mux.observe("child", ToolUseStart(index=1, tool_use_id="two", name=second_name))
+    second_expected = len("child") + len("two") + len(tool_display_name(second_name).encode()) + 16 + len("#002")
+    assert mux.retained_collector_bytes == second_expected
+    assert mux.retained_suppression_bytes > 0
+    mux.observe("child", ToolInputDelta(index=1, tool_use_id="two", partial_json="{}"))
+    assert mux.retained_bytes <= 4096
+
+    suppressed, call = mux.drain(max_frames=2)
+    assert "incomplete action" in suppressed
+    assert "▶ " in call and "#002" in call
+    assert max(len(line.encode("utf-8")) for line in call.splitlines()) <= 100
+
+    mux.observe(
+        "child",
+        ToolResult(tool_use_id="two", name=second_name, is_error=False, content="done"),
+    )
+    [result] = mux.drain()
+    assert "✓ " in result and "#002" in result
+    assert "name mismatch" not in result
+    assert mux.retained_collector_bytes == 0
 
 
 def test_tool_arguments_are_framed_only_after_complete_json() -> None:

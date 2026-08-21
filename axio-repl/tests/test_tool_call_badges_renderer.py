@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from axio.events import ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
-from axio.types import StopReason
+from axio.events import Error, IterationEnd, SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
+from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
     ExecutionMode,
@@ -133,6 +133,45 @@ async def test_direct_api_uses_distinct_synthetic_scopes_for_reused_active_id(
     )
     second = capsys.readouterr().out
     assert "✓ shell #002" in second
+    assert renderer.active_tool_call_count == 0
+
+
+async def test_direct_scopes_survive_iteration_and_error_but_clear_at_session_end(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(theme=NO_COLOR_THEME)
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="same", name="shell"))
+    await renderer.render(
+        "main",
+        IterationEnd(iteration=1, stop_reason=StopReason.tool_use, usage=Usage(1, 1)),
+    )
+    await renderer.finish_turn(
+        "main",
+        TurnFinished(status=TurnStatus.CANCELLED, stop_reason=None, error="cancelled"),
+        run_id="unrelated-run",
+        turn_id="unrelated-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render("main", Error(exception=RuntimeError("stream failed")))
+    assert renderer.active_tool_call_count == 1
+
+    await renderer.render(
+        "main",
+        SessionEndEvent(stop_reason=StopReason.error, total_usage=Usage(1, 1)),
+    )
+    assert renderer.active_tool_call_count == 0
+    assert renderer._direct_tool_keys == {}
+
+    capsys.readouterr()
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="same", name="shell"))
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="same", name="shell", is_error=False, content="fresh"),
+    )
+    output = capsys.readouterr().out
+    assert "▶ shell #002" in output
+    assert "✓ shell #002" in output
+    assert "[orphan tool result]" not in output
     assert renderer.active_tool_call_count == 0
 
 

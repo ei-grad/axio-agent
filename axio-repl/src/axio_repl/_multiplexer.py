@@ -114,7 +114,6 @@ class ActionFrame:
 
 @dataclass(slots=True)
 class _ToolAction:
-    name: str
     call: ToolCallDisplay
     agent_name: str | None = None
     arguments: list[str] = field(default_factory=list)
@@ -128,7 +127,8 @@ class _ToolAction:
     def retained_bytes(self) -> int:
         agent_name_bytes = len(self.agent_name.encode("utf-8")) if self.agent_name is not None else 0
         return (
-            len(tool_display_name(self.name).encode("utf-8"))
+            len(self.call.name.encode("utf-8"))
+            + len(self.call.name_identity)
             + len(self.call.marker.encode("utf-8"))
             + agent_name_bytes
             + self.arguments_bytes
@@ -512,7 +512,7 @@ class ActionMultiplexer:
                     self._remember_tool(
                         agent_id,
                         started_call.key,
-                        _ToolAction(name=name, call=started_call, agent_name=agent_name),
+                        _ToolAction(call=started_call, agent_name=agent_name),
                     )
                 case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
                     assert call_key is not None
@@ -584,7 +584,7 @@ class ActionMultiplexer:
                             tool_call=result_display.call,
                             tool_badge_kind=badge_kind,
                         )
-                    elif name == action.name == "write_file" and is_write_file_result(safe_content):
+                    elif action.call.name == "write_file" and is_write_file_result(safe_content):
                         self._enqueue(
                             agent_id,
                             "tool result",
@@ -663,7 +663,7 @@ class ActionMultiplexer:
         self._remember_tool(
             agent_id,
             key,
-            _ToolAction(name=name, call=call, agent_name=agent_name, call_emitted=True),
+            _ToolAction(call=call, agent_name=agent_name, call_emitted=True),
         )
         self._enforce_retained_limit()
 
@@ -789,7 +789,7 @@ class ActionMultiplexer:
                 break
             self._enqueue(
                 agent_id,
-                f"{tool_display_name(action.name)} {key}",
+                f"{action.call.name} {key}",
                 buffer[:end],
                 agent_name=action.agent_name,
             )
@@ -810,7 +810,7 @@ class ActionMultiplexer:
             key, buffer = action.output.popleft()
             self._enqueue(
                 agent_id,
-                f"{tool_display_name(action.name)} {key}",
+                f"{action.call.name} {key}",
                 buffer,
                 agent_name=action.agent_name,
             )
