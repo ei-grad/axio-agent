@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
 from axio.tool_codec import (
     TOOL_ARGUMENT_CODEC,
+    TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION,
     TOOL_ARGUMENT_FRAME_KEY,
     ToolArgumentCodecError,
+    augment_system_for_tool_argument_codec,
     decode_tool_arguments,
     encode_tool_arguments,
     encode_tool_schema,
@@ -44,6 +47,8 @@ def test_schema_and_arguments_round_trip_nested_string_leaves() -> None:
     assert top["type"] == "object"
     assert top["required"] == [TOOL_ARGUMENT_FRAME_KEY]
     assert top["additionalProperties"] is False
+    assert "never pass a plain string" in top["description"]
+    assert top["examples"] == [{TOOL_ARGUMENT_FRAME_KEY: "          sentinel"}]
     assert "x-axio-tool-argument-codec" not in top
     assert top["properties"][TOOL_ARGUMENT_FRAME_KEY]["enum"] == ["          sentinel"]
 
@@ -53,6 +58,51 @@ def test_schema_and_arguments_round_trip_nested_string_leaves() -> None:
     assert wire_arguments["nested"]["items"][1] == 7
     assert wire_arguments["dynamic"]["empty"] == {TOOL_ARGUMENT_FRAME_KEY: ""}
     assert decode_tool_arguments(wire_arguments, schema, TOOL_ARGUMENT_CODEC) == arguments
+
+
+def test_codec_system_instruction_is_compact_and_idempotent() -> None:
+    augmented = augment_system_for_tool_argument_codec("base system", TOOL_ARGUMENT_CODEC)
+
+    assert augmented == f"base system\n\n{TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION}"
+    assert augment_system_for_tool_argument_codec(augmented, TOOL_ARGUMENT_CODEC) == augmented
+    assert augment_system_for_tool_argument_codec("", TOOL_ARGUMENT_CODEC) == TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ({"examples": ["first", "second"]}, ["first", "second"]),
+        ({"const": "fixed"}, ["fixed"]),
+        ({"enum": ["one", "two"]}, ["one", "two"]),
+        ({"default": "chosen"}, ["chosen"]),
+    ],
+)
+def test_schema_examples_follow_declared_valid_values(source: dict[str, Any], expected: list[str]) -> None:
+    schema = {"type": "object", "properties": {"value": {"type": "string", **source}}}
+
+    encoded = encode_tool_schema(schema, TOOL_ARGUMENT_CODEC)
+
+    assert encoded["properties"]["value"]["examples"] == [{TOOL_ARGUMENT_FRAME_KEY: item} for item in expected]
+
+
+@pytest.mark.parametrize("constraint", [{"pattern": "^x+$"}, {"minLength": 20}, {"maxLength": 2}])
+def test_schema_omits_synthesized_example_when_validity_is_unknown(constraint: dict[str, Any]) -> None:
+    schema = {"type": "object", "properties": {"value": {"type": "string", **constraint}}}
+
+    encoded = encode_tool_schema(schema, TOOL_ARGUMENT_CODEC)
+
+    assert "examples" not in encoded["properties"]["value"]
+
+
+def test_nested_string_schema_uses_valid_declared_example() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"values": {"type": "array", "items": {"type": "string", "const": "nested"}}},
+    }
+
+    encoded = encode_tool_schema(schema, TOOL_ARGUMENT_CODEC)
+
+    assert encoded["properties"]["values"]["items"]["examples"] == [{TOOL_ARGUMENT_FRAME_KEY: "nested"}]
 
 
 def test_literal_frame_key_content_has_no_collision() -> None:

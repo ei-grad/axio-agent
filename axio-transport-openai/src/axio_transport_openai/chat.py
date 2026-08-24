@@ -28,7 +28,7 @@ from axio.messages import (
 )
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
-from axio.tool_codec import encode_tool_arguments, encode_tool_schema
+from axio.tool_codec import augment_system_for_tool_argument_codec, encode_tool_arguments, encode_tool_schema
 from axio.transport import CompletionTransport, EmbeddingTransport
 from axio.types import CostSource, StopReason, Usage
 
@@ -39,6 +39,7 @@ _VT = frozenset({Capability.text, Capability.vision, Capability.tool_use})
 _RT = frozenset({Capability.text, Capability.reasoning, Capability.tool_use})
 _TT = frozenset({Capability.text, Capability.tool_use})
 _VRT = frozenset({Capability.text, Capability.vision, Capability.reasoning, Capability.tool_use})
+_RESERVED_CHAT_PARAMS = frozenset({"messages", "model", "stream", "stream_options", "tools"})
 
 _OPENAI_REASONING_EFFORTS: tuple[tuple[str, tuple[EffortLevel, ...]], ...] = (
     ("gpt-5.6", ("none", "low", "medium", "high", "xhigh", "max")),
@@ -757,9 +758,18 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
         return PromptEffortAdapter().configure_effort(level)
 
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
+        conflicts = _RESERVED_CHAT_PARAMS.intersection(self.extra_params)
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise ValueError(f"extra_params cannot override Chat Completions fields: {names}")
+        effective_system = (
+            augment_system_for_tool_argument_codec(system, self.tool_argument_codec)
+            if self.tool_argument_codec is not None and tools
+            else system
+        )
         payload: dict[str, Any] = {
             "model": self.model.id,
-            "messages": _convert_messages(messages, system, self.tool_argument_codec, tools),
+            "messages": _convert_messages(messages, effective_system, self.tool_argument_codec, tools),
             "stream": True,
             "stream_options": {"include_usage": True},
         }

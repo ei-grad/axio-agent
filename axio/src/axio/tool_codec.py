@@ -17,11 +17,16 @@ from urllib.parse import unquote
 
 TOOL_ARGUMENT_CODEC = "axio.verbatim.v1"
 TOOL_ARGUMENT_FRAME_KEY = "__axio_verbatim_v1__"
+TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION = (
+    "Tool argument wire protocol: whenever a string parameter schema is an object whose sole required property is "
+    f"{TOOL_ARGUMENT_FRAME_KEY!r}, pass that object exactly; never flatten it to a plain string. Put the original "
+    f"string inside {TOOL_ARGUMENT_FRAME_KEY!r} and preserve it verbatim."
+)
 _SCHEMA_CODEC_KEY = "x-axio-tool-argument-codec"
 _FRAME_DESCRIPTION = (
-    f"Wire format for one exact string: pass an object whose only property is "
-    f"{TOOL_ARGUMENT_FRAME_KEY!r}; its value is the original string. Preserve the inner value exactly, "
-    "including leading/trailing spaces, tabs, newlines, and an empty value."
+    f"Required exact-string wire object; never pass a plain string. The only property must be "
+    f"{TOOL_ARGUMENT_FRAME_KEY!r}, containing the original string verbatim. Preserve leading/trailing spaces, "
+    "tabs, newlines, and an empty value."
 )
 
 _SCHEMA_MAP_KEYWORDS = frozenset(
@@ -37,6 +42,9 @@ _SCHEMA_SINGLE_KEYWORDS = frozenset({"additionalProperties", "items"})
 _SCHEMA_LIST_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
 _SCHEMA_IDENTIFIERS = ("$anchor", "$dynamicAnchor", "$id")
 _UNSUPPORTED_VALUE_KEYWORDS = ("contains", "else", "if", "then", "unevaluatedItems", "unevaluatedProperties")
+_GENERIC_EXAMPLE_ANNOTATIONS = frozenset(
+    {"$comment", "deprecated", "description", "readOnly", "title", "type", "writeOnly"}
+)
 
 
 class ToolArgumentCodecError(ValueError):
@@ -46,6 +54,17 @@ class ToolArgumentCodecError(ValueError):
 def _require_codec(codec: str) -> None:
     if codec != TOOL_ARGUMENT_CODEC:
         raise ToolArgumentCodecError(f"Unsupported tool argument codec: {codec!r}")
+
+
+def augment_system_for_tool_argument_codec(system: str, codec: str) -> str:
+    """Add the compact model-facing wire instruction once for *codec*."""
+
+    _require_codec(codec)
+    if TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION in system:
+        return system
+    if not system:
+        return TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION
+    return f"{system}\n\n{TOOL_ARGUMENT_CODEC_SYSTEM_INSTRUCTION}"
 
 
 def _is_direct_string_schema(schema: Mapping[str, Any]) -> bool:
@@ -78,6 +97,7 @@ def _wrap_string_schema(schema: dict[str, Any], *, include_marker: bool) -> dict
         description = f"{description} Decoded value: {original_description}"
     wrapped: dict[str, Any] = {
         "type": "object",
+        "title": "Required exact-string wire object (not a plain string)",
         "properties": {TOOL_ARGUMENT_FRAME_KEY: inner},
         "required": [TOOL_ARGUMENT_FRAME_KEY],
         "additionalProperties": False,
@@ -88,6 +108,24 @@ def _wrap_string_schema(schema: dict[str, Any], *, include_marker: bool) -> dict
     wrapped.update(identifiers)
     if default is not None:
         wrapped["default"] = {TOOL_ARGUMENT_FRAME_KEY: default}
+    examples = schema.get("examples")
+    framed_examples = (
+        [{TOOL_ARGUMENT_FRAME_KEY: item} for item in examples if isinstance(item, str)]
+        if isinstance(examples, list)
+        else []
+    )
+    constant = schema.get("const")
+    enum = schema.get("enum")
+    if not framed_examples and isinstance(constant, str):
+        framed_examples = [{TOOL_ARGUMENT_FRAME_KEY: constant}]
+    if not framed_examples and isinstance(enum, list):
+        framed_examples = [{TOOL_ARGUMENT_FRAME_KEY: item} for item in enum if isinstance(item, str)]
+    if not framed_examples and default is not None:
+        framed_examples = [{TOOL_ARGUMENT_FRAME_KEY: default}]
+    if not framed_examples and set(schema).issubset(_GENERIC_EXAMPLE_ANNOTATIONS):
+        framed_examples = [{TOOL_ARGUMENT_FRAME_KEY: "exact string"}]
+    if framed_examples:
+        wrapped["examples"] = framed_examples
     return wrapped
 
 
