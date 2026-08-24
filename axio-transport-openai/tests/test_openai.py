@@ -765,6 +765,16 @@ def test_build_payload_uses_model_spec_max_tokens() -> None:
     assert payload["max_completion_tokens"] == 4096
 
 
+def test_output_token_limit_reports_exact_extra_param_sent_for_request() -> None:
+    transport = ChatCompletionsTransport(
+        model=ModelSpec(id="custom-model", max_output_tokens=4096),
+        extra_params={"max_completion_tokens": 42},
+    )
+
+    assert transport.output_token_limit([], [], "") == 42
+    assert transport.build_payload([], [], "")["max_completion_tokens"] == 42
+
+
 def test_build_payload_image_block() -> None:
     t = ChatCompletionsTransport(model=OPENAI_MODELS["gpt-4.1-mini"])
     img_data = b"\x89PNG\r\n\x1a\nfake"
@@ -1565,6 +1575,28 @@ async def test_extra_params_override_payload_field(
         await _collect(t.stream([], [], ""))
 
     assert server.received_payloads[0]["max_completion_tokens"] == 42
+
+
+async def test_stream_uses_request_snapshot_if_model_changes_before_consumption(
+    fake_server: tuple[FakeOpenAIServer, str],
+) -> None:
+    server, base_url = fake_server
+    server.responses.append(_text_chunks("ok"))
+    original = ModelSpec(id="original", max_output_tokens=64)
+
+    async with aiohttp.ClientSession() as session:
+        transport = ChatCompletionsTransport(
+            base_url=base_url,
+            api_key="test-key",
+            model=original,
+            session=session,
+        )
+        stream = transport.stream([], [], "")
+        transport.model = ModelSpec(id="mutated", max_output_tokens=1_000_000)
+        await _collect(stream)
+
+    assert server.received_payloads[0]["model"] == "original"
+    assert server.received_payloads[0]["max_completion_tokens"] == 64
 
 
 def test_extra_params_default_is_proxy() -> None:

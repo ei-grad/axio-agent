@@ -540,26 +540,46 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def output_token_limit(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> int | None:
+        """Return the exact output limit produced by this request builder."""
+
+        payload = self.build_payload(messages, tools, system)
+        for key in ("max_completion_tokens", "max_output_tokens"):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
     def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
 
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[StreamEvent]:
-        return self._do_stream(messages, tools, system)
+        request_model_id = self.model.id
+        payload = self.build_payload(messages, tools, system)
+        return self._do_stream(
+            payload,
+            request_model_id=request_model_id,
+            message_count=len(messages),
+            tool_count=len(tools),
+        )
 
     async def _do_stream(
-        self, messages: list[Message], tools: list[Tool[Any]], system: str
+        self,
+        payload: dict[str, Any],
+        *,
+        request_model_id: str,
+        message_count: int,
+        tool_count: int,
     ) -> AsyncIterator[StreamEvent]:
         assert self.session is not None, "session is required for streaming"
         url = f"{self.base_url.rstrip('/')}/{self.stream_path}"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = self.build_payload(messages, tools, system)
-
         logger.info(
             "POST %s model=%s messages=%d tools=%d",
             url,
-            self.model.id,
-            len(messages),
-            len(tools),
+            request_model_id,
+            message_count,
+            tool_count,
         )
 
         if logger.getEffectiveLevel() <= logging.DEBUG:

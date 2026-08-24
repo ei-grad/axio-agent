@@ -11,7 +11,7 @@ name: test_agent_dataclass
 -->
 ```python
 from dataclasses import dataclass, field
-from axio import Tool, CompletionTransport, ToolSelector
+from axio import CompletionTransport, ProviderOutputPolicy, Tool, ToolSelector
 from axio.agent import DeferredToolSink
 from axio.messages import Message
 
@@ -25,6 +25,7 @@ class Agent:
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
+    provider_output_policy: ProviderOutputPolicy = field(default_factory=ProviderOutputPolicy)
 ```
 
 `system`
@@ -59,6 +60,28 @@ class Agent:
   the original tool protocol with a placeholder and deliver the eventual
   result later through a new user message.
 
+`provider_output_policy`
+: Per-provider-call circuit breaker for malformed or amplified streams. The
+  default accepts one buffered first frame, then permits a 256 KiB burst and a
+  sustained 64 KiB/s across text, reasoning, and raw tool-argument deltas. It
+  also caps accepted provider data at 512 KiB and at an expected request
+  envelope of 32 decoded UTF-8 bytes per requested output token plus 16 KiB.
+  The token envelope is deliberately conservative rather than a tokenizer: it
+  accommodates code, Cyrillic, and long whitespace runs while still detecting
+  output that cannot plausibly fit the exact request limit. If a transport
+  exposes `OutputTokenLimitSource`, the Agent snapshots its effective fitted
+  request limit before streaming; otherwise it falls back to the transport or
+  model limit when available.
+
+  Growing deltas on the same text, reasoning, or tool-call stream are also
+  stopped after two consecutive deltas retain at least 90% of a prefix of 2
+  KiB or more. Independent indexes and tool call IDs do not share detector
+  state, and equal repeated prose is left to the existing repetition detector.
+  This can still stop a legitimate API that intentionally emits cumulative
+  snapshots; configure a different frozen `ProviderOutputPolicy` on that
+  `Agent` when integrating such a transport. Rejected provider frames are
+  never yielded or persisted, and tool execution output is not counted.
+
 ## How the loop works
 
 ```{mermaid}
@@ -78,8 +101,9 @@ flowchart TD
 1. The user message is appended to the context store.
 2. The agent retrieves the full conversation history and streams it to the
    transport along with the tool definitions and system prompt.
-3. As `StreamEvent` values arrive, the agent accumulates text deltas and
-   buffers pending tool calls.
+3. As `StreamEvent` values arrive, the agent checks provider-owned deltas
+   before yielding or retaining them, then accumulates text and buffers pending
+   tool calls.
 4. When the transport yields an `IterationEnd` event:
    - If tool-use blocks were collected, the agent dispatches **all tool calls
      concurrently** via `asyncio.gather`, appends the assistant message and

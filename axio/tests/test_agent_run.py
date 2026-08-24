@@ -483,13 +483,29 @@ class TestReasoningPassthrough:
 
         reasoning = [event for event in events if isinstance(event, ReasoningDelta)]
         notices = [event for event in events if isinstance(event, TextDelta)]
-        assert len(reasoning) < 10
+        assert reasoning == provider_events[:4]
         assert [event.delta for event in notices] == ["\n\n[Output truncated: repetitive content detected]"]
         assert isinstance(events[-1], SessionEndEvent)
         assert events[-1].stop_reason is StopReason.error
         history = await context.get_history()
         assistant = next(message for message in history if message.role == "assistant")
         assert assistant.content == [TextBlock(text="\n\n[Output truncated: repetitive content detected]")]
+
+    async def test_repetitive_text_keeps_threshold_crossing_delta_in_partial_output(self) -> None:
+        repeated_chunk = "ab" * 100
+        provider_events: list[StreamEvent] = [TextDelta(0, repeated_chunk) for _ in range(10)]
+        provider_events.append(IterationEnd(1, StopReason.end_turn, Usage(10, 5)))
+        context = MemoryContextStore()
+        agent = Agent(system="test", tools=[], transport=StubTransport([provider_events]))
+
+        events = [event async for event in agent.run_stream("hi", context)]
+
+        text = [event for event in events if isinstance(event, TextDelta)]
+        note = "\n\n[Output truncated: repetitive content detected]"
+        assert text == [*provider_events[:4], TextDelta(0, note)]
+        history = await context.get_history()
+        assistant = next(message for message in history if message.role == "assistant")
+        assert assistant.content == [TextBlock(text=repeated_chunk * 4 + note)]
 
     async def test_short_repeated_reasoning_does_not_trigger_loop_detection(self) -> None:
         transport = StubTransport(

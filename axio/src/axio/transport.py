@@ -29,6 +29,17 @@ class CompletionTransport(Protocol):
 
 
 @runtime_checkable
+class OutputTokenLimitSource(Protocol):
+    """Optional capability exposing the effective limit for one request.
+
+    Implementations must derive the value from the same immutable inputs and
+    payload-building rules used by :meth:`CompletionTransport.stream`.
+    """
+
+    def output_token_limit(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> int | None: ...
+
+
+@runtime_checkable
 class ImageGenTransport(Protocol):
     """Generate ``n`` image samples for a text prompt.  Returns raw image bytes
     (PNG / JPEG / WebP — provider-defined)."""

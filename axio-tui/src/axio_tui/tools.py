@@ -10,7 +10,9 @@ from axio.agent import Agent
 from axio.blocks import ImageBlock, TextBlock
 from axio.context import ContextStore
 from axio.events import TextDelta
+from axio.exceptions import ProviderOutputLimitError
 from axio.messages import InputProvenance, Message
+from axio.provider_output import ProviderOutputGuard, ProviderOutputPolicy, snapshot_output_token_limit
 from axio.transport import CompletionTransport
 
 
@@ -132,10 +134,26 @@ async def vision_analyze(
         ),
     ]
 
+    system = "You are a helpful vision assistant."
+    output_guard = ProviderOutputGuard(
+        ProviderOutputPolicy(),
+        effective_output_tokens=snapshot_output_token_limit(vision_transport, messages, [], system),
+    )
     text_parts: list[str] = []
-    async for event in vision_transport.stream(messages, [], "You are a helpful vision assistant."):
-        if isinstance(event, TextDelta):
-            text_parts.append(event.delta)
+    output_limit_error: ProviderOutputLimitError | None = None
+    provider_stream = vision_transport.stream(messages, [], system)
+    try:
+        async for event in provider_stream:
+            output_limit_error = output_guard.inspect(event)
+            if output_limit_error is not None:
+                raise output_limit_error
+            if isinstance(event, TextDelta):
+                text_parts.append(event.delta)
+    finally:
+        if output_limit_error is not None:
+            close_provider_stream = getattr(provider_stream, "aclose", None)
+            if close_provider_stream is not None:
+                await close_provider_stream()
     return "".join(text_parts) or "(no response)"
 
 

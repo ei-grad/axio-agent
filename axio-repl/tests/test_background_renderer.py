@@ -25,6 +25,7 @@ from axio.events import (
     ToolUseStart,
 )
 from axio.messages import Message
+from axio.provider_output import ProviderOutputPolicy
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 from axio_tools_agents.peers import PeerMessage, run_agent, set_run_agent_factory, set_session_event_hub
@@ -40,6 +41,8 @@ from axio_tools_agents.runtime import (
     TurnFinished,
     TurnStarted,
     TurnStatus,
+    new_turn_identity,
+    observe_agent_turn,
 )
 
 from axio_repl import (
@@ -57,6 +60,74 @@ from axio_repl._powerline import agent_header
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME
 
 _ACTION_FRAME = re.compile(r"\x1b\[0m\n── agent .*?── /agent .*?\n\x1b\[0m\n", re.DOTALL)
+
+
+@pytest.mark.parametrize("execution_mode", [ExecutionMode.FOREGROUND, ExecutionMode.BACKGROUND])
+async def test_provider_circuit_breaker_bounds_foreground_and_background_rendering(
+    execution_mode: ExecutionMode,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class AmplifyingTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[Any]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            try:
+                yield TextDelta(index=0, delta="safe prefix\n\n")
+                yield TextDelta(index=0, delta="DO-NOT-RENDER" + "x" * 40_000)
+                yield IterationEnd(1, StopReason.end_turn, Usage(1, 1))
+            finally:
+                self.closed = True
+
+    transport = AmplifyingTransport()
+    agent = Agent(
+        system="test",
+        transport=transport,
+        provider_output_policy=ProviderOutputPolicy(
+            max_response_bytes=32 * 1024,
+            sustained_rate_bytes_per_second=None,
+        ),
+    )
+    agent_id = "main" if execution_mode is ExecutionMode.FOREGROUND else "background-child"
+    identity = new_turn_identity(
+        agent_id=agent_id,
+        parent_agent_id=None if execution_mode is ExecutionMode.FOREGROUND else "main",
+        execution_mode=execution_mode,
+        run_id=f"{agent_id}-run",
+        context_id="context",
+    )
+    hub = SessionEventHub(session_id="bounded-render")
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    if execution_mode is ExecutionMode.BACKGROUND:
+        renderer.set_focus(agent_id)
+
+    async def render(envelope: AgentEventEnvelope) -> None:
+        await render_runtime_event(renderer, envelope)
+
+    hub.subscribe(render)
+    outcome = await observe_agent_turn(
+        agent=agent,
+        context=MemoryContextStore(),
+        prompt="go",
+        identity=identity,
+        hub=hub,
+    )
+    await renderer.mark_idle()
+    output = capsys.readouterr().out
+
+    assert outcome.status is TurnStatus.FAILED
+    assert outcome.error is not None and "ProviderOutputLimitError" in outcome.error
+    assert transport.closed
+    assert "safe prefix" in output
+    assert "safety size limit" in output
+    assert "DO-NOT-RENDER" not in output
+    assert len(output) < 10_000
 
 
 async def _queue_background_tool_action(renderer: ReplRenderer, agent_id: str = "child") -> None:

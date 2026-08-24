@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
 from axio.events import (
@@ -30,6 +31,7 @@ from axio.events import (
 )
 from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
+from axio.provider_output import ProviderOutputPolicy
 from axio.testing import make_text_response, make_tool_use_response
 from axio.tool import Tool
 from axio.types import CostSource, StopReason, Usage
@@ -48,6 +50,7 @@ from axio_tools_agents.runtime import (
     TurnStarted,
     TurnStatus,
     new_turn_identity,
+    observe_agent_turn,
 )
 
 from axio_repl import _journal as journal_module
@@ -77,6 +80,77 @@ def _only_events_path(root: Path) -> Path:
     paths = list(root.glob(f"*/*/*/*/{journal_module.SEMANTIC_FILENAME}"))
     assert len(paths) == 1
     return paths[0]
+
+
+async def test_provider_circuit_breaker_keeps_journal_bounded_and_records_cause(tmp_path: Path) -> None:
+    class AmplifyingTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, system
+            try:
+                yield TextDelta(index=0, delta="available partial\n")
+                yield TextDelta(index=0, delta="REJECTED-JOURNAL-DATA" + "x" * 40_000)
+                yield IterationEnd(1, StopReason.end_turn, Usage(1, 1))
+            finally:
+                self.closed = True
+
+    journal = await SessionJournal.open(session_id="bounded-provider", root=tmp_path)
+    hub = SessionEventHub(session_id="bounded-provider")
+
+    async def persist(envelope: AgentEventEnvelope) -> None:
+        await _write_runtime_event(journal, envelope)
+
+    hub.subscribe(persist)
+    identity = new_turn_identity(
+        agent_id="main",
+        parent_agent_id=None,
+        execution_mode=ExecutionMode.FOREGROUND,
+        run_id="main-run",
+        context_id="context",
+    )
+    transport = AmplifyingTransport()
+    agent = Agent(
+        system="test",
+        transport=transport,
+        provider_output_policy=ProviderOutputPolicy(
+            max_response_bytes=32 * 1024,
+            sustained_rate_bytes_per_second=None,
+        ),
+    )
+
+    outcome = await observe_agent_turn(
+        agent=agent,
+        context=MemoryContextStore(),
+        prompt="go",
+        identity=identity,
+        hub=hub,
+    )
+    await journal.close()
+
+    raw = journal.semantic_path.read_text(encoding="utf-8")
+    records = read_journal(journal.semantic_path).records
+    checkpoint_parts: list[str] = []
+    for record in records:
+        if record["kind"] != "turn_checkpoint":
+            continue
+        payload = record["payload"]
+        assert isinstance(payload, dict)
+        checkpoint_parts.append(str(payload["text"]))
+    checkpoint_text = "".join(checkpoint_parts)
+    assert outcome.status is TurnStatus.FAILED
+    assert transport.closed
+    assert "available partial" in checkpoint_text
+    assert "safety size limit" in checkpoint_text
+    assert "REJECTED-JOURNAL-DATA" not in raw
+    assert "ProviderOutputLimitError" in raw
+    assert len(raw.encode()) < 16 * 1024
 
 
 class _OneShotTransport:

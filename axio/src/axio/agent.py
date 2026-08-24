@@ -33,9 +33,15 @@ from .events import (
     ToolUseStart,
     VideoOutput,
 )
-from .exceptions import GuardCrash, HandlerCrash, ToolError
+from .exceptions import (
+    GuardCrash,
+    HandlerCrash,
+    ProviderOutputLimitError,
+    ToolError,
+)
 from .messages import InputProvenance, Message
 from .models import Capability
+from .provider_output import ProviderOutputGuard, ProviderOutputPolicy, snapshot_output_token_limit
 from .selector import ToolSelector
 from .stream import AgentStream
 from .tool import BACKGROUND_PARAM, CURRENT_TOOL_CALL, Tool, ToolCallContext
@@ -183,6 +189,11 @@ class Agent:
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
     before_next_provider_request: Callable[[], Awaitable[None]] | None = field(default=None)
+    provider_output_policy: ProviderOutputPolicy = field(default_factory=ProviderOutputPolicy)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_output_policy, ProviderOutputPolicy):
+            raise TypeError("provider_output_policy must be a ProviderOutputPolicy")
 
     def copy(self, **overrides: Any) -> Self:
         """Return a new Agent with *overrides* applied."""
@@ -501,13 +512,31 @@ class Agent:
                     stop_reason = StopReason.end_turn
                     malformed: set[str] = set()
                     repetition_detected = False
+                    output_limit_error: ProviderOutputLimitError | None = None
                     text_rep_detector = _RepetitionDetector()
                     reasoning_rep_detector = _RepetitionDetector()
 
                     try:
+                        output_guard = ProviderOutputGuard(
+                            self.provider_output_policy,
+                            effective_output_tokens=snapshot_output_token_limit(
+                                self.transport,
+                                effective_history,
+                                active_tools,
+                                self.system,
+                            ),
+                        )
                         provider_stream = self.transport.stream(effective_history, active_tools, self.system)
                         try:
                             async for event in provider_stream:
+                                output_limit_error = output_guard.inspect(event)
+                                if output_limit_error is not None:
+                                    logger.error(
+                                        "Provider output circuit breaker stopped the response: %s",
+                                        output_limit_error,
+                                    )
+                                    self._accumulate_text(content, output_limit_error.note)
+                                    break
                                 yield event
                                 match event:
                                     case TextDelta(delta=delta):
@@ -542,7 +571,7 @@ class Agent:
                                         await context.add_context_tokens(usage.input_tokens, usage.output_tokens)
                                         stop_reason = sr
                         finally:
-                            if repetition_detected:
+                            if repetition_detected or output_limit_error is not None:
                                 close_provider_stream = getattr(provider_stream, "aclose", None)
                                 if close_provider_stream is not None:
                                     _, cancellation = await shield_until_done(close_provider_stream())
@@ -555,10 +584,13 @@ class Agent:
                         session_end_emitted = True
                         return
 
-                    if repetition_detected:
+                    if repetition_detected or output_limit_error is not None:
                         await self._append(context, Message(role="assistant", content=list(content)))
                         # The provider did not emit IterationEnd, so this call has no
                         # trustworthy usage or provider stop reason to account.
+                        if output_limit_error is not None:
+                            yield TextDelta(index=0, delta=output_limit_error.note)
+                            yield Error(exception=output_limit_error)
                         yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
                         session_end_emitted = True
                         return

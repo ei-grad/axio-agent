@@ -10,7 +10,8 @@ from typing import Any
 import pytest
 from axio.agent import Agent
 from axio.context import MemoryContextStore
-from axio.events import StreamEvent
+from axio.events import StreamEvent, TextDelta
+from axio.exceptions import ProviderOutputLimitError
 from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
@@ -249,3 +250,40 @@ class TestVisionAnalyze:
         finally:
             os.chdir(old_cwd)
             _tools.vision_transport = None
+
+    async def test_cumulative_vision_response_is_closed_and_bounded(self, tmp_path: Path) -> None:
+        (tmp_path / "amplified.png").write_bytes(_TINY_PNG)
+        base = "".join(f"line {index:06d}\n" for index in range(200))
+
+        class AmplifyingTransport:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def stream(
+                self,
+                messages: list[Message],
+                tools: list[Tool[Any]],
+                system: str,
+            ) -> AsyncIterator[StreamEvent]:
+                del messages, tools, system
+                try:
+                    yield TextDelta(index=0, delta=base)
+                    yield TextDelta(index=0, delta=base + "first growth")
+                    yield TextDelta(index=0, delta=base + "first growth and second growth")
+                finally:
+                    self.closed = True
+
+        transport = AmplifyingTransport()
+        _tools.vision_transport = transport
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            with pytest.raises(ProviderOutputLimitError) as raised:
+                await vision_analyze(path="amplified.png")
+        finally:
+            os.chdir(old_cwd)
+            _tools.vision_transport = None
+
+        assert transport.closed
+        assert "cumulative snapshot" in str(raised.value)
+        assert len(str(raised.value)) < 200

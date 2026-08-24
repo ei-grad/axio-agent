@@ -366,6 +366,17 @@ def test_output_limit_leaves_room_for_responses_input() -> None:
     assert transport.build_payload(messages, [], "")["max_output_tokens"] <= 80_000
 
 
+def test_output_token_limit_reports_prompt_fitted_request_value() -> None:
+    model = ModelSpec(id="m", context_window=100_000, max_output_tokens=100_000)
+    transport = OpenAITransport(model=model)
+    messages = [Message(role="user", content=[TextBlock(text="x" * 60_000)])]
+
+    assert (
+        transport.output_token_limit(messages, [], "")
+        == transport.build_payload(messages, [], "")["max_output_tokens"]
+    )
+
+
 def test_output_limit_leaves_room_for_responses_instructions() -> None:
     model = ModelSpec(id="m", context_window=100_000, max_output_tokens=100_000)
     transport = OpenAITransport(model=model)

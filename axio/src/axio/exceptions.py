@@ -27,3 +27,11 @@ class HandlerCrash(HandlerError):
 
 class StreamError(AxioError):
     """Error during stream collection."""
+
+
+class ProviderOutputLimitError(StreamError):
+    """A provider response crossed a local output safety boundary."""
+
+    def __init__(self, message: str, *, note: str) -> None:
+        super().__init__(message)
+        self.note = note
