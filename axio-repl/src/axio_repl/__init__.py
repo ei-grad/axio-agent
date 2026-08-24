@@ -2542,10 +2542,14 @@ async def _read_input_async(
         while True:
             try:
                 if initial_text:
-                    value = await session.prompt_async(prompt_factory(), default=initial_text)
+                    value = await session.prompt_async(
+                        prompt_factory(),
+                        default=initial_text,
+                        handle_sigint=False,
+                    )
                     initial_text = ""
                 else:
-                    value = await session.prompt_async(prompt_factory())
+                    value = await session.prompt_async(prompt_factory(), handle_sigint=False)
                 editor_value = str(value)
                 text = editor_value.strip()
                 if text:
@@ -3922,11 +3926,23 @@ async def main() -> None:
             incoming_admission_tasks.add(task)
             task.add_done_callback(incoming_admission_tasks.discard)
 
+        def _show_eof_status() -> None:
+            if (
+                foreground_state.active_turn_id("main") is not None
+                or pending_input.pending_count
+                or _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task)
+            ):
+                renderer.show_panel("Draining active/pending work; Ctrl-C cancels.")
+            else:
+                renderer.clear_panel()
+
         def _handle_empty_eof(now: float) -> bool:
             nonlocal exit_arming
             exit_arming, should_exit = exit_arming.press(now)
             if not should_exit:
                 renderer.show_panel("Press Ctrl-D again within 2 seconds to exit.")
+            else:
+                _show_eof_status()
             return should_exit
 
         prompt_replay = session_journal.replay_log if session_journal is not None else None
@@ -4841,6 +4857,7 @@ async def main() -> None:
                     print()
                     shutdown_reason = "double_eof"
                     input_closed = True
+                    _show_eof_status()
                     continue
                 finally:
                     input_task = None

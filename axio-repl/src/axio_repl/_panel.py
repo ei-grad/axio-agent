@@ -29,6 +29,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from axio_repl import _replay
 from axio_repl._multiplexer import sanitize_identity_component, sanitize_terminal_text
 from axio_repl._powerline import prompt_badge, submitted_prompt_badge
+from axio_repl._prompt_terminal import PromptToolkitInlineOutput
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
 
 HISTORY_PATH = Path.home() / ".axio_repl_history"
@@ -341,7 +342,10 @@ def input_bindings(
         if buffer.text:
             buffer.delete()
         elif on_empty_eof(time.monotonic()):
+            PromptToolkitInlineOutput.redraw_now(event.app)
             event.app.exit(exception=EOFError())
+        else:
+            event.app.invalidate()
 
     return bindings
 

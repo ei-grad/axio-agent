@@ -29,6 +29,16 @@ class PromptToolkitInlineOutput:
         self._session = prompt_session
         self._live: _LiveOutput | None = None
 
+    @staticmethod
+    def redraw_now(app: Any) -> None:
+        """Synchronously render changed temporary UI state before prompt exit."""
+
+        if not app.is_running:
+            return
+        PromptToolkitInlineOutput._validate(app)
+        app._redraw()
+        app.output.flush()
+
     async def write(self, write: Callable[[], None], *, preserve_live: bool = True) -> None:
         app = self._session.app
         if not app.is_running:

@@ -421,7 +421,8 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
             self._capture_target = capture_target
             self._reserve_sequence = reserve_sequence
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             if self.previous == "queued request 2":
                 waiting_after_queued.set()
@@ -612,7 +613,8 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
             )
 
     class PromptSession:
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             return await inputs.get()
 
@@ -830,7 +832,8 @@ async def test_queued_input_defers_unstarted_dispatch_then_reissued_shell_stream
             )
 
     class PromptSession:
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             return await inputs.get()
 
@@ -1035,7 +1038,8 @@ async def test_queued_input_keeps_a_completed_tool_result_in_the_next_provider_c
             )
 
     class PromptSession:
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             return await inputs.get()
 
@@ -1248,7 +1252,8 @@ async def test_queued_input_is_injected_before_provider_after_any_tool_boundary(
             self.accepted_sequence: int | None = None
             self.accepted_target = "main"
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             result = await inputs.get()
             self.accepted_sequence = self.reserve_sequence()
@@ -1500,7 +1505,8 @@ async def test_background_child_injects_targeted_input_at_its_next_provider_boun
             self.reserve_sequence = reserve_sequence
             self.accepted_sequence: int | None = None
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             result = await inputs.get()
             self.accepted_sequence = self.reserve_sequence()
@@ -1715,7 +1721,8 @@ async def test_escape_cancels_an_active_tool_without_deferring_it(
             )
 
     class PromptSession:
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
             return await inputs.get()
 
@@ -1859,6 +1866,14 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
     inputs: asyncio.Queue[str | BaseException] = asyncio.Queue()
     prompt_calls = 0
     calls: list[list[Message]] = []
+    panel_messages: list[str] = []
+    original_show_panel = ReplRenderer.show_panel
+
+    def record_panel_message(renderer: ReplRenderer, text: str) -> None:
+        panel_messages.append(text)
+        original_show_panel(renderer, text)
+
+    monkeypatch.setattr(ReplRenderer, "show_panel", record_panel_message)
 
     class DrainingTransport:
         name = "stub"
@@ -1984,7 +1999,11 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
     await inputs.put(EOFError())
     prompt_calls_at_eof = prompt_calls
 
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if "Draining active/pending work; Ctrl-C cancels." in panel_messages:
+            break
+        await asyncio.sleep(0.01)
+    assert "Draining active/pending work; Ctrl-C cancels." in panel_messages
     assert not repl_task.done()
     release_active.set()
     await asyncio.wait_for(pending_started.wait(), timeout=1)
@@ -2073,7 +2092,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
             nonlocal prompt_calls
             prompt_calls += 1
             assert to_plain_text(cast(Any, prompt)).endswith("> ")
-            assert kwargs == {"default": "restored editor"}
+            assert kwargs == {"default": "restored editor", "handle_sigint": False}
             self.default_buffer.text = "restored editor"
             raise EOFError
 

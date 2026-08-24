@@ -92,6 +92,15 @@ async def test_inline_output_orders_the_complete_transaction() -> None:
     assert app._running_in_terminal_f.done()
 
 
+def test_synchronous_redraw_uses_the_compatibility_boundary() -> None:
+    operations: list[str] = []
+    app = _App(operations)
+
+    PromptToolkitInlineOutput.redraw_now(app)
+
+    assert operations == ["redraw", "flush"]
+
+
 async def test_inline_output_waits_for_cpr_before_erasing() -> None:
     operations: list[str] = []
     app = _App(operations)

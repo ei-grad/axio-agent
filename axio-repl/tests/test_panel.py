@@ -389,7 +389,8 @@ async def test_ctrl_c_at_the_prompt_interrupts_instead_of_ending_the_read() -> N
     observed_prompts: list[object] = []
 
     class _Session:
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             observed_prompts.append(prompt)
             answer = answers.pop(0)
             if isinstance(answer, BaseException):
@@ -565,7 +566,8 @@ async def test_admission_failure_clears_accept_metadata_without_retrying() -> No
     class Session:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             del prompt
             return self.default_buffer.text
 
@@ -627,7 +629,8 @@ async def test_enter_admission_completes_before_editor_clear_even_when_reader_is
     class Session:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert prompt == _panel.PROMPT_MESSAGE
             return self.default_buffer.text
 
@@ -706,7 +709,8 @@ async def test_reader_cancellation_after_accept_cannot_abandon_reserved_sequence
     class Session:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert prompt == _panel.PROMPT_MESSAGE
             self.default_buffer._axio_accepted_target = "main"
             self.default_buffer._axio_accepted_seq = hub.reserve_sequence()
@@ -792,7 +796,8 @@ async def test_prompt_failure_after_accept_completes_reservation_before_reraisin
     class Session:
         default_buffer = Buffer()
 
-        async def prompt_async(self, prompt: object) -> str:
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert kwargs == {"handle_sigint": False}
             assert prompt == _panel.PROMPT_MESSAGE
             raise OSError("prompt teardown failed")
 
@@ -1144,6 +1149,37 @@ async def test_empty_ctrl_d_requires_two_presses_but_nonempty_ctrl_d_deletes_for
             with pytest.raises(EOFError):
                 await prompt
             assert len(presses) == 2
+
+
+async def test_double_eof_remains_available_when_prompt_session_is_reused() -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    presses = 0
+
+    def arm_exit(_now: float) -> bool:
+        nonlocal presses
+        presses += 1
+        return presses % 2 == 0
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", on_empty_eof=arm_exit)
+
+            first_prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
+            pipe.send_text("\x04\x04")
+            with pytest.raises(EOFError):
+                await asyncio.wait_for(first_prompt, timeout=1)
+            assert presses == 2
+
+            second_prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
+            pipe.send_text("\x04\x04")
+            with pytest.raises(EOFError):
+                await asyncio.wait_for(second_prompt, timeout=1)
+            assert presses == 4
 
 
 def test_editor_text_reads_without_mutating_default_buffer() -> None:
