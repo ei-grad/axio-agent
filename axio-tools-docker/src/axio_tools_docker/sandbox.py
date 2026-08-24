@@ -24,8 +24,8 @@ from aiodocker.exceptions import DockerError
 from axio._asyncio import shield_until_done
 from axio.diff import (
     MAX_DIFF_SOURCE_BYTES,
-    MAX_FIRST_LINE_INDENT,
-    apply_first_line_indent,
+    PATCH_CONTENT_DESCRIPTION,
+    decode_patch_content,
     describe_patch,
     describe_write,
 )
@@ -236,9 +236,10 @@ async def read_file(
     Lines are 1-indexed: start_line=1 is the first line, end_line=3 includes
     line 3. Pass line_numbers=True to prefix each line as
     ``L<number>│<source>`` — required before calling patch_file. Everything
-    after ``│`` is exact file content; the prefix is metadata and must not be
-    copied into patch_file content. Large files are truncated to max_chars.
-    Always read the file before editing it with write_file or patch_file."""
+    after ``│`` is exact file content. For patch_file content, remove only
+    ``L<number>`` and retain ``│source`` as its required visible framing. Large
+    files are truncated to max_chars. Always read the file before editing it
+    with write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     if max_chars < 0:
@@ -384,34 +385,21 @@ async def patch_file(
     path: str,
     from_line: int,
     to_line: int,
-    content: str,
+    content: Annotated[str, Field(description=PATCH_CONTENT_DESCRIPTION)],
     mode: int = 0o644,
-    first_line_indent: Annotated[
-        int,
-        Field(
-            description=(
-                "Number of ASCII spaces to prefix to the first content line. Use this when the model provider "
-                "cannot reliably preserve leading spaces in the first JSON string line; indentation is explicit "
-                "and is never inferred from surrounding code. Leave at 0 when content already starts with whitespace."
-            ),
-            ge=0,
-            le=MAX_FIRST_LINE_INDENT,
-        ),
-    ] = 0,
 ) -> str:
     """Replace a range of lines in an existing UTF-8 text file. Lines are
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. content is applied literally: include exact
-    leading whitespace on the first and every following line, and do not copy
-    read_file's ``L<number>│`` metadata prefix. If the provider cannot preserve
-    leading spaces in the first JSON string line, set first_line_indent to the
-    exact number of ASCII spaces to add; it is never inferred from surrounding
-    code and must not be combined with existing first-line whitespace. Use this
-    for surgical edits instead of rewriting the whole file with write_file. The
-    result reports a compact diff fragment with function context when it can be
-    inferred. Binary files cannot be patched."""
+    to get correct line numbers. Frame every content line as ``│source``: put
+    exact whitespace after the visible sentinel, remove ``L<number>`` from
+    read_file output, and retain ``│source``. A framed literal source line that
+    begins with ``│`` is ``││source``. Entirely unframed content remains literal
+    for programmatic compatibility, but framed and unframed lines cannot be
+    mixed. Use this for surgical edits instead of rewriting the whole file with
+    write_file. The result reports a compact diff fragment with function context
+    when it can be inferred. Binary files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:
@@ -424,10 +412,9 @@ async def patch_file(
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
     try:
-        applied_content = apply_first_line_indent(content, first_line_indent)
+        content_lines = decode_patch_content(content)
     except ValueError as exc:
         raise HandlerError(str(exc)) from exc
-    content_lines = applied_content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
         content_lines[-1] += "\n"
     after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])

@@ -440,15 +440,15 @@ class TestToolResultCarriesData:
         assert r.content != ""
         assert not r.is_error
 
-    async def test_streamed_string_whitespace_reaches_context_handler_and_result_exactly(self) -> None:
-        expected = "        first line\n\tsecond line"
+    async def test_framed_patch_content_reaches_context_handler_and_result_exactly(self) -> None:
+        expected = "│        first line\n│\tsecond line"
         received: list[str] = []
 
         async def capture(content: str) -> str:
             received.append(content)
             return content
 
-        raw = json.dumps({"content": expected})
+        raw = json.dumps({"content": expected}, ensure_ascii=False)
         transport = StubTransport(
             [
                 [

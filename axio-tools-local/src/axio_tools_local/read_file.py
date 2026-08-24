@@ -150,11 +150,12 @@ async def read_file(
     capable models. Lines are 1-indexed: start_line=1 is the first line,
     end_line=3 includes line 3. Pass line_numbers=True to prefix each line as
     ``L<number>│<source>`` — required before calling patch_file. Everything
-    after ``│`` is exact file content; the prefix is metadata and must not be
-    copied into patch_file content. Without max_chars, text and binary reads
-    larger than 32768 chars fail with an explanation. With max_chars, large
-    reads are truncated to that explicit limit. Always read the file before
-    editing it with write_file or patch_file."""
+    after ``│`` is exact file content. For patch_file content, remove only
+    ``L<number>`` and retain ``│source`` as its required visible framing.
+    Without max_chars, text and binary reads larger than 32768 chars fail with
+    an explanation. With max_chars, large reads are truncated to that explicit
+    limit. Always read the file before editing it with write_file or
+    patch_file."""
 
     def _blocking() -> ReadFileResult:
         resolved = os.path.join(os.getcwd(), path)
