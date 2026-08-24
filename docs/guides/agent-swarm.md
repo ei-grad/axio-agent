@@ -55,7 +55,6 @@ Roles are TOML files. Each file describes one specialist: its name, description,
 name = "architect"
 description = "Designs system architecture, component interfaces, and documents technical decisions"
 max_iterations = 100
-patch_line_framing = "auto"
 tools = ["read_file", "write_file", "patch_file", "list_files", "shell", "run_python", "analyze", "notes"]
 
 [system]
@@ -74,10 +73,6 @@ If you wrote or updated a note, say so explicitly in your response.
 
 The `tools` list contains names that are resolved against the shared toolbox at
 runtime - the TOML file does not know about `Tool` objects, only names.
-`patch_line_framing` accepts `auto`, `on`, or `off`; `auto` avoids the legacy
-line protocol when the selected transport already protects all string tool
-arguments structurally, and otherwise adds the current rule as a non-human
-tool-protocol conversation message.
 `analyze` and `notes` are added to the toolbox by `run_swarm()` after the sandbox
 tools are injected.
 

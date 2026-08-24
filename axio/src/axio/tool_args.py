@@ -11,19 +11,11 @@ raw ``ToolInputDelta`` fragment for strict final JSON validation.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from enum import IntEnum
 from types import MappingProxyType
 
 from .events import ToolFieldDelta, ToolFieldEnd, ToolFieldStart
-from .tool_codec import (
-    TOOL_ARGUMENT_CODEC,
-    TOOL_ARGUMENT_FRAME_KEY,
-    ToolArgumentCodecError,
-    decode_framed_values,
-    sanitize_presentation_value,
-)
 
 type ToolFieldEvent = ToolFieldStart | ToolFieldDelta | ToolFieldEnd
 
@@ -39,9 +31,6 @@ class State(IntEnum):
     AFTER = 7
     ESC = 8
     UESC = 9
-    FRAME_PROBE = 10
-    FRAME_AFTER = 11
-    ENCODED_RAW = 12
 
 
 ESCAPES: Mapping[str, str] = MappingProxyType(
@@ -59,101 +48,6 @@ ESCAPES: Mapping[str, str] = MappingProxyType(
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _REPLACEMENT = "\ufffd"
-
-
-class _FrameProbe:
-    """Recognize the one-property structural frame before its string value."""
-
-    __slots__ = ("buffer", "_state", "_key", "_escape")
-
-    def __init__(self) -> None:
-        self.buffer = ["{"]
-        self._state = "before-key"
-        self._key: list[str] = []
-        self._escape = False
-
-    def feed(self, char: str) -> str:
-        self.buffer.append(char)
-        if self._state == "before-key":
-            if char.isspace():
-                return "continue"
-            if char == '"':
-                self._state = "key"
-                return "continue"
-            return "rejected"
-        if self._state == "key":
-            if self._escape:
-                self._key.append(char)
-                self._escape = False
-                return "continue"
-            if char == "\\":
-                self._key.append(char)
-                self._escape = True
-                return "continue"
-            if char != '"':
-                self._key.append(char)
-                return "continue"
-            try:
-                key = json.loads(f'"{"".join(self._key)}"')
-            except json.JSONDecodeError:
-                return "rejected"
-            if key != TOOL_ARGUMENT_FRAME_KEY:
-                return "rejected"
-            self._state = "after-key"
-            return "continue"
-        if self._state == "after-key":
-            if char.isspace():
-                return "continue"
-            if char == ":":
-                self._state = "before-value"
-                return "continue"
-            return "rejected"
-        if self._state == "before-value":
-            if char.isspace():
-                return "continue"
-            return "confirmed" if char == '"' else "rejected"
-        return "rejected"
-
-
-class _BufferedEncodedRaw:
-    """Hold a nested value until frames can be removed without leaking them."""
-
-    __slots__ = ("_raw", "_depth", "_in_string", "_escape", "done")
-
-    def __init__(self, initial: str) -> None:
-        self._raw: list[str] = []
-        self._depth = 0
-        self._in_string = False
-        self._escape = False
-        self.done = False
-        for char in initial:
-            self.feed(char)
-
-    def feed(self, char: str) -> None:
-        self._raw.append(char)
-        if self._in_string:
-            if self._escape:
-                self._escape = False
-            elif char == "\\":
-                self._escape = True
-            elif char == '"':
-                self._in_string = False
-            return
-        if char == '"':
-            self._in_string = True
-        elif char in "[{":
-            self._depth += 1
-        elif char in "]}":
-            self._depth -= 1
-            self.done = self._depth == 0
-
-    def display(self) -> str:
-        try:
-            value = json.loads("".join(self._raw))
-            decoded = sanitize_presentation_value(decode_framed_values(value, TOOL_ARGUMENT_CODEC))
-        except (json.JSONDecodeError, ToolArgumentCodecError):
-            return "[invalid encoded value]"
-        return json.dumps(decoded, ensure_ascii=False)
 
 
 class ToolArgStream:
@@ -184,13 +78,9 @@ class ToolArgStream:
         "_esc_ret",
         "_events",
         "_done",
-        "_codec",
-        "_frame_probe",
-        "_encoded_raw",
-        "_frame_active",
     )
 
-    def __init__(self, tool_use_id: str, index: int = 0, argument_codec: str | None = None) -> None:
+    def __init__(self, tool_use_id: str, index: int = 0) -> None:
         self._id = tool_use_id
         self._idx = index
         self._st = State.INIT
@@ -206,10 +96,6 @@ class ToolArgStream:
         self._esc_ret = State.KEY
         self._events: list[ToolFieldEvent] = []
         self._done = False
-        self._codec = argument_codec if argument_codec == TOOL_ARGUMENT_CODEC else None
-        self._frame_probe: _FrameProbe | None = None
-        self._encoded_raw: _BufferedEncodedRaw | None = None
-        self._frame_active = False
 
     @property
     def current_key(self) -> str:
@@ -241,10 +127,6 @@ class ToolArgStream:
         elif self._st is State.ESC:
             self._flush_high_surrogate()
             self._st = self._esc_ret
-        elif self._st is State.FRAME_PROBE:
-            self._buf.append("[incomplete encoded value]")
-        elif self._st is State.ENCODED_RAW:
-            self._buf.append("[incomplete encoded value]")
         else:
             self._flush_high_surrogate()
         self._flush()
@@ -337,12 +219,6 @@ class ToolArgStream:
             case State.VAL:
                 if ch in " \t\r\n":
                     pass
-                elif self._codec is not None and ch == "{":
-                    self._frame_probe = _FrameProbe()
-                    self._st = State.FRAME_PROBE
-                elif self._codec is not None and ch == "[":
-                    self._encoded_raw = _BufferedEncodedRaw(ch)
-                    self._st = State.ENCODED_RAW
                 elif ch == '"':
                     self._esc_key = False
                     self._st = State.STR
@@ -359,12 +235,8 @@ class ToolArgStream:
                     self._esc_ret = State.STR
                     self._st = State.ESC
                 elif ch == '"':
-                    if self._frame_active:
-                        self._frame_active = False
-                        self._st = State.FRAME_AFTER
-                    else:
-                        self._end()
-                        self._st = State.AFTER
+                    self._end()
+                    self._st = State.AFTER
                 else:
                     self._append_literal_character(ch)
 
@@ -428,49 +300,3 @@ class ToolArgStream:
                     code = int("".join(self._u), 16)
                     self._append_unicode_code_unit(code)
                     self._st = self._esc_ret
-
-            case State.FRAME_PROBE:
-                probe = self._frame_probe
-                if probe is None:
-                    self._st = State.AFTER
-                    return
-                status = probe.feed(ch)
-                if status == "confirmed":
-                    self._frame_probe = None
-                    self._frame_active = True
-                    self._esc_key = False
-                    self._st = State.STR
-                elif status == "rejected":
-                    self._encoded_raw = _BufferedEncodedRaw("".join(probe.buffer))
-                    self._frame_probe = None
-                    if self._encoded_raw.done:
-                        self._buf.append(self._encoded_raw.display())
-                        self._encoded_raw = None
-                        self._end()
-                        self._st = State.AFTER
-                    else:
-                        self._st = State.ENCODED_RAW
-
-            case State.FRAME_AFTER:
-                if ch in " \t\r\n":
-                    pass
-                elif ch == "}":
-                    self._end()
-                    self._st = State.AFTER
-                else:
-                    self._buf.append("[invalid encoded value]")
-                    self._end()
-                    self._st = State.AFTER
-                    self._step(ch)
-
-            case State.ENCODED_RAW:
-                raw = self._encoded_raw
-                if raw is None:
-                    self._st = State.AFTER
-                    return
-                raw.feed(ch)
-                if raw.done:
-                    self._buf.append(raw.display())
-                    self._encoded_raw = None
-                    self._end()
-                    self._st = State.AFTER

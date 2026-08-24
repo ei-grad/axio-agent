@@ -8,7 +8,6 @@ import pytest
 from axio.blocks import TextBlock
 from axio.events import ReasoningDelta, TextDelta, ToolInputDelta, ToolOutputDelta, ToolUseStart
 from axio.messages import InputProvenance, Message
-from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio_tools_agents.runtime import (
     EditorSnapshot,
     InputBuffered,
@@ -166,82 +165,6 @@ async def test_recovery_restores_messages_pending_editor_and_partial_turn(tmp_pa
     assert "Available reasoning fragment:\nchecking" in notice.text
     assert "name=shell, call_id=call" in notice.text
     assert "still running" in notice.text
-
-
-async def test_recovery_decodes_only_tool_arguments_marked_with_wire_codec(tmp_path: Path) -> None:
-    journal = await SessionJournal.open(session_id="source", root=tmp_path)
-    await _publish_event(journal, "turn_started", TurnStarted("work"), 1, "unfinished")
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolUseStart(
-            index=0,
-            tool_use_id="call",
-            name="write_file",
-            argument_codec=TOOL_ARGUMENT_CODEC,
-        ),
-        2,
-        "unfinished",
-    )
-    arguments = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: "          body"}})
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolInputDelta(index=0, tool_use_id="call", partial_json=arguments),
-        3,
-        "unfinished",
-    )
-    await journal.close()
-
-    recovered = materialize_recovery(journal.events_path)
-    notice = recovered.messages[-1].content[0]
-
-    assert isinstance(notice, TextBlock)
-    assert TOOL_ARGUMENT_FRAME_KEY not in notice.text
-    assert '"content": "          body"' in notice.text
-
-
-async def test_recovery_hides_malformed_frames_and_sanitizes_surrogates(tmp_path: Path) -> None:
-    journal = await SessionJournal.open(session_id="source", root=tmp_path)
-    await _publish_event(journal, "turn_started", TurnStarted("work"), 1, "unfinished")
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolUseStart(0, "bad", "write_file", argument_codec=TOOL_ARGUMENT_CODEC),
-        2,
-        "unfinished",
-    )
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolInputDelta(0, "bad", json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: 7}})),
-        3,
-        "unfinished",
-    )
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolUseStart(1, "surrogate", "tool", argument_codec=TOOL_ARGUMENT_CODEC),
-        4,
-        "unfinished",
-    )
-    await _publish_event(
-        journal,
-        "stream_event",
-        ToolInputDelta(1, "surrogate", partial_json=r'{"options":{"value":"\uD800"}}'),
-        5,
-        "unfinished",
-    )
-    await journal.close()
-
-    recovered = materialize_recovery(journal.events_path)
-    notice = recovered.messages[-1].content[0]
-
-    assert isinstance(notice, TextBlock)
-    assert TOOL_ARGUMENT_FRAME_KEY not in notice.text
-    assert "invalid or incomplete encoded arguments" in notice.text
-    assert "\ufffd" in notice.text
-    notice.text.encode("utf-8", errors="strict")
 
 
 async def test_recovery_applied_record_prevents_duplicate_partial_materialization(tmp_path: Path) -> None:

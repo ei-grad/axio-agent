@@ -1356,17 +1356,13 @@ class AgentApp(App[None]):
                                 await self._ensure_md()
                                 self._response_text += delta
                                 self._text_dirty = True
-                            case ToolUseStart(
-                                tool_use_id=tid,
-                                name=name,
-                                argument_codec=codec,
-                            ) if name != "status_line":
+                            case ToolUseStart(tool_use_id=tid, name=name) if name != "status_line":
                                 self._agent_emoji = "🔧"
                                 await self._update_status()
                                 w = await self._ensure_tool_status()
                                 w.track(tid, name)
                                 # Start a new arg stream for this tool
-                                self._tool_arg_streams[tid] = ToolArgStream(tid, argument_codec=codec)
+                                self._tool_arg_streams[tid] = ToolArgStream(tid)
                             case ToolInputDelta(tool_use_id=tid, partial_json=json_chunk):
                                 arg_stream = self._tool_arg_streams.get(tid)
                                 if arg_stream is not None:

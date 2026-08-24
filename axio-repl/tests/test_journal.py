@@ -32,7 +32,6 @@ from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.testing import make_text_response, make_tool_use_response
 from axio.tool import Tool
-from axio.tool_codec import TOOL_ARGUMENT_CODEC
 from axio.types import CostSource, StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
@@ -630,22 +629,11 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     assert configurations["effort"]["mechanism"] == "prompt-fallback"
 
     committed = [record for record in records if record["kind"] == "message_committed"]
-    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "user", "assistant"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
     assert all(record["agent_id"] == "main" for record in committed)
     assert all(record["context_id"] for record in committed)
     assert committed[0]["payload"]["message"]["content"][0]["text"].endswith("] test prompt")
-    hook = committed[1]["payload"]["message"]
-    assert hook["provenance"] == {
-        "record_type": "InputProvenance",
-        "human_authored": False,
-        "source": "tool-hook",
-        "author": "patch_file",
-        "submitted_at": None,
-        "authority": "tool-protocol",
-        "protocol_state": "patch-file:line-framed:prior=",
-    }
-    assert "frame every logical line" in hook["content"][0]["text"]
-    assert committed[2]["payload"]["message"]["content"][0]["text"] == "stub answer"
+    assert committed[1]["payload"]["message"]["content"][0]["text"] == "stub answer"
 
     captured = capsys.readouterr()
     assert "Semantic log:" not in captured.out
@@ -831,12 +819,7 @@ async def test_cli_effort_is_recorded_as_configuration_without_extra_history_mes
     assert effort_change["payload"]["event"]["value"]["requested"] == "high"
     assert effort_change["payload"]["event"]["value"]["mechanism"] == "prompt-fallback"
     committed = [record for record in records if record["kind"] == "message_committed"]
-    non_protocol = [
-        record
-        for record in committed
-        if (record["payload"]["message"].get("provenance") or {}).get("authority") != "tool-protocol"
-    ]
-    assert [record["payload"]["message"]["role"] for record in non_protocol] == ["user", "assistant"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
 
 
 async def test_one_shot_session_log_can_be_disabled(
@@ -1148,12 +1131,7 @@ async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_
     await _write_runtime_event(journal, base)
     raw_parts = ('{"content":"        first line\\n', '\\tsecond line"}')
     events: tuple[RuntimeEvent, ...] = (
-        ToolUseStart(
-            index=0,
-            tool_use_id="call-1",
-            name="patch_file",
-            argument_codec=TOOL_ARGUMENT_CODEC,
-        ),
+        ToolUseStart(index=0, tool_use_id="call-1", name="patch_file"),
         ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[0]),
         ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[1]),
     )
@@ -1171,25 +1149,17 @@ async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_
 
     records = read_journal(journal.semantic_path).records
     fragments: list[str] = []
-    codecs: list[str] = []
     for record in records:
         if record["kind"] != "turn_checkpoint":
             continue
         payload = record["payload"]
         assert isinstance(payload, dict)
         tool_arguments = payload["tool_arguments"]
-        tool_argument_codecs = payload["tool_argument_codecs"]
         assert isinstance(tool_arguments, dict)
-        assert isinstance(tool_argument_codecs, dict)
         fragment = tool_arguments.get("call-1", "")
         assert isinstance(fragment, str)
         fragments.append(fragment)
-        codec = tool_argument_codecs.get("call-1")
-        if codec is not None:
-            assert isinstance(codec, str)
-            codecs.append(codec)
     assert "".join(fragments) == "".join(raw_parts)
-    assert codecs == [TOOL_ARGUMENT_CODEC]
 
 
 @pytest.mark.parametrize(
@@ -1267,10 +1237,7 @@ async def test_one_shot_journal_captures_actual_local_subagent_session(
     assert all(record["parent_tool_use_id"] == f"{tool_name}-call" for record in child_records)
     assert any(record["kind"] == "turn_checkpoint" for record in child_records)
     committed = [record for record in child_records if record["kind"] == "message_committed"]
-    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "user", "assistant"]
-    hook = committed[1]["payload"]["message"]
-    assert hook["provenance"]["authority"] == "tool-protocol"
-    assert hook["provenance"]["human_authored"] is False
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
     assert len({record["context_id"] for record in child_records if record["context_id"]}) == 1
     if tool_name == "run_agent":
         assert not any(record["kind"] == "outcome_delivered" for record in child_records)

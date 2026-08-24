@@ -6,14 +6,13 @@ import asyncio
 import io
 import tarfile
 from collections.abc import AsyncGenerator
-from types import MappingProxyType
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiodocker
 import pytest
 from axio.exceptions import HandlerError
-from axio.tool import CONTEXT, ToolInputContext
+from axio.tool import CONTEXT
 
 from axio_tools_docker import sandbox as sandbox_module
 from axio_tools_docker.sandbox import DockerSandbox, ImageNotAvailableError, parse_cpus, parse_device, parse_memory
@@ -311,7 +310,7 @@ async def test_tools_names_match_axio_tools_local() -> None:
     assert names == EXPECTED_TOOL_NAMES
 
 
-async def test_patch_file_tool_schema_does_not_advertise_legacy_line_framing() -> None:
+async def test_patch_file_tool_schema_uses_literal_content_without_indent_workaround() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
@@ -319,21 +318,20 @@ async def test_patch_file_tool_schema_does_not_advertise_legacy_line_framing() -
 
     assert "first_line_indent" not in tool.schema["properties"]
     content = tool.schema["properties"]["content"]
-    assert "exact whitespace" in content["description"]
-    assert "│" not in content["description"]
-    assert "framed" not in content["description"].lower()
-    assert "Frame every content line" not in tool.description
+    assert "applied literally" in content["description"]
+    assert "exact leading and trailing whitespace" in content["description"]
+    assert "L<number>" in content["description"]
 
 
-async def test_read_file_tool_description_does_not_advertise_patch_line_framing() -> None:
+async def test_read_file_tool_description_marks_line_prefix_as_display_metadata() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             tool = next(item for item in sb.tools if item.name == "read_file")
 
-    assert "line_numbers=True" in tool.description
-    assert "retain ``│source``" not in tool.description
-    assert "required visible framing" not in tool.description
+    assert "``L<number>│<source>``" in tool.description
+    assert "display metadata" in tool.description
+    assert "must not be copied" in tool.description
 
 
 async def test_shell_discovery_prefers_bash_and_builds_runtime_schema() -> None:
@@ -774,15 +772,6 @@ def _bind_context(sb: DockerSandbox) -> Any:
     return CONTEXT.set(sb)
 
 
-async def _call_line_framed_patch(sb: DockerSandbox, **input: Any) -> Any:
-    tool = next(item for item in sb.tools if item.name == "patch_file")
-    prepared = tool.prepare_input(
-        input,
-        ToolInputContext(policy=MappingProxyType({"patch_line_framing": "on"})),
-    )
-    return await tool.invoke_prepared(**prepared.input)
-
-
 async def test_read_file_handler_missing_path_raises_handler_error() -> None:
     cls, client, container = mock_docker_factory()
     container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
@@ -1041,20 +1030,20 @@ async def test_patch_file_handler_preserves_leading_spaces_and_tabs_exactly() ->
     assert member.read() == b"before\n        first\n\tsecond\nafter\n"
 
 
-async def test_patch_file_handler_decodes_framed_multiline_whitespace_and_empty_line() -> None:
+async def test_patch_file_handler_preserves_literal_multiline_whitespace_and_empty_line() -> None:
     cls, client, container = mock_docker_factory(
         archive_content=make_tar_file("patch_me.txt", b"before\nold one\nold two\nafter\n")
     )
+    content = "      first\n\tsecond\n\n"
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await _call_line_framed_patch(
-                    sb,
+                await sandbox_module.patch_file(
                     path="patch_me.txt",
                     from_line=2,
                     to_line=3,
-                    content="│      first\n│\tsecond\n│\n",
+                    content=content,
                 )
             finally:
                 CONTEXT.reset(token)
@@ -1065,25 +1054,7 @@ async def test_patch_file_handler_decodes_framed_multiline_whitespace_and_empty_
     assert member.read() == b"before\n      first\n\tsecond\n\nafter\n"
 
 
-async def test_patch_file_tool_direct_call_treats_all_sentinel_lines_as_literal() -> None:
-    cls, client, container = mock_docker_factory(archive_content=make_tar_file("patch_me.txt", b"old\n"))
-    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
-        async with DockerSandbox() as sb:
-            tool = next(item for item in sb.tools if item.name == "patch_file")
-            await tool(
-                path="patch_me.txt",
-                from_line=1,
-                to_line=1,
-                content="│literal\n│still literal\n",
-            )
-
-    written = container.put_archive.call_args.kwargs["data"]
-    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
-    assert member is not None
-    assert member.read() == "│literal\n│still literal\n".encode()
-
-
-async def test_patch_file_handler_preserves_crlf_from_framed_content_and_untouched_lines() -> None:
+async def test_patch_file_handler_preserves_literal_crlf_content_and_untouched_lines() -> None:
     cls, client, container = mock_docker_factory(
         archive_content=make_tar_file("patch_me.txt", b"before\r\nold\r\nafter\r\n")
     )
@@ -1091,12 +1062,11 @@ async def test_patch_file_handler_preserves_crlf_from_framed_content_and_untouch
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await _call_line_framed_patch(
-                    sb,
+                await sandbox_module.patch_file(
                     path="patch_me.txt",
                     from_line=2,
                     to_line=2,
-                    content="│    replacement\r\n",
+                    content="    replacement\r\n",
                 )
             finally:
                 CONTEXT.reset(token)
@@ -1107,50 +1077,30 @@ async def test_patch_file_handler_preserves_crlf_from_framed_content_and_untouch
     assert member.read() == b"before\r\n    replacement\r\nafter\r\n"
 
 
-async def test_patch_file_handler_framed_empty_line_is_not_a_deletion() -> None:
-    cls, client, container = mock_docker_factory(
-        archive_content=make_tar_file("patch_me.txt", b"before\nold\nafter\n")
-    )
-    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
-        async with DockerSandbox() as sb:
-            token = _bind_context(sb)
-            try:
-                await _call_line_framed_patch(
-                    sb,
-                    path="patch_me.txt",
-                    from_line=2,
-                    to_line=2,
-                    content="│",
-                )
-            finally:
-                CONTEXT.reset(token)
-
-    written = container.put_archive.call_args.kwargs["data"]
-    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
-    assert member is not None
-    assert member.read() == b"before\n\nafter\n"
-
-
 @pytest.mark.parametrize(
-    ("before", "from_line", "to_line"),
-    [(b"old\n", 1, 1), (b"", 1, 0)],
+    ("before", "from_line", "to_line", "after"),
+    [
+        (b"before\nold\nafter\n", 2, 2, b"before\n\nafter\n"),
+        (b"old\n", 1, 1, b"\n"),
+        (b"", 1, 0, b"\n"),
+    ],
 )
-async def test_patch_file_handler_framed_empty_line_survives_at_eof(
+async def test_patch_file_handler_literal_empty_line_is_not_a_deletion(
     before: bytes,
     from_line: int,
     to_line: int,
+    after: bytes,
 ) -> None:
     cls, client, container = mock_docker_factory(archive_content=make_tar_file("patch_me.txt", before))
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await _call_line_framed_patch(
-                    sb,
+                await sandbox_module.patch_file(
                     path="patch_me.txt",
                     from_line=from_line,
                     to_line=to_line,
-                    content="│",
+                    content="\n",
                 )
             finally:
                 CONTEXT.reset(token)
@@ -1158,41 +1108,20 @@ async def test_patch_file_handler_framed_empty_line_survives_at_eof(
     written = container.put_archive.call_args.kwargs["data"]
     member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
     assert member is not None
-    assert member.read() == b"\n"
-
-
-async def test_patch_file_handler_repairs_provider_style_counter_indent_with_framing() -> None:
-    cls, client, container = mock_docker_factory(archive_content=make_tar_file("patch_me.txt", b"old\n"))
-    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
-        async with DockerSandbox() as sb:
-            token = _bind_context(sb)
-            try:
-                result = await _call_line_framed_patch(
-                    sb,
-                    path="patch_me.txt",
-                    from_line=1,
-                    to_line=1,
-                    content="│          $counter.textContent =",
-                )
-            finally:
-                CONTEXT.reset(token)
-
-    written = container.put_archive.call_args.kwargs["data"]
-    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
-    assert member is not None
-    assert member.read() == b"          $counter.textContent ="
-    assert result != "No changes"
+    assert member.read() == after
 
 
 @pytest.mark.parametrize(
     ("before", "from_line", "to_line", "content", "after"),
     [
-        (b"after\n", 1, 0, "│   inserted", b"   inserted\nafter\n"),
-        (b"old\n", 1, 1, "│last", b"last"),
-        (b"old\n", 1, 1, "││literal\n", "│literal\n".encode()),
+        (b"after\n", 1, 0, "   inserted", b"   inserted\nafter\n"),
+        (b"old\n", 1, 1, "last", b"last"),
+        (b"old\n", 1, 1, "│literal\n", "│literal\n".encode()),
+        (b"old\n", 1, 1, "L12│source\n", "L12│source\n".encode()),
+        (b"old\n", 1, 1, "│marked\nplain\n", "│marked\nplain\n".encode()),
     ],
 )
-async def test_patch_file_handler_framed_insert_eof_and_literal_sentinel(
+async def test_patch_file_handler_treats_all_content_as_literal(
     before: bytes,
     from_line: int,
     to_line: int,
@@ -1204,8 +1133,7 @@ async def test_patch_file_handler_framed_insert_eof_and_literal_sentinel(
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await _call_line_framed_patch(
-                    sb,
+                await sandbox_module.patch_file(
                     path="patch_me.txt",
                     from_line=from_line,
                     to_line=to_line,
@@ -1218,34 +1146,6 @@ async def test_patch_file_handler_framed_insert_eof_and_literal_sentinel(
     member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
     assert member is not None
     assert member.read() == after
-
-
-@pytest.mark.parametrize(
-    ("content", "message"),
-    [
-        ("│framed\nlegacy", "every content line"),
-        ("legacy\n│framed", "every content line"),
-        ("L12│source", "remove the L<number> prefix"),
-    ],
-)
-async def test_patch_file_handler_rejects_invalid_framing_without_writing(content: str, message: str) -> None:
-    cls, client, container = mock_docker_factory(archive_content=make_tar_file("patch_me.txt", b"old\n"))
-    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
-        async with DockerSandbox() as sb:
-            token = _bind_context(sb)
-            try:
-                with pytest.raises(HandlerError, match=message):
-                    await _call_line_framed_patch(
-                        sb,
-                        path="patch_me.txt",
-                        from_line=1,
-                        to_line=1,
-                        content=content,
-                    )
-            finally:
-                CONTEXT.reset(token)
-
-    container.put_archive.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

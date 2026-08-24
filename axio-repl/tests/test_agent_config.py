@@ -213,57 +213,6 @@ def test_theme_rejects_invalid_environment_value(tmp_path: Path) -> None:
         load_agent_profile(tmp_path, None, {"AXIO_REPL_THEME": "unknown"})
 
 
-def test_patch_line_framing_uses_global_agent_environment_and_cli_precedence(tmp_path: Path) -> None:
-    from argparse import Namespace
-
-    write_config(
-        tmp_path / "config.yaml",
-        'version: 1\ndefaults:\n  runtime:\n    patch_line_framing: "on"\n',
-    )
-    write_config(
-        tmp_path / "agents" / "local" / "agent.yaml",
-        'version: 1\nruntime:\n  patch_line_framing: "off"\n',
-    )
-
-    agent_profile = load_agent_profile(tmp_path, "local", {})
-    assert agent_profile.settings.runtime.patch_line_framing == "off"
-    args = Namespace(patch_line_framing="auto", no_session_log=False)
-    apply_profile_to_args(args, agent_profile, explicit_cli_destinations([]))
-    assert args.patch_line_framing == "off"
-
-    environment_profile = load_agent_profile(
-        tmp_path,
-        "local",
-        {"AXIO_REPL_PATCH_LINE_FRAMING": "auto"},
-    )
-    assert environment_profile.settings.runtime.patch_line_framing == "auto"
-
-    args = Namespace(patch_line_framing="on", no_session_log=False)
-    apply_profile_to_args(args, environment_profile, explicit_cli_destinations(["--patch-line-framing=on"]))
-    assert args.patch_line_framing == "on"
-
-
-@pytest.mark.parametrize("value", ["yes", True, 7])
-def test_patch_line_framing_rejects_invalid_yaml_values(tmp_path: Path, value: object) -> None:
-    import yaml
-
-    write_config(
-        tmp_path / "config.yaml",
-        yaml.safe_dump(
-            {"version": 1, "defaults": {"runtime": {"patch_line_framing": value}}},
-            sort_keys=False,
-        ),
-    )
-
-    with pytest.raises(AgentConfigError, match="runtime.patch_line_framing"):
-        load_agent_profile(tmp_path, None, {})
-
-
-def test_patch_line_framing_rejects_invalid_environment_value(tmp_path: Path) -> None:
-    with pytest.raises(AgentConfigError, match="AXIO_REPL_PATCH_LINE_FRAMING"):
-        load_agent_profile(tmp_path, None, {"AXIO_REPL_PATCH_LINE_FRAMING": "yes"})
-
-
 def test_selected_agent_manifest_exposes_trusted_model_context(tmp_path: Path) -> None:
     write_config(
         tmp_path / "agents" / "local" / "agent.yaml",

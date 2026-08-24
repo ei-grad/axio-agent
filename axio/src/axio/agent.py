@@ -8,13 +8,11 @@ import dataclasses
 import json
 import logging
 import time
-from collections import Counter
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from types import MappingProxyType
-from typing import Any, Literal, Protocol, Self, cast
+from typing import Any, Protocol, Self
 
 from . import background, notify
 from ._asyncio import shield_until_done
@@ -35,37 +33,16 @@ from .events import (
     ToolUseStart,
     VideoOutput,
 )
-from .exceptions import GuardCrash, HandlerCrash, ToolError, ToolInputPreparationError, ToolProtocolError
-from .messages import INPUT_PROVENANCE_SYSTEM_INSTRUCTION, InputProvenance, Message
+from .exceptions import GuardCrash, HandlerCrash, ToolError
+from .messages import InputProvenance, Message
 from .models import Capability
 from .selector import ToolSelector
 from .stream import AgentStream
-from .tool import (
-    BACKGROUND_PARAM,
-    CURRENT_TOOL_CALL,
-    Tool,
-    ToolCallContext,
-    ToolInputContext,
-    ToolProtocolContext,
-)
-from .tool_codec import ToolArgumentCodecError, decode_framed_values, decode_tool_arguments
+from .tool import BACKGROUND_PARAM, CURRENT_TOOL_CALL, Tool, ToolCallContext
 from .transport import CompletionTransport
 from .types import StopReason, Usage
 
 logger = logging.getLogger(__name__)
-
-type PatchLineFraming = Literal["auto", "on", "off"]
-
-_PATCH_LINE_FRAMING_VALUES = frozenset({"auto", "on", "off"})
-_MAX_TOOL_PROTOCOL_STABILIZATION_ATTEMPTS = 8
-
-
-def validate_patch_line_framing(value: object) -> PatchLineFraming:
-    """Validate and narrow one public patch-line-framing setting."""
-
-    if not isinstance(value, str) or value not in _PATCH_LINE_FRAMING_VALUES:
-        raise ValueError("patch_line_framing must be 'auto', 'on', or 'off'")
-    return cast(PatchLineFraming, value)
 
 
 @contextmanager
@@ -171,7 +148,7 @@ def _log_tool_failure(name: str, exc: Exception) -> None:
 
 
 async def _tool_result_text(tool: Tool[Any], args: dict[str, Any]) -> str:
-    result = await tool.invoke_prepared(**args)
+    result = await tool(**args)
     return result if isinstance(result, str) else str(result)
 
 
@@ -206,10 +183,6 @@ class Agent:
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
     before_next_provider_request: Callable[[], Awaitable[None]] | None = field(default=None)
-    patch_line_framing: PatchLineFraming = field(default="auto")
-
-    def __post_init__(self) -> None:
-        self.patch_line_framing = validate_patch_line_framing(self.patch_line_framing)
 
     def copy(self, **overrides: Any) -> Self:
         """Return a new Agent with *overrides* applied."""
@@ -288,7 +261,7 @@ class Agent:
                 return ToolResultBlock(tool_use_id=block.id, content=background.started_message(block.name, handle))
             with _tool_call_scope(block, iteration):
                 try:
-                    result = await tool.invoke_prepared(**args)
+                    result = await tool(**args)
                     if isinstance(result, str):
                         content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
                     elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
@@ -347,7 +320,7 @@ class Agent:
                 t0 = time.monotonic()
                 with _tool_call_scope(block, iteration):
                     try:
-                        async for key, text in tool.call_streaming_prepared(**args):
+                        async for key, text in tool.call_streaming(**args):
                             chunks.append((time.monotonic() - t0, key, text))
                             await output_queue.put(
                                 ToolOutputDelta(tool_use_id=block.id, name=block.name, key=key, delta=text)
@@ -359,7 +332,7 @@ class Agent:
             else:
                 with _tool_call_scope(block, iteration):
                     try:
-                        result = await tool.invoke_prepared(**args)
+                        result = await tool(**args)
                         if isinstance(result, str):
                             content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock] = result
                         elif isinstance(result, list) and all(isinstance(b, ContentBlock) for b in result):
@@ -430,22 +403,21 @@ class Agent:
             input=block.input if block else {},
         )
 
+    @staticmethod
     def _finalize_pending_tools(
-        self,
         pending: dict[str, dict[str, Any]],
         usage: Usage,
-        request_context: ToolInputContext,
-    ) -> tuple[list[ToolUseBlock], dict[str, str]]:
+    ) -> tuple[list[ToolUseBlock], set[str]]:
         """Convert streamed tool-call fragments into ToolUseBlocks.
 
-        Returns (blocks, argument_errors). Errors include truncated JSON and
-        provider arguments that do not satisfy their advertised wire codec.
-        The caller is responsible for not executing those calls.
+        Returns (blocks, malformed_ids).  Malformed IDs arise when
+        max_tokens truncates the response mid-tool-call, producing
+        incomplete JSON (expected with eager_input_streaming).  The
+        caller is responsible for not executing malformed tools.
         """
         blocks: list[ToolUseBlock] = []
-        argument_errors: dict[str, str] = {}
+        malformed: set[str] = set()
         for tid, info in pending.items():
-            input_preparation = "canonical"
             raw = "".join(info["json_parts"])
             if not raw:
                 logger.warning(
@@ -466,46 +438,10 @@ class Agent:
                         exc,
                         raw,
                     )
-                    argument_errors[tid] = (
-                        f"Malformed JSON arguments for tool {info['name']}. Raw input could not be parsed; "
-                        "retry the tool call with valid JSON."
-                    )
+                    malformed.add(tid)
                     inp = {}
-            codec = info.get("argument_codec")
-            if codec is not None and tid not in argument_errors:
-                try:
-                    tool = self._find_tool(info["name"])
-                    if tool is None:
-                        inp = decode_framed_values(inp, codec)
-                    else:
-                        inp = decode_tool_arguments(inp, tool.input_schema, codec)
-                except ToolArgumentCodecError as exc:
-                    logger.info("Tool %s (id=%s) has invalid encoded arguments: %s", info["name"], tid, exc)
-                    argument_errors[tid] = (
-                        f"Invalid encoded arguments for tool {info['name']}: {exc}. "
-                        "Retry using the exact framing advertised in the tool schema."
-                    )
-                    inp = {}
-            tool = self._find_tool(info["name"])
-            if tool is not None and tid not in argument_errors:
-                call_context = dataclasses.replace(request_context, argument_codec=codec)
-                try:
-                    prepared = tool.prepare_input(inp, call_context)
-                    inp = prepared.input
-                    input_preparation = prepared.mode
-                except ToolInputPreparationError as exc:
-                    logger.info("Tool %s (id=%s) input preparation failed: %s", info["name"], tid, exc)
-                    argument_errors[tid] = f"Invalid arguments for tool {info['name']}: {exc}"
-                    inp = {}
-            blocks.append(
-                ToolUseBlock(
-                    id=tid,
-                    name=info["name"],
-                    input=inp,
-                    input_preparation=input_preparation,
-                )
-            )
-        return blocks, argument_errors
+            blocks.append(ToolUseBlock(id=tid, name=info["name"], input=inp))
+        return blocks, malformed
 
     async def _select_tools(self, history: list[Message], tools: list[Tool[Any]]) -> Iterable[Tool[Any]]:
         if not tools:
@@ -513,84 +449,6 @@ class Agent:
         if not self.selector:
             return tools
         return await self.selector.select(history, tools)
-
-    def _tool_input_context(self, transport: CompletionTransport, model: object | None) -> ToolInputContext:
-        raw_capabilities: object = getattr(model, "capabilities", frozenset())
-        capabilities = (
-            frozenset(capability for capability in raw_capabilities if isinstance(capability, Capability))
-            if isinstance(raw_capabilities, frozenset | set | tuple | list)
-            else frozenset()
-        )
-        model_id = getattr(model, "id", None)
-        return ToolInputContext(
-            model_id=model_id if isinstance(model_id, str) else None,
-            model_capabilities=capabilities,
-            argument_codec=getattr(transport, "tool_argument_codec", None),
-            policy=MappingProxyType({"patch_line_framing": self.patch_line_framing}),
-        )
-
-    @staticmethod
-    def _latest_tool_protocol_state(history: list[Message], tool_name: str) -> str | None:
-        for message in reversed(history):
-            provenance = message.provenance
-            if (
-                provenance is not None
-                and provenance.authority == "tool-protocol"
-                and provenance.source == "tool-hook"
-                and provenance.author == tool_name
-            ):
-                return provenance.protocol_state
-        return None
-
-    def _tool_protocol_messages(
-        self,
-        history: list[Message],
-        active_tools: list[Tool[Any]],
-        request_context: ToolInputContext,
-    ) -> list[Message]:
-        messages: list[Message] = []
-        for tool in active_tools:
-            if tool.protocol_transition is None:
-                continue
-            preparations: Counter[str | None] = Counter(
-                block.input_preparation
-                for message in history
-                for block in message.content
-                if isinstance(block, ToolUseBlock) and block.name == tool.name
-            )
-            latest_state = self._latest_tool_protocol_state(history, tool.name)
-            transition = tool.resolve_protocol_transition(
-                ToolProtocolContext(
-                    request=request_context,
-                    prior_input_preparations=MappingProxyType(dict(preparations)),
-                    latest_state=latest_state,
-                )
-            )
-            if transition is None or transition.text is None or transition.state_id == latest_state:
-                continue
-            messages.append(
-                Message(
-                    role="user",
-                    content=[TextBlock(text=transition.text)],
-                    provenance=InputProvenance(
-                        human_authored=False,
-                        source="tool-hook",
-                        author=tool.name,
-                        authority="tool-protocol",
-                        protocol_state=transition.state_id,
-                    ),
-                )
-            )
-        return messages
-
-    def _system_for_history(self, history: list[Message]) -> str:
-        has_tool_protocol = any(
-            message.provenance is not None and message.provenance.authority == "tool-protocol" for message in history
-        )
-        if not has_tool_protocol or INPUT_PROVENANCE_SYSTEM_INSTRUCTION in self.system:
-            return self.system
-        authority = f"Input provenance:\n- {INPUT_PROVENANCE_SYSTEM_INSTRUCTION}"
-        return f"{self.system}\n\n{authority}" if self.system else authority
 
     async def _run_loop(
         self,
@@ -626,63 +484,28 @@ class Agent:
                         )
                     history = await context.get_history()
                     logger.info("Iteration %d, history length=%d", iteration, len(history))
-                    try:
-                        for _ in range(_MAX_TOOL_PROTOCOL_STABILIZATION_ATTEMPTS):
-                            active_transport = self.transport
-                            model = getattr(active_transport, "model", None)
-                            model_caps = getattr(model, "capabilities", None)
-                            selection_history = (
-                                [*history, self.last_iteration_message]
-                                if self.last_iteration_message and iteration == self.max_iterations
-                                else history
-                            )
-                            if model_caps is not None and Capability.tool_use not in model_caps:
-                                active_tools: list[Tool[Any]] = []
-                            else:
-                                active_tools = list(await self._select_tools(selection_history, self.tools))
-                            request_context = self._tool_input_context(active_transport, model)
-                            protocol_messages = self._tool_protocol_messages(history, active_tools, request_context)
-                            if protocol_messages:
-                                await context.append_many(protocol_messages)
-                                history = [*history, *protocol_messages]
-                                continue
-                            current_model = getattr(active_transport, "model", None)
-                            if (
-                                self.transport is active_transport
-                                and current_model is model
-                                and self._tool_input_context(active_transport, current_model) == request_context
-                            ):
-                                break
-                        else:
-                            raise ToolProtocolError(
-                                "Tool protocol configuration did not stabilize before the provider request"
-                            )
-                    except ToolProtocolError as exc:
-                        logger.error("Tool protocol setup failed: %s", exc, exc_info=True)
-                        yield Error(exception=exc)
-                        yield SessionEndEvent(stop_reason=StopReason.error, total_usage=total_usage)
-                        session_end_emitted = True
-                        return
                     effective_history = (
                         [*history, self.last_iteration_message]
                         if self.last_iteration_message and iteration == self.max_iterations
                         else history
                     )
+                    model = getattr(self.transport, "model", None)
+                    model_caps = getattr(model, "capabilities", None)
+                    if model_caps is not None and Capability.tool_use not in model_caps:
+                        active_tools: list[Tool[Any]] = []
+                    else:
+                        active_tools = list(await self._select_tools(effective_history, self.tools))
 
                     content: list[TextBlock | ImageBlock | AudioBlock | VideoBlock | ToolUseBlock] = []
                     pending: dict[str, dict[str, Any]] = {}
                     stop_reason = StopReason.end_turn
-                    argument_errors: dict[str, str] = {}
+                    malformed: set[str] = set()
                     repetition_detected = False
                     text_rep_detector = _RepetitionDetector()
                     reasoning_rep_detector = _RepetitionDetector()
 
                     try:
-                        provider_stream = active_transport.stream(
-                            effective_history,
-                            active_tools,
-                            self._system_for_history(effective_history),
-                        )
+                        provider_stream = self.transport.stream(effective_history, active_tools, self.system)
                         try:
                             async for event in provider_stream:
                                 yield event
@@ -706,21 +529,13 @@ class Agent:
                                         content.append(ImageBlock(media_type=mt, data=data))
                                     case VideoOutput(data=data, media_type=mt):
                                         content.append(VideoBlock(media_type=mt, data=data))
-                                    case ToolUseStart(tool_use_id=tid, name=name, argument_codec=codec):
-                                        pending[tid] = {
-                                            "name": name,
-                                            "json_parts": [],
-                                            "argument_codec": codec,
-                                        }
+                                    case ToolUseStart(tool_use_id=tid, name=name):
+                                        pending[tid] = {"name": name, "json_parts": []}
                                     case ToolInputDelta(tool_use_id=tid, partial_json=pj):
                                         if tid in pending:
                                             pending[tid]["json_parts"].append(pj)
                                     case IterationEnd(usage=usage, stop_reason=sr):
-                                        blocks, argument_errors = self._finalize_pending_tools(
-                                            pending,
-                                            usage,
-                                            request_context,
-                                        )
+                                        blocks, malformed = self._finalize_pending_tools(pending, usage)
                                         content.extend(blocks)
                                         pending.clear()
                                         total_usage = total_usage + usage
@@ -761,15 +576,19 @@ class Agent:
                         # Dispatch tools BEFORE appending to context - cancellation
                         # between here and the two appends below cannot leave orphan
                         # ToolUseBlocks in the persistent context store.
-                        valid = [b for b in tool_blocks if b.id not in argument_errors]
+                        valid = [b for b in tool_blocks if b.id not in malformed]
                         error_results = [
                             ToolResultBlock(
                                 tool_use_id=b.id,
-                                content=argument_errors[b.id],
+                                content=(
+                                    f"Malformed JSON arguments for tool {b.name}."
+                                    f" Raw input could not be parsed. Please retry the tool call"
+                                    f" with valid JSON arguments."
+                                ),
                                 is_error=True,
                             )
                             for b in tool_blocks
-                            if b.id in argument_errors
+                            if b.id in malformed
                         ]
 
                         partial_output: dict[str, list[tuple[float, str, str]]] = {}
@@ -860,7 +679,7 @@ class Agent:
                                         interrupted_results.append(completed)
                                         visible_results.append((b, completed))
                                         continue
-                                    if deferred and b.id not in argument_errors:
+                                    if deferred and b.id not in malformed:
                                         interrupted_results.append(
                                             ToolResultBlock(
                                                 tool_use_id=b.id,

@@ -14,11 +14,25 @@ from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
-from axio.tool_codec import TOOL_ARGUMENT_CODEC
 
 from axio_transport_openai import ChatCompletionsTransport, ThinkingMixin
 
 logger = logging.getLogger(__name__)
+
+OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS = (
+    "streamlake/fp8",
+    "relace/fp4",
+    "cloudflare",
+)
+_BROKEN_PROVIDER_IDENTITIES = frozenset(
+    {
+        "streamlake",
+        "streamlake/fp8",
+        "relace",
+        "relace/fp4",
+        "cloudflare",
+    }
+)
 
 
 def _split_provider(model_id: str) -> tuple[str, str | None]:
@@ -29,6 +43,74 @@ def _split_provider(model_id: str) -> tuple[str, str | None]:
     return base, provider
 
 
+def _provider_list(value: object, field_name: str) -> list[str]:
+    if not isinstance(value, list | tuple) or not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"OpenRouter provider.{field_name} must be an array of non-empty strings")
+    return list(value)
+
+
+def _dedupe_providers(providers: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for provider in providers:
+        identity = provider.casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(provider)
+    return result
+
+
+def _is_known_broken_provider(provider: str) -> bool:
+    return provider.casefold() in _BROKEN_PROVIDER_IDENTITIES
+
+
+def _merge_provider_routing(raw: object, pinned_provider: str | None) -> dict[str, Any]:
+    if raw is None:
+        routing: dict[str, Any] = {}
+    elif isinstance(raw, Mapping):
+        routing = dict(raw)
+    else:
+        raise ValueError("OpenRouter provider routing must be an object")
+
+    only = _dedupe_providers(_provider_list(routing["only"], "only")) if "only" in routing else []
+    order = _dedupe_providers(_provider_list(routing["order"], "order")) if "order" in routing else []
+    ignored = _dedupe_providers(_provider_list(routing["ignore"], "ignore")) if "ignore" in routing else []
+
+    for field_name, providers in (("only", only), ("order", order)):
+        broken = [provider for provider in providers if _is_known_broken_provider(provider)]
+        if broken:
+            names = ", ".join(broken)
+            raise ValueError(f"OpenRouter provider.{field_name} selects excluded provider(s): {names}")
+
+    if pinned_provider is not None:
+        if _is_known_broken_provider(pinned_provider):
+            raise ValueError(f"OpenRouter model provider pin selects excluded provider: {pinned_provider}")
+        if only and [provider.casefold() for provider in only] != [pinned_provider.casefold()]:
+            raise ValueError("OpenRouter model provider pin conflicts with provider.only")
+        if order and any(provider.casefold() != pinned_provider.casefold() for provider in order):
+            raise ValueError("OpenRouter model provider pin conflicts with provider.order")
+        only = [pinned_provider]
+
+    ignored = _dedupe_providers([*ignored, *OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS])
+    ignored_ids = {provider.casefold() for provider in ignored}
+    only_ids = {provider.casefold() for provider in only}
+    order_ids = {provider.casefold() for provider in order}
+    if conflict := sorted(only_ids & ignored_ids):
+        raise ValueError(f"OpenRouter provider.only conflicts with provider.ignore: {', '.join(conflict)}")
+    if conflict := sorted(order_ids & ignored_ids):
+        raise ValueError(f"OpenRouter provider.order conflicts with provider.ignore: {', '.join(conflict)}")
+    if only_ids and not order_ids.issubset(only_ids):
+        raise ValueError("OpenRouter provider.order must be a subset of provider.only when both are set")
+
+    if only:
+        routing["only"] = only
+    if order:
+        routing["order"] = order
+    routing["ignore"] = ignored
+    return routing
+
+
 @dataclass(slots=True)
 class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
     name: str = "OpenRouter"
@@ -36,7 +118,6 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
     base_url: str = "https://openrouter.ai/api/v1"
     model: ModelSpec = ModelSpec(id="google/gemini-2.5-pro-preview")
     thinking: bool = False
-    tool_argument_codec: str | None = TOOL_ARGUMENT_CODEC
     _reasoning_efforts: dict[str, tuple[str, ...] | None] = field(default_factory=dict, repr=False)
     _reasoning_mandatory: set[str] = field(default_factory=set, repr=False)
 
@@ -94,9 +175,8 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
         if self.reasoning_effort is not None and Capability.reasoning in self.model.capabilities:
             payload["reasoning"] = {"effort": self.reasoning_effort}
         model_id, provider = _split_provider(str(payload.get("model", "")))
-        if provider:
-            payload["model"] = model_id
-            payload.setdefault("provider", {"only": [provider]})
+        payload["model"] = model_id
+        payload["provider"] = _merge_provider_routing(payload.get("provider"), provider)
         return payload
 
     def _provider_cost_usd(self, usage: Mapping[str, Any]) -> float | None:

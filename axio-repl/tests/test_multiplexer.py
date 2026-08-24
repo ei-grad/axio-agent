@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 from axio.events import SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
-from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, TurnFinished, TurnStarted, TurnStatus
 
@@ -141,66 +138,6 @@ def test_tool_arguments_are_framed_only_after_complete_json() -> None:
     assert len(frames) == 1
     assert "agent child · tool call" in frames[0]
     assert 'arguments: {"command": "echo hi"}' in frames[0]
-
-
-def test_incomplete_encoded_arguments_do_not_expose_wire_protocol() -> None:
-    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
-    mux.observe(
-        "child",
-        ToolUseStart(
-            index=0,
-            tool_use_id="call",
-            name="write_file",
-            argument_codec=TOOL_ARGUMENT_CODEC,
-        ),
-    )
-    mux.observe(
-        "child",
-        ToolInputDelta(
-            index=0,
-            tool_use_id="call",
-            partial_json=f'{{"content":{{"{TOOL_ARGUMENT_FRAME_KEY}":"partial',
-        ),
-    )
-    mux.observe(
-        "child",
-        ToolResult(tool_use_id="call", name="write_file", is_error=True, content="invalid"),
-    )
-
-    frames = mux.drain(max_frames=2)
-
-    assert TOOL_ARGUMENT_FRAME_KEY not in "".join(frames)
-    assert "incomplete encoded arguments" in frames[0]
-
-
-def test_malformed_encoded_arguments_and_surrogates_are_safe_for_background_output() -> None:
-    malformed = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
-    malformed.observe(
-        "child",
-        ToolUseStart(0, "bad", "write_file", argument_codec=TOOL_ARGUMENT_CODEC),
-    )
-    malformed.observe(
-        "child",
-        ToolInputDelta(0, "bad", json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: 7}})),
-    )
-    [malformed_frame] = malformed.drain()
-
-    assert TOOL_ARGUMENT_FRAME_KEY not in malformed_frame
-    assert "invalid encoded arguments" in malformed_frame
-
-    surrogate = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
-    surrogate.observe(
-        "child",
-        ToolUseStart(0, "surrogate", "tool", argument_codec=TOOL_ARGUMENT_CODEC),
-    )
-    surrogate.observe(
-        "child",
-        ToolInputDelta(0, "surrogate", partial_json=r'{"options":{"value":"\uD800"}}'),
-    )
-    [surrogate_frame] = surrogate.drain()
-
-    assert "\ufffd" in surrogate_frame
-    surrogate_frame.encode("utf-8", errors="strict")
 
 
 def test_streaming_output_is_grouped_by_lines_and_flushed_at_result() -> None:

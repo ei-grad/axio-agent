@@ -7,7 +7,6 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncGenerator, Callable
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -27,8 +26,7 @@ from axio.events import (
 from axio.exceptions import GuardError, HandlerError
 from axio.permission import PermissionGuard
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
-from axio.tool import CURRENT_TOOL_CALL, PreparedToolInput, Tool, ToolCallContext, ToolInputContext
-from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
+from axio.tool import CURRENT_TOOL_CALL, Tool, ToolCallContext
 from axio.types import StopReason, Usage
 
 calls_log: list[dict[str, Any]] = []
@@ -442,24 +440,19 @@ class TestToolResultCarriesData:
         assert r.content != ""
         assert not r.is_error
 
-    async def test_encoded_string_reaches_guard_handler_result_and_history_decoded(self) -> None:
-        expected = "        first line\n\tsecond line          "
-        observed: list[tuple[str, str]] = []
-
-        class CaptureGuard(PermissionGuard):
-            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
-                observed.append(("guard", kwargs["content"]))
-                return kwargs
+    async def test_streamed_string_whitespace_reaches_context_handler_and_result_exactly(self) -> None:
+        expected = "        first line\n\tsecond line"
+        received: list[str] = []
 
         async def capture(content: str) -> str:
-            observed.append(("handler", content))
+            received.append(content)
             return content
 
-        raw = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: expected}}, ensure_ascii=False)
+        raw = json.dumps({"content": expected})
         transport = StubTransport(
             [
                 [
-                    ToolUseStart(0, "c1", "write_file", argument_codec=TOOL_ARGUMENT_CODEC),
+                    ToolUseStart(0, "c1", "patch_file"),
                     ToolInputDelta(0, "c1", raw[:17]),
                     ToolInputDelta(0, "c1", raw[17:25]),
                     ToolInputDelta(0, "c1", raw[25:]),
@@ -469,17 +462,13 @@ class TestToolResultCarriesData:
             ]
         )
         context = MemoryContextStore()
-        agent = Agent(
-            system="test",
-            tools=[Tool(name="write_file", handler=capture, guards=(CaptureGuard(),))],
-            transport=transport,
-        )
+        agent = Agent(system="test", tools=[Tool(name="patch_file", handler=capture)], transport=transport)
         events = [event async for event in agent.run_stream("go", context)]
 
         result = next(event for event in events if isinstance(event, ToolResult))
         assert result.input == {"content": expected}
         assert result.content == expected
-        assert observed == [("guard", expected), ("handler", expected)]
+        assert received == [expected]
 
         history = await context.get_history()
         tool_use = next(
@@ -498,138 +487,6 @@ class TestToolResultCarriesData:
         )
         assert tool_use.input == {"content": expected}
         assert tool_result.content == expected
-
-    async def test_missing_required_string_frame_fails_closed_before_guard_and_handler(self) -> None:
-        called: list[str] = []
-
-        class CaptureGuard(PermissionGuard):
-            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
-                called.append("guard")
-                return kwargs
-
-        async def capture(content: str) -> str:
-            called.append("handler")
-            return content
-
-        transport = StubTransport(
-            [
-                [
-                    ToolUseStart(0, "c1", "write_file", argument_codec=TOOL_ARGUMENT_CODEC),
-                    ToolInputDelta(0, "c1", json.dumps({"content": "unframed"})),
-                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
-                ],
-                make_text_response("Done"),
-            ]
-        )
-        context = MemoryContextStore()
-        agent = Agent(
-            system="test",
-            tools=[Tool(name="write_file", handler=capture, guards=(CaptureGuard(),))],
-            transport=transport,
-        )
-        events = [event async for event in agent.run_stream("go", context)]
-
-        result = next(event for event in events if isinstance(event, ToolResult))
-        assert result.is_error
-        assert "encoded arguments" in result.content
-        assert called == []
-
-    async def test_input_preparation_failure_is_persisted_canonical_and_skips_dispatch(self) -> None:
-        called: list[str] = []
-
-        class CaptureGuard(PermissionGuard):
-            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
-                called.append("guard")
-                return kwargs
-
-        def broken(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
-            raise RuntimeError("cannot prepare")
-
-        async def capture(content: str) -> str:
-            called.append("handler")
-            return content
-
-        transport = StubTransport(
-            [
-                make_tool_use_response("write_file", "c1", {"content": "raw"}),
-                make_text_response("Done"),
-            ]
-        )
-        context = MemoryContextStore()
-        tool: Tool[Any] = Tool(
-            name="write_file",
-            handler=capture,
-            guards=(CaptureGuard(),),
-            input_preparer=broken,
-        )
-
-        events = [
-            event async for event in Agent(system="test", tools=[tool], transport=transport).run_stream("go", context)
-        ]
-
-        result = next(event for event in events if isinstance(event, ToolResult))
-        assert result.is_error
-        assert result.input == {}
-        assert "cannot prepare" in result.content
-        assert called == []
-        stored = next(
-            block
-            for message in await context.get_history()
-            for block in message.content
-            if isinstance(block, ToolUseBlock)
-        )
-        assert stored.input == {}
-        assert stored.input_preparation == "canonical"
-
-    async def test_union_wire_value_is_decoded_before_tool_use_persistence(self) -> None:
-        observed: list[dict[str, Any]] = []
-
-        async def capture(value: dict[str, Any]) -> str:
-            observed.append(value)
-            return "ok"
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "value": {
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {"x": {"type": "integer"}},
-                            "required": ["x"],
-                        },
-                        {
-                            "type": "object",
-                            "properties": {"x": {"type": "string"}},
-                            "required": ["x"],
-                        },
-                    ]
-                }
-            },
-            "required": ["value"],
-        }
-        wire = {"value": {"x": {TOOL_ARGUMENT_FRAME_KEY: "  exact  "}}}
-        transport = StubTransport(
-            [
-                [
-                    ToolUseStart(0, "c1", "union_tool", argument_codec=TOOL_ARGUMENT_CODEC),
-                    ToolInputDelta(0, "c1", json.dumps(wire)),
-                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
-                ],
-                make_text_response("Done"),
-            ]
-        )
-        context = MemoryContextStore()
-        tool: Tool[Any] = Tool(name="union_tool", handler=capture, schema=MappingProxyType(schema))
-        agent = Agent(system="test", tools=[tool], transport=transport)
-
-        await agent.run("go", context)
-
-        canonical = {"value": {"x": "  exact  "}}
-        assert observed == [{"x": "  exact  "}]
-        history = await context.get_history()
-        persisted = next(block for message in history for block in message.content if isinstance(block, ToolUseBlock))
-        assert persisted.input == canonical
 
     async def test_error_result_has_content(self) -> None:
         """Error ToolResult events carry the error message as content."""

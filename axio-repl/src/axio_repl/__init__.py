@@ -217,18 +217,15 @@ def _styled(style: str, text: str) -> str:
 
 
 def _visible_patch_content_fragment(text: str, *, line_start: bool) -> str:
-    """Expose source indentation while keeping canonical framing unambiguous."""
+    """Mark source column zero and leading whitespace without changing tool input."""
 
     if not line_start:
         return text
-    framed = text.startswith("│")
-    source = text[1:] if framed else text
     prefix_end = 0
-    while prefix_end < len(source) and source[prefix_end] in {" ", "\t"}:
+    while prefix_end < len(text) and text[prefix_end] in {" ", "\t"}:
         prefix_end += 1
-    visible_prefix = source[:prefix_end].replace(" ", "·").replace("\t", "→")
-    marker = "│" if framed else "┊"
-    return f"{marker}{visible_prefix}{source[prefix_end:]}"
+    visible_prefix = text[:prefix_end].replace(" ", "·").replace("\t", "→")
+    return f"│{visible_prefix}{text[prefix_end:]}"
 
 
 # ── Custom search tool ───────────────────────────────────────────────
@@ -1381,26 +1378,6 @@ class ReplRenderer:
                 state.mode = _BoundaryMode()
         yield
 
-    async def render_tool_protocol_message(self, agent_id: str, message: Message) -> None:
-        """Render one authoritative local-tool protocol message as non-human conversation."""
-
-        provenance = message.provenance
-        if provenance is None or provenance.authority != "tool-protocol" or provenance.author is None:
-            return
-        body = sanitize_terminal_text(
-            "".join(block.text for block in message.content if isinstance(block, TextBlock))
-        ).strip()
-        label = f"tool protocol · {provenance.author}"
-        if agent_id != self.foreground_agent:
-            label = f"{self.agent_identity(agent_id)} · {label}"
-        async with self._lock:
-            with self._persistent_insertion_locked():
-                sys.stdout.write(f"\n{_styled(self._theme.command.ansi, label)}\n")
-                if body:
-                    sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, body)}\n")
-                self._flush()
-                self._drain_safe_boundary_locked()
-
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
         state.mode = _BoundaryMode()
         state.arg_streams.clear()
@@ -1762,7 +1739,7 @@ class ReplRenderer:
                 print(f"{self._theme.success.ansi}[video saved: {path}]{self._theme.reset}")
                 self._drain_safe_boundary_locked()
 
-            case ToolUseStart(index=index, tool_use_id=tid, name=name, argument_codec=codec):
+            case ToolUseStart(index=index, tool_use_id=tid, name=name):
                 assert tool_key is not None
                 if isinstance(state.mode, _TextMode):
                     print()
@@ -1781,7 +1758,7 @@ class ReplRenderer:
                 )
                 sys.stdout.write(f"\n{badge}")
                 self._flush()
-                state.arg_streams[tool_key] = ToolArgStream(tid, index, argument_codec=codec)
+                state.arg_streams[tool_key] = ToolArgStream(tid, index)
                 state.active_tool_ids.add(tool_key)
                 state.tool_names[tool_key] = call.name
                 state.tool_calls[tool_key] = call
@@ -2351,10 +2328,6 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
                 event,
                 background=envelope.execution_mode is ExecutionMode.BACKGROUND,
             )
-        case MessageCommitted(message=message) if (
-            message.provenance is not None and message.provenance.authority == "tool-protocol"
-        ):
-            await renderer.render_tool_protocol_message(envelope.agent_id, message)
         case (
             OutcomeDelivered()
             | InputReceived()
@@ -2480,8 +2453,6 @@ def _clone_tools_for_child(tools: list[Tool[Any]], *, foreground: bool) -> list[
             guards=tool.guards,
             context=tool.context,
             concurrency=tool.concurrency,
-            input_preparer=tool.input_preparer,
-            protocol_transition=tool.protocol_transition,
             detachable=tool.detachable and not foreground,
             # Reusing a generated schema as explicit would discard Annotated validators.
             schema=tool.schema if tool._schema_explicit else MappingProxyType({}),
@@ -2708,13 +2679,6 @@ class Command(NamedTuple):
 
     show: Callable[[], None]
     apply: Callable[[str], object]
-
-
-def _can_dispatch_command_during_foreground(user_input: str, commands: dict[str, Command]) -> bool:
-    command = user_input.lower().split(maxsplit=1)[0]
-    if command in {"/help", "/agents", "/agent-actions"}:
-        return True
-    return command in commands and command == user_input.lower()
 
 
 _COMMAND_OUTPUT: ContextVar[list[str] | None] = ContextVar("axio_repl_command_output", default=None)
@@ -3320,12 +3284,6 @@ def _build_argument_parser() -> Any:
     parser.add_argument("--effort", default=None, help=f"Effort level: default, {', '.join(EFFORT_LEVELS)}")
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
-    parser.add_argument(
-        "--patch-line-framing",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="Legacy patch_file line framing: auto, on, or off (default: auto)",
-    )
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument("--debug", dest="debug", action="store_true", help="Log request/response bodies")
     debug_group.add_argument("--no-debug", dest="debug", action="store_false", help="Disable request/response logging")
@@ -3624,7 +3582,6 @@ async def main() -> None:
             transport=transport,
             max_iterations=args.max_iterations,
             last_iteration_message=LAST_ITERATION_HINT,
-            patch_line_framing=args.patch_line_framing,
         )
         ctx = ObservedContextStore(MemoryContextStore(), event_hub)
         set_session_event_hub(event_hub)
@@ -3659,7 +3616,6 @@ async def main() -> None:
             ("agent_actions", args.agent_actions),
             ("theme", theme.name),
             ("powerline", args.powerline),
-            ("patch_line_framing", agent.patch_line_framing),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
 
@@ -4449,6 +4405,12 @@ async def main() -> None:
                     renderer.show_panel("".join(output))
                 return handled, should_exit
 
+            def _can_dispatch_during_foreground(user_input: str) -> bool:
+                command = user_input.lower().split(maxsplit=1)[0]
+                if command in {"/help", "/agents", "/agent-actions"}:
+                    return True
+                return command in commands and command == user_input.lower()
+
             def _is_known_command(user_input: str) -> bool:
                 command = user_input.lower().split(maxsplit=1)[0]
                 return command in {
@@ -4909,10 +4871,7 @@ async def main() -> None:
                     )
                     continue
                 if submitted.disposition is SubmissionDisposition.COMMAND:
-                    if foreground_task is not None and not _can_dispatch_command_during_foreground(
-                        user_input,
-                        commands,
-                    ):
+                    if foreground_task is not None and not _can_dispatch_during_foreground(user_input):
                         pending_commands.append(submitted)
                         _panel.complete_submission(
                             prompt_session,

@@ -13,19 +13,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from types import MappingProxyType
-from typing import Any, ParamSpec, TypeVar, get_args, get_type_hints
+from typing import Any, get_args, get_type_hints
 
 from .background import BACKGROUND_PROPERTY
-from .exceptions import (
-    GuardCrash,
-    GuardError,
-    HandlerCrash,
-    HandlerError,
-    ToolInputPreparationError,
-    ToolProtocolError,
-)
+from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from .field import MISSING, FieldInfo, bare_type, get_field_info
-from .models import Capability
 from .permission import PermissionGuard
 from .schema import build_tool_schema
 from .types import ToolCallID, ToolName
@@ -117,73 +109,6 @@ class ToolCallContext:
 CURRENT_TOOL_CALL: ContextVar[ToolCallContext] = ContextVar("CURRENT_TOOL_CALL")
 
 
-@dataclass(frozen=True, slots=True)
-class ToolInputContext:
-    """Immutable provider-boundary facts available to tool protocol hooks."""
-
-    model_id: str | None = None
-    model_capabilities: frozenset[Capability] = frozenset()
-    argument_codec: str | None = None
-    policy: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "policy", MappingProxyType(dict(self.policy)))
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedToolInput:
-    """Canonical handler kwargs plus an opaque persisted preparation mode."""
-
-    input: dict[str, Any]
-    mode: str = "canonical"
-
-
-@dataclass(frozen=True, slots=True)
-class ToolProtocolContext:
-    """Request facts and visible historical preparation modes for one tool."""
-
-    request: ToolInputContext
-    prior_input_preparations: Mapping[str | None, int]
-    latest_state: str | None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "prior_input_preparations",
-            MappingProxyType(dict(self.prior_input_preparations)),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ToolProtocolTransition:
-    """A stable protocol state and optional chronological model-facing notice."""
-
-    state_id: str
-    text: str | None
-
-
-type ToolInputPreparer = Callable[[dict[str, Any], ToolInputContext], PreparedToolInput]
-type ToolProtocolTransitionProvider = Callable[[ToolProtocolContext], ToolProtocolTransition]
-
-P = ParamSpec("P")
-R = TypeVar("R")
-
-
-def with_tool_hooks(
-    *,
-    input_preparer: ToolInputPreparer | None = None,
-    protocol_transition: ToolProtocolTransitionProvider | None = None,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
-    """Attach hooks to a handler so entry-point-created Tools inherit them."""
-
-    def decorate(handler: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-        setattr(handler, "_tool_input_preparer", input_preparer)
-        setattr(handler, "_tool_protocol_transition", protocol_transition)
-        return handler
-
-    return decorate
-
-
 def _default_format_stream_result(chunks: list[tuple[float, str, str]]) -> str:
     """Default streaming-aggregator: join all text, discard keys/timestamps."""
     return "".join(text for _, _, text in chunks)
@@ -196,13 +121,6 @@ class Tool[T]:
     description: str = ""
     guards: tuple[PermissionGuard, ...] = ()
     concurrency: int | None = None
-    input_preparer: ToolInputPreparer | None = field(default=None, repr=False, compare=False, kw_only=True)
-    protocol_transition: ToolProtocolTransitionProvider | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-        kw_only=True,
-    )
 
     context: T = field(default=MappingProxyType({}), compare=False)  # type: ignore[assignment]
     schema: MappingProxyType[str, Any] = field(default=MappingProxyType({}), repr=False, compare=False)
@@ -221,18 +139,6 @@ class Tool[T]:
             )
         if not self.description:
             object.__setattr__(self, "description", self.handler.__doc__ or "")
-        if self.input_preparer is None:
-            inherited_preparer = getattr(self.handler, "_tool_input_preparer", None)
-            if inherited_preparer is not None:
-                if not callable(inherited_preparer):
-                    raise TypeError(f"Tool {self.name!r} handler input preparer must be callable")
-                object.__setattr__(self, "input_preparer", inherited_preparer)
-        if self.protocol_transition is None:
-            inherited_transition = getattr(self.handler, "_tool_protocol_transition", None)
-            if inherited_transition is not None:
-                if not callable(inherited_transition):
-                    raise TypeError(f"Tool {self.name!r} handler protocol transition must be callable")
-                object.__setattr__(self, "protocol_transition", inherited_transition)
         hints = get_type_hints(self.handler, include_extras=True)
         param_hints = {k: v for k, v in hints.items() if k != "return"}
         try:
@@ -311,61 +217,6 @@ class Tool[T]:
             return result if isinstance(result, str) else str(result)
         return _default_format_stream_result(chunks)
 
-    def prepare_input(
-        self,
-        input: dict[str, Any],
-        context: ToolInputContext | None = None,
-    ) -> PreparedToolInput:
-        """Prepare raw semantic input exactly once before validation and persistence."""
-
-        if self.input_preparer is None:
-            return PreparedToolInput(input=dict(input))
-        try:
-            prepared = self.input_preparer(dict(input), context or ToolInputContext())
-        except ToolInputPreparationError:
-            raise
-        except Exception as exc:
-            # Third-party hook callables may raise arbitrary implementation exceptions.
-            raise ToolInputPreparationError(f"{type(exc).__name__}: {exc}") from exc
-        try:
-            if not isinstance(prepared, PreparedToolInput):
-                raise ToolInputPreparationError("input preparer must return PreparedToolInput")
-            if not isinstance(prepared.input, Mapping):
-                raise ToolInputPreparationError("prepared input must be a mapping")
-            if any(not isinstance(key, str) for key in prepared.input):
-                raise ToolInputPreparationError("prepared input keys must be strings")
-            if not isinstance(prepared.mode, str) or not prepared.mode:
-                raise ToolInputPreparationError("prepared input mode must be a non-empty string")
-            normalized = dict(prepared.input)
-        except ToolInputPreparationError:
-            raise
-        except Exception as exc:
-            # User-defined Mapping implementations may fail while being copied.
-            raise ToolInputPreparationError(f"Invalid prepared input: {type(exc).__name__}: {exc}") from exc
-        return PreparedToolInput(input=normalized, mode=prepared.mode)
-
-    def resolve_protocol_transition(self, context: ToolProtocolContext) -> ToolProtocolTransition | None:
-        """Resolve one bounded protocol state without mutating the Tool or history."""
-
-        if self.protocol_transition is None:
-            return None
-        try:
-            transition = self.protocol_transition(context)
-        except ToolProtocolError:
-            raise
-        except Exception as exc:
-            # Third-party hook callables may raise arbitrary implementation exceptions.
-            raise ToolProtocolError(f"Tool {self.name!r} protocol hook failed: {type(exc).__name__}: {exc}") from exc
-        if not isinstance(transition, ToolProtocolTransition):
-            raise ToolProtocolError(f"Tool {self.name!r} protocol hook must return ToolProtocolTransition")
-        if not isinstance(transition.state_id, str) or not transition.state_id or len(transition.state_id) > 256:
-            raise ToolProtocolError(f"Tool {self.name!r} protocol state must contain 1..256 characters")
-        if transition.text is not None and (
-            not isinstance(transition.text, str) or not transition.text or len(transition.text) > 4096
-        ):
-            raise ToolProtocolError(f"Tool {self.name!r} protocol text must contain 1..4096 characters")
-        return transition
-
     def _prepare_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Inject defaults, validate types, and strip extras per schema."""
         required_set: set[str] = set(self.schema.get("required", []))
@@ -388,12 +239,6 @@ class Tool[T]:
         return kwargs
 
     async def __call__(self, **kwargs: Any) -> Any:
-        prepared = self.prepare_input(kwargs)
-        return await self.invoke_prepared(**prepared.input)
-
-    async def invoke_prepared(self, **kwargs: Any) -> Any:
-        """Validate, guard, and invoke kwargs already prepared for this Tool."""
-
         async with self._acquire():
             try:
                 kwargs = self._prepare_kwargs(kwargs)
@@ -434,13 +279,6 @@ class Tool[T]:
         falls back to ``__call__()`` and yields the full result as a single
         ``("output", ...)`` chunk. Semaphore is held for the entire iteration.
         """
-        prepared = self.prepare_input(kwargs)
-        async for chunk in self.call_streaming_prepared(**prepared.input):
-            yield chunk
-
-    async def call_streaming_prepared(self, **kwargs: Any) -> AsyncGenerator[tuple[str, str], None]:
-        """Stream kwargs already prepared for this Tool."""
-
         async with self._acquire():
             try:
                 kwargs = self._prepare_kwargs(kwargs)

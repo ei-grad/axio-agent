@@ -12,7 +12,6 @@ TOML::
     name = "architect"
     description = "System design and interface specs"
     max_iterations = 100
-    patch_line_framing = "auto"
     tools = ["read_file", "write_file"]
 
     [system]
@@ -26,7 +25,6 @@ JSON::
       "name": "architect",
       "description": "System design and interface specs",
       "max_iterations": 100,
-      "patch_line_framing": "auto",
       "tools": ["read_file", "write_file"],
       "system": "You are an expert software architect..."
     }
@@ -37,7 +35,6 @@ INI::
     name = architect
     description = System design and interface specs
     max_iterations = 100
-    patch_line_framing = auto
     tools = read_file, write_file
 
     [system]
@@ -45,7 +42,7 @@ INI::
 
 In all formats ``name`` falls back to the file stem when omitted.  ``system``
 may be a plain string or a ``{"text": "..."}`` mapping (TOML/JSON).  INI tools
-are comma-separated. ``patch_line_framing`` accepts ``auto``, ``on``, or ``off``.
+are comma-separated.
 
 Custom sources
 --------------
@@ -71,7 +68,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, TypedDict
 
-from .agent import Agent, PatchLineFraming, validate_patch_line_framing
+from .agent import Agent
 from .context import ContextStore, MemoryContextStore
 from .events import StreamEvent, TextDelta
 from .field import Field
@@ -90,10 +87,6 @@ class AgentSpec:
     max_iterations: int = 50
     tools: tuple[str, ...] = ()
     model: str | None = None
-    patch_line_framing: PatchLineFraming = "auto"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "patch_line_framing", validate_patch_line_framing(self.patch_line_framing))
 
     def to_agent(self, toolbox: Mapping[str, Tool[Any]] = MappingProxyType({})) -> Agent:
         """Return a prototype Agent with *toolbox* tools attached.
@@ -114,7 +107,6 @@ class AgentSpec:
             transport=DummyCompletionTransport(),
             tools=resolved,
             max_iterations=self.max_iterations,
-            patch_line_framing=self.patch_line_framing,
         )
 
 
@@ -183,7 +175,6 @@ class AgentLoader:
 
         model_raw = data.get("model")
         model = str(model_raw) if model_raw is not None else None
-        patch_line_framing = validate_patch_line_framing(data.get("patch_line_framing", "auto"))
 
         return AgentSpec(
             name=name,
@@ -192,7 +183,6 @@ class AgentLoader:
             max_iterations=max_iterations,
             tools=tools,
             model=model,
-            patch_line_framing=patch_line_framing,
         )
 
 
@@ -246,7 +236,6 @@ class IniAgentLoader(AgentLoader):
         max_iterations = int(agent_section.get("max_iterations", 50))
         model_raw = agent_section.get("model")
         model = model_raw if model_raw else None
-        patch_line_framing = validate_patch_line_framing(agent_section.get("patch_line_framing", "auto"))
         system = system_section.get("text", agent_section.get("system", ""))
         tools_raw = agent_section.get("tools", "")
         tools = tuple(t.strip() for t in tools_raw.split(",") if t.strip()) if tools_raw else ()
@@ -258,7 +247,6 @@ class IniAgentLoader(AgentLoader):
             max_iterations=max_iterations,
             tools=tools,
             model=model,
-            patch_line_framing=patch_line_framing,
         )
 
 

@@ -65,18 +65,6 @@ class TestAgentSpec:
         spec = AgentSpec(name="x", description="d", system="s", max_iterations=99)
         assert spec.to_agent().max_iterations == 99
 
-    def test_patch_line_framing_default_and_agent_conversion(self) -> None:
-        default = AgentSpec(name="default", description="d", system="s")
-        enabled = AgentSpec(name="enabled", description="d", system="s", patch_line_framing="on")
-
-        assert default.patch_line_framing == "auto"
-        assert default.to_agent().patch_line_framing == "auto"
-        assert enabled.to_agent().patch_line_framing == "on"
-
-    def test_invalid_patch_line_framing_is_rejected(self) -> None:
-        with pytest.raises(ValueError, match="patch_line_framing"):
-            AgentSpec(name="x", description="d", system="s", patch_line_framing="sometimes")  # type: ignore[arg-type]
-
 
 # ---------------------------------------------------------------------------
 # TOML loader
@@ -87,8 +75,7 @@ class TestTomlAgentLoader:
     def test_full_spec(self, tmp_path: Path) -> None:
         (tmp_path / "arch.toml").write_text(
             'name = "architect"\ndescription = "Design"\nmax_iterations = 77\n'
-            'tools = ["echo"]\nmodel = "big"\npatch_line_framing = "off"\n\n'
-            '[system]\ntext = "You are an architect."\n',
+            'tools = ["echo"]\nmodel = "big"\n\n[system]\ntext = "You are an architect."\n',
             encoding="utf-8",
         )
         spec = TomlAgentLoader().load_file(tmp_path / "arch.toml")
@@ -97,7 +84,6 @@ class TestTomlAgentLoader:
         assert spec.max_iterations == 77
         assert spec.tools == ("echo",)
         assert spec.model == "big"
-        assert spec.patch_line_framing == "off"
         assert spec.system == "You are an architect."
 
     def test_name_falls_back_to_stem(self, tmp_path: Path) -> None:
@@ -155,7 +141,6 @@ class TestJsonAgentLoader:
             "max_iterations": 30,
             "tools": ["echo"],
             "model": "small",
-            "patch_line_framing": "on",
         }
         (tmp_path / "planner.json").write_text(json.dumps(data), encoding="utf-8")
         spec = JsonAgentLoader().load_file(tmp_path / "planner.json")
@@ -165,7 +150,6 @@ class TestJsonAgentLoader:
         assert spec.max_iterations == 30
         assert spec.tools == ("echo",)
         assert spec.model == "small"
-        assert spec.patch_line_framing == "on"
 
     def test_name_falls_back_to_stem(self, tmp_path: Path) -> None:
         (tmp_path / "myagent.json").write_text('{"system": "s"}', encoding="utf-8")
@@ -191,13 +175,6 @@ class TestJsonAgentLoader:
         with pytest.raises(ValueError, match="arr.json"):
             JsonAgentLoader().load_file(tmp_path / "arr.json")
 
-    def test_invalid_patch_line_framing_raises_with_path(self, tmp_path: Path) -> None:
-        config_file = tmp_path / "bad-mode.json"
-        config_file.write_text('{"patch_line_framing": "sometimes"}', encoding="utf-8")
-
-        with pytest.raises(ValueError, match=r"bad-mode.json: patch_line_framing"):
-            JsonAgentLoader().load_file(config_file)
-
     def test_scan_returns_agents(self, tmp_path: Path) -> None:
         (tmp_path / "bot.json").write_text(
             '{"name": "bot", "description": "Bots", "system": "Go.", "tools": ["echo"]}',
@@ -221,7 +198,6 @@ class TestIniAgentLoader:
             "max_iterations = 20\n"
             "tools = echo, read_file\n"
             "model = medium\n\n"
-            "patch_line_framing = off\n\n"
             "[system]\n"
             "text = You are a worker.\n"
         )
@@ -232,7 +208,6 @@ class TestIniAgentLoader:
         assert spec.max_iterations == 20
         assert spec.tools == ("echo", "read_file")
         assert spec.model == "medium"
-        assert spec.patch_line_framing == "off"
         assert spec.system == "You are a worker."
 
     def test_name_falls_back_to_stem(self, tmp_path: Path) -> None:

@@ -25,13 +25,5 @@ class HandlerCrash(HandlerError):
     """An unexpected exception escaped a tool handler."""
 
 
-class ToolInputPreparationError(HandlerError):
-    """A tool-specific input preparation hook rejected or corrupted an input."""
-
-
-class ToolProtocolError(AxioError):
-    """A tool-specific protocol transition hook failed before a provider request."""
-
-
 class StreamError(AxioError):
     """Error during stream collection."""

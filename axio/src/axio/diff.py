@@ -16,30 +16,21 @@ from __future__ import annotations
 
 import re
 from difflib import unified_diff
-from typing import Any
 
 from axio.symbol_context import line_contexts, sanitize_symbol
-from axio.tool import PreparedToolInput, ToolInputContext, ToolProtocolContext, ToolProtocolTransition
 
 CONTEXT_LINES = 3
 MAX_DIFF_LINES = 400
 MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
 PATCH_CONTENT_DESCRIPTION = (
-    "Replacement source text. Preserve exact whitespace within lines, including indentation, tabs, and empty lines."
+    "Replacement source text applied literally. Preserve exact leading and trailing whitespace, tabs, empty lines, "
+    "and newlines. Do not copy the L<number>│ metadata prefix from numbered read_file output."
 )
-PATCH_LINE_FRAMING_INSTRUCTION = (
-    "For patch_file content, frame every logical line as │source. Remove L<number> from numbered read_file output "
-    "but retain │source; put exact indentation after │; use │ for an empty line and ││source for a literal source "
-    "line beginning with │. Never mix framed and unframed content lines."
-)
-PATCH_INPUT_LITERAL = "literal"
-PATCH_INPUT_LINE_FRAMED = "line-framed"
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
 _NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
-_READ_FILE_LINE_PREFIX = re.compile(r"^L\d+│")
 
 
 class _AmbiguousContext:
@@ -47,96 +38,6 @@ class _AmbiguousContext:
 
 
 _AMBIGUOUS = _AmbiguousContext()
-
-
-def decode_patch_content(content: str) -> list[str]:
-    """Decode model-safe framed patch content into exact source lines.
-
-    Canonical content prefixes every logical line with ``│`` so leading source
-    whitespace follows a visible character in the JSON string. One sentinel is
-    removed from each framed line. Entirely unframed content remains literal for
-    programmatic compatibility, while mixing the two forms is rejected.
-
-    Returning lines instead of one joined string preserves a framed empty line
-    (``│``) as ``["\n"]``. Callers can therefore distinguish it from the empty
-    content string used to delete a selected range, including at end of file.
-    """
-    lines = content.splitlines(keepends=True)
-    if not lines:
-        return []
-    if any(_READ_FILE_LINE_PREFIX.match(line) for line in lines):
-        raise ValueError("content includes read_file metadata; remove the L<number> prefix and keep │source")
-    framed = [line.startswith("│") for line in lines]
-    if any(framed) and not all(framed):
-        raise ValueError("framed patch content requires every content line to begin with │")
-    if all(framed):
-        decoded = [line[1:] for line in lines]
-        if decoded[-1] == "":
-            decoded[-1] = "\n"
-        return decoded
-    return lines
-
-
-def _patch_input_mode(context: ToolInputContext) -> str:
-    requested = context.policy.get("patch_line_framing", "off")
-    if requested not in {"auto", "on", "off"}:
-        raise ValueError("patch_line_framing policy must be 'auto', 'on', or 'off'")
-    enabled = requested == "on" or (requested == "auto" and context.argument_codec is None)
-    return PATCH_INPUT_LINE_FRAMED if enabled else PATCH_INPUT_LITERAL
-
-
-def prepare_patch_input(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
-    """Canonicalize one current patch call according to its snapshotted protocol."""
-
-    mode = _patch_input_mode(context)
-    prepared = dict(input)
-    content = prepared.get("content")
-    if mode == PATCH_INPUT_LINE_FRAMED and isinstance(content, str):
-        prepared["content"] = "".join(decode_patch_content(content))
-    return PreparedToolInput(input=prepared, mode=mode)
-
-
-def patch_protocol_transition(context: ToolProtocolContext) -> ToolProtocolTransition:
-    """Describe the current patch protocol only when framing or history requires it."""
-
-    current = _patch_input_mode(context.request)
-    prior: set[str] = set()
-    for preparation, count in context.prior_input_preparations.items():
-        if count <= 0 or preparation == current:
-            continue
-        if preparation in {PATCH_INPUT_LITERAL, PATCH_INPUT_LINE_FRAMED}:
-            prior.add(preparation)
-        else:
-            prior.add("opaque")
-    if context.latest_state is not None:
-        prefix = "patch-file:"
-        state_mode = context.latest_state.removeprefix(prefix).partition(":prior=")[0]
-        if not context.latest_state.startswith(prefix) or state_mode not in {
-            PATCH_INPUT_LITERAL,
-            PATCH_INPUT_LINE_FRAMED,
-        }:
-            prior.add("opaque")
-        elif state_mode != current:
-            prior.add(state_mode)
-    prior_key = ",".join(sorted(prior))
-    state_id = f"patch-file:{current}:prior={prior_key}"
-    transition = (
-        "Prior patch_file calls may reflect a previous or unknown provider protocol. "
-        "They are historical records, not format examples for the current call. "
-        if prior
-        else ""
-    )
-    if current == PATCH_INPUT_LINE_FRAMED:
-        return ToolProtocolTransition(state_id=state_id, text=transition + PATCH_LINE_FRAMING_INSTRUCTION)
-    if prior:
-        return ToolProtocolTransition(
-            state_id=state_id,
-            text=(
-                transition
-                + "From this call onward, pass patch_file content as literal source text; │ has no framing meaning."
-            ),
-        )
-    return ToolProtocolTransition(state_id=state_id, text=None)
 
 
 def describe_write(path: str, written: int, before: str | None, after: str) -> str:

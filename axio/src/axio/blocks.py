@@ -70,13 +70,6 @@ class ToolUseBlock(ContentBlock):
     id: ToolCallID
     name: ToolName
     input: dict[str, Any]
-    input_preparation: str | None = "canonical"
-
-    def __post_init__(self) -> None:
-        if self.input_preparation is not None and (
-            not isinstance(self.input_preparation, str) or not self.input_preparation
-        ):
-            raise ValueError("tool input preparation must be a non-empty string or null")
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,13 +108,7 @@ def _video_to_dict(block: VideoBlock) -> dict[str, Any]:
 
 @to_dict.register(ToolUseBlock)
 def _tool_use_to_dict(block: ToolUseBlock) -> dict[str, Any]:
-    return {
-        "type": "tool_use",
-        "id": block.id,
-        "name": block.name,
-        "input": block.input,
-        "input_preparation": block.input_preparation,
-    }
+    return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
 
 
 @to_dict.register(ToolResultBlock)
@@ -150,15 +137,7 @@ def from_dict(data: dict[str, Any]) -> ContentBlock:
         case "video":
             return VideoBlock(media_type=data["media_type"], data=base64.b64decode(data["data"]))
         case "tool_use":
-            input_preparation = data.get("input_preparation")
-            if input_preparation is not None and not isinstance(input_preparation, str):
-                raise ValueError("tool input preparation must be a string or null")
-            return ToolUseBlock(
-                id=data["id"],
-                name=data["name"],
-                input=data["input"],
-                input_preparation=input_preparation,
-            )
+            return ToolUseBlock(id=data["id"], name=data["name"], input=data["input"])
         case "tool_result":
             raw = data["content"]
             if isinstance(raw, str):

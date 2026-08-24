@@ -91,12 +91,12 @@ class TestReadFileIndexed:
         result = await read(tmp_cwd, "f.py", line_numbers=True)
         assert "L2│    pass" in result
 
-    def test_tool_description_does_not_advertise_patch_line_framing(self) -> None:
+    def test_tool_description_marks_line_prefix_as_display_metadata(self) -> None:
         tool: Tool[Any] = Tool(name="read_file", handler=read_file)
 
-        assert "line_numbers=True" in tool.description
-        assert "retain ``│source``" not in tool.description
-        assert "required visible framing" not in tool.description
+        assert "``L<number>│<source>``" in tool.description
+        assert "display metadata" in tool.description
+        assert "must not be copied" in tool.description
 
 
 class TestReadFileRange:

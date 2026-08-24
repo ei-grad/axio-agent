@@ -258,6 +258,30 @@ Model ids follow `[<lab>/]<model>[:tier][@<provider>]`:
 
 The `@<provider>` part is not an OpenRouter model name: it is stripped off when the request is built and sent as `provider: {"only": [...]}`. Tier and provider suffixes stay in `model.id`, and the metadata of the base model applies to them.
 
+Every OpenRouter chat-completions request also sends a `provider.ignore` list
+for endpoint builds that failed Axio's exact tool-string probe:
+`streamlake/fp8`, `relace/fp4`, and `cloudflare`. Those exclusions prevent
+routing to the observed failures; they do not prove that every other endpoint,
+future build, or model preserves exact argument whitespace.
+
+`extra_params.provider.ignore` is merged with the built-in exclusions and
+deduplicated. Other routing fields are preserved. A user `provider.only`,
+`provider.order`, or `@<provider>` selection that includes an excluded endpoint
+raises `ValueError` instead of silently overriding the exclusion. Contradictory
+`only`/`order`/`ignore` combinations also fail before the request is sent.
+
+```python
+transport = OpenRouterTransport(
+    extra_params={
+        "provider": {
+            "only": ["deepinfra/fp8"],
+            "order": ["deepinfra/fp8"],
+            "allow_fallbacks": False,
+        }
+    }
+)
+```
+
 ### CustomChatCompletionsTransport
 
 `CustomChatCompletionsTransport` is the explicit Chat Completions transport for

@@ -11,7 +11,7 @@ name: test_agent_dataclass
 -->
 ```python
 from dataclasses import dataclass, field
-from axio import PatchLineFraming, Tool, CompletionTransport, ToolSelector
+from axio import Tool, CompletionTransport, ToolSelector
 from axio.agent import DeferredToolSink
 from axio.messages import Message
 
@@ -25,7 +25,6 @@ class Agent:
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
-    patch_line_framing: PatchLineFraming = field(default="auto")
 ```
 
 `system`
@@ -59,18 +58,6 @@ class Agent:
   ordinary cancellation semantics. REPL-like hosts can use the hook to close
   the original tool protocol with a placeholder and deliver the eventual
   result later through a new user message.
-
-`patch_line_framing`
-: Controls the legacy visible-line protocol used to protect leading whitespace
-  in `patch_file` content. `auto` (the default) enables that protocol only
-  when the active transport does not provide a general `tool_argument_codec`;
-  `on` forces it and `off` suppresses it. When enabled, the Agent appends a
-  chronological `role=user` message with non-human `tool-protocol` provenance;
-  it is authoritative only for argument formatting of that named local tool.
-  A fresh `auto` request on a codec-capable transport needs no such message.
-  The setting is evaluated per agent immediately before each provider request
-  and does not mutate shared tools. Protocol changes append a concise transition
-  message, while old calls stay byte-for-byte unchanged.
 
 ## How the loop works
 

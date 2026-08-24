@@ -10,25 +10,22 @@ from typing import Any
 import aiohttp
 import pytest
 from aiohttp import web
+from axio.blocks import ToolUseBlock
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta
 from axio.exceptions import StreamError
+from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
-from axio.tool_codec import TOOL_ARGUMENT_CODEC
+from axio.tool import Tool
 from axio.types import CostSource, StopReason, Usage
 
-from axio_transport_openai.openrouter import OpenRouterTransport
+from axio_transport_openai.openrouter import (
+    OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS,
+    OpenRouterTransport,
+)
 
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
-
-
-def test_tool_argument_codec_defaults_on_and_explicit_off_round_trips() -> None:
-    transport = OpenRouterTransport(tool_argument_codec=None)
-
-    assert OpenRouterTransport().tool_argument_codec == TOOL_ARGUMENT_CODEC
-    restored = OpenRouterTransport.from_dict(transport.to_dict())
-    assert restored.tool_argument_codec is None
 
 
 def _sse_chunk(data: dict[str, Any]) -> str:
@@ -47,6 +44,10 @@ def _text_chunks(text: str) -> str:
     lines += _sse_chunk({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
     lines += _sse_done()
     return lines
+
+
+async def _write_content(content: str) -> str:
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -553,10 +554,13 @@ async def test_provider_suffix_becomes_provider_only(
 
     payload = server.received_payloads[0]
     assert payload["model"] == "z-ai/glm-4.7"
-    assert payload["provider"] == {"only": ["Cerebras"]}
+    assert payload["provider"] == {
+        "only": ["Cerebras"],
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
 
 
-async def test_plain_model_sends_no_provider(
+async def test_plain_model_excludes_known_whitespace_broken_providers(
     fake_server: tuple[FakeOpenRouterServer, str],
     transport: OpenRouterTransport,
 ) -> None:
@@ -568,7 +572,138 @@ async def test_plain_model_sends_no_provider(
 
     payload = server.received_payloads[0]
     assert payload["model"] == "z-ai/glm-4.7"
-    assert "provider" not in payload
+    assert payload["provider"] == {"ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS)}
+
+
+def test_existing_provider_ignore_is_merged_and_deduplicated() -> None:
+    transport = OpenRouterTransport(
+        extra_params={
+            "provider": {
+                "ignore": ["deepinfra/fp8", "streamlake/fp8", "DeepInfra/FP8"],
+                "allow_fallbacks": False,
+            }
+        }
+    )
+
+    payload = transport.build_payload([], [], "")
+
+    assert payload["provider"] == {
+        "ignore": ["deepinfra/fp8", "streamlake/fp8", "relace/fp4", "cloudflare"],
+        "allow_fallbacks": False,
+    }
+
+
+def test_safe_provider_only_and_order_are_preserved() -> None:
+    transport = OpenRouterTransport(extra_params={"provider": {"only": ["deepinfra/fp8"], "order": ["deepinfra/fp8"]}})
+
+    payload = transport.build_payload([], [], "")
+
+    assert payload["provider"] == {
+        "only": ["deepinfra/fp8"],
+        "order": ["deepinfra/fp8"],
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
+
+
+@pytest.mark.parametrize("field", ["only", "order"])
+@pytest.mark.parametrize("provider", ["streamlake/fp8", "Relace", "cloudflare"])
+def test_explicit_broken_provider_selection_is_rejected(field: str, provider: str) -> None:
+    transport = OpenRouterTransport(extra_params={"provider": {field: [provider]}})
+
+    with pytest.raises(ValueError, match=rf"provider\.{field} selects excluded"):
+        transport.build_payload([], [], "")
+
+
+def test_provider_only_and_ignore_conflict_is_rejected() -> None:
+    transport = OpenRouterTransport(
+        extra_params={"provider": {"only": ["deepinfra/fp8"], "ignore": ["deepinfra/fp8"]}}
+    )
+
+    with pytest.raises(ValueError, match="provider.only conflicts with provider.ignore"):
+        transport.build_payload([], [], "")
+
+
+def test_provider_order_outside_only_is_rejected() -> None:
+    transport = OpenRouterTransport(extra_params={"provider": {"only": ["deepinfra/fp8"], "order": ["cerebras"]}})
+
+    with pytest.raises(ValueError, match="provider.order must be a subset"):
+        transport.build_payload([], [], "")
+
+
+def test_model_provider_pin_conflicts_are_explicit_and_equivalent_duplicates_are_accepted() -> None:
+    broken = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash@StreamLake"))
+    conflicting = OpenRouterTransport(
+        model=ModelSpec(id="z-ai/glm-4.7@Cerebras"),
+        extra_params={"provider": {"only": ["deepinfra/fp8"]}},
+    )
+    equivalent = OpenRouterTransport(
+        model=ModelSpec(id="z-ai/glm-4.7@Cerebras"),
+        extra_params={"provider": {"only": ["Cerebras", "cerebras"]}},
+    )
+
+    with pytest.raises(ValueError, match="provider pin selects excluded"):
+        broken.build_payload([], [], "")
+    with pytest.raises(ValueError, match="provider pin conflicts with provider.only"):
+        conflicting.build_payload([], [], "")
+    assert equivalent.build_payload([], [], "")["provider"]["only"] == ["Cerebras"]
+
+
+def test_provider_routing_must_be_an_object() -> None:
+    transport = OpenRouterTransport(extra_params={"provider": "deepinfra/fp8"})
+
+    with pytest.raises(ValueError, match="provider routing must be an object"):
+        transport.build_payload([], [], "")
+
+
+def test_provider_policy_round_trips_with_serialized_transport() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="z-ai/glm-4.7"),
+        extra_params={"provider": {"order": ["deepinfra/fp8"], "allow_fallbacks": False}},
+    )
+
+    restored = OpenRouterTransport.from_dict(transport.to_dict())
+
+    assert restored.extra_params == transport.extra_params
+    assert restored.build_payload([], [], "")["provider"] == {
+        "order": ["deepinfra/fp8"],
+        "allow_fallbacks": False,
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
+
+
+def test_provider_exclusion_follows_runtime_model_switch() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash"))
+
+    assert transport.build_payload([], [], "")["provider"] == {
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS)
+    }
+    transport.model = ModelSpec(id="deepseek/deepseek-v4-flash@streamlake/fp8")
+    with pytest.raises(ValueError, match="provider pin selects excluded"):
+        transport.build_payload([], [], "")
+    transport.model = ModelSpec(id="deepseek/deepseek-v4-flash@deepinfra/fp8")
+    assert transport.build_payload([], [], "")["provider"] == {
+        "only": ["deepinfra/fp8"],
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
+
+
+def test_tool_schema_and_history_keep_plain_canonical_strings() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash"))
+    tool: Tool[Any] = Tool(name="write_content", handler=_write_content)
+    content = "          first\n\tsecond  "
+    history = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call-1", name="write_content", input={"content": content})],
+        )
+    ]
+
+    payload = transport.build_payload(history, [tool], "")
+
+    schema = payload["tools"][0]["function"]["parameters"]["properties"]["content"]
+    call = payload["messages"][0]["tool_calls"][0]
+    assert schema == {"type": "string"}
+    assert json.loads(call["function"]["arguments"]) == {"content": content}
 
 
 async def test_thinking_is_requested_the_openrouter_way(

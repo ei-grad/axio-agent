@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -15,7 +14,6 @@ from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, To
 from axio.messages import InputProvenance, Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
-from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentStarted,
@@ -29,10 +27,8 @@ from prompt_toolkit.formatted_text import to_plain_text
 
 from axio_repl import (
     TOOLS,
-    Command,
     ReplRenderer,
     _build_argument_parser,
-    _can_dispatch_command_during_foreground,
     _cancel_and_settle_tasks,
     _capture_command_output,
     _handle_agent_actions,
@@ -185,23 +181,6 @@ def test_session_replay_is_disabled_by_default_and_has_explicit_toggle() -> None
     assert _build_argument_parser().parse_args(["--no-session-replay"]).session_replay is False
 
 
-def test_patch_line_framing_defaults_to_auto_and_validates_explicit_mode() -> None:
-    parser = _build_argument_parser()
-
-    assert parser.parse_args([]).patch_line_framing == "auto"
-    assert parser.parse_args(["--patch-line-framing", "on"]).patch_line_framing == "on"
-    assert parser.parse_args(["--patch-line-framing=off"]).patch_line_framing == "off"
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--patch-line-framing", "yes"])
-
-
-def test_model_change_waits_for_foreground_turn_boundary() -> None:
-    commands = {"/model": Command(lambda: None, lambda _arg: None)}
-
-    assert _can_dispatch_command_during_foreground("/model", commands)
-    assert not _can_dispatch_command_during_foreground("/model next-model", commands)
-
-
 def test_sandbox_networking_defaults_to_fail_closed() -> None:
     args = _build_argument_parser().parse_args([])
 
@@ -323,26 +302,6 @@ async def test_agent_actions_command_reports_discarded_incomplete_payload(
     output = capsys.readouterr().out
     assert "discarded 0 queued frame(s)" in output
     assert f"({retained} bytes)" in output
-
-
-def test_agent_action_tool_call_hides_encoded_string_frames() -> None:
-    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
-    mux.observe(
-        "child",
-        ToolUseStart(
-            index=0,
-            tool_use_id="call",
-            name="send_message",
-            argument_codec=TOOL_ARGUMENT_CODEC,
-        ),
-    )
-    wire = json.dumps({"message": {TOOL_ARGUMENT_FRAME_KEY: "  child text  "}})
-    for character in wire:
-        mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
-
-    output = "".join(mux.drain())
-    assert "child text" in output
-    assert TOOL_ARGUMENT_FRAME_KEY not in output
 
 
 async def test_pending_prompt_count_includes_claimed_and_buffered_prompts() -> None:

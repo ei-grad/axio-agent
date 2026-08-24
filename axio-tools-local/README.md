@@ -119,15 +119,10 @@ os.unlink(name)
 
 Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`
 
-Pass `content` as exact source text. `Agent(patch_line_framing="auto")`, the
-default, uses a transport's general verbatim tool-argument protection when
-available and emits an authoritative, non-human tool-protocol message for the
-older visible-line protocol only as a fallback. Set it to `"on"` to force that
-fallback or `"off"` to suppress it. The Agent decodes newly submitted framed
-input before guards, persistence, and the handler. Direct `Tool` and handler
-calls always treat `│` literally; a compatibility caller must explicitly
-prepare input with the `"on"` policy. Existing persisted calls are never
-rewritten. An empty string still deletes the selected range.
+`content` is applied literally, including leading spaces, tabs, empty lines, and
+newlines. The `L<number>│` prefix in numbered `read_file` output is display
+metadata and is not part of the source; remove the whole prefix before copying a
+line into `content`. An empty string deletes the selected range.
 
 ### Text encoding and edit reports
 

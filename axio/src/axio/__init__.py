@@ -1,6 +1,6 @@
 """axio - public API."""
 
-from .agent import Agent, PatchLineFraming
+from .agent import Agent
 from .blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from .context import ContextStore, MemoryContextStore
 from .effort import EFFORT_LEVELS, EffortControl, EffortLevel, EffortMechanism, EffortRuntime, EffortState
@@ -17,47 +17,24 @@ from .events import (
     TranscriptDelta,
     TurnComplete,
 )
-from .exceptions import (
-    GuardCrash,
-    GuardError,
-    HandlerCrash,
-    HandlerError,
-    ToolInputPreparationError,
-    ToolProtocolError,
-)
+from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
 from .field import Field, FieldInfo, StrictStr
-from .messages import InputAuthority, InputProvenance, Message
+from .messages import InputProvenance, Message
 from .permission import ConcurrentGuard, PermissionGuard
 from .realtime import RealtimeAgent
 from .selector import ToolSelector
 from .stream import AgentStream
-from .tool import (
-    CONTEXT,
-    CURRENT_TOOL_CALL,
-    PreparedToolInput,
-    Tool,
-    ToolCallContext,
-    ToolInputContext,
-    ToolProtocolContext,
-    ToolProtocolTransition,
-    with_tool_hooks,
-)
+from .tool import CONTEXT, CURRENT_TOOL_CALL, Tool, ToolCallContext
 from .transport import CompletionTransport, RealtimeSession, RealtimeTransport
 from .types import CostSource, StopReason, Usage
 
 __all__ = [
     # core
     "Agent",
-    "PatchLineFraming",
     "Tool",
     "CONTEXT",
     "CURRENT_TOOL_CALL",
     "ToolCallContext",
-    "ToolInputContext",
-    "PreparedToolInput",
-    "ToolProtocolContext",
-    "ToolProtocolTransition",
-    "with_tool_hooks",
     "ContextStore",
     "MemoryContextStore",
     "CompletionTransport",
@@ -86,7 +63,6 @@ __all__ = [
     # messages & blocks
     "Message",
     "InputProvenance",
-    "InputAuthority",
     "TextBlock",
     "ToolUseBlock",
     "ToolResultBlock",
@@ -98,8 +74,6 @@ __all__ = [
     "GuardCrash",
     "HandlerError",
     "HandlerCrash",
-    "ToolInputPreparationError",
-    "ToolProtocolError",
     # permissions
     "PermissionGuard",
     "ConcurrentGuard",

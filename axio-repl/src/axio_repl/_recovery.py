@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -22,11 +21,6 @@ from axio.blocks import (
     VideoMediaType,
 )
 from axio.messages import InputProvenance, Message
-from axio.tool_codec import (
-    ToolArgumentCodecError,
-    decode_framed_values,
-    sanitize_presentation_value,
-)
 
 from axio_repl._journal import LEGACY_SCHEMA_VERSION, SCHEMA_VERSION, read_journal
 
@@ -69,7 +63,6 @@ class _TurnFragments:
     text: list[str] = field(default_factory=list)
     reasoning: list[str] = field(default_factory=list)
     tool_names: dict[str, str] = field(default_factory=dict)
-    tool_argument_codecs: dict[str, str] = field(default_factory=dict)
     tool_arguments: dict[str, list[str]] = field(default_factory=dict)
     tool_fields: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     tool_output: dict[str, list[str]] = field(default_factory=dict)
@@ -411,12 +404,6 @@ def _apply_stream_event(fragments: _TurnFragments, event: dict[str, Any]) -> Non
     elif record_type == "ToolUseStart":
         tool_use_id = _string(event.get("tool_use_id"), "ToolUseStart.tool_use_id")
         fragments.tool_names[tool_use_id] = _string(event.get("name"), "ToolUseStart.name")
-        argument_codec = event.get("argument_codec")
-        if argument_codec is not None:
-            fragments.tool_argument_codecs[tool_use_id] = _string(
-                argument_codec,
-                "ToolUseStart.argument_codec",
-            )
         fragments.tool_arguments.setdefault(tool_use_id, [])
     elif record_type == "ToolInputDelta":
         tool_use_id = _string(event.get("tool_use_id"), "ToolInputDelta.tool_use_id")
@@ -435,11 +422,6 @@ def _apply_turn_checkpoint(fragments: _TurnFragments, payload: dict[str, Any]) -
     for tool_use_id, name in _string_mapping(payload.get("tool_names"), "turn_checkpoint.tool_names").items():
         fragments.tool_names[tool_use_id] = name
         fragments.tool_arguments.setdefault(tool_use_id, [])
-    for tool_use_id, codec in _string_mapping(
-        payload.get("tool_argument_codecs", {}),
-        "turn_checkpoint.tool_argument_codecs",
-    ).items():
-        fragments.tool_argument_codecs[tool_use_id] = codec
     for tool_use_id, arguments in _string_mapping(
         payload.get("tool_arguments"), "turn_checkpoint.tool_arguments"
     ).items():
@@ -483,18 +465,7 @@ def _interruption_notice(
     for tool_use_id, name in fragments.tool_names.items():
         tool_detail = [f"Available partial tool call: name={name}, call_id={tool_use_id}"]
         if arguments := "".join(fragments.tool_arguments.get(tool_use_id, ())):
-            codec = fragments.tool_argument_codecs.get(tool_use_id)
-            if codec is None:
-                display_arguments = arguments
-            else:
-                try:
-                    display_arguments = json.dumps(
-                        sanitize_presentation_value(decode_framed_values(json.loads(arguments), codec)),
-                        ensure_ascii=False,
-                    )
-                except (json.JSONDecodeError, ToolArgumentCodecError):
-                    display_arguments = "[invalid or incomplete encoded arguments]"
-            tool_detail.append("Arguments fragment:\n" + display_arguments)
+            tool_detail.append("Arguments fragment:\n" + arguments)
         if fields := fragments.tool_fields.get(tool_use_id):
             field_lines = [f"{key}: {''.join(parts)}" for key, parts in fields.items()]
             tool_detail.append("Argument fields:\n" + "\n".join(field_lines))
@@ -560,14 +531,10 @@ def _decode_block(data: dict[str, Any], session_dir: Path) -> ContentBlock:
         raw_input = data.get("input")
         if not isinstance(raw_input, dict):
             raise RecoveryError("ToolUseBlock.input is not an object")
-        input_preparation = data.get("input_preparation")
-        if input_preparation is not None and not isinstance(input_preparation, str):
-            raise RecoveryError("ToolUseBlock.input_preparation is not a string or null")
         return ToolUseBlock(
             id=_string(data.get("id"), "ToolUseBlock.id"),
             name=_string(data.get("name"), "ToolUseBlock.name"),
             input=cast(dict[str, Any], raw_input),
-            input_preparation=input_preparation,
         )
     if record_type == "ToolResultBlock":
         raw_content = data.get("content")

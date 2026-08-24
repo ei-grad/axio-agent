@@ -241,7 +241,6 @@ sandbox:
     pypi: http://devpi:3141/root/pypi/+simple/
 runtime:
   theme: default
-  patch_line_framing: "auto"
 ```
 
 ```bash
@@ -256,13 +255,6 @@ missing secret references stop startup. LLM credentials use
 `transport.api_key_env`; secret values do not belong in YAML. See the
 [REPL guide](../docs/guides/axio-repl.md#persistent-configuration-and-agent-bundles)
 for the complete schema and sandbox registry mapping.
-
-`runtime.patch_line_framing` accepts `"auto"`, `"on"`, or `"off"`. The default
-`"auto"` enables the legacy visible-line protocol only for transports that do
-not provide general verbatim protection for string tool arguments. Protocol
-rules and transitions are chronological, visibly non-human conversation
-messages; old tool calls remain unchanged. Quote `"on"` and `"off"` in YAML so
-they are not parsed as booleans.
 
 `model_context` is optional trusted operator text from the selected agent
 manifest only. It is passed unchanged to the main and local child agents as

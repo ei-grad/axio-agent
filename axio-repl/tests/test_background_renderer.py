@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import io
-import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,7 +11,6 @@ from typing import Any
 
 import pytest
 from axio.agent import Agent
-from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     Error,
@@ -26,9 +24,8 @@ from axio.events import (
     ToolResult,
     ToolUseStart,
 )
-from axio.messages import InputProvenance, Message
+from axio.messages import Message
 from axio.tool import Tool
-from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 from axio_tools_agents.peers import PeerMessage, run_agent, set_run_agent_factory, set_session_event_hub
 from axio_tools_agents.runtime import (
@@ -648,30 +645,6 @@ async def test_submitted_input_closes_an_open_text_line_before_persistent_output
     assert output.count("12:41 alice>") == 1
 
 
-async def test_tool_protocol_message_is_visible_and_not_rendered_as_human(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    renderer = ReplRenderer(effective_username="alice")
-    message = Message(
-        role="user",
-        content=[TextBlock(text="Use literal patch content from this request.")],
-        provenance=InputProvenance(
-            human_authored=False,
-            source="tool-hook",
-            author="patch_file",
-            authority="tool-protocol",
-            protocol_state="patch-file:literal:prior=line-framed",
-        ),
-    )
-
-    await renderer.render_tool_protocol_message("main", message)
-
-    output = sanitize_terminal_text(capsys.readouterr().out)
-    assert "tool protocol · patch_file" in output
-    assert "Use literal patch content" in output
-    assert "alice>" not in output
-
-
 async def test_submitted_input_reopens_reasoning_with_prefix_and_owned_style(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -810,7 +783,7 @@ async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.Ca
     assert "\x1b[" not in output
 
 
-async def test_patch_file_content_distinguishes_canonical_framing_from_legacy_ui_marker(
+async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(theme=NO_COLOR_THEME)
@@ -821,7 +794,7 @@ async def test_patch_file_content_distinguishes_canonical_framing_from_legacy_ui
         ToolInputDelta(
             index=0,
             tool_use_id="indented",
-            partial_json='{"content":"│        first line\\n│\\tsecond line"}',
+            partial_json='{"content":"        first line\\n\\tsecond line"}',
         ),
     )
     await renderer.render("main", ToolUseStart(index=1, tool_use_id="column-zero", name="patch_file"))
@@ -832,10 +805,10 @@ async def test_patch_file_content_distinguishes_canonical_framing_from_legacy_ui
 
     output = capsys.readouterr().out
     assert "content:\n│········first line\n│→second line\n" in output
-    assert "content: ┊// no indent\n" in output
+    assert "content: │// no indent\n" in output
 
 
-async def test_patch_file_renders_canonical_sentinel_once(
+async def test_patch_file_renders_literal_leading_indentation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(theme=NO_COLOR_THEME)
@@ -846,13 +819,12 @@ async def test_patch_file_renders_canonical_sentinel_once(
         ToolInputDelta(
             index=0,
             tool_use_id="patch",
-            partial_json='{"content":"│          $counter.textContent ="}',
+            partial_json='{"content":"          $counter.textContent ="}',
         ),
     )
 
     output = capsys.readouterr().out
     assert "content: │··········$counter.textContent =\n" in output
-    assert "││" not in output
 
 
 @pytest.mark.parametrize("interruption", ["tool", "incoming"])
@@ -865,7 +837,7 @@ async def test_patch_file_content_marks_only_real_source_line_starts_across_inte
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
     await renderer.render(
         "main",
-        ToolInputDelta(index=0, tool_use_id="patch", partial_json='{"content":"│    alpha'),
+        ToolInputDelta(index=0, tool_use_id="patch", partial_json='{"content":"    alpha'),
     )
     if interruption == "tool":
         await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell", name="shell"))
@@ -984,34 +956,6 @@ async def test_character_chunks_preserve_json_escapes_unicode_and_block_indentat
     assert output == '\n  content:\nalpha 😀\n  beta\t"q"\\tail\n'
     assert output.count("content:") == 1
     assert "(continued)" not in output
-
-
-async def test_encoded_string_chunks_stream_without_exposing_protocol_frame(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    renderer = ReplRenderer()
-    renderer.set_input_active(True)
-    content = "          alpha\n\tbeta          "
-    encoded = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: content}})
-
-    await renderer.render(
-        "main",
-        ToolUseStart(
-            index=0,
-            tool_use_id="call",
-            name="write_file",
-            argument_codec=TOOL_ARGUMENT_CODEC,
-        ),
-    )
-    capsys.readouterr()
-    for character in encoded:
-        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
-
-    output = sanitize_terminal_text(capsys.readouterr().out)
-    assert "content:" in output
-    assert "alpha" in output
-    assert "beta" in output
-    assert TOOL_ARGUMENT_FRAME_KEY not in output
 
 
 async def test_strict_utf8_renderer_recovers_malformed_unicode_in_inline_block_and_error_boundaries() -> None:

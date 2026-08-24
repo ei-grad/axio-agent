@@ -135,19 +135,7 @@ class TestToDict:
 
     def test_tool_use(self) -> None:
         d = to_dict(ToolUseBlock(id="c1", name="echo", input={"x": 1}))
-        assert d == {
-            "type": "tool_use",
-            "id": "c1",
-            "name": "echo",
-            "input": {"x": 1},
-            "input_preparation": "canonical",
-        }
-
-    def test_tool_use_rejects_invalid_preparation_marker(self) -> None:
-        with pytest.raises(ValueError, match="non-empty string or null"):
-            ToolUseBlock(id="c1", name="patch_file", input={}, input_preparation="")
-        with pytest.raises(ValueError, match="non-empty string or null"):
-            ToolUseBlock(id="c1", name="patch_file", input={}, input_preparation=7)  # type: ignore[arg-type]
+        assert d == {"type": "tool_use", "id": "c1", "name": "echo", "input": {"x": 1}}
 
     def test_tool_result_str(self) -> None:
         d = to_dict(ToolResultBlock(tool_use_id="c1", content="ok"))
@@ -183,6 +171,23 @@ class TestFromDict:
     def test_tool_use(self) -> None:
         block = ToolUseBlock(id="c1", name="echo", input={"x": 1})
         assert from_dict(to_dict(block)) == block
+
+    def test_legacy_tool_preparation_metadata_does_not_rewrite_input(self) -> None:
+        persisted = {
+            "type": "tool_use",
+            "id": "c1",
+            "name": "patch_file",
+            "input": {"content": "│historical\nplain\n"},
+            "input_preparation": "line-framed",
+        }
+
+        block = from_dict(persisted)
+
+        assert block == ToolUseBlock(
+            id="c1",
+            name="patch_file",
+            input={"content": "│historical\nplain\n"},
+        )
 
     def test_tool_result_str(self) -> None:
         block = ToolResultBlock(tool_use_id="c1", content="ok", is_error=True)
@@ -234,57 +239,6 @@ class TestMessageSerialization:
             "source": "peer",
             "author": "agent-7",
         }
-
-    def test_tool_protocol_provenance_is_narrow_and_round_trips(self) -> None:
-        provenance = InputProvenance(
-            human_authored=False,
-            source="tool-hook",
-            author="patch_file",
-            authority="tool-protocol",
-            protocol_state="patch-file:literal:prior=opaque",
-        )
-
-        assert InputProvenance.from_dict(provenance.to_dict()) == provenance
-        assert provenance.to_dict()["authority"] == "tool-protocol"
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {
-                "human_authored": True,
-                "source": "tool-hook",
-                "author": "patch",
-                "authority": "tool-protocol",
-                "protocol_state": "x",
-            },
-            {
-                "human_authored": False,
-                "source": "peer",
-                "author": "patch",
-                "authority": "tool-protocol",
-                "protocol_state": "x",
-            },
-            {
-                "human_authored": False,
-                "source": "tool-hook",
-                "author": None,
-                "authority": "tool-protocol",
-                "protocol_state": "x",
-            },
-            {"human_authored": False, "source": "tool-hook", "author": "patch", "authority": "tool-protocol"},
-            {"human_authored": False, "source": "peer", "author": "patch", "protocol_state": "x"},
-        ],
-    )
-    def test_invalid_tool_protocol_authority_is_rejected(self, kwargs: dict[str, object]) -> None:
-        with pytest.raises(ValueError):
-            InputProvenance(**kwargs)  # type: ignore[arg-type]
-
-    def test_legacy_tool_use_without_preparation_is_opaque(self) -> None:
-        block = from_dict({"type": "tool_use", "id": "c1", "name": "patch_file", "input": {"content": "│x"}})
-
-        assert isinstance(block, ToolUseBlock)
-        assert block.input == {"content": "│x"}
-        assert block.input_preparation is None
 
     def test_human_input_provenance_roundtrips_submission_identity_and_time(self) -> None:
         submitted_at = datetime(2026, 8, 21, 13, 42, 17, 123456, tzinfo=UTC)

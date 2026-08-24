@@ -27,13 +27,11 @@ from axio.diff import (
     PATCH_CONTENT_DESCRIPTION,
     describe_patch,
     describe_write,
-    patch_protocol_transition,
-    prepare_patch_input,
 )
 from axio.exceptions import HandlerError
 from axio.field import Field
 from axio.schema import build_tool_schema
-from axio.tool import CONTEXT, Tool, with_tool_hooks
+from axio.tool import CONTEXT, Tool
 
 logger = logging.getLogger(__name__)
 
@@ -236,9 +234,11 @@ async def read_file(
     """Read file contents. Returns text for text files, hex for binaries.
     Lines are 1-indexed: start_line=1 is the first line, end_line=3 includes
     line 3. Pass line_numbers=True to prefix each line as
-    ``L<number>│<source>``. Everything after ``│`` is exact file content. Large
-    files are truncated to max_chars. Always read the file before editing it with
-    write_file or patch_file."""
+    ``L<number>│<source>`` — required before calling patch_file. Everything
+    after ``│`` is exact file content; the whole prefix is display metadata and
+    must not be copied into patch_file content. Large files are truncated to
+    max_chars. Always read the file before editing it with write_file or
+    patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     if max_chars < 0:
@@ -380,7 +380,6 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
     return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
 
 
-@with_tool_hooks(input_preparer=prepare_patch_input, protocol_transition=patch_protocol_transition)
 async def patch_file(
     path: str,
     from_line: int,
@@ -392,10 +391,12 @@ async def patch_file(
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. Pass replacement content with its exact source
-    whitespace. Use this for surgical edits instead of rewriting the whole file
-    with write_file. The result reports a compact diff fragment with function
-    context when it can be inferred. Binary files cannot be patched."""
+    to get correct line numbers. content is applied literally: include exact
+    leading whitespace on the first and every following line, and do not copy
+    read_file's ``L<number>│`` metadata prefix. Use this for surgical edits
+    instead of rewriting the whole file with write_file. The result reports a
+    compact diff fragment with function context when it can be inferred. Binary
+    files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:
