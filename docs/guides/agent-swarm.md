@@ -76,7 +76,8 @@ The `tools` list contains names that are resolved against the shared toolbox at
 runtime - the TOML file does not know about `Tool` objects, only names.
 `patch_line_framing` accepts `auto`, `on`, or `off`; `auto` avoids the legacy
 line protocol when the selected transport already protects all string tool
-arguments structurally.
+arguments structurally, and otherwise adds the current rule as a non-human
+tool-protocol conversation message.
 `analyze` and `notes` are added to the toolbox by `run_swarm()` after the sandbox
 tools are injected.
 

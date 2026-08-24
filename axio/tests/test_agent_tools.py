@@ -27,7 +27,7 @@ from axio.events import (
 from axio.exceptions import GuardError, HandlerError
 from axio.permission import PermissionGuard
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
-from axio.tool import CURRENT_TOOL_CALL, Tool, ToolCallContext
+from axio.tool import CURRENT_TOOL_CALL, PreparedToolInput, Tool, ToolCallContext, ToolInputContext
 from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 
@@ -533,6 +533,53 @@ class TestToolResultCarriesData:
         assert result.is_error
         assert "encoded arguments" in result.content
         assert called == []
+
+    async def test_input_preparation_failure_is_persisted_canonical_and_skips_dispatch(self) -> None:
+        called: list[str] = []
+
+        class CaptureGuard(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                called.append("guard")
+                return kwargs
+
+        def broken(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
+            raise RuntimeError("cannot prepare")
+
+        async def capture(content: str) -> str:
+            called.append("handler")
+            return content
+
+        transport = StubTransport(
+            [
+                make_tool_use_response("write_file", "c1", {"content": "raw"}),
+                make_text_response("Done"),
+            ]
+        )
+        context = MemoryContextStore()
+        tool: Tool[Any] = Tool(
+            name="write_file",
+            handler=capture,
+            guards=(CaptureGuard(),),
+            input_preparer=broken,
+        )
+
+        events = [
+            event async for event in Agent(system="test", tools=[tool], transport=transport).run_stream("go", context)
+        ]
+
+        result = next(event for event in events if isinstance(event, ToolResult))
+        assert result.is_error
+        assert result.input == {}
+        assert "cannot prepare" in result.content
+        assert called == []
+        stored = next(
+            block
+            for message in await context.get_history()
+            for block in message.content
+            if isinstance(block, ToolUseBlock)
+        )
+        assert stored.input == {}
+        assert stored.input_preparation == "canonical"
 
     async def test_union_wire_value_is_decoded_before_tool_use_persistence(self) -> None:
         observed: list[dict[str, Any]] = []

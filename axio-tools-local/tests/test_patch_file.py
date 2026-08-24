@@ -11,15 +11,18 @@ import json
 import os
 from collections.abc import Generator
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 from axio.agent import Agent
+from axio.blocks import ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import IterationEnd, ToolInputDelta, ToolResult, ToolUseStart
 from axio.exceptions import HandlerError
 from axio.testing import StubTransport, make_text_response
-from axio.tool import Tool
+from axio.tool import Tool, ToolInputContext
+from axio.tool_codec import TOOL_ARGUMENT_CODEC, encode_tool_arguments
 from axio.types import StopReason, Usage
 
 from axio_tools_local.patch_file import patch_file
@@ -35,6 +38,17 @@ def tmp_cwd(tmp_path: Path) -> Generator[Path, None, None]:
 
 async def patch(path: Path, from_line: int, to_line: int, content: str) -> str:
     return await patch_file(path=path.name, from_line=from_line, to_line=to_line, content=content)
+
+
+async def framed_patch(path: Path, from_line: int, to_line: int, content: str) -> str:
+    tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+    prepared = tool.prepare_input(
+        {"path": path.name, "from_line": from_line, "to_line": to_line, "content": content},
+        ToolInputContext(policy=MappingProxyType({"patch_line_framing": "on"})),
+    )
+    result = await tool.invoke_prepared(**prepared.input)
+    assert isinstance(result, str)
+    return result
 
 
 class TestPatchBasic:
@@ -117,7 +131,7 @@ class TestFramedContent:
         f = tmp_cwd / "index.html"
         f.write_text("before\n          old();\nafter\n")
 
-        result = await patch_file(path=f.name, from_line=2, to_line=2, content="│          replacement();")
+        result = await framed_patch(f, 2, 2, "│          replacement();")
 
         assert f.read_text() == "before\n          replacement();\nafter\n"
         assert "-          old();\n" in result
@@ -127,12 +141,7 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_text("before\nold one\nold two\nafter\n")
 
-        await patch_file(
-            path=f.name,
-            from_line=2,
-            to_line=3,
-            content="│      first\n│\tsecond\n│\n",
-        )
+        await framed_patch(f, 2, 3, "│      first\n│\tsecond\n│\n")
 
         assert f.read_bytes() == b"before\n      first\n\tsecond\n\nafter\n"
 
@@ -140,7 +149,7 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_bytes(b"before\r\nold\r\nafter\r\n")
 
-        await patch_file(path=f.name, from_line=2, to_line=2, content="│    replacement\r\n")
+        await framed_patch(f, 2, 2, "│    replacement\r\n")
 
         assert f.read_bytes() == b"before\r\n    replacement\r\nafter\r\n"
 
@@ -148,7 +157,7 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_text("before\nold\nafter\n")
 
-        await patch_file(path=f.name, from_line=2, to_line=2, content="│")
+        await framed_patch(f, 2, 2, "│")
 
         assert f.read_text() == "before\n\nafter\n"
 
@@ -166,7 +175,7 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_text(before)
 
-        await patch_file(path=f.name, from_line=from_line, to_line=to_line, content="│")
+        await framed_patch(f, from_line, to_line, "│")
 
         assert f.read_bytes() == b"\n"
 
@@ -174,8 +183,8 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_text("after\n")
 
-        await patch_file(path=f.name, from_line=1, to_line=0, content="│   inserted")
-        await patch_file(path=f.name, from_line=2, to_line=2, content="│last")
+        await framed_patch(f, 1, 0, "│   inserted")
+        await framed_patch(f, 2, 2, "│last")
 
         assert f.read_bytes() == b"   inserted\nlast"
 
@@ -183,7 +192,7 @@ class TestFramedContent:
         f = tmp_cwd / "f.txt"
         f.write_text("old\n")
 
-        await patch_file(path=f.name, from_line=1, to_line=1, content="││literal\n")
+        await framed_patch(f, 1, 1, "││literal\n")
 
         assert f.read_text() == "│literal\n"
 
@@ -196,6 +205,15 @@ class TestFramedContent:
 
         assert f.read_bytes() == content.encode()
 
+    async def test_direct_call_treats_every_leading_sentinel_as_literal_source(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("old\n")
+        content = "│literal\n│    still literal\n"
+
+        await patch_file(path=f.name, from_line=1, to_line=1, content=content)
+
+        assert f.read_text() == content
+
     @pytest.mark.parametrize("content", ["│framed\nlegacy", "legacy\n│framed"])
     async def test_rejects_mixed_framing_without_writing(self, tmp_cwd: Path, content: str) -> None:
         f = tmp_cwd / "f.txt"
@@ -203,7 +221,7 @@ class TestFramedContent:
         f.write_text(original)
 
         with pytest.raises(HandlerError, match="every content line"):
-            await patch_file(path=f.name, from_line=1, to_line=1, content=content)
+            await framed_patch(f, 1, 1, content)
 
         assert f.read_text() == original
 
@@ -213,7 +231,7 @@ class TestFramedContent:
         f.write_text(original)
 
         with pytest.raises(HandlerError, match=r"remove the L<number> prefix"):
-            await patch_file(path=f.name, from_line=1, to_line=1, content="L489│          replacement")
+            await framed_patch(f, 1, 1, "L489│          replacement")
 
         assert f.read_text() == original
 
@@ -252,13 +270,91 @@ class TestFramedContent:
         )
         agent = Agent(system="test", tools=[Tool(name="patch_file", handler=patch_file)], transport=transport)
 
-        events = [event async for event in agent.run_stream("repair", MemoryContextStore())]
+        context = MemoryContextStore()
+        events = [event async for event in agent.run_stream("repair", context)]
 
         result = next(event for event in events if isinstance(event, ToolResult))
-        assert result.input == arguments
+        assert result.input == {**arguments, "content": "          $counter.textContent ="}
         assert not result.is_error
         assert result.content != "No changes"
         assert f.read_text() == "          $counter.textContent ="
+        history = await context.get_history()
+        stored = next(block for message in history for block in message.content if isinstance(block, ToolUseBlock))
+        assert stored.input == result.input
+        assert stored.input_preparation == "line-framed"
+
+    async def test_agent_off_mode_preserves_all_sentinel_lines_as_literal(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "literal.txt"
+        f.write_text("old\n")
+        content = "│literal\n│    literal indentation\n"
+        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "patch-off", "patch_file"),
+                    ToolInputDelta(
+                        0,
+                        "patch-off",
+                        json.dumps(
+                            {"path": f.name, "from_line": 1, "to_line": 1, "content": content},
+                            ensure_ascii=False,
+                        ),
+                    ),
+                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
+                ],
+                make_text_response("Done"),
+            ]
+        )
+        context = MemoryContextStore()
+
+        await Agent(
+            system="test",
+            tools=[tool],
+            transport=transport,
+            patch_line_framing="off",
+        ).run("repair", context)
+
+        assert f.read_text() == content
+        stored = next(
+            block
+            for message in await context.get_history()
+            for block in message.content
+            if isinstance(block, ToolUseBlock)
+        )
+        assert stored.input["content"] == content
+        assert stored.input_preparation == "literal"
+
+    async def test_agent_auto_with_general_codec_preserves_literal_sentinel_lines(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "literal.txt"
+        f.write_text("old\n")
+        content = "│literal\n│    literal indentation\n"
+        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+        arguments = {"path": f.name, "from_line": 1, "to_line": 1, "content": content}
+        wire = encode_tool_arguments(arguments, tool.input_schema, TOOL_ARGUMENT_CODEC)
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "patch-codec", "patch_file", argument_codec=TOOL_ARGUMENT_CODEC),
+                    ToolInputDelta(0, "patch-codec", json.dumps(wire, ensure_ascii=False)),
+                    IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
+                ],
+                make_text_response("Done"),
+            ]
+        )
+        setattr(transport, "tool_argument_codec", TOOL_ARGUMENT_CODEC)
+        context = MemoryContextStore()
+
+        await Agent(system="test", tools=[tool], transport=transport).run("repair", context)
+
+        assert f.read_text() == content
+        stored = next(
+            block
+            for message in await context.get_history()
+            for block in message.content
+            if isinstance(block, ToolUseBlock)
+        )
+        assert stored.input == arguments
+        assert stored.input_preparation == "literal"
 
 
 class TestNewlineHandling:

@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-from axio.diff import PATCH_CONTENT_DESCRIPTION, decode_patch_content, describe_patch
+from axio.diff import PATCH_CONTENT_DESCRIPTION, describe_patch, patch_protocol_transition, prepare_patch_input
 from axio.exceptions import HandlerError
 from axio.field import Field, StrictStr
+from axio.tool import with_tool_hooks
 
 
+@with_tool_hooks(input_preparer=prepare_patch_input, protocol_transition=patch_protocol_transition)
 async def patch_file(
     path: StrictStr,
     from_line: int,
@@ -38,10 +40,7 @@ async def patch_file(
                 before = f.read()
 
             lines = before.splitlines(keepends=True)
-            try:
-                content_lines = decode_patch_content(content)
-            except ValueError as exc:
-                raise HandlerError(str(exc)) from exc
+            content_lines = content.splitlines(keepends=True)
             if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
                 content_lines[-1] += "\n"
 

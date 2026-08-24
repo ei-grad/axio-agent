@@ -168,6 +168,7 @@ class _BackgroundAgent:
     runner: asyncio.Task[None] | None = None
     current_turn: asyncio.Task[TurnOutcome] | None = None
     current_identity: TurnIdentity | None = None
+    processing_input: bool = False
     stopping: bool = False
     # A failed turn leaves the agent alive and waiting, so without this the
     # parent cannot tell a crashed agent from one that finished its work.
@@ -191,7 +192,9 @@ _background_agents: dict[str, _BackgroundAgent] = {}
 
 def _is_background_idle(background: _BackgroundAgent) -> bool:
     current_turn = background.current_turn
-    return (current_turn is None or current_turn.done()) and background.inbox.empty()
+    return (
+        not background.processing_input and (current_turn is None or current_turn.done()) and background.inbox.empty()
+    )
 
 
 def _enqueue_background_input(background: _BackgroundAgent, queued: _QueuedPrompt) -> None:
@@ -852,9 +855,11 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
     try:
         while True:
             queued = await background.inbox.get()
+            background.processing_input = True
             if queued.is_stop or background.stopping:
                 if queued.done is not None and not queued.done.done():
                     queued.done.set_result(None)
+                background.processing_input = False
                 break
             if queued.context_only:
                 try:
@@ -871,6 +876,7 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                     if queued.done is not None and not queued.done.done():
                         queued.done.set_result(None)
                 finally:
+                    background.processing_input = False
                     _notify_idle(background)
                 continue
             identity = new_turn_identity(
@@ -906,10 +912,12 @@ async def _run_background_agent(background: _BackgroundAgent) -> None:
                 try:
                     await _deliver_background_turn(background, outcome, identity)
                 finally:
+                    background.processing_input = False
                     _notify_idle(background)
             if background.stopping:
                 break
     finally:
+        background.processing_input = False
         status = (
             TurnStatus.CANCELLED
             if background.stopping or background.interrupted

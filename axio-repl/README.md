@@ -258,9 +258,11 @@ missing secret references stop startup. LLM credentials use
 for the complete schema and sandbox registry mapping.
 
 `runtime.patch_line_framing` accepts `"auto"`, `"on"`, or `"off"`. The default
-`"auto"` advertises the legacy visible-line protocol only for transports that
-do not provide general verbatim protection for string tool arguments. Quote
-`"on"` and `"off"` in YAML so they are not parsed as booleans.
+`"auto"` enables the legacy visible-line protocol only for transports that do
+not provide general verbatim protection for string tool arguments. Protocol
+rules and transitions are chronological, visibly non-human conversation
+messages; old tool calls remain unchanged. Quote `"on"` and `"off"` in YAML so
+they are not parsed as booleans.
 
 `model_context` is optional trusted operator text from the selected agent
 manifest only. It is passed unchanged to the main and local child agents as

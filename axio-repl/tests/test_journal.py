@@ -630,11 +630,22 @@ async def test_default_one_shot_writes_complete_main_session_journal(
     assert configurations["effort"]["mechanism"] == "prompt-fallback"
 
     committed = [record for record in records if record["kind"] == "message_committed"]
-    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "user", "assistant"]
     assert all(record["agent_id"] == "main" for record in committed)
     assert all(record["context_id"] for record in committed)
     assert committed[0]["payload"]["message"]["content"][0]["text"].endswith("] test prompt")
-    assert committed[1]["payload"]["message"]["content"][0]["text"] == "stub answer"
+    hook = committed[1]["payload"]["message"]
+    assert hook["provenance"] == {
+        "record_type": "InputProvenance",
+        "human_authored": False,
+        "source": "tool-hook",
+        "author": "patch_file",
+        "submitted_at": None,
+        "authority": "tool-protocol",
+        "protocol_state": "patch-file:line-framed:prior=",
+    }
+    assert "frame every logical line" in hook["content"][0]["text"]
+    assert committed[2]["payload"]["message"]["content"][0]["text"] == "stub answer"
 
     captured = capsys.readouterr()
     assert "Semantic log:" not in captured.out
@@ -820,7 +831,12 @@ async def test_cli_effort_is_recorded_as_configuration_without_extra_history_mes
     assert effort_change["payload"]["event"]["value"]["requested"] == "high"
     assert effort_change["payload"]["event"]["value"]["mechanism"] == "prompt-fallback"
     committed = [record for record in records if record["kind"] == "message_committed"]
-    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
+    non_protocol = [
+        record
+        for record in committed
+        if (record["payload"]["message"].get("provenance") or {}).get("authority") != "tool-protocol"
+    ]
+    assert [record["payload"]["message"]["role"] for record in non_protocol] == ["user", "assistant"]
 
 
 async def test_one_shot_session_log_can_be_disabled(
@@ -1251,7 +1267,10 @@ async def test_one_shot_journal_captures_actual_local_subagent_session(
     assert all(record["parent_tool_use_id"] == f"{tool_name}-call" for record in child_records)
     assert any(record["kind"] == "turn_checkpoint" for record in child_records)
     committed = [record for record in child_records if record["kind"] == "message_committed"]
-    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "assistant"]
+    assert [record["payload"]["message"]["role"] for record in committed] == ["user", "user", "assistant"]
+    hook = committed[1]["payload"]["message"]
+    assert hook["provenance"]["authority"] == "tool-protocol"
+    assert hook["provenance"]["human_authored"] is False
     assert len({record["context_id"] for record in child_records if record["context_id"]}) == 1
     if tool_name == "run_agent":
         assert not any(record["kind"] == "outcome_delivered" for record in child_records)

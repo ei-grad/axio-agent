@@ -62,10 +62,15 @@ class Agent:
 
 `patch_line_framing`
 : Controls the legacy visible-line protocol used to protect leading whitespace
-  in `patch_file` content. `auto` (the default) advertises that protocol only
+  in `patch_file` content. `auto` (the default) enables that protocol only
   when the active transport does not provide a general `tool_argument_codec`;
-  `on` forces it and `off` suppresses it. The setting is evaluated per agent
-  immediately before each provider request and does not mutate shared tools.
+  `on` forces it and `off` suppresses it. When enabled, the Agent appends a
+  chronological `role=user` message with non-human `tool-protocol` provenance;
+  it is authoritative only for argument formatting of that named local tool.
+  A fresh `auto` request on a codec-capable transport needs no such message.
+  The setting is evaluated per agent immediately before each provider request
+  and does not mutate shared tools. Protocol changes append a concise transition
+  message, while old calls stay byte-for-byte unchanged.
 
 ## How the loop works
 

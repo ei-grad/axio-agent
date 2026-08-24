@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from axio.agent import Agent
+from axio.blocks import TextBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     Error,
@@ -25,7 +26,7 @@ from axio.events import (
     ToolResult,
     ToolUseStart,
 )
-from axio.messages import Message
+from axio.messages import InputProvenance, Message
 from axio.tool import Tool
 from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
@@ -645,6 +646,30 @@ async def test_submitted_input_closes_an_open_text_line_before_persistent_output
     output = sanitize_terminal_text(capsys.readouterr().out)
     assert output == "partial model text\n12:41 alice> queued input\nremaining model text"
     assert output.count("12:41 alice>") == 1
+
+
+async def test_tool_protocol_message_is_visible_and_not_rendered_as_human(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(effective_username="alice")
+    message = Message(
+        role="user",
+        content=[TextBlock(text="Use literal patch content from this request.")],
+        provenance=InputProvenance(
+            human_authored=False,
+            source="tool-hook",
+            author="patch_file",
+            authority="tool-protocol",
+            protocol_state="patch-file:literal:prior=line-framed",
+        ),
+    )
+
+    await renderer.render_tool_protocol_message("main", message)
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert "tool protocol · patch_file" in output
+    assert "Use literal patch content" in output
+    assert "alice>" not in output
 
 
 async def test_submitted_input_reopens_reasoning_with_prefix_and_owned_style(

@@ -1298,6 +1298,30 @@ async def test_background_outcome_delivery_does_not_depend_on_renderer(tmp_path:
         await parent.close()
 
 
+async def test_wait_for_idle_includes_background_outcome_delivery() -> None:
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        return Agent(system="child", transport=_AnsweringTransport()), MemoryContextStore()
+
+    async def hold_outcome(outcome: TurnOutcome) -> None:
+        delivery_started.set()
+        await release_delivery.wait()
+
+    set_spawn_agent_factory(factory)
+    set_background_outcome_handler(hold_outcome)
+    agent_id = _spawn_id(await spawn_agent(task="answer"))
+    await asyncio.wait_for(delivery_started.wait(), timeout=1)
+
+    waiter = asyncio.create_task(wait_local_background_agents_idle([agent_id]))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release_delivery.set()
+    await asyncio.wait_for(waiter, timeout=1)
+
+
 async def test_spawn_agent_not_configured_raises_handler_error() -> None:
     with pytest.raises(HandlerError, match="spawn_agent is not configured"):
         await spawn_agent(task="anything")

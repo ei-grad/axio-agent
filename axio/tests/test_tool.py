@@ -11,11 +11,27 @@ from typing import Annotated, Any, Literal
 
 import pytest
 
-from axio.exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
+from axio.exceptions import (
+    GuardCrash,
+    GuardError,
+    HandlerCrash,
+    HandlerError,
+    ToolInputPreparationError,
+    ToolProtocolError,
+)
 from axio.field import Field, StrictStr
 from axio.permission import PermissionGuard
 from axio.schema import build_tool_schema
-from axio.tool import BACKGROUND_PARAM, CONTEXT, Tool
+from axio.tool import (
+    BACKGROUND_PARAM,
+    CONTEXT,
+    PreparedToolInput,
+    Tool,
+    ToolInputContext,
+    ToolProtocolContext,
+    ToolProtocolTransition,
+    with_tool_hooks,
+)
 
 
 async def _empty() -> str:
@@ -24,6 +40,136 @@ async def _empty() -> str:
 
 async def _msg(msg: str) -> str:
     return msg
+
+
+class TestToolHooks:
+    def test_hook_contexts_snapshot_mutable_mappings(self) -> None:
+        policy = {"patch_line_framing": "on"}
+        preparations: dict[str | None, int] = {"literal": 1}
+        request = ToolInputContext(policy=policy)
+        protocol = ToolProtocolContext(request, preparations, None)
+
+        policy["patch_line_framing"] = "off"
+        preparations["line-framed"] = 1
+
+        assert request.policy == {"patch_line_framing": "on"}
+        assert protocol.prior_input_preparations == {"literal": 1}
+        with pytest.raises(TypeError):
+            request.policy["patch_line_framing"] = "off"  # type: ignore[index]
+
+    async def test_direct_call_prepares_once_before_guard_and_handler(self) -> None:
+        observed: list[tuple[str, str]] = []
+
+        def prepare(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
+            assert context.policy == {}
+            observed.append(("prepare", input["msg"]))
+            return PreparedToolInput(input={"msg": f"prepared:{input['msg']}"}, mode="test")
+
+        class CaptureGuard(PermissionGuard):
+            async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+                observed.append(("guard", kwargs["msg"]))
+                return kwargs
+
+        @with_tool_hooks(input_preparer=prepare)
+        async def handler(msg: str) -> str:
+            observed.append(("handler", msg))
+            return msg
+
+        tool: Tool[Any] = Tool(name="prepared", handler=handler, guards=(CaptureGuard(),))
+
+        assert await tool(msg="raw") == "prepared:raw"
+        assert observed == [
+            ("prepare", "raw"),
+            ("guard", "prepared:raw"),
+            ("handler", "prepared:raw"),
+        ]
+        assert tool.input_preparer is prepare
+
+    async def test_invoke_prepared_does_not_run_preparer_again(self) -> None:
+        calls = 0
+
+        def prepare(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
+            nonlocal calls
+            calls += 1
+            return PreparedToolInput(input=input, mode="test")
+
+        async def handler(msg: str) -> str:
+            return msg
+
+        tool: Tool[Any] = Tool(name="prepared", handler=handler, input_preparer=prepare)
+        prepared = tool.prepare_input({"msg": "canonical"}, ToolInputContext())
+
+        assert await tool.invoke_prepared(**prepared.input) == "canonical"
+        assert calls == 1
+
+    def test_input_preparer_failure_is_typed_and_fail_closed(self) -> None:
+        async def handler(msg: str) -> str:
+            return msg
+
+        def broken(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
+            raise RuntimeError("broken prepare")
+
+        tool: Tool[Any] = Tool(name="broken", handler=handler, input_preparer=broken)
+
+        with pytest.raises(ToolInputPreparationError, match="broken prepare"):
+            tool.prepare_input({"msg": "raw"})
+
+    @pytest.mark.parametrize(
+        ("prepared", "message"),
+        [
+            (PreparedToolInput(input=None, mode="test"), "must be a mapping"),  # type: ignore[arg-type]
+            (PreparedToolInput(input={"msg": "ok"}, mode=7), "non-empty string"),  # type: ignore[arg-type]
+            (PreparedToolInput(input={1: "bad"}, mode="test"), "keys must be strings"),  # type: ignore[dict-item]
+        ],
+    )
+    def test_invalid_prepared_values_fail_with_typed_error(
+        self,
+        prepared: PreparedToolInput,
+        message: str,
+    ) -> None:
+        async def handler(msg: str) -> str:
+            return msg
+
+        def prepare(input: dict[str, Any], context: ToolInputContext) -> PreparedToolInput:
+            return prepared
+
+        tool: Tool[Any] = Tool(name="invalid", handler=handler, input_preparer=prepare)
+
+        with pytest.raises(ToolInputPreparationError, match=message):
+            tool.prepare_input({"msg": "raw"})
+
+    def test_protocol_hook_failure_is_typed(self) -> None:
+        async def handler() -> str:
+            return ""
+
+        def broken(context: ToolProtocolContext) -> object:
+            raise RuntimeError("broken protocol")
+
+        tool: Tool[Any] = Tool(name="broken", handler=handler, protocol_transition=broken)  # type: ignore[arg-type]
+        context = ToolProtocolContext(ToolInputContext(), MappingProxyType({}), None)
+
+        with pytest.raises(ToolProtocolError, match="broken protocol"):
+            tool.resolve_protocol_transition(context)
+
+    @pytest.mark.parametrize(
+        "transition",
+        [
+            ToolProtocolTransition(state_id=7, text=None),  # type: ignore[arg-type]
+            ToolProtocolTransition(state_id="valid", text=7),  # type: ignore[arg-type]
+        ],
+    )
+    def test_invalid_protocol_values_fail_with_typed_error(self, transition: ToolProtocolTransition) -> None:
+        async def handler() -> str:
+            return ""
+
+        def resolve(context: ToolProtocolContext) -> ToolProtocolTransition:
+            return transition
+
+        tool: Tool[Any] = Tool(name="invalid", handler=handler, protocol_transition=resolve)
+        context = ToolProtocolContext(ToolInputContext(), MappingProxyType({}), None)
+
+        with pytest.raises(ToolProtocolError):
+            tool.resolve_protocol_transition(context)
 
 
 class TestBuildSchema:

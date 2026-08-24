@@ -6,13 +6,14 @@ import asyncio
 import io
 import tarfile
 from collections.abc import AsyncGenerator
+from types import MappingProxyType
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiodocker
 import pytest
 from axio.exceptions import HandlerError
-from axio.tool import CONTEXT
+from axio.tool import CONTEXT, ToolInputContext
 
 from axio_tools_docker import sandbox as sandbox_module
 from axio_tools_docker.sandbox import DockerSandbox, ImageNotAvailableError, parse_cpus, parse_device, parse_memory
@@ -773,6 +774,15 @@ def _bind_context(sb: DockerSandbox) -> Any:
     return CONTEXT.set(sb)
 
 
+async def _call_line_framed_patch(sb: DockerSandbox, **input: Any) -> Any:
+    tool = next(item for item in sb.tools if item.name == "patch_file")
+    prepared = tool.prepare_input(
+        input,
+        ToolInputContext(policy=MappingProxyType({"patch_line_framing": "on"})),
+    )
+    return await tool.invoke_prepared(**prepared.input)
+
+
 async def test_read_file_handler_missing_path_raises_handler_error() -> None:
     cls, client, container = mock_docker_factory()
     container.get_archive = AsyncMock(side_effect=aiodocker.exceptions.DockerError(404, "Not found"))
@@ -1039,7 +1049,8 @@ async def test_patch_file_handler_decodes_framed_multiline_whitespace_and_empty_
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await sandbox_module.patch_file(
+                await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=2,
                     to_line=3,
@@ -1054,6 +1065,24 @@ async def test_patch_file_handler_decodes_framed_multiline_whitespace_and_empty_
     assert member.read() == b"before\n      first\n\tsecond\n\nafter\n"
 
 
+async def test_patch_file_tool_direct_call_treats_all_sentinel_lines_as_literal() -> None:
+    cls, client, container = mock_docker_factory(archive_content=make_tar_file("patch_me.txt", b"old\n"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            tool = next(item for item in sb.tools if item.name == "patch_file")
+            await tool(
+                path="patch_me.txt",
+                from_line=1,
+                to_line=1,
+                content="│literal\n│still literal\n",
+            )
+
+    written = container.put_archive.call_args.kwargs["data"]
+    member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("patch_me.txt")
+    assert member is not None
+    assert member.read() == "│literal\n│still literal\n".encode()
+
+
 async def test_patch_file_handler_preserves_crlf_from_framed_content_and_untouched_lines() -> None:
     cls, client, container = mock_docker_factory(
         archive_content=make_tar_file("patch_me.txt", b"before\r\nold\r\nafter\r\n")
@@ -1062,7 +1091,8 @@ async def test_patch_file_handler_preserves_crlf_from_framed_content_and_untouch
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await sandbox_module.patch_file(
+                await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=2,
                     to_line=2,
@@ -1085,7 +1115,8 @@ async def test_patch_file_handler_framed_empty_line_is_not_a_deletion() -> None:
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await sandbox_module.patch_file(
+                await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=2,
                     to_line=2,
@@ -1114,7 +1145,8 @@ async def test_patch_file_handler_framed_empty_line_survives_at_eof(
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await sandbox_module.patch_file(
+                await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=from_line,
                     to_line=to_line,
@@ -1135,7 +1167,8 @@ async def test_patch_file_handler_repairs_provider_style_counter_indent_with_fra
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                result = await sandbox_module.patch_file(
+                result = await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=1,
                     to_line=1,
@@ -1171,7 +1204,8 @@ async def test_patch_file_handler_framed_insert_eof_and_literal_sentinel(
         async with DockerSandbox() as sb:
             token = _bind_context(sb)
             try:
-                await sandbox_module.patch_file(
+                await _call_line_framed_patch(
+                    sb,
                     path="patch_me.txt",
                     from_line=from_line,
                     to_line=to_line,
@@ -1201,7 +1235,8 @@ async def test_patch_file_handler_rejects_invalid_framing_without_writing(conten
             token = _bind_context(sb)
             try:
                 with pytest.raises(HandlerError, match=message):
-                    await sandbox_module.patch_file(
+                    await _call_line_framed_patch(
+                        sb,
                         path="patch_me.txt",
                         from_line=1,
                         to_line=1,

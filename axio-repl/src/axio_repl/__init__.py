@@ -1381,6 +1381,26 @@ class ReplRenderer:
                 state.mode = _BoundaryMode()
         yield
 
+    async def render_tool_protocol_message(self, agent_id: str, message: Message) -> None:
+        """Render one authoritative local-tool protocol message as non-human conversation."""
+
+        provenance = message.provenance
+        if provenance is None or provenance.authority != "tool-protocol" or provenance.author is None:
+            return
+        body = sanitize_terminal_text(
+            "".join(block.text for block in message.content if isinstance(block, TextBlock))
+        ).strip()
+        label = f"tool protocol · {provenance.author}"
+        if agent_id != self.foreground_agent:
+            label = f"{self.agent_identity(agent_id)} · {label}"
+        async with self._lock:
+            with self._persistent_insertion_locked():
+                sys.stdout.write(f"\n{_styled(self._theme.command.ansi, label)}\n")
+                if body:
+                    sys.stdout.write(f"{_styled(self._theme.reasoning.ansi, body)}\n")
+                self._flush()
+                self._drain_safe_boundary_locked()
+
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
         state.mode = _BoundaryMode()
         state.arg_streams.clear()
@@ -2331,6 +2351,10 @@ async def render_runtime_event(renderer: ReplRenderer, envelope: AgentEventEnvel
                 event,
                 background=envelope.execution_mode is ExecutionMode.BACKGROUND,
             )
+        case MessageCommitted(message=message) if (
+            message.provenance is not None and message.provenance.authority == "tool-protocol"
+        ):
+            await renderer.render_tool_protocol_message(envelope.agent_id, message)
         case (
             OutcomeDelivered()
             | InputReceived()
@@ -2456,6 +2480,8 @@ def _clone_tools_for_child(tools: list[Tool[Any]], *, foreground: bool) -> list[
             guards=tool.guards,
             context=tool.context,
             concurrency=tool.concurrency,
+            input_preparer=tool.input_preparer,
+            protocol_transition=tool.protocol_transition,
             detachable=tool.detachable and not foreground,
             # Reusing a generated schema as explicit would discard Annotated validators.
             schema=tool.schema if tool._schema_explicit else MappingProxyType({}),

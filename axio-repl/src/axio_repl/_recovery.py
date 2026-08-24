@@ -560,10 +560,14 @@ def _decode_block(data: dict[str, Any], session_dir: Path) -> ContentBlock:
         raw_input = data.get("input")
         if not isinstance(raw_input, dict):
             raise RecoveryError("ToolUseBlock.input is not an object")
+        input_preparation = data.get("input_preparation")
+        if input_preparation is not None and not isinstance(input_preparation, str):
+            raise RecoveryError("ToolUseBlock.input_preparation is not a string or null")
         return ToolUseBlock(
             id=_string(data.get("id"), "ToolUseBlock.id"),
             name=_string(data.get("name"), "ToolUseBlock.name"),
             input=cast(dict[str, Any], raw_input),
+            input_preparation=input_preparation,
         )
     if record_type == "ToolResultBlock":
         raw_content = data.get("content")

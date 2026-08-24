@@ -66,7 +66,7 @@ These mirror `axio-tools-local` exactly - same names and field schemas:
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, `max_chars`. |
 | `list_files` | List immediate directory entries without reading descendant contents; directories first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess. Supports `timeout`, `cwd`, `stdin`. |
-| `patch_file` | Replace lines `from_line`..`to_line` in a UTF-8 text file (1-indexed, inclusive). `to_line = from_line - 1` inserts. Pass exact source text; legacy fully framed `│source` input remains accepted for compatibility. |
+| `patch_file` | Replace lines `from_line`..`to_line` in a UTF-8 text file (1-indexed, inclusive). `to_line = from_line - 1` inserts. Pass exact source text. Agent-managed legacy framing is decoded before the handler only when that agent enables it; direct calls treat `│` literally. |
 
 The shell stream and final result retain Docker's multiplex-frame order. Channel
 transitions in the final string are labelled `[stdout]` or `[stderr]`; an

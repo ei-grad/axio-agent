@@ -121,11 +121,13 @@ Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode
 
 Pass `content` as exact source text. `Agent(patch_line_framing="auto")`, the
 default, uses a transport's general verbatim tool-argument protection when
-available and advertises the older visible-line protocol only as a fallback.
-Set it to `"on"` to force that fallback or `"off"` to suppress it. The handler
-continues accepting older fully framed `│source` input for compatibility;
-mixed framed and unframed lines and numbered `read_file` prefixes are rejected
-without writing. An empty string still deletes the selected range.
+available and emits an authoritative, non-human tool-protocol message for the
+older visible-line protocol only as a fallback. Set it to `"on"` to force that
+fallback or `"off"` to suppress it. The Agent decodes newly submitted framed
+input before guards, persistence, and the handler. Direct `Tool` and handler
+calls always treat `│` literally; a compatibility caller must explicitly
+prepare input with the `"on"` policy. Existing persisted calls are never
+rewritten. An empty string still deletes the selected range.
 
 ### Text encoding and edit reports
 

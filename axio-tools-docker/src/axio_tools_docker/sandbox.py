@@ -25,14 +25,15 @@ from axio._asyncio import shield_until_done
 from axio.diff import (
     MAX_DIFF_SOURCE_BYTES,
     PATCH_CONTENT_DESCRIPTION,
-    decode_patch_content,
     describe_patch,
     describe_write,
+    patch_protocol_transition,
+    prepare_patch_input,
 )
 from axio.exceptions import HandlerError
 from axio.field import Field
 from axio.schema import build_tool_schema
-from axio.tool import CONTEXT, Tool
+from axio.tool import CONTEXT, Tool, with_tool_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +380,7 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
     return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
 
 
+@with_tool_hooks(input_preparer=prepare_patch_input, protocol_transition=patch_protocol_transition)
 async def patch_file(
     path: str,
     from_line: int,
@@ -405,10 +407,7 @@ async def patch_file(
         lines = before.splitlines(keepends=True)
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
-    try:
-        content_lines = decode_patch_content(content)
-    except ValueError as exc:
-        raise HandlerError(str(exc)) from exc
+    content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
         content_lines[-1] += "\n"
     after = "".join(lines[: from_line - 1] + content_lines + lines[to_line:])

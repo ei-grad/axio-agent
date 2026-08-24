@@ -17,14 +17,31 @@ from .events import (
     TranscriptDelta,
     TurnComplete,
 )
-from .exceptions import GuardCrash, GuardError, HandlerCrash, HandlerError
+from .exceptions import (
+    GuardCrash,
+    GuardError,
+    HandlerCrash,
+    HandlerError,
+    ToolInputPreparationError,
+    ToolProtocolError,
+)
 from .field import Field, FieldInfo, StrictStr
-from .messages import InputProvenance, Message
+from .messages import InputAuthority, InputProvenance, Message
 from .permission import ConcurrentGuard, PermissionGuard
 from .realtime import RealtimeAgent
 from .selector import ToolSelector
 from .stream import AgentStream
-from .tool import CONTEXT, CURRENT_TOOL_CALL, Tool, ToolCallContext
+from .tool import (
+    CONTEXT,
+    CURRENT_TOOL_CALL,
+    PreparedToolInput,
+    Tool,
+    ToolCallContext,
+    ToolInputContext,
+    ToolProtocolContext,
+    ToolProtocolTransition,
+    with_tool_hooks,
+)
 from .transport import CompletionTransport, RealtimeSession, RealtimeTransport
 from .types import CostSource, StopReason, Usage
 
@@ -36,6 +53,11 @@ __all__ = [
     "CONTEXT",
     "CURRENT_TOOL_CALL",
     "ToolCallContext",
+    "ToolInputContext",
+    "PreparedToolInput",
+    "ToolProtocolContext",
+    "ToolProtocolTransition",
+    "with_tool_hooks",
     "ContextStore",
     "MemoryContextStore",
     "CompletionTransport",
@@ -64,6 +86,7 @@ __all__ = [
     # messages & blocks
     "Message",
     "InputProvenance",
+    "InputAuthority",
     "TextBlock",
     "ToolUseBlock",
     "ToolResultBlock",
@@ -75,6 +98,8 @@ __all__ = [
     "GuardCrash",
     "HandlerError",
     "HandlerCrash",
+    "ToolInputPreparationError",
+    "ToolProtocolError",
     # permissions
     "PermissionGuard",
     "ConcurrentGuard",

@@ -238,11 +238,13 @@ named when that backend actually provides them. Unknown or unavailable names,
 duplicates, and mixing `all` or `none` with named tools are errors.
 
 `runtime.patch_line_framing` controls the legacy visible-line protocol for
-`patch_file`: `"auto"` advertises it only when the transport lacks general
+`patch_file`: `"auto"` enables it only when the transport lacks general
 verbatim protection for string tool arguments, `"on"` forces it, and `"off"`
 suppresses it. `"auto"` is the built-in default and prevents double framing on
-capable transports. Quote `"on"` and `"off"` because YAML otherwise treats
-those words as booleans.
+capable transports. The current rule or protocol transition is stored in
+conversation order as a visibly non-human tool-protocol message; historical
+tool calls are not rewritten. Quote `"on"` and `"off"` because YAML otherwise
+treats those words as booleans.
 
 `model_context` is an optional trusted operator-policy description accepted
 only in the selected `agent.yaml`; it is not a layered global default and has
