@@ -2,11 +2,47 @@
 
 from __future__ import annotations
 
-from axio.diff import CONTEXT_LINES, MAX_DIFF_LINES, describe_patch, describe_write, render_diff
+import pytest
+
+from axio.diff import CONTEXT_LINES, MAX_DIFF_LINES, decode_patch_content, describe_patch, describe_write, render_diff
 
 
 def _numbered(count: int) -> str:
     return "".join(f"line{i}\n" for i in range(count))
+
+
+@pytest.mark.parametrize(
+    ("framed", "decoded"),
+    [
+        ("│zero", "zero"),
+        ("│    spaces\n│\ttext", "    spaces\n\ttext"),
+        ("│empty follows\n│\n│last", "empty follows\n\nlast"),
+        ("│with newline\n", "with newline\n"),
+        ("│", "\n"),
+        ("││literal sentinel", "│literal sentinel"),
+    ],
+)
+def test_decode_patch_content_strips_one_sentinel_from_every_framed_line(framed: str, decoded: str) -> None:
+    assert "".join(decode_patch_content(framed)) == decoded
+    if framed == "│":
+        assert decode_patch_content(framed) == ["\n"]
+
+
+@pytest.mark.parametrize("legacy", ["", "zero", "    spaces\n\ttext", "zero\n"])
+def test_decode_patch_content_keeps_entirely_unframed_legacy_content_literal(legacy: str) -> None:
+    assert "".join(decode_patch_content(legacy)) == legacy
+
+
+@pytest.mark.parametrize("mixed", ["│framed\nlegacy", "legacy\n│framed", "│framed\n\n│framed"])
+def test_decode_patch_content_rejects_mixed_framing(mixed: str) -> None:
+    with pytest.raises(ValueError, match="every content line"):
+        decode_patch_content(mixed)
+
+
+@pytest.mark.parametrize("numbered", ["L1│source", "L0042│    source\n"])
+def test_decode_patch_content_rejects_read_file_line_number_metadata(numbered: str) -> None:
+    with pytest.raises(ValueError, match="remove the L<number> prefix"):
+        decode_patch_content(numbered)
 
 
 def test_change_is_shown_with_surrounding_context() -> None:

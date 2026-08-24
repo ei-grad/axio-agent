@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from axio.blocks import ImageBlock, TextBlock, VideoBlock
 from axio.exceptions import HandlerError
+from axio.tool import Tool
 
 from axio_tools_local.read_file import read_file
 
@@ -89,6 +90,13 @@ class TestReadFileIndexed:
         (tmp_cwd / "f.py").write_text("def f():\n    pass\n")
         result = await read(tmp_cwd, "f.py", line_numbers=True)
         assert "L2│    pass" in result
+
+    def test_tool_description_keeps_patch_framing_when_removing_line_numbers(self) -> None:
+        tool: Tool[Any] = Tool(name="read_file", handler=read_file)
+
+        assert "remove only" in tool.description
+        assert "``L<number>``" in tool.description
+        assert "retain ``│source``" in tool.description
 
 
 class TestReadFileRange:

@@ -330,12 +330,12 @@ async def test_tool_call_streaming(
     assert ends[0].stop_reason == StopReason.tool_use
 
 
-async def test_tool_call_streaming_preserves_leading_whitespace_in_string_arguments(
+async def test_tool_call_streaming_preserves_framed_patch_sentinels_and_whitespace(
     fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
 ) -> None:
     server, _ = fake_server
-    content = "        first line\n\tsecond line"
-    args = json.dumps({"content": content})
+    content = "│          first line\n│\tsecond line"
+    args = json.dumps({"content": content}, ensure_ascii=False)
     server.responses.append(_tool_call_chunks("call_whitespace", "patch_file", args))
 
     events = await _collect(transport.stream([], [], ""))

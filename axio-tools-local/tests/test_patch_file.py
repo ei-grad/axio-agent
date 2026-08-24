@@ -112,8 +112,18 @@ class TestPatchInsertDelete:
         assert f.read_text() == "a\nd\n"
 
 
-class TestFirstLineIndent:
-    async def test_prefixes_only_first_line_and_preserves_following_whitespace(self, tmp_cwd: Path) -> None:
+class TestFramedContent:
+    async def test_replaces_indented_line_from_provider_safe_framed_content(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "index.html"
+        f.write_text("before\n          old();\nafter\n")
+
+        result = await patch_file(path=f.name, from_line=2, to_line=2, content="│          replacement();")
+
+        assert f.read_text() == "before\n          replacement();\nafter\n"
+        assert "-          old();\n" in result
+        assert "+          replacement();\n" in result
+
+    async def test_preserves_multiline_whitespace_empty_line_and_trailing_newline(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("before\nold one\nold two\nafter\n")
 
@@ -121,118 +131,119 @@ class TestFirstLineIndent:
             path=f.name,
             from_line=2,
             to_line=3,
-            content="first\n\t second",
-            first_line_indent=6,
+            content="│      first\n│\tsecond\n│\n",
         )
 
-        assert f.read_text() == "before\n      first\n\t second\nafter\n"
+        assert f.read_bytes() == b"before\n      first\n\tsecond\n\nafter\n"
 
-    async def test_zero_preserves_content_byte_for_byte(self, tmp_cwd: Path) -> None:
+    async def test_preserves_crlf_from_framed_content_and_untouched_lines(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
-        f.write_text("old\n")
-        content = " \tfirst\n\t second\n"
+        f.write_bytes(b"before\r\nold\r\nafter\r\n")
 
-        await patch_file(path=f.name, from_line=1, to_line=1, content=content, first_line_indent=0)
+        await patch_file(path=f.name, from_line=2, to_line=2, content="│    replacement\r\n")
 
-        assert f.read_bytes() == content.encode()
+        assert f.read_bytes() == b"before\r\n    replacement\r\nafter\r\n"
 
-    @pytest.mark.parametrize("content", [" already indented", "\talready indented"])
-    async def test_rejects_ambiguous_existing_first_line_indent(self, tmp_cwd: Path, content: str) -> None:
+    async def test_framed_empty_line_is_not_a_deletion(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
-        original = "old\n"
-        f.write_text(original)
+        f.write_text("before\nold\nafter\n")
 
-        with pytest.raises(HandlerError, match="already begins with whitespace"):
-            await patch_file(path=f.name, from_line=1, to_line=1, content=content, first_line_indent=4)
+        await patch_file(path=f.name, from_line=2, to_line=2, content="│")
 
-        assert f.read_text() == original
+        assert f.read_text() == "before\n\nafter\n"
 
-    async def test_rejects_indent_for_empty_deletion_without_writing(self, tmp_cwd: Path) -> None:
+    @pytest.mark.parametrize(
+        ("before", "from_line", "to_line"),
+        [("old\n", 1, 1), ("", 1, 0)],
+    )
+    async def test_framed_empty_line_survives_at_eof(
+        self,
+        tmp_cwd: Path,
+        before: str,
+        from_line: int,
+        to_line: int,
+    ) -> None:
         f = tmp_cwd / "f.txt"
-        original = "keep\ndelete\n"
-        f.write_text(original)
+        f.write_text(before)
 
-        with pytest.raises(HandlerError, match="empty content"):
-            await patch_file(path=f.name, from_line=2, to_line=2, content="", first_line_indent=4)
+        await patch_file(path=f.name, from_line=from_line, to_line=to_line, content="│")
 
-        assert f.read_text() == original
+        assert f.read_bytes() == b"\n"
 
-    async def test_indents_inserted_first_line(self, tmp_cwd: Path) -> None:
+    async def test_framed_insert_and_eof_without_newline(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("after\n")
 
-        await patch_file(path=f.name, from_line=1, to_line=0, content="inserted", first_line_indent=3)
+        await patch_file(path=f.name, from_line=1, to_line=0, content="│   inserted")
+        await patch_file(path=f.name, from_line=2, to_line=2, content="│last")
 
-        assert f.read_text() == "   inserted\nafter\n"
+        assert f.read_bytes() == b"   inserted\nlast"
 
-    async def test_reproduces_counter_indent_repair_with_nonempty_diff(self, tmp_cwd: Path) -> None:
-        f = tmp_cwd / "index.html"
-        f.write_text("          const activeCount = 1;\n$counter.textContent =\n            `${activeCount}`;\n")
+    async def test_double_sentinel_produces_literal_source_sentinel(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("old\n")
 
-        result = await patch_file(
-            path=f.name,
-            from_line=2,
-            to_line=2,
-            content="$counter.textContent =",
-            first_line_indent=10,
-        )
+        await patch_file(path=f.name, from_line=1, to_line=1, content="││literal\n")
 
-        assert result != "No changes"
-        assert "-$counter.textContent =\n" in result
-        assert "+          $counter.textContent =\n" in result
-        assert f.read_text().splitlines()[1] == "          $counter.textContent ="
+        assert f.read_text() == "│literal\n"
 
-    async def test_schema_exposes_bounded_optional_integer(self) -> None:
-        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+    async def test_legacy_unframed_content_remains_byte_literal(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("old\n")
+        content = " \tfirst\n\tsecond\n"
 
-        prop = tool.schema["properties"]["first_line_indent"]
-        assert prop["type"] == "integer"
-        assert prop["minimum"] == 0
-        assert prop["maximum"] == 256
-        assert prop["default"] == 0
-        assert "never inferred" in prop["description"]
-        assert "first_line_indent" not in tool.schema["required"]
+        await patch_file(path=f.name, from_line=1, to_line=1, content=content)
 
-    @pytest.mark.parametrize("first_line_indent", [-1, 257])
-    async def test_tool_rejects_out_of_range_indent_without_writing(
-        self,
-        tmp_cwd: Path,
-        first_line_indent: int,
-    ) -> None:
+        assert f.read_bytes() == content.encode()
+
+    @pytest.mark.parametrize("content", ["│framed\nlegacy", "legacy\n│framed"])
+    async def test_rejects_mixed_framing_without_writing(self, tmp_cwd: Path, content: str) -> None:
         f = tmp_cwd / "f.txt"
         original = "old\n"
         f.write_text(original)
-        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
 
-        with pytest.raises(HandlerError, match="first_line_indent"):
-            await tool(
-                path=f.name,
-                from_line=1,
-                to_line=1,
-                content="new",
-                first_line_indent=first_line_indent,
-            )
+        with pytest.raises(HandlerError, match="every content line"):
+            await patch_file(path=f.name, from_line=1, to_line=1, content=content)
 
         assert f.read_text() == original
 
-    async def test_fragmented_tool_input_preserves_numeric_argument_in_handler_and_result(self, tmp_cwd: Path) -> None:
+    async def test_rejects_read_file_metadata_without_writing(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        original = "old\n"
+        f.write_text(original)
+
+        with pytest.raises(HandlerError, match=r"remove the L<number> prefix"):
+            await patch_file(path=f.name, from_line=1, to_line=1, content="L489│          replacement")
+
+        assert f.read_text() == original
+
+    async def test_schema_requires_visible_framing_and_has_no_indent_workaround(self) -> None:
+        tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
+
+        assert "first_line_indent" not in tool.schema["properties"]
+        content = tool.schema["properties"]["content"]
+        assert "every logical line" in content["description"]
+        assert "│" in content["description"]
+        assert "L<number>" in content["description"]
+
+    async def test_fragmented_tool_input_repairs_counter_and_keeps_raw_input_in_result(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "index.html"
         f.write_text("$counter.textContent =\n")
         arguments = {
             "path": f.name,
             "from_line": 1,
             "to_line": 1,
-            "content": "$counter.textContent =",
-            "first_line_indent": 10,
+            "content": "│          $counter.textContent =",
         }
-        raw = json.dumps(arguments)
-        indent_at = raw.index("10")
+        raw = json.dumps(arguments, ensure_ascii=False)
+        sentinel_at = raw.index("│")
         transport = StubTransport(
             [
                 [
                     ToolUseStart(0, "patch-1", "patch_file"),
-                    ToolInputDelta(0, "patch-1", raw[: indent_at + 1]),
-                    ToolInputDelta(0, "patch-1", raw[indent_at + 1 :]),
+                    ToolInputDelta(0, "patch-1", raw[:sentinel_at]),
+                    ToolInputDelta(0, "patch-1", raw[sentinel_at : sentinel_at + 4]),
+                    ToolInputDelta(0, "patch-1", raw[sentinel_at + 4 :]),
                     IterationEnd(1, StopReason.tool_use, Usage(10, 5)),
                 ],
                 make_text_response("Done"),
@@ -245,6 +256,7 @@ class TestFirstLineIndent:
         result = next(event for event in events if isinstance(event, ToolResult))
         assert result.input == arguments
         assert not result.is_error
+        assert result.content != "No changes"
         assert f.read_text() == "          $counter.textContent ="
 
 

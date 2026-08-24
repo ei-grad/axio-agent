@@ -217,15 +217,18 @@ def _styled(style: str, text: str) -> str:
 
 
 def _visible_patch_content_fragment(text: str, *, line_start: bool) -> str:
-    """Mark source column zero and leading whitespace without changing tool input."""
+    """Expose source indentation while keeping canonical framing unambiguous."""
 
     if not line_start:
         return text
+    framed = text.startswith("│")
+    source = text[1:] if framed else text
     prefix_end = 0
-    while prefix_end < len(text) and text[prefix_end] in {" ", "\t"}:
+    while prefix_end < len(source) and source[prefix_end] in {" ", "\t"}:
         prefix_end += 1
-    visible_prefix = text[:prefix_end].replace(" ", "·").replace("\t", "→")
-    return f"│{visible_prefix}{text[prefix_end:]}"
+    visible_prefix = source[:prefix_end].replace(" ", "·").replace("\t", "→")
+    marker = "│" if framed else "┊"
+    return f"{marker}{visible_prefix}{source[prefix_end:]}"
 
 
 # ── Custom search tool ───────────────────────────────────────────────

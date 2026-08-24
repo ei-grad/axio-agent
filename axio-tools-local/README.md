@@ -113,20 +113,21 @@ with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
     name = f.name
 
 # Replace line 2
-asyncio.run(patch_file(path=name, from_line=2, to_line=2, content="replaced\n"))
+asyncio.run(patch_file(path=name, from_line=2, to_line=2, content="│replaced\n"))
 os.unlink(name)
 ```
 
-Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`,
-`first_line_indent: int = 0`
+Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`
 
-`content` remains literal by default. If a model provider cannot reliably carry
-leading spaces at the start of the JSON string, set `first_line_indent` to the
-exact number of ASCII spaces to add to its first line. The value is bounded to
-0..256 and is never inferred from surrounding source. Do not combine a positive
-value with content that already begins with a space or tab; the tool rejects the
-ambiguous request without writing. An empty `content` still deletes the selected
-range when `first_line_indent` is left at zero.
+For model calls, frame every logical `content` line with one visible `│` at
+column zero, then put the exact source text after it. For example, `│value` writes
+at column zero, `│    value` writes four leading spaces, `│\tvalue` writes a tab,
+and `││value` writes a literal source line beginning with `│`. When copying
+`L<number>│source` from numbered `read_file` output, remove `L<number>` but retain
+`│source`. Empty framed lines are written as `│`. Mixed framed and unframed lines,
+and numbered `read_file` prefixes, are rejected without writing. Entirely
+unframed content remains byte-literal for compatibility with programmatic
+callers; an empty string still deletes the selected range.
 
 ### Text encoding and edit reports
 

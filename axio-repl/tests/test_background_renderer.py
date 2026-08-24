@@ -783,7 +783,7 @@ async def test_write_file_argument_rendering_respects_no_color(capsys: pytest.Ca
     assert "\x1b[" not in output
 
 
-async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
+async def test_patch_file_content_distinguishes_canonical_framing_from_legacy_ui_marker(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(theme=NO_COLOR_THEME)
@@ -794,7 +794,7 @@ async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
         ToolInputDelta(
             index=0,
             tool_use_id="indented",
-            partial_json='{"content":"        first line\\n\\tsecond line"}',
+            partial_json='{"content":"│        first line\\n│\\tsecond line"}',
         ),
     )
     await renderer.render("main", ToolUseStart(index=1, tool_use_id="column-zero", name="patch_file"))
@@ -805,10 +805,10 @@ async def test_patch_file_content_marks_leading_spaces_tabs_and_column_zero(
 
     output = capsys.readouterr().out
     assert "content:\n│········first line\n│→second line\n" in output
-    assert "content: │// no indent\n" in output
+    assert "content: ┊// no indent\n" in output
 
 
-async def test_patch_file_renders_explicit_first_line_indent_alongside_visible_content(
+async def test_patch_file_renders_canonical_sentinel_once(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(theme=NO_COLOR_THEME)
@@ -819,13 +819,13 @@ async def test_patch_file_renders_explicit_first_line_indent_alongside_visible_c
         ToolInputDelta(
             index=0,
             tool_use_id="patch",
-            partial_json='{"first_line_indent":10,"content":"$counter.textContent ="}',
+            partial_json='{"content":"│          $counter.textContent ="}',
         ),
     )
 
     output = capsys.readouterr().out
-    assert "first_line_indent: 10\n" in output
-    assert "content: │$counter.textContent =\n" in output
+    assert "content: │··········$counter.textContent =\n" in output
+    assert "││" not in output
 
 
 @pytest.mark.parametrize("interruption", ["tool", "incoming"])
@@ -838,7 +838,7 @@ async def test_patch_file_content_marks_only_real_source_line_starts_across_inte
     await renderer.render("main", ToolUseStart(index=0, tool_use_id="patch", name="patch_file"))
     await renderer.render(
         "main",
-        ToolInputDelta(index=0, tool_use_id="patch", partial_json='{"content":"    alpha'),
+        ToolInputDelta(index=0, tool_use_id="patch", partial_json='{"content":"│    alpha'),
     )
     if interruption == "tool":
         await renderer.render("main", ToolUseStart(index=1, tool_use_id="shell", name="shell"))

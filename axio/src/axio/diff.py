@@ -23,11 +23,17 @@ CONTEXT_LINES = 3
 MAX_DIFF_LINES = 400
 MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
-MAX_FIRST_LINE_INDENT = 256
+PATCH_CONTENT_DESCRIPTION = (
+    "Canonical model format: begin every logical line with exactly one │ sentinel, followed by the exact source "
+    "bytes for that line. Put indentation after │: │foo is column zero, │    foo has four spaces, and │\\tfoo "
+    "starts with a tab. When copying L<number>│source from read_file, remove L<number> but retain │source. Frame "
+    "every line, including empty lines (│); never mix framed and unframed lines."
+)
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
 _NO_NEWLINE_MARKER = "\\ No newline at end of file\n"
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
+_READ_FILE_LINE_PREFIX = re.compile(r"^L\d+│")
 
 
 class _AmbiguousContext:
@@ -37,19 +43,32 @@ class _AmbiguousContext:
 _AMBIGUOUS = _AmbiguousContext()
 
 
-def apply_first_line_indent(content: str, count: int) -> str:
-    """Prefix the first patch content line with an explicit number of spaces."""
-    if isinstance(count, bool) or not isinstance(count, int):
-        raise ValueError("first_line_indent must be an integer")
-    if not 0 <= count <= MAX_FIRST_LINE_INDENT:
-        raise ValueError(f"first_line_indent must be between 0 and {MAX_FIRST_LINE_INDENT}")
-    if count == 0:
-        return content
-    if not content:
-        raise ValueError("first_line_indent cannot be used with empty content")
-    if content.startswith((" ", "\t")):
-        raise ValueError("content already begins with whitespace; use first_line_indent=0 or remove that whitespace")
-    return " " * count + content
+def decode_patch_content(content: str) -> list[str]:
+    """Decode model-safe framed patch content into exact source lines.
+
+    Canonical content prefixes every logical line with ``│`` so leading source
+    whitespace follows a visible character in the JSON string. One sentinel is
+    removed from each framed line. Entirely unframed content remains literal for
+    programmatic compatibility, while mixing the two forms is rejected.
+
+    Returning lines instead of one joined string preserves a framed empty line
+    (``│``) as ``["\n"]``. Callers can therefore distinguish it from the empty
+    content string used to delete a selected range, including at end of file.
+    """
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return []
+    if any(_READ_FILE_LINE_PREFIX.match(line) for line in lines):
+        raise ValueError("content includes read_file metadata; remove the L<number> prefix and keep │source")
+    framed = [line.startswith("│") for line in lines]
+    if any(framed) and not all(framed):
+        raise ValueError("framed patch content requires every content line to begin with │")
+    if all(framed):
+        decoded = [line[1:] for line in lines]
+        if decoded[-1] == "":
+            decoded[-1] = "\n"
+        return decoded
+    return lines
 
 
 def describe_write(path: str, written: int, before: str | None, after: str) -> str:
