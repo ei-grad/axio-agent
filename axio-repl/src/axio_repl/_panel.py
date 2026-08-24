@@ -12,7 +12,6 @@ says can be tested without a terminal.
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -268,8 +267,8 @@ arrive farther apart, so this remains an explicit compatibility tradeoff.
 def input_bindings(
     on_interrupt: Callable[[], None],
     on_shutdown: Callable[[], None],
+    on_eof: Callable[[], None],
     recall_pending: Callable[[], Awaitable[str | None]],
-    on_empty_eof: Callable[[float], bool],
 ) -> Any:
     """Bind interruption and pending recall without submitting the editor.
 
@@ -340,11 +339,10 @@ def input_bindings(
         buffer = event.current_buffer
         if buffer.text:
             buffer.delete()
-        elif on_empty_eof(time.monotonic()):
+        else:
+            on_eof()
             PromptToolkitInlineOutput.redraw_now(event.app)
             event.app.exit(exception=EOFError())
-        else:
-            event.app.invalidate()
 
     return bindings
 
@@ -353,8 +351,8 @@ def make_session(
     status: Any = None,
     on_interrupt: Callable[[], None] | None = None,
     on_shutdown: Callable[[], None] | None = None,
+    on_eof: Callable[[], None] | None = None,
     recall_pending: Callable[[], Awaitable[str | None]] | None = None,
-    on_empty_eof: Callable[[float], bool] | None = None,
     capture_target: Callable[[], str] | None = None,
     reserve_sequence: Callable[[], int] | None = None,
     accepted_at_provider: Callable[[], datetime] | None = None,
@@ -416,8 +414,8 @@ def make_session(
         key_bindings=input_bindings(
             on_interrupt or (lambda: None),
             on_shutdown or (lambda: None),
+            on_eof or (lambda: None),
             recall_pending or no_pending_input,
-            on_empty_eof or (lambda _now: True),
         ),
         # Redraw while idle so finished agents show up without a keypress.
         refresh_interval=0.5,

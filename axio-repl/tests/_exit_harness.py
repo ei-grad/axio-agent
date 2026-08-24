@@ -7,10 +7,11 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
-from axio.events import ReasoningDelta, StreamEvent
+from axio.events import IterationEnd, ReasoningDelta, StreamEvent, ToolInputDelta, ToolUseStart
 from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
+from axio.types import StopReason, Usage
 
 import axio_repl
 
@@ -20,14 +21,27 @@ JOURNAL_ROOT = Path(os.environ["AXIO_EXIT_HARNESS_JOURNAL_ROOT"])
 CONFIG_ROOT = Path(os.environ["AXIO_EXIT_HARNESS_CONFIG_ROOT"])
 PEER_ROOT = Path(os.environ["AXIO_EXIT_HARNESS_PEER_ROOT"])
 PROMPT_COUNT = Path(os.environ["AXIO_EXIT_HARNESS_PROMPT_COUNT"])
+CALL_COUNT = Path(os.environ["AXIO_EXIT_HARNESS_CALL_COUNT"])
+MODE = os.environ["AXIO_EXIT_HARNESS_MODE"]
 
 
-class NeverEndingTransport:
+def record_transport_call() -> int:
+    try:
+        count = int(CALL_COUNT.read_text())
+    except FileNotFoundError:
+        count = 0
+    count += 1
+    CALL_COUNT.write_text(str(count))
+    return count
+
+
+class ExitTransport:
     name = "never-ending"
 
     def __init__(self, **kwargs: object) -> None:
         del kwargs
-        self.model = ModelSpec(id="stub/never-ending", capabilities=frozenset({Capability.text}))
+        capabilities = {Capability.text, Capability.tool_use} if MODE in {"tool", "detached"} else {Capability.text}
+        self.model = ModelSpec(id="stub/exit", capabilities=frozenset(capabilities))
         self.models = ModelRegistry([self.model])
         self.temperature: float | None = None
         self.max_output_tokens: int | None = None
@@ -43,22 +57,56 @@ class NeverEndingTransport:
         system: str,
     ) -> AsyncIterator[StreamEvent]:
         del messages, tools, system
+        call = record_transport_call()
+        if MODE != "detached" and call > 1:
+            raise AssertionError("EOF shutdown started another provider iteration")
+        if MODE in {"tool", "detached"} and call == 1:
+            yield ToolUseStart(index=0, tool_use_id="blocking-call", name="blocking_tool")
+            partial_json = '{"background":true}' if MODE == "detached" else "{}"
+            yield ToolInputDelta(index=0, tool_use_id="blocking-call", partial_json=partial_json)
+            yield IterationEnd(
+                iteration=1,
+                stop_reason=StopReason.tool_use,
+                usage=Usage(input_tokens=1, output_tokens=1),
+            )
+            return
+        if MODE == "detached":
+            if call > 2:
+                raise AssertionError("EOF shutdown started another provider iteration")
+            await asyncio.Future[None]()
+            return
         STARTED.touch()
         try:
             yield ReasoningDelta(index=0, delta="provider stream is active")
             await asyncio.Future()
         finally:
-            FINALIZED.touch()
+            try:
+                if MODE == "provider_resistant":
+                    await asyncio.Future[None]()
+            finally:
+                FINALIZED.touch()
+
+
+async def blocking_tool() -> str:
+    STARTED.touch()
+    try:
+        await asyncio.Future[None]()
+        return "unreachable"
+    finally:
+        FINALIZED.touch()
 
 
 async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
     del args, kwargs
-    return [], "none", Path.cwd(), ""
+    tools: list[Tool[object]] = []
+    if MODE in {"tool", "detached"}:
+        tools.append(Tool(name="blocking_tool", handler=blocking_tool))
+    return tools, "none", Path.cwd(), ""
 
 
 def select_transport(name: str | None, credential_override: bool = False) -> tuple[Callable[..., Any], str]:
     del name, credential_override
-    return NeverEndingTransport, ""
+    return ExitTransport, ""
 
 
 def effective_username() -> str:
@@ -91,10 +139,8 @@ def main() -> None:
     sys.argv = [
         "axio-repl",
         "--transport",
-        "never-ending",
+        "exit",
         "--sandbox",
-        "none",
-        "--tools",
         "none",
         "--no-powerline",
         "--config-dir",

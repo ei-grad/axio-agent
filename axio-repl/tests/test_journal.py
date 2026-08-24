@@ -1242,7 +1242,7 @@ async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_
         (EditorSnapshot("draft"), "editor_snapshot"),
         (
             ShutdownRecorded(
-                reason="double_eof",
+                reason="eof",
                 pending_input_ids=("input",),
                 deferred_tool_use_ids=("tool",),
             ),

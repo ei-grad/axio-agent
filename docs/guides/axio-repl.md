@@ -604,7 +604,10 @@ protocol is closed with a placeholder saying that the call continues, while the
 session retains ownership of the actual task. Its eventual result is delivered
 once as a labelled user message in session order; it is never emitted as a
 second `ToolResult` for the closed call. On process shutdown, unfinished
-deferred calls are cancelled and their identities are preserved for recovery.
+deferred and detached calls are cancelled and deferred identities are preserved
+for recovery. Cancellation uses bounded grace periods and repeats the request;
+if a task still has not stopped, its owner retains it while sandbox and HTTP
+resources are force-closed before one final bounded settlement attempt.
 
 ## Tools
 
@@ -727,12 +730,12 @@ A lone Escape is distinguished from an escape-prefixed key sequence with a
 standard Alt-key word-motion bindings such as Alt+B and Alt+F are therefore not
 available in this prompt.
 
-On an empty editor, the first **Ctrl-D** warns that exit is armed for two
-seconds. A second Ctrl-D during that window closes the input source: no new
-editor prompt is created, while the active turn, already submitted input, ready
-claims, peer arrivals, and admission work drain in chronological order before
-shutdown. With text in the editor, Ctrl-D keeps its normal forward-delete
-behavior.
+On an empty editor, **Ctrl-D** immediately closes input, cancels the active
+foreground turn, and starts shutdown. Already submitted input, ready claims,
+peer arrivals, and queued commands are not started during shutdown; recoverable
+input remains in the journal. Active tool results use an EOF-shutdown cause,
+not an Escape interruption. With text in the editor, Ctrl-D keeps its normal
+forward-delete behavior.
 
 **Ctrl-C** starts graceful REPL shutdown and neither submits nor clears the
 editor. Its current text is included in the shutdown snapshot and restored by

@@ -9,7 +9,7 @@ from axio import notify
 from axio.agent import Agent
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
-from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
+from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.exceptions import HandlerError
 from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
@@ -757,6 +757,45 @@ async def test_an_interrupted_child_turn_is_not_announced_as_finished(tmp_path: 
         assert "finished its turn" not in received[0]
     finally:
         await parent.close()
+
+
+async def test_shutdown_cancels_a_child_tool_with_a_shutdown_cause() -> None:
+    tool_started = asyncio.Event()
+    tool_finalized = asyncio.Event()
+    observed: list[AgentEventEnvelope] = []
+
+    async def slow_tool() -> str:
+        tool_started.set()
+        try:
+            await asyncio.Future[None]()
+        finally:
+            tool_finalized.set()
+        return "unreachable"
+
+    async def collect(envelope: AgentEventEnvelope) -> None:
+        observed.append(envelope)
+
+    hub = SessionEventHub()
+    hub.subscribe(collect)
+    set_session_event_hub(hub)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        del inherit_context
+        transport = StubTransport([make_tool_use_response("slow_tool", tool_id="child-call")])
+        return Agent(system="child", transport=transport, tools=[Tool(name="slow_tool", handler=slow_tool)]), (
+            MemoryContextStore()
+        )
+
+    set_spawn_agent_factory(factory)
+    await spawn_agent(task="use the tool")
+    await asyncio.wait_for(tool_started.wait(), timeout=1)
+
+    assert await stop_local_background_agents() == ()
+
+    assert tool_finalized.is_set()
+    tool_results = [envelope.event for envelope in observed if isinstance(envelope.event, ToolResult)]
+    assert len(tool_results) == 1
+    assert tool_results[0].content == "[cancelled: local agent shutdown]"
 
 
 async def test_a_turn_already_reported_to_the_parent_is_not_announced_again(tmp_path: Path) -> None:

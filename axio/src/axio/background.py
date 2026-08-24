@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import notify
+from ._asyncio import CancellationCause, cancel_tasks_bounded
 
 BACKGROUND_PARAM = "background"
 
@@ -131,12 +132,17 @@ async def next_completion() -> BackgroundCall:
     return await waiter
 
 
-async def cancel_all() -> None:
-    for call in _calls.values():
-        if not call.task.done():
-            call.task.cancel()
-    await asyncio.gather(*(c.task for c in _calls.values()), return_exceptions=True)
+async def cancel_all(*, grace_seconds: float = 1.0) -> tuple[asyncio.Task[Any], ...]:
+    calls = tuple(_calls.values())
+    stragglers = await cancel_tasks_bounded(
+        tuple(call.task for call in calls),
+        grace_seconds=grace_seconds,
+        message=CancellationCause("background task shutdown"),
+    )
+    straggler_tasks = set(stragglers)
     _calls.clear()
+    _calls.update((call.id, call) for call in calls if call.task in straggler_tasks)
+    return stragglers
 
 
 def started_message(name: str, handle: str) -> str:

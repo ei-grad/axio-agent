@@ -237,6 +237,31 @@ async def test_a_cancelled_call_notifies_nobody() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_all_repeats_cancellation_for_a_handler_stuck_in_cleanup() -> None:
+    cleanup_started = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def resists_first_cancellation() -> str:
+        try:
+            await asyncio.Future[None]()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            try:
+                await asyncio.Future[None]()
+            finally:
+                finalized.set()
+        return "unreachable"
+
+    background.start("resistant", resists_first_cancellation())
+    await asyncio.sleep(0)
+    await background.cancel_all(grace_seconds=0.01)
+
+    assert cleanup_started.is_set()
+    assert finalized.is_set()
+    assert background.snapshot() == []
+
+
+@pytest.mark.asyncio
 async def test_a_failed_call_reports_its_error() -> None:
     async def boom() -> str:
         raise RuntimeError("nope")

@@ -1,4 +1,4 @@
-"""Typed interactive input events and EOF arming state."""
+"""Typed interactive input events."""
 
 from __future__ import annotations
 
@@ -52,11 +52,6 @@ class InputSubmitted:
 
 
 @dataclass(frozen=True, slots=True)
-class PendingRecallRequested:
-    """Request that every still-pending user input be returned to the editor."""
-
-
-@dataclass(frozen=True, slots=True)
 class InterruptRequested:
     """Interrupt a turn without submitting or mutating editor text."""
 
@@ -66,32 +61,3 @@ class InterruptRequested:
     def __post_init__(self) -> None:
         if not self.target_agent_id:
             raise ValueError("target_agent_id must not be empty")
-
-
-@dataclass(frozen=True, slots=True)
-class EndOfInput:
-    """Ctrl-D received while the editor is empty."""
-
-    monotonic_at: float
-
-
-type PromptEvent = InputSubmitted | PendingRecallRequested | InterruptRequested | EndOfInput
-
-
-@dataclass(frozen=True, slots=True)
-class ExitArmingState:
-    """Two-press Ctrl-D state driven by a monotonic clock."""
-
-    deadline: float | None = None
-
-    def press(self, now: float, *, window_seconds: float = 2.0) -> tuple[ExitArmingState, bool]:
-        if window_seconds <= 0:
-            raise ValueError("window_seconds must be positive")
-        if self.deadline is not None and now <= self.deadline:
-            return ExitArmingState(), True
-        return ExitArmingState(deadline=now + window_seconds), False
-
-    def expire(self, now: float) -> ExitArmingState:
-        if self.deadline is None or now <= self.deadline:
-            return self
-        return ExitArmingState()

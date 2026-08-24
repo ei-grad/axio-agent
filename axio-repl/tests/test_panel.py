@@ -1148,69 +1148,55 @@ async def test_enter_reservation_precedes_peer_published_after_accept_handler() 
     assert [envelope.seq for envelope in observed] == [1, 2]
 
 
-async def test_empty_ctrl_d_requires_two_presses_but_nonempty_ctrl_d_deletes_forward() -> None:
+async def test_empty_ctrl_d_exits_once_but_nonempty_ctrl_d_deletes_forward() -> None:
     from typing import Any
 
     from prompt_toolkit.application import create_app_session
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    presses: list[float] = []
+    eof_calls = 0
 
-    def arm_exit(now: float) -> bool:
-        presses.append(now)
-        return len(presses) == 2
+    def on_eof() -> None:
+        nonlocal eof_calls
+        eof_calls += 1
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", on_empty_eof=arm_exit)
+            session: Any = _panel.make_session(lambda: "status", on_eof=on_eof)
 
             prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
             pipe.send_text("ab\x1b[D\x04\r")
             assert await prompt == "a"
-            assert presses == []
+            assert eof_calls == 0
 
             prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
             pipe.send_text("\x04")
-            await asyncio.sleep(0.05)
-            assert prompt.done() is False
-            assert len(presses) == 1
-
-            pipe.send_text("\x04")
             with pytest.raises(EOFError):
-                await prompt
-            assert len(presses) == 2
+                await asyncio.wait_for(prompt, timeout=1)
+            assert eof_calls == 1
 
 
-async def test_double_eof_remains_available_when_prompt_session_is_reused() -> None:
+async def test_single_eof_remains_available_when_prompt_session_is_reused() -> None:
     from typing import Any
 
     from prompt_toolkit.application import create_app_session
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    presses = 0
-
-    def arm_exit(_now: float) -> bool:
-        nonlocal presses
-        presses += 1
-        return presses % 2 == 0
-
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", on_empty_eof=arm_exit)
+            session: Any = _panel.make_session(lambda: "status")
 
             first_prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
-            pipe.send_text("\x04\x04")
+            pipe.send_text("\x04")
             with pytest.raises(EOFError):
                 await asyncio.wait_for(first_prompt, timeout=1)
-            assert presses == 2
 
             second_prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
-            pipe.send_text("\x04\x04")
+            pipe.send_text("\x04")
             with pytest.raises(EOFError):
                 await asyncio.wait_for(second_prompt, timeout=1)
-            assert presses == 4
 
 
 def test_editor_text_reads_without_mutating_default_buffer() -> None:

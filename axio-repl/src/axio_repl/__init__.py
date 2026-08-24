@@ -32,8 +32,8 @@ from typing import Any, NamedTuple, cast
 from uuid import uuid4
 
 import aiohttp
-from axio import notify
-from axio._asyncio import cancel_task_once
+from axio import background, notify
+from axio._asyncio import CancellationCause, cancel_task_once, cancel_tasks_bounded
 from axio.agent import Agent, ToolDispatch
 from axio.blocks import TextBlock, ToolUseBlock
 from axio.context import ContextStore, MemoryContextStore
@@ -141,7 +141,7 @@ from axio_repl._coordinator import (
 )
 from axio_repl._deferred_tools import DeferredToolNotification, DeferredToolRegistry
 from axio_repl._identity import append_runtime_identity_metadata, resolve_effective_username
-from axio_repl._input import ExitArmingState, InputSubmitted, SubmissionDisposition
+from axio_repl._input import InputSubmitted, SubmissionDisposition
 from axio_repl._input import InterruptRequested as PromptInterruptRequested
 from axio_repl._multiplexer import (
     ActionMultiplexer,
@@ -719,14 +719,38 @@ def _retain_interrupted_partial(
         partials[turn_id] = partial
 
 
-async def _cancel_and_settle_tasks(*tasks: asyncio.Task[Any] | None) -> tuple[Any, ...]:
+class _TaskSettlement(NamedTuple):
+    outcomes: tuple[Any, ...]
+    stragglers: tuple[asyncio.Task[Any], ...]
+
+
+async def _cancel_and_settle_tasks(
+    *tasks: asyncio.Task[Any] | None,
+    cancellation_message: object | None = None,
+    grace_seconds: float = 1.0,
+) -> _TaskSettlement:
     """Cancel unfinished coordinator tasks and retrieve every task outcome."""
     managed_tasks = tuple(task for task in tasks if task is not None)
-    for task in managed_tasks:
-        cancel_task_once(task)
     if not managed_tasks:
-        return ()
-    return tuple(await asyncio.gather(*managed_tasks, return_exceptions=True))
+        return _TaskSettlement((), ())
+    stragglers = set(
+        await cancel_tasks_bounded(
+            managed_tasks,
+            grace_seconds=grace_seconds,
+            message=cancellation_message,
+        )
+    )
+    outcomes: list[Any] = []
+    for task in managed_tasks:
+        if task in stragglers:
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            outcomes.append(asyncio.CancelledError("task did not settle during bounded shutdown"))
+            continue
+        try:
+            outcomes.append(task.result())
+        except BaseException as exc:
+            outcomes.append(exc)
+    return _TaskSettlement(tuple(outcomes), tuple(stragglers))
 
 
 def _peer_incoming_prompt(message: PeerMessage) -> _IncomingPrompt:
@@ -3872,8 +3896,8 @@ async def main() -> None:
         interrupt_queue: asyncio.Queue[_AcceptedInterrupt] = asyncio.Queue()
         shutdown_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         shutdown_queued = False
+        eof_requested = False
         foreground_state = ForegroundCoordinatorState()
-        exit_arming = ExitArmingState()
 
         def _queue_shutdown(reason: str) -> None:
             nonlocal shutdown_queued
@@ -3887,6 +3911,16 @@ async def main() -> None:
 
         def _on_sigterm() -> None:
             _queue_shutdown("sigterm")
+
+        def _on_eof() -> None:
+            nonlocal eof_requested
+            if eof_requested:
+                return
+            eof_requested = True
+            cause = CancellationCause("eof shutdown")
+            for current in (prompt_task, foreground_task):
+                if current is not None:
+                    cancel_task_once(current, message=cause)
 
         async def _recall_pending_input() -> str | None:
             batch = await pending_input.recall_all()
@@ -3926,25 +3960,6 @@ async def main() -> None:
             incoming_admission_tasks.add(task)
             task.add_done_callback(incoming_admission_tasks.discard)
 
-        def _show_eof_status() -> None:
-            if (
-                foreground_state.active_turn_id("main") is not None
-                or pending_input.pending_count
-                or _pending_prompt_count(peer_queue, pending_peer_prompts, inbox_task)
-            ):
-                renderer.show_panel("Draining active/pending work; Ctrl-C cancels.")
-            else:
-                renderer.clear_panel()
-
-        def _handle_empty_eof(now: float) -> bool:
-            nonlocal exit_arming
-            exit_arming, should_exit = exit_arming.press(now)
-            if not should_exit:
-                renderer.show_panel("Press Ctrl-D again within 2 seconds to exit.")
-            else:
-                _show_eof_status()
-            return should_exit
-
         prompt_replay = session_journal.replay_log if session_journal is not None else None
         prompt_session_options: dict[str, Any] = {"theme": theme}
         if prompt_replay is not None:
@@ -3959,8 +3974,8 @@ async def main() -> None:
             ),
             on_interrupt=_queue_escape,
             on_shutdown=_on_sigint,
+            on_eof=_on_eof,
             recall_pending=_recall_pending_input,
-            on_empty_eof=_handle_empty_eof,
             capture_target=lambda: renderer.focused_agent,
             reserve_sequence=event_hub.reserve_sequence,
             history_path=_history.project_history_path(root),
@@ -4087,10 +4102,11 @@ async def main() -> None:
                     partial=partial,
                     preemption_reason=preemption.reason if preemption is not None else None,
                 )
-                if preemption is None:
-                    renderer.show_panel("Main turn interrupted.")
-                else:
-                    renderer.show_panel(f"Main turn preempted for {preemption.reason}.")
+                if not eof_requested and foreground_state.shutdown_reason is None:
+                    if preemption is None:
+                        renderer.show_panel("Main turn interrupted.")
+                    else:
+                        renderer.show_panel(f"Main turn preempted for {preemption.reason}.")
             finally:
                 tool_preemption_reasons.pop(identity.turn_id, None)
                 prompt_task = None
@@ -4306,7 +4322,6 @@ async def main() -> None:
 
             ready_claims: deque[_ReadyClaim] = deque()
             settling_interrupts: deque[_InterruptTransaction] = deque()
-            input_closed = False
 
             async def _dispatch_command(user_input: str) -> tuple[bool, bool]:
                 lowered = user_input.lower()
@@ -4685,6 +4700,8 @@ async def main() -> None:
             async def _start_next_foreground() -> bool:
                 nonlocal foreground_task
                 while foreground_task is None:
+                    if eof_requested:
+                        return False
                     oldest_user_seq = (
                         pending_input.state.pending[0].arrival_seq if pending_input.state.pending else None
                     )
@@ -4744,6 +4761,8 @@ async def main() -> None:
                             source_input_ids=source_input_ids,
                             source="interactive",
                         )
+                    if eof_requested:
+                        return False
 
                     if len(ready.batch.entries) == 1:
                         handled, should_exit = await _dispatch_command_to_panel(ready.batch.entries[0].text)
@@ -4755,6 +4774,8 @@ async def main() -> None:
                     if handled:
                         await pending_input.mark_delivered(ready.batch)
                         continue
+                    if eof_requested:
+                        return False
                     foreground_task = asyncio.create_task(
                         _run_targeted_claim(ready),
                         name="axio-repl-interactive-turn",
@@ -4764,24 +4785,15 @@ async def main() -> None:
             pending_commands: deque[InputSubmitted] = deque()
 
             while True:
+                if eof_requested:
+                    shutdown_reason = "eof"
+                    main_status = TurnStatus.CANCELLED
+                    break
                 if foreground_task is None:
-                    if (
-                        input_closed
-                        and pending_input.pending_count == 0
-                        and not ready_claims
-                        and not pending_commands
-                        and not settling_interrupts
-                        and not pending_peer_prompts
-                        and peer_queue.empty()
-                        and (inbox_task is None or not inbox_task.done())
-                        and (interrupt_task is None or not interrupt_task.done())
-                        and not incoming_admission_tasks
-                    ):
-                        break
                     if await _start_next_foreground():
                         break
 
-                if input_task is None and not input_closed:
+                if input_task is None:
                     input_task = asyncio.create_task(
                         _read_input_async(
                             prompt_session,
@@ -4818,6 +4830,11 @@ async def main() -> None:
                     shutdown_reason = "terminal_failure"
                     await terminal_failure_task
                     raise RuntimeError("terminal failure monitor stopped unexpectedly")
+
+                if eof_requested:
+                    shutdown_reason = "eof"
+                    main_status = TurnStatus.CANCELLED
+                    break
 
                 for admission_task in admission_waiters:
                     if admission_task in done:
@@ -4856,10 +4873,9 @@ async def main() -> None:
                     submitted = input_task.result()
                 except EOFError:
                     print()
-                    shutdown_reason = "double_eof"
-                    input_closed = True
-                    _show_eof_status()
-                    continue
+                    shutdown_reason = "eof"
+                    main_status = TurnStatus.CANCELLED
+                    break
                 finally:
                     input_task = None
 
@@ -4909,7 +4925,7 @@ async def main() -> None:
         finally:
             shutdown_turn_id = foreground_state.active_turn_id("main")
             foreground_state = foreground_state.request_shutdown(shutdown_reason)
-            await _cancel_and_settle_tasks(
+            coordinator_settlement = await _cancel_and_settle_tasks(
                 foreground_task,
                 input_task,
                 inbox_task,
@@ -4917,6 +4933,7 @@ async def main() -> None:
                 terminal_failure_task,
                 shutdown_task,
                 *tuple(incoming_admission_tasks),
+                cancellation_message=CancellationCause(f"{shutdown_reason} shutdown"),
             )
             try:
                 deferred_snapshots = deferred_tools.snapshots()
@@ -4954,8 +4971,24 @@ async def main() -> None:
                             deferred_tool_phases=deferred_phases,
                         )
                     )
-                await stop_local_background_agents()
+                local_agent_stragglers = await stop_local_background_agents()
                 await deferred_tools.close()
+                detached_stragglers = await background.cancel_all()
+                shutdown_stragglers = (
+                    *coordinator_settlement.stragglers,
+                    *local_agent_stragglers,
+                    *deferred_tools.shutdown_stragglers(),
+                    *detached_stragglers,
+                )
+                if shutdown_stragglers:
+                    await stack.aclose()
+                    await session.close()
+                    await cancel_tasks_bounded(
+                        shutdown_stragglers,
+                        message=CancellationCause(f"forced {shutdown_reason} shutdown"),
+                    )
+                    await deferred_tools.close()
+                    await background.cancel_all()
                 await renderer.discard_deferred_tool_calls()
                 await ctx.close()
                 await _publish_main_event(AgentStopped(status=main_status))

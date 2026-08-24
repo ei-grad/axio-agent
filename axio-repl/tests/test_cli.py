@@ -15,6 +15,7 @@ from axio.messages import InputProvenance, Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.types import StopReason, Usage
+from axio_tools_agents.peers import PeerMessage
 from axio_tools_agents.runtime import (
     AgentStarted,
     ConfigurationChanged,
@@ -334,11 +335,69 @@ async def test_cancel_and_settle_tasks_retrieves_done_sibling_failure() -> None:
     pending_task = asyncio.create_task(wait_forever())
     await asyncio.sleep(0)
 
-    outcomes = await _cancel_and_settle_tasks(failed_task, pending_task, None)
+    settlement = await _cancel_and_settle_tasks(failed_task, pending_task, None)
 
-    assert isinstance(outcomes[0], RuntimeError)
-    assert isinstance(outcomes[1], asyncio.CancelledError)
+    assert isinstance(settlement.outcomes[0], RuntimeError)
+    assert isinstance(settlement.outcomes[1], asyncio.CancelledError)
+    assert settlement.stragglers == ()
     assert pending_task.cancelled()
+
+
+async def test_cancel_and_settle_tasks_repeats_cancellation_after_the_grace_period() -> None:
+    cleanup_started = asyncio.Event()
+    finalized = asyncio.Event()
+    cancellations = 0
+
+    async def resists_two_cancellations() -> None:
+        nonlocal cancellations
+        try:
+            while True:
+                try:
+                    await asyncio.Future[None]()
+                except asyncio.CancelledError:
+                    cancellations += 1
+                    cleanup_started.set()
+                    if cancellations >= 3:
+                        raise
+        finally:
+            finalized.set()
+
+    task = asyncio.create_task(resists_two_cancellations())
+    await asyncio.sleep(0)
+
+    settlement = await _cancel_and_settle_tasks(task, grace_seconds=0.01)
+    [outcome] = settlement.outcomes
+
+    assert isinstance(outcome, asyncio.CancelledError)
+    assert cleanup_started.is_set()
+    assert finalized.is_set()
+    assert cancellations == 3
+    assert task.cancelled()
+    assert settlement.stragglers == ()
+
+
+async def test_cancel_and_settle_tasks_returns_live_stragglers_to_the_owner() -> None:
+    release = asyncio.Event()
+
+    async def resist_until_released() -> None:
+        while True:
+            try:
+                await asyncio.Future[None]()
+            except asyncio.CancelledError:
+                if release.is_set():
+                    raise
+
+    task = asyncio.create_task(resist_until_released())
+    await asyncio.sleep(0)
+
+    settlement = await _cancel_and_settle_tasks(task, grace_seconds=0.001)
+
+    assert settlement.stragglers == (task,)
+    assert isinstance(settlement.outcomes[0], asyncio.CancelledError)
+    assert not task.done()
+    release.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
@@ -453,14 +512,14 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del history_path, on_empty_eof, on_shutdown, recall_pending, theme
+        del history_path, on_eof, on_shutdown, recall_pending, theme
         status_callbacks.append(cast(Callable[[], str], status))
         interrupt_callbacks.append(on_interrupt)
         return PromptSession(capture_target, reserve_sequence)
@@ -638,14 +697,14 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, history_path, on_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, theme
         status_callbacks.append(cast(Callable[[], str], status))
         return PromptSession()
@@ -859,14 +918,14 @@ async def test_queued_input_defers_unstarted_dispatch_then_reissued_shell_stream
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, history_path, on_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
         return PromptSession()
 
@@ -1067,14 +1126,14 @@ async def test_queued_input_keeps_a_completed_tool_result_in_the_next_provider_c
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, history_path, on_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
         return PromptSession()
 
@@ -1290,14 +1349,14 @@ async def test_queued_input_is_injected_before_provider_after_any_tool_boundary(
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        del capture_target, history_path, on_eof, on_interrupt, on_shutdown, recall_pending, status, theme
         return PromptSession(reserve_sequence)
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
@@ -1541,14 +1600,14 @@ async def test_background_child_injects_targeted_input_at_its_next_provider_boun
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        del capture_target, history_path, on_eof, on_interrupt, on_shutdown, recall_pending, status, theme
         return PromptSession(reserve_sequence)
 
     spawn_tool = next(tool for tool in TOOLS if tool.name == "spawn_agent")
@@ -1754,14 +1813,14 @@ async def test_escape_cancels_an_active_tool_without_deferring_it(
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_shutdown, recall_pending, reserve_sequence, status, theme
+        del capture_target, history_path, on_eof, on_shutdown, recall_pending, reserve_sequence, status, theme
         interrupt_callbacks.append(on_interrupt)
         return PromptSession()
 
@@ -1864,29 +1923,36 @@ async def test_escape_cancels_an_active_tool_without_deferring_it(
     )
 
 
-async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
+async def test_eof_latch_blocks_a_pending_claim_before_it_can_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import axio_repl
 
-    turn_started = asyncio.Event()
-    release_active = asyncio.Event()
-    pending_started = asyncio.Event()
-    release_pending_tool = asyncio.Event()
     inputs: asyncio.Queue[str | BaseException] = asyncio.Queue()
-    prompt_calls = 0
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    eof_prompt_active = asyncio.Event()
+    claim_blocked = asyncio.Event()
+    release_claim = asyncio.Event()
+    eof_latched = asyncio.Event()
+    eof_callbacks: list[Callable[[], None]] = []
     calls: list[list[Message]] = []
-    panel_messages: list[str] = []
-    original_show_panel = ReplRenderer.show_panel
+    claim_count = 0
+    original_claim_oldest = PendingInputCoordinator.claim_oldest
 
-    def record_panel_message(renderer: ReplRenderer, text: str) -> None:
-        panel_messages.append(text)
-        original_show_panel(renderer, text)
+    async def block_second_claim(coordinator: PendingInputCoordinator) -> Any:
+        nonlocal claim_count
+        if coordinator.pending_count:
+            claim_count += 1
+            if claim_count == 2:
+                claim_blocked.set()
+                await release_claim.wait()
+        return await original_claim_oldest(coordinator)
 
-    monkeypatch.setattr(ReplRenderer, "show_panel", record_panel_message)
+    monkeypatch.setattr(PendingInputCoordinator, "claim_oldest", block_second_claim)
 
-    class DrainingTransport:
+    class OneTurnTransport:
         name = "stub"
 
         def __init__(self, **kwargs: object) -> None:
@@ -1908,27 +1974,170 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
         ) -> AsyncIterator[StreamEvent]:
             del tools, system
             calls.append(list(messages))
-            if len(calls) == 1:
-                turn_started.set()
-                await release_active.wait()
-            elif len(calls) == 2:
-                yield ToolUseStart(index=0, tool_use_id="drain-call", name="drain_tool")
-                yield ToolInputDelta(index=0, tool_use_id="drain-call", partial_json="{}")
-                yield IterationEnd(
-                    iteration=2,
-                    stop_reason=StopReason.tool_use,
-                    usage=Usage(input_tokens=1, output_tokens=1),
-                )
-                return
-            yield TextDelta(index=0, delta=f"answer {len(calls)}")
+            if len(calls) > 1:
+                raise AssertionError("EOF latch allowed a pending provider turn")
+            first_started.set()
+            await release_first.wait()
+            yield TextDelta(index=0, delta="done")
             yield IterationEnd(
-                iteration=len(calls),
+                iteration=1,
                 stop_reason=StopReason.end_turn,
                 usage=Usage(input_tokens=1, output_tokens=1),
             )
 
     class Buffer:
         text = ""
+
+        def reset(self) -> None:
+            self.text = ""
+
+    class PromptSession:
+        default_buffer = Buffer()
+        calls = 0
+
+        async def prompt_async(self, prompt: object, **kwargs: object) -> str:
+            assert to_plain_text(cast(Any, prompt)).endswith("> ")
+            self.calls += 1
+            if self.calls >= 3:
+                eof_prompt_active.set()
+            value = await inputs.get()
+            if isinstance(value, BaseException):
+                if isinstance(value, EOFError):
+                    eof_callbacks[0]()
+                raise value
+            self.default_buffer.text = ""
+            return value
+
+    class InertTerminal:
+        def __init__(self, session: PromptSession) -> None:
+            del session
+
+        async def start(self) -> None:
+            pass
+
+        async def wait_failed(self) -> None:
+            await asyncio.Future[None]()
+
+        async def close(self) -> None:
+            pass
+
+    prompt_session = PromptSession()
+
+    async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
+        del args, kwargs
+        return [], "test", tmp_path, ""
+
+    def make_prompt_session(
+        status: object,
+        *,
+        on_interrupt: Callable[[], None],
+        on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
+        recall_pending: Callable[[], Awaitable[str | None]],
+        capture_target: Callable[[], str],
+        reserve_sequence: Callable[[], int],
+        history_path: Path,
+        theme: object,
+    ) -> PromptSession:
+        del capture_target, history_path, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, status, theme
+
+        def latch_eof() -> None:
+            on_eof()
+            eof_latched.set()
+
+        eof_callbacks.append(latch_eof)
+        return prompt_session
+
+    journal_root = tmp_path / "journals"
+    monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (OneTurnTransport, ""))
+    monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
+    monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
+    monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
+    monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["axio-repl", "--sandbox", "none", "--session-log-dir", str(journal_root)],
+    )
+
+    await inputs.put("first request")
+    repl_task = asyncio.create_task(main())
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await inputs.put("pending request")
+        await asyncio.wait_for(eof_prompt_active.wait(), timeout=1)
+        release_first.set()
+        await asyncio.wait_for(claim_blocked.wait(), timeout=1)
+        await inputs.put(EOFError())
+        await asyncio.wait_for(eof_latched.wait(), timeout=1)
+        release_claim.set()
+
+        await asyncio.wait_for(repl_task, timeout=2)
+        assert len(calls) == 1
+        events_paths = list(journal_root.rglob(SEMANTIC_FILENAME))
+        assert len(events_paths) == 1
+        recovered = materialize_recovery(events_paths[0])
+        assert [pending.text for pending in recovered.pending_inputs] == ["pending request"]
+    finally:
+        release_first.set()
+        release_claim.set()
+        if not repl_task.done():
+            repl_task.cancel()
+            await asyncio.gather(repl_task, return_exceptions=True)
+
+
+async def test_eof_cancels_active_provider_and_preserves_pending_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import axio_repl
+
+    turn_started = asyncio.Event()
+    provider_finalized = asyncio.Event()
+    inputs: asyncio.Queue[str | BaseException] = asyncio.Queue()
+    prompt_calls = 0
+    calls: list[list[Message]] = []
+    peer_handlers: list[Callable[[PeerMessage], Awaitable[None]]] = []
+    eof_callbacks: list[Callable[[], None]] = []
+
+    class CancellableTransport:
+        name = "stub"
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+            self.model = ModelSpec(id="stub/model", capabilities=frozenset({Capability.text}))
+            self.models = ModelRegistry([self.model])
+            self.temperature: float | None = None
+            self.max_output_tokens: int | None = None
+            self.debug = False
+
+        async def fetch_models(self) -> None:
+            pass
+
+        async def stream(
+            self,
+            messages: list[Message],
+            tools: list[Tool[object]],
+            system: str,
+        ) -> AsyncIterator[StreamEvent]:
+            del tools, system
+            calls.append(list(messages))
+            if len(calls) > 1:
+                raise AssertionError("EOF shutdown must not start another provider request")
+            try:
+                yield TextDelta(index=0, delta="partial answer")
+                turn_started.set()
+                await asyncio.Future()
+            finally:
+                provider_finalized.set()
+
+    class Buffer:
+        text = ""
+
+        def reset(self) -> None:
+            self.text = ""
 
     class PromptSession:
         default_buffer = Buffer()
@@ -1941,6 +2150,8 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
                 self.default_buffer.text = str(default)
             value = await inputs.get()
             if isinstance(value, BaseException):
+                if isinstance(value, EOFError):
+                    eof_callbacks[0]()
                 raise value
             self.default_buffer.text = ""
             return value
@@ -1958,40 +2169,50 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
         async def close(self) -> None:
             pass
 
-    prompt_session = PromptSession()
+    class InertPeerServer:
+        id = "test-peer"
 
-    async def drain_tool() -> str:
-        pending_started.set()
-        await release_pending_tool.wait()
-        return "drained tool result"
+        def __init__(self, *args: object, handler: Callable[[PeerMessage], Awaitable[None]], **kwargs: object) -> None:
+            del args, kwargs
+            peer_handlers.append(handler)
+
+        async def start(self) -> InertPeerServer:
+            return self
+
+        async def close(self) -> None:
+            pass
+
+    prompt_session = PromptSession()
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
         del args, kwargs
-        return [Tool(name="drain_tool", handler=drain_tool)], "test", tmp_path, ""
+        return [], "test", tmp_path, ""
 
     def make_prompt_session(
         status: object,
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, history_path, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
+        eof_callbacks.append(on_eof)
         return prompt_session
 
     journal_root = tmp_path / "journals"
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
-    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (DrainingTransport, ""))
+    monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (CancellableTransport, ""))
     monkeypatch.setattr(axio_repl._sandbox, "build_tools", build_tools)
     monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
     monkeypatch.setattr(axio_repl._panel, "commit_history", lambda _session, _texts: None)
     monkeypatch.setattr(axio_repl, "TerminalUI", InertTerminal)
+    monkeypatch.setattr(axio_repl, "PeerServer", InertPeerServer)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -2002,48 +2223,56 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
     repl_task = asyncio.create_task(main())
     await asyncio.wait_for(turn_started.wait(), timeout=1)
     await inputs.put("pending request")
+    await inputs.put("/iterations 1")
     for _ in range(100):
-        if prompt_calls >= 3:
+        if prompt_calls >= 4:
             break
         await asyncio.sleep(0.01)
-    assert prompt_calls >= 3
-    prompt_session.default_buffer.text = "unsent editor"
+    assert prompt_calls >= 4
+    assert len(peer_handlers) == 1
+    await peer_handlers[0](
+        PeerMessage(
+            id="message-1",
+            from_id="peer-1",
+            from_name="peer",
+            to_id="test-peer",
+            body="pending peer request",
+            sent_at=0.0,
+        )
+    )
     await inputs.put(EOFError())
     prompt_calls_at_eof = prompt_calls
 
-    for _ in range(100):
-        if "Draining active/pending work; Ctrl-C cancels." in panel_messages:
-            break
-        await asyncio.sleep(0.01)
-    assert "Draining active/pending work; Ctrl-C cancels." in panel_messages
-    assert not repl_task.done()
-    release_active.set()
-    await asyncio.wait_for(pending_started.wait(), timeout=1)
-    assert not repl_task.done()
-    release_pending_tool.set()
-
     await asyncio.wait_for(repl_task, timeout=2)
+    assert provider_finalized.is_set()
     assert prompt_calls == prompt_calls_at_eof
-    assert len(calls) == 3
-    assert any(
-        isinstance(block, TextBlock) and block.text == "pending request"
-        for message in calls[1]
-        for block in message.content
-    )
+    assert len(calls) == 1
 
     events_paths = list(journal_root.rglob(SEMANTIC_FILENAME))
     assert len(events_paths) == 1
     recovered = materialize_recovery(events_paths[0])
-    assert recovered.pending_inputs == ()
-    assert recovered.editor_text == "unsent editor"
-    shutdown = next(
-        record for record in read_journal(events_paths[0]).records if record["kind"] == "shutdown_recorded"
-    )
+    assert [pending.text for pending in recovered.pending_inputs] == ["pending request"]
+    assert recovered.editor_text == ""
+    records = read_journal(events_paths[0]).records
+    shutdown = next(record for record in records if record["kind"] == "shutdown_recorded")
     shutdown_payload = shutdown["payload"]
     assert isinstance(shutdown_payload, dict)
     shutdown_event = shutdown_payload["event"]
     assert isinstance(shutdown_event, dict)
-    assert shutdown_event["reason"] == "double_eof"
+    assert shutdown_event["reason"] == "eof"
+    assert shutdown_event["interrupted_turn_id"] is not None
+    assert shutdown_event["partial_text"] == "partial answer"
+    assert not any(str(record["kind"]).startswith("interruption_") for record in records)
+    assert any(record["kind"] == "input_received" and "pending peer request" in repr(record) for record in records)
+    assert not any(
+        record["kind"] == "message_committed" and "pending peer request" in repr(record) for record in records
+    )
+    assert not any(
+        record["kind"] == "configuration_changed"
+        and "'source': 'interactive'" in repr(record)
+        and "'name': 'iterations'" in repr(record)
+        for record in records
+    )
 
 
 async def test_resume_copies_context_and_restores_editor_before_input(
@@ -2129,8 +2358,8 @@ async def test_resume_copies_context_and_restores_editor_before_input(
         *,
         on_interrupt: Callable[[], None],
         on_shutdown: Callable[[], None],
+        on_eof: Callable[[], None],
         recall_pending: Callable[[], Awaitable[str | None]],
-        on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
         history_path: Path,
@@ -2138,7 +2367,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
     ) -> PromptSession:
         nonlocal captured_history_path
         captured_history_path = history_path
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, on_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
         return prompt_session
 

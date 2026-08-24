@@ -74,9 +74,11 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   submitted with Enter. Pending messages remain separate conversation objects;
   editor text is never submitted or changed by Escape. Without pending user
   input, no replacement model turn starts.
-- **Ctrl-D** on an empty editor warns once; a second press within two seconds
-  closes input, lets the active turn and already submitted work drain, then
-  exits without starting another editor prompt.
+- **Ctrl-D** on an empty editor immediately cancels the active turn and exits.
+  Already submitted input remains recoverable and is not started during
+  shutdown. Active, deferred, child-agent, and detached tool tasks receive
+  bounded cancellation before sandbox resources close. With editor text
+  present, Ctrl-D keeps its forward-delete behavior.
 - **Ctrl-C** starts graceful shutdown. It does not submit or clear the editor;
   the shutdown journal retains it for `--resume`.
 

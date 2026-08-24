@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any, Protocol, Self
 
 from . import background, notify
-from ._asyncio import shield_until_done
+from ._asyncio import CancellationCause, shield_until_done
 from .blocks import AudioBlock, ContentBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from .context import ContextStore
 from .events import (
@@ -665,7 +665,10 @@ class Agent:
                             else:
                                 dispatched = []
                             results = dispatched + error_results
-                        except asyncio.CancelledError:
+                        except asyncio.CancelledError as cancellation:
+                            cancellation_note = "[interrupted by user]"
+                            if cancellation.args and isinstance(cancellation.args[0], CancellationCause):
+                                cancellation_note = f"[cancelled: {cancellation.args[0].reason}]"
 
                             async def finalize_interrupted_dispatch() -> list[tuple[ToolUseBlock, ToolResultBlock]]:
                                 completed_results: dict[str, ToolResultBlock] = {}
@@ -733,11 +736,11 @@ class Agent:
                                     chunks = partial_output.get(b.id, [])
                                     tool = self._find_tool(b.name)
                                     if chunks and tool:
-                                        msg = tool.format_stream_result(chunks) + "\n[interrupted by user]"
+                                        msg = tool.format_stream_result(chunks) + f"\n{cancellation_note}"
                                     elif chunks:
-                                        msg = "".join(text for _, _, text in chunks) + "\n[interrupted by user]"
+                                        msg = "".join(text for _, _, text in chunks) + f"\n{cancellation_note}"
                                     else:
-                                        msg = "[interrupted by user]"
+                                        msg = cancellation_note
                                     interrupted = ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
                                     interrupted_results.append(interrupted)
                                     visible_results.append((b, interrupted))

@@ -30,7 +30,7 @@ from axio_repl._coordinator import (
     claim_batch_arrivals,
     ordered_messages,
 )
-from axio_repl._input import ExitArmingState, InterruptRequested
+from axio_repl._input import InterruptRequested
 
 
 def _entry(identifier: str, seq: int, text: str, target: str = "main") -> PendingUserEntry:
@@ -311,24 +311,6 @@ def test_empty_pending_transitions_are_explicit_noops() -> None:
     assert claimed is not None
     assert claimed.target_agent_id == "child"
     assert claimed_state.pending == ()
-
-
-def test_double_eof_only_shuts_down_inside_two_second_window() -> None:
-    state, shutdown = ExitArmingState().press(10.0)
-    assert not shutdown
-    assert state.deadline == 12.0
-
-    state, shutdown = state.press(11.5)
-    assert shutdown
-    assert state.deadline is None
-
-    state, shutdown = ExitArmingState().press(20.0)
-    assert not shutdown
-    expired = state.expire(22.1)
-    assert expired.deadline is None
-    rearmed, shutdown = expired.press(23.0)
-    assert not shutdown
-    assert rearmed.deadline == 25.0
 
 
 def test_context_arrivals_reject_invalid_identity_and_duplicate_sequence() -> None:

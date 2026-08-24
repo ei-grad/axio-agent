@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from axio._asyncio import CancellationCause, cancel_tasks_bounded
 from axio.agent import ToolDispatch
 from axio.blocks import AudioBlock, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock, VideoBlock
 from axio_tools_agents.runtime import current_turn_identity
@@ -76,6 +77,7 @@ class DeferredToolRegistry:
         self._on_dispatch_started = on_dispatch_started
         self._on_dispatch_deferred = on_dispatch_deferred
         self._records: dict[asyncio.Task[list[ToolResultBlock]], _OwnedDispatch] = {}
+        self._shutdown_stragglers: tuple[asyncio.Task[object], ...] = ()
 
     def set_dispatch_started_handler(self, handler: DispatchStartedHandler | None) -> None:
         self._on_dispatch_started = handler
@@ -183,6 +185,9 @@ class DeferredToolRegistry:
             for record in self._records.values()
         )
 
+    def shutdown_stragglers(self) -> tuple[asyncio.Task[object], ...]:
+        return self._shutdown_stragglers
+
     async def close(self) -> tuple[DeferredToolSnapshot, ...]:
         snapshots = self.snapshots()
         records = tuple(self._records.values())
@@ -195,8 +200,16 @@ class DeferredToolRegistry:
         tasks.extend(record.dispatch.task for record in records)
         tasks.extend(record.watcher for record in records if record.watcher is not None)
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._records.clear()
+            self._shutdown_stragglers = await cancel_tasks_bounded(
+                tuple(tasks),
+                message=CancellationCause("deferred tool shutdown"),
+            )
+        stragglers = set(self._shutdown_stragglers)
+        self._records = {
+            task: record
+            for task, record in self._records.items()
+            if task in stragglers or (record.watcher is not None and record.watcher in stragglers)
+        }
         return snapshots
 
     def _require(self, dispatch: ToolDispatch) -> _OwnedDispatch:

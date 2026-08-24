@@ -16,7 +16,7 @@ from typing import Any, Self
 from uuid import uuid4
 
 from axio import notify
-from axio._asyncio import cancel_task_once
+from axio._asyncio import CancellationCause, cancel_task_once, cancel_tasks_bounded
 from axio.agent import Agent
 from axio.context import ContextStore
 from axio.events import StreamEvent
@@ -1191,17 +1191,19 @@ async def enqueue_local_agent_context(
     return True
 
 
-async def stop_local_background_agents() -> None:
+async def stop_local_background_agents() -> tuple[asyncio.Task[Any], ...]:
     backgrounds = list(_background_agents.values())
+    cause = CancellationCause("local agent shutdown")
     for background in backgrounds:
         background.stopping = True
         if background.current_turn is not None:
-            cancel_task_once(background.current_turn)
+            cancel_task_once(background.current_turn, message=cause)
         background.inbox.put_nowait(_QueuedPrompt(None))
-    for background in backgrounds:
-        if background.runner is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await background.runner
+    runners = tuple(background.runner for background in backgrounds if background.runner is not None)
+    return await cancel_tasks_bounded(
+        runners,
+        message=cause,
+    )
 
 
 async def spawn_agent(
