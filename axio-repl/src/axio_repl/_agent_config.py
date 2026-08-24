@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
+from axio.agent import PatchLineFraming, validate_patch_line_framing
 from axio.effort import EFFORT_LEVELS
 
 from axio_repl._theme import theme_names
@@ -37,6 +38,7 @@ _RUNTIME_KEYS = frozenset(
         "session_log",
         "session_replay",
         "session_log_dir",
+        "patch_line_framing",
     }
 )
 _SANDBOX_KEYS = frozenset(
@@ -76,6 +78,7 @@ _CLI_OPTION_DESTINATIONS = {
     "--session-replay": "session_replay",
     "--no-session-replay": "session_replay",
     "--session-log-dir": "session_log_dir",
+    "--patch-line-framing": "patch_line_framing",
     "--sandbox": "sandbox",
     "--sandbox-image": "sandbox_image",
     "--sandbox-network": "sandbox_network",
@@ -166,6 +169,7 @@ class RuntimeSettings:
     session_log: bool | None = None
     session_replay: bool | None = None
     session_log_dir: Path | None = None
+    patch_line_framing: PatchLineFraming | None = None
 
     def overlay(self, other: RuntimeSettings) -> RuntimeSettings:
         return RuntimeSettings(
@@ -180,6 +184,9 @@ class RuntimeSettings:
             session_log=other.session_log if other.session_log is not None else self.session_log,
             session_replay=other.session_replay if other.session_replay is not None else self.session_replay,
             session_log_dir=(other.session_log_dir if other.session_log_dir is not None else self.session_log_dir),
+            patch_line_framing=(
+                other.patch_line_framing if other.patch_line_framing is not None else self.patch_line_framing
+            ),
         )
 
 
@@ -318,6 +325,7 @@ def apply_profile_to_args(args: Any, profile: ResolvedAgentProfile, explicit: fr
         "powerline": settings.runtime.powerline,
         "session_replay": settings.runtime.session_replay,
         "session_log_dir": settings.runtime.session_log_dir,
+        "patch_line_framing": settings.runtime.patch_line_framing,
         "sandbox": settings.sandbox.backend,
         "sandbox_image": settings.sandbox.image,
         "sandbox_network": settings.sandbox.network,
@@ -529,6 +537,18 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
     theme = _optional_string(data, "theme", source, "runtime.theme")
     if theme is not None and theme not in _THEME_VALUES:
         raise AgentConfigError(f"{source}: runtime.theme must be one of: {', '.join(sorted(_THEME_VALUES))}")
+    patch_line_framing_raw = _optional_string(
+        data,
+        "patch_line_framing",
+        source,
+        "runtime.patch_line_framing",
+    )
+    try:
+        patch_line_framing = (
+            validate_patch_line_framing(patch_line_framing_raw) if patch_line_framing_raw is not None else None
+        )
+    except ValueError as exc:
+        raise AgentConfigError(f"{source}: runtime.{exc}") from exc
     return RuntimeSettings(
         temperature=temperature,
         effort=effort,
@@ -541,6 +561,7 @@ def _parse_runtime(data: Mapping[str, object], source: Path, base_dir: Path) -> 
         session_log=_optional_bool(data, "session_log", source, "runtime.session_log"),
         session_replay=_optional_bool(data, "session_replay", source, "runtime.session_replay"),
         session_log_dir=_optional_path(data, "session_log_dir", source, "runtime.session_log_dir", base_dir),
+        patch_line_framing=patch_line_framing,
     )
 
 
@@ -753,6 +774,13 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
     theme = text("AXIO_REPL_THEME")
     if theme is not None and theme not in _THEME_VALUES:
         raise AgentConfigError(f"AXIO_REPL_THEME must be one of: {', '.join(sorted(_THEME_VALUES))}")
+    patch_line_framing_raw = text("AXIO_REPL_PATCH_LINE_FRAMING")
+    try:
+        patch_line_framing = (
+            validate_patch_line_framing(patch_line_framing_raw) if patch_line_framing_raw is not None else None
+        )
+    except ValueError as exc:
+        raise AgentConfigError(f"AXIO_REPL_PATCH_LINE_FRAMING: {exc}") from exc
     runtime = RuntimeSettings(
         temperature=temperature,
         effort=text("AXIO_REPL_EFFORT"),
@@ -765,6 +793,7 @@ def _environment_settings(values: Mapping[str, str], cwd: Path) -> ProfileSettin
         session_log=boolean("AXIO_REPL_SESSION_LOG"),
         session_replay=boolean("AXIO_REPL_SESSION_REPLAY"),
         session_log_dir=external_path("AXIO_REPL_SESSION_LOG_DIR"),
+        patch_line_framing=patch_line_framing,
     )
     if runtime.effort is not None and runtime.effort not in _EFFORT_VALUES:
         raise AgentConfigError(f"AXIO_REPL_EFFORT must be one of: {', '.join(sorted(_EFFORT_VALUES))}")

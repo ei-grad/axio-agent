@@ -29,8 +29,10 @@ from prompt_toolkit.formatted_text import to_plain_text
 
 from axio_repl import (
     TOOLS,
+    Command,
     ReplRenderer,
     _build_argument_parser,
+    _can_dispatch_command_during_foreground,
     _cancel_and_settle_tasks,
     _capture_command_output,
     _handle_agent_actions,
@@ -181,6 +183,23 @@ def test_session_replay_is_disabled_by_default_and_has_explicit_toggle() -> None
     assert _build_argument_parser().parse_args([]).session_replay is False
     assert _build_argument_parser().parse_args(["--session-replay"]).session_replay is True
     assert _build_argument_parser().parse_args(["--no-session-replay"]).session_replay is False
+
+
+def test_patch_line_framing_defaults_to_auto_and_validates_explicit_mode() -> None:
+    parser = _build_argument_parser()
+
+    assert parser.parse_args([]).patch_line_framing == "auto"
+    assert parser.parse_args(["--patch-line-framing", "on"]).patch_line_framing == "on"
+    assert parser.parse_args(["--patch-line-framing=off"]).patch_line_framing == "off"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--patch-line-framing", "yes"])
+
+
+def test_model_change_waits_for_foreground_turn_boundary() -> None:
+    commands = {"/model": Command(lambda: None, lambda _arg: None)}
+
+    assert _can_dispatch_command_during_foreground("/model", commands)
+    assert not _can_dispatch_command_during_foreground("/model next-model", commands)
 
 
 def test_sandbox_networking_defaults_to_fail_closed() -> None:

@@ -149,9 +149,7 @@ async def read_file(
     video files (mp4/webm/etc.) are returned as multimodal content blocks for
     capable models. Lines are 1-indexed: start_line=1 is the first line,
     end_line=3 includes line 3. Pass line_numbers=True to prefix each line as
-    ``L<number>│<source>`` — required before calling patch_file. Everything
-    after ``│`` is exact file content. For patch_file content, remove only
-    ``L<number>`` and retain ``│source`` as its required visible framing.
+    ``L<number>│<source>``. Everything after ``│`` is exact file content.
     Without max_chars, text and binary reads larger than 32768 chars fail with
     an explanation. With max_chars, large reads are truncated to that explicit
     limit. Always read the file before editing it with write_file or

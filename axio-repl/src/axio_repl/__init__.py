@@ -2684,6 +2684,13 @@ class Command(NamedTuple):
     apply: Callable[[str], object]
 
 
+def _can_dispatch_command_during_foreground(user_input: str, commands: dict[str, Command]) -> bool:
+    command = user_input.lower().split(maxsplit=1)[0]
+    if command in {"/help", "/agents", "/agent-actions"}:
+        return True
+    return command in commands and command == user_input.lower()
+
+
 _COMMAND_OUTPUT: ContextVar[list[str] | None] = ContextVar("axio_repl_command_output", default=None)
 _COMMAND_THEME: ContextVar[TerminalTheme] = ContextVar("axio_repl_command_theme", default=DEFAULT_THEME)
 
@@ -3287,6 +3294,12 @@ def _build_argument_parser() -> Any:
     parser.add_argument("--effort", default=None, help=f"Effort level: default, {', '.join(EFFORT_LEVELS)}")
     parser.add_argument("--max-tokens", type=int, default=None, help="Max output tokens")
     parser.add_argument("--max-iterations", type=int, default=1000)
+    parser.add_argument(
+        "--patch-line-framing",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Legacy patch_file line framing: auto, on, or off (default: auto)",
+    )
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument("--debug", dest="debug", action="store_true", help="Log request/response bodies")
     debug_group.add_argument("--no-debug", dest="debug", action="store_false", help="Disable request/response logging")
@@ -3585,6 +3598,7 @@ async def main() -> None:
             transport=transport,
             max_iterations=args.max_iterations,
             last_iteration_message=LAST_ITERATION_HINT,
+            patch_line_framing=args.patch_line_framing,
         )
         ctx = ObservedContextStore(MemoryContextStore(), event_hub)
         set_session_event_hub(event_hub)
@@ -3619,6 +3633,7 @@ async def main() -> None:
             ("agent_actions", args.agent_actions),
             ("theme", theme.name),
             ("powerline", args.powerline),
+            ("patch_line_framing", agent.patch_line_framing),
         ):
             await _publish_main_event(ConfigurationChanged(name=config_name, value=config_value, source="startup"))
 
@@ -4408,12 +4423,6 @@ async def main() -> None:
                     renderer.show_panel("".join(output))
                 return handled, should_exit
 
-            def _can_dispatch_during_foreground(user_input: str) -> bool:
-                command = user_input.lower().split(maxsplit=1)[0]
-                if command in {"/help", "/agents", "/agent-actions"}:
-                    return True
-                return command in commands and command == user_input.lower()
-
             def _is_known_command(user_input: str) -> bool:
                 command = user_input.lower().split(maxsplit=1)[0]
                 return command in {
@@ -4874,7 +4883,10 @@ async def main() -> None:
                     )
                     continue
                 if submitted.disposition is SubmissionDisposition.COMMAND:
-                    if foreground_task is not None and not _can_dispatch_during_foreground(user_input):
+                    if foreground_task is not None and not _can_dispatch_command_during_foreground(
+                        user_input,
+                        commands,
+                    ):
                         pending_commands.append(submitted)
                         _panel.complete_submission(
                             prompt_session,

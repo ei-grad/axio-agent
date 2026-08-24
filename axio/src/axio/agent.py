@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Itera
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, Self
+from typing import Any, Literal, Protocol, Self, cast
 
 from . import background, notify
 from ._asyncio import shield_until_done
@@ -44,6 +44,23 @@ from .transport import CompletionTransport
 from .types import StopReason, Usage
 
 logger = logging.getLogger(__name__)
+
+type PatchLineFraming = Literal["auto", "on", "off"]
+
+PATCH_LINE_FRAMING_INSTRUCTION = (
+    "When calling patch_file, frame every content line as │source. Remove L<number> from numbered read_file "
+    "output but retain │source; put exact indentation after │; use │ for an empty line and ││source for a "
+    "literal source line beginning with │. Never mix framed and unframed content lines."
+)
+_PATCH_LINE_FRAMING_VALUES = frozenset({"auto", "on", "off"})
+
+
+def validate_patch_line_framing(value: object) -> PatchLineFraming:
+    """Validate and narrow one public patch-line-framing setting."""
+
+    if not isinstance(value, str) or value not in _PATCH_LINE_FRAMING_VALUES:
+        raise ValueError("patch_line_framing must be 'auto', 'on', or 'off'")
+    return cast(PatchLineFraming, value)
 
 
 @contextmanager
@@ -184,6 +201,10 @@ class Agent:
     last_iteration_message: Message | None = field(default=None)
     deferred_tool_sink: DeferredToolSink | None = field(default=None)
     before_next_provider_request: Callable[[], Awaitable[None]] | None = field(default=None)
+    patch_line_framing: PatchLineFraming = field(default="auto")
+
+    def __post_init__(self) -> None:
+        self.patch_line_framing = validate_patch_line_framing(self.patch_line_framing)
 
     def copy(self, **overrides: Any) -> Self:
         """Return a new Agent with *overrides* applied."""
@@ -468,6 +489,23 @@ class Agent:
             return tools
         return await self.selector.select(history, tools)
 
+    def _effective_system(
+        self,
+        active_tools: list[Tool[Any]],
+        transport: CompletionTransport | None = None,
+    ) -> str:
+        if not any(tool.name == "patch_file" for tool in active_tools):
+            return self.system
+        active_transport = self.transport if transport is None else transport
+        enabled = self.patch_line_framing == "on" or (
+            self.patch_line_framing == "auto" and getattr(active_transport, "tool_argument_codec", None) is None
+        )
+        if not enabled:
+            return self.system
+        if not self.system:
+            return PATCH_LINE_FRAMING_INSTRUCTION
+        return f"{PATCH_LINE_FRAMING_INSTRUCTION}\n\n{self.system}"
+
     async def _run_loop(
         self,
         initial_messages: tuple[Message, ...],
@@ -507,7 +545,8 @@ class Agent:
                         if self.last_iteration_message and iteration == self.max_iterations
                         else history
                     )
-                    model = getattr(self.transport, "model", None)
+                    active_transport = self.transport
+                    model = getattr(active_transport, "model", None)
                     model_caps = getattr(model, "capabilities", None)
                     if model_caps is not None and Capability.tool_use not in model_caps:
                         active_tools: list[Tool[Any]] = []
@@ -523,7 +562,11 @@ class Agent:
                     reasoning_rep_detector = _RepetitionDetector()
 
                     try:
-                        provider_stream = self.transport.stream(effective_history, active_tools, self.system)
+                        provider_stream = active_transport.stream(
+                            effective_history,
+                            active_tools,
+                            self._effective_system(active_tools, active_transport),
+                        )
                         try:
                             async for event in provider_stream:
                                 yield event

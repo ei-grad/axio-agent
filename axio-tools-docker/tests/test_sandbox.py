@@ -310,7 +310,7 @@ async def test_tools_names_match_axio_tools_local() -> None:
     assert names == EXPECTED_TOOL_NAMES
 
 
-async def test_patch_file_tool_schema_requires_visible_framing_without_indent_workaround() -> None:
+async def test_patch_file_tool_schema_does_not_advertise_legacy_line_framing() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
@@ -318,20 +318,21 @@ async def test_patch_file_tool_schema_requires_visible_framing_without_indent_wo
 
     assert "first_line_indent" not in tool.schema["properties"]
     content = tool.schema["properties"]["content"]
-    assert "every logical line" in content["description"]
-    assert "│" in content["description"]
-    assert "L<number>" in content["description"]
+    assert "exact whitespace" in content["description"]
+    assert "│" not in content["description"]
+    assert "framed" not in content["description"].lower()
+    assert "Frame every content line" not in tool.description
 
 
-async def test_read_file_tool_description_keeps_patch_framing_when_removing_line_numbers() -> None:
+async def test_read_file_tool_description_does_not_advertise_patch_line_framing() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             tool = next(item for item in sb.tools if item.name == "read_file")
 
-    assert "remove only" in tool.description
-    assert "``L<number>``" in tool.description
-    assert "retain ``│source``" in tool.description
+    assert "line_numbers=True" in tool.description
+    assert "retain ``│source``" not in tool.description
+    assert "required visible framing" not in tool.description
 
 
 async def test_shell_discovery_prefers_bash_and_builds_runtime_schema() -> None:

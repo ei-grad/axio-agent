@@ -217,14 +217,15 @@ class TestFramedContent:
 
         assert f.read_text() == original
 
-    async def test_schema_requires_visible_framing_and_has_no_indent_workaround(self) -> None:
+    async def test_schema_does_not_advertise_legacy_line_framing(self) -> None:
         tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
 
         assert "first_line_indent" not in tool.schema["properties"]
         content = tool.schema["properties"]["content"]
-        assert "every logical line" in content["description"]
-        assert "│" in content["description"]
-        assert "L<number>" in content["description"]
+        assert "exact whitespace" in content["description"]
+        assert "│" not in content["description"]
+        assert "framed" not in content["description"].lower()
+        assert "Frame every content line" not in tool.description
 
     async def test_fragmented_tool_input_repairs_counter_and_keeps_raw_input_in_result(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "index.html"

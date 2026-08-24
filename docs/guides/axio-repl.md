@@ -166,6 +166,7 @@ defaults:
     theme: default
     session_log: true
     session_replay: false
+    patch_line_framing: "auto"
   sandbox:
     backend: docker
     image: axio-agent-sandbox:standard
@@ -201,6 +202,7 @@ runtime:
   powerline: true
   session_log: true
   session_replay: false
+  patch_line_framing: "auto"
 
 sandbox:
   backend: docker
@@ -234,6 +236,13 @@ to every nested setting. `tools: [all]` enables the complete built-in set and
 order. Docker-only `run_python` and environment-dependent `ast_grep` can be
 named when that backend actually provides them. Unknown or unavailable names,
 duplicates, and mixing `all` or `none` with named tools are errors.
+
+`runtime.patch_line_framing` controls the legacy visible-line protocol for
+`patch_file`: `"auto"` advertises it only when the transport lacks general
+verbatim protection for string tool arguments, `"on"` forces it, and `"off"`
+suppresses it. `"auto"` is the built-in default and prevents double framing on
+capable transports. Quote `"on"` and `"off"` because YAML otherwise treats
+those words as booleans.
 
 `model_context` is an optional trusted operator-policy description accepted
 only in the selected `agent.yaml`; it is not a layered global default and has
@@ -302,7 +311,7 @@ The environment layer maps directly to manifest fields:
 | Area | Variables |
 |---|---|
 | Agent/transport | `AXIO_REPL_AGENT`, `AXIO_REPL_TRANSPORT`, `AXIO_REPL_TRANSPORT_BASE_URL`, `AXIO_REPL_TRANSPORT_API_KEY_ENV`, `AXIO_REPL_MODEL` |
-| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_THEME`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_REPLAY`, `AXIO_REPL_SESSION_LOG_DIR` |
+| Runtime | `AXIO_REPL_TEMPERATURE`, `AXIO_REPL_EFFORT`, `AXIO_REPL_MAX_TOKENS`, `AXIO_REPL_MAX_ITERATIONS`, `AXIO_REPL_DEBUG`, `AXIO_REPL_AGENT_ACTIONS`, `AXIO_REPL_THEME`, `AXIO_REPL_POWERLINE`, `AXIO_REPL_SESSION_LOG`, `AXIO_REPL_SESSION_REPLAY`, `AXIO_REPL_SESSION_LOG_DIR`, `AXIO_REPL_PATCH_LINE_FRAMING` |
 | Sandbox | `AXIO_REPL_SANDBOX`, `AXIO_REPL_SANDBOX_IMAGE`, `AXIO_REPL_SANDBOX_NETWORK`, `AXIO_REPL_SANDBOX_MEMORY`, `AXIO_REPL_SANDBOX_CPUS`, `AXIO_REPL_SANDBOX_PROXY`, `AXIO_REPL_SANDBOX_NO_PROXY`, `AXIO_REPL_SANDBOX_DATASETS`, `AXIO_REPL_SANDBOX_CA_CERT` |
 | Registries | `AXIO_REPL_SANDBOX_PYPI_INDEX`, `AXIO_REPL_SANDBOX_NPM_REGISTRY`, `AXIO_REPL_SANDBOX_CARGO_INDEX`, `AXIO_REPL_SANDBOX_GO_PROXY`, `AXIO_REPL_SANDBOX_GO_SUMDB` |
 | Tools | `AXIO_REPL_TOOLS` as a comma-separated list, `all`, or `none` |
@@ -343,6 +352,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--effort` | `default` | Effort: `none`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `--max-tokens` | transport default | Max output tokens |
 | `--max-iterations` | 1000 | Max agent iterations |
+| `--patch-line-framing` | `auto` | Legacy `patch_file` line framing: `auto`, `on`, or `off` |
 | `--debug` | off | Log raw request/response bodies |
 | `--no-debug` | off | Explicitly disable debug logging after config resolution |
 | `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |

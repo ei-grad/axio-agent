@@ -1,6 +1,6 @@
 """axio - public API."""
 
-from .agent import Agent
+from .agent import Agent, PatchLineFraming
 from .blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from .context import ContextStore, MemoryContextStore
 from .effort import EFFORT_LEVELS, EffortControl, EffortLevel, EffortMechanism, EffortRuntime, EffortState
@@ -31,6 +31,7 @@ from .types import CostSource, StopReason, Usage
 __all__ = [
     # core
     "Agent",
+    "PatchLineFraming",
     "Tool",
     "CONTEXT",
     "CURRENT_TOOL_CALL",

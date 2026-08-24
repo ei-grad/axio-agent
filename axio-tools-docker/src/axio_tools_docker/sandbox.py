@@ -235,11 +235,9 @@ async def read_file(
     """Read file contents. Returns text for text files, hex for binaries.
     Lines are 1-indexed: start_line=1 is the first line, end_line=3 includes
     line 3. Pass line_numbers=True to prefix each line as
-    ``L<number>│<source>`` — required before calling patch_file. Everything
-    after ``│`` is exact file content. For patch_file content, remove only
-    ``L<number>`` and retain ``│source`` as its required visible framing. Large
-    files are truncated to max_chars. Always read the file before editing it
-    with write_file or patch_file."""
+    ``L<number>│<source>``. Everything after ``│`` is exact file content. Large
+    files are truncated to max_chars. Always read the file before editing it with
+    write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     if max_chars < 0:
@@ -392,14 +390,10 @@ async def patch_file(
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
     to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. Frame every content line as ``│source``: put
-    exact whitespace after the visible sentinel, remove ``L<number>`` from
-    read_file output, and retain ``│source``. A framed literal source line that
-    begins with ``│`` is ``││source``. Entirely unframed content remains literal
-    for programmatic compatibility, but framed and unframed lines cannot be
-    mixed. Use this for surgical edits instead of rewriting the whole file with
-    write_file. The result reports a compact diff fragment with function context
-    when it can be inferred. Binary files cannot be patched."""
+    to get correct line numbers. Pass replacement content with its exact source
+    whitespace. Use this for surgical edits instead of rewriting the whole file
+    with write_file. The result reports a compact diff fragment with function
+    context when it can be inferred. Binary files cannot be patched."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
     try:

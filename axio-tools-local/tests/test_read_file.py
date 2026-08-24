@@ -91,12 +91,12 @@ class TestReadFileIndexed:
         result = await read(tmp_cwd, "f.py", line_numbers=True)
         assert "L2│    pass" in result
 
-    def test_tool_description_keeps_patch_framing_when_removing_line_numbers(self) -> None:
+    def test_tool_description_does_not_advertise_patch_line_framing(self) -> None:
         tool: Tool[Any] = Tool(name="read_file", handler=read_file)
 
-        assert "remove only" in tool.description
-        assert "``L<number>``" in tool.description
-        assert "retain ``│source``" in tool.description
+        assert "line_numbers=True" in tool.description
+        assert "retain ``│source``" not in tool.description
+        assert "required visible framing" not in tool.description
 
 
 class TestReadFileRange:

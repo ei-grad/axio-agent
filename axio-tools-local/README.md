@@ -113,21 +113,19 @@ with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
     name = f.name
 
 # Replace line 2
-asyncio.run(patch_file(path=name, from_line=2, to_line=2, content="│replaced\n"))
+asyncio.run(patch_file(path=name, from_line=2, to_line=2, content="replaced\n"))
 os.unlink(name)
 ```
 
 Parameters: `path: str`, `from_line: int`, `to_line: int`, `content: str`, `mode: int = 0o644`
 
-For model calls, frame every logical `content` line with one visible `│` at
-column zero, then put the exact source text after it. For example, `│value` writes
-at column zero, `│    value` writes four leading spaces, `│\tvalue` writes a tab,
-and `││value` writes a literal source line beginning with `│`. When copying
-`L<number>│source` from numbered `read_file` output, remove `L<number>` but retain
-`│source`. Empty framed lines are written as `│`. Mixed framed and unframed lines,
-and numbered `read_file` prefixes, are rejected without writing. Entirely
-unframed content remains byte-literal for compatibility with programmatic
-callers; an empty string still deletes the selected range.
+Pass `content` as exact source text. `Agent(patch_line_framing="auto")`, the
+default, uses a transport's general verbatim tool-argument protection when
+available and advertises the older visible-line protocol only as a fallback.
+Set it to `"on"` to force that fallback or `"off"` to suppress it. The handler
+continues accepting older fully framed `│source` input for compatibility;
+mixed framed and unframed lines and numbered `read_file` prefixes are rejected
+without writing. An empty string still deletes the selected range.
 
 ### Text encoding and edit reports
 

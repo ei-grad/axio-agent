@@ -24,10 +24,7 @@ MAX_DIFF_LINES = 400
 MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
 PATCH_CONTENT_DESCRIPTION = (
-    "Canonical model format: begin every logical line with exactly one │ sentinel, followed by the exact source "
-    "bytes for that line. Put indentation after │: │foo is column zero, │    foo has four spaces, and │\\tfoo "
-    "starts with a tab. When copying L<number>│source from read_file, remove L<number> but retain │source. Frame "
-    "every line, including empty lines (│); never mix framed and unframed lines."
+    "Replacement source text. Preserve exact whitespace within lines, including indentation, tabs, and empty lines."
 )
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
