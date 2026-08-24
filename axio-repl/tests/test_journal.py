@@ -601,6 +601,7 @@ async def test_default_one_shot_writes_complete_main_session_journal(
 
     await _run_stub_one_shot(monkeypatch, tmp_path)
 
+    assert not (state_home / "axio" / "history").exists()
     events_path = _only_events_path(state_home / "axio" / "sessions")
     records = _read_records(events_path)
     kinds = [record["kind"] for record in records]

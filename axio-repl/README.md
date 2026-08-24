@@ -50,8 +50,10 @@ The system prompt encodes hard-won lessons from watching models cut corners:
 - **Graceful interruption** — Escape cancels the captured agent turn without
   submitting the editor and preserves available partial output for context or
   recovery.
-- **Prompt history** — `prompt_toolkit` history is persisted across sessions in
-  `~/.axio_repl_history` after input has been claimed by an agent.
+- **Prompt history** — claimed input is persisted separately for each canonical
+  project root under `${XDG_STATE_HOME:-~/.local/state}/axio/history/`. Symlinked
+  paths to the same project share history. The former global
+  `~/.axio_repl_history` is left untouched and is not imported automatically.
 - **Terminal scrollback** — interactive output stays on the primary screen
   buffer; only the editor and status line are temporary redrawable UI.
 - **Session logs** — a private semantic JSONL records resumable conversation

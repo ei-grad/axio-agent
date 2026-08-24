@@ -42,6 +42,7 @@ from axio_repl import (
 )
 from axio_repl._coordinator import PendingInputCoordinator
 from axio_repl._deferred_tools import DeferredToolRegistry
+from axio_repl._history import project_history_path
 from axio_repl._journal import SEMANTIC_FILENAME, SessionJournal, read_journal
 from axio_repl._multiplexer import ActionMultiplexer, DisplayMode
 from axio_repl._recovery import materialize_recovery
@@ -456,9 +457,10 @@ async def test_interactive_input_is_arbitrated_while_a_turn_is_running(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del on_empty_eof, on_shutdown, recall_pending, theme
+        del history_path, on_empty_eof, on_shutdown, recall_pending, theme
         status_callbacks.append(cast(Callable[[], str], status))
         interrupt_callbacks.append(on_interrupt)
         return PromptSession(capture_target, reserve_sequence)
@@ -640,9 +642,11 @@ async def test_input_preempts_blocking_tool_and_actual_result_arrives_later(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, theme
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, theme
         status_callbacks.append(cast(Callable[[], str], status))
         return PromptSession()
 
@@ -859,9 +863,11 @@ async def test_queued_input_defers_unstarted_dispatch_then_reissued_shell_stream
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, status, theme
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, status, theme
         return PromptSession()
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
@@ -1065,9 +1071,11 @@ async def test_queued_input_keeps_a_completed_tool_result_in_the_next_provider_c
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, reserve_sequence, status, theme
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
+        del recall_pending, reserve_sequence, status, theme
         return PromptSession()
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
@@ -1286,9 +1294,10 @@ async def test_queued_input_is_injected_before_provider_after_any_tool_boundary(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
         return PromptSession(reserve_sequence)
 
     async def build_tools(*args: object, **kwargs: object) -> tuple[list[Tool[object]], str, Path, str]:
@@ -1536,9 +1545,10 @@ async def test_background_child_injects_targeted_input_at_its_next_provider_boun
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown, recall_pending, status, theme
         return PromptSession(reserve_sequence)
 
     spawn_tool = next(tool for tool in TOOLS if tool.name == "spawn_agent")
@@ -1748,9 +1758,10 @@ async def test_escape_cancels_an_active_tool_without_deferring_it(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_shutdown, recall_pending, reserve_sequence, status, theme
+        del capture_target, history_path, on_empty_eof, on_shutdown, recall_pending, reserve_sequence, status, theme
         interrupt_callbacks.append(on_interrupt)
         return PromptSession()
 
@@ -1967,9 +1978,10 @@ async def test_double_eof_drains_active_and_pending_turns_before_shutdown(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
-        del capture_target, on_empty_eof, on_interrupt, on_shutdown
+        del capture_target, history_path, on_empty_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
         return prompt_session
 
@@ -2110,6 +2122,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
             pass
 
     prompt_session = PromptSession()
+    captured_history_path: Path | None = None
 
     def make_prompt_session(
         status: object,
@@ -2120,13 +2133,19 @@ async def test_resume_copies_context_and_restores_editor_before_input(
         on_empty_eof: Callable[[float], bool],
         capture_target: Callable[[], str],
         reserve_sequence: Callable[[], int],
+        history_path: Path,
         theme: object,
     ) -> PromptSession:
+        nonlocal captured_history_path
+        captured_history_path = history_path
         del capture_target, on_empty_eof, on_interrupt, on_shutdown
         del recall_pending, reserve_sequence, status, theme
         return prompt_session
 
     resumed_root = tmp_path / "resumed"
+    current_project = tmp_path / "current-project"
+    current_project.mkdir()
+    monkeypatch.chdir(current_project)
     monkeypatch.setenv("AXIO_PEER_DIR", str(tmp_path / "peers"))
     monkeypatch.setattr(axio_repl, "_select_transport", lambda _name: (IdleTransport, ""))
     monkeypatch.setattr(axio_repl._panel, "make_session", make_prompt_session)
@@ -2148,6 +2167,7 @@ async def test_resume_copies_context_and_restores_editor_before_input(
     await asyncio.wait_for(main(), timeout=2)
 
     assert prompt_calls == 1
+    assert captured_history_path == project_history_path(current_project)
     resumed_paths = list(resumed_root.rglob(SEMANTIC_FILENAME))
     assert len(resumed_paths) == 1
     records = read_journal(resumed_paths[0]).records

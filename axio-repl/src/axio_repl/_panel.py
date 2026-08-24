@@ -27,12 +27,11 @@ from axio_tools_agents.peers import background_agent_state, local_background_age
 from prompt_toolkit.formatted_text import FormattedText
 
 from axio_repl import _replay
+from axio_repl._history import PrivateFileHistory
 from axio_repl._multiplexer import sanitize_identity_component, sanitize_terminal_text
 from axio_repl._powerline import prompt_badge, submitted_prompt_badge
 from axio_repl._prompt_terminal import PromptToolkitInlineOutput
 from axio_repl._theme import DEFAULT_THEME, TerminalTheme
-
-HISTORY_PATH = Path.home() / ".axio_repl_history"
 
 SEPARATOR = " │ "
 MAX_PANEL_MESSAGE_LINES = 8
@@ -361,6 +360,7 @@ def make_session(
     accepted_at_provider: Callable[[], datetime] | None = None,
     replay: _replay.ReplayLog | None = None,
     *,
+    history_path: Path | None = None,
     theme: TerminalTheme = DEFAULT_THEME,
 ) -> Any:
     """A prompt session with history, a status line, and explicit controls.
@@ -375,20 +375,21 @@ def make_session(
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application.current import get_app_session
     from prompt_toolkit.filters import to_filter
-    from prompt_toolkit.history import FileHistory, History
+    from prompt_toolkit.history import History
     from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, Window
     from prompt_toolkit.styles import Style
 
     class ClaimedHistory(History):
-        def __init__(self, filename: Path) -> None:
+        def __init__(self, filename: Path | None) -> None:
             super().__init__()
-            self._stored = FileHistory(str(filename))
+            self._stored = PrivateFileHistory(filename) if filename is not None else None
 
         def load_history_strings(self) -> Iterable[str]:
-            return self._stored.load_history_strings()
+            return () if self._stored is None else self._stored.load_history_strings()
 
         def store_string(self, string: str) -> None:
-            self._stored.store_string(string)
+            if self._stored is not None:
+                self._stored.store_string(string)
 
         def append_string(self, string: str) -> None:
             del string
@@ -401,7 +402,7 @@ def make_session(
     async def no_pending_input() -> str | None:
         return None
 
-    history = ClaimedHistory(HISTORY_PATH)
+    history = ClaimedHistory(history_path)
     app_session = get_app_session()
     session: Any = PromptSession(
         history=history,

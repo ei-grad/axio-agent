@@ -5,14 +5,20 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def repl_history_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Keep prompt-toolkit history writes inside each test's temporary directory."""
-    from axio_repl import _panel
+@pytest.fixture
+def repl_history_path(tmp_path: Path) -> Path:
+    """Return an explicit persistent history path for prompt behavior tests."""
 
-    history_path = tmp_path / "history"
-    monkeypatch.setattr(_panel, "HISTORY_PATH", history_path)
-    return history_path
+    return tmp_path / "history"
+
+
+@pytest.fixture(autouse=True)
+def isolated_repl_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Prevent main() and child processes from writing to the developer's state."""
+
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+    return state_dir
 
 
 @pytest.fixture(autouse=True)

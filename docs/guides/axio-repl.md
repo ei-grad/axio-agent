@@ -704,6 +704,13 @@ that edited text with Enter creates one new pending message. If no pending input
 exists, Up falls back to normal prompt history or movement within a multi-line
 editor value.
 
+Claimed prompt history is scoped to the resolved project root. It is stored in
+`${XDG_STATE_HOME:-~/.local/state}/axio/history/` using a sanitized project name
+and a digest of the canonical absolute root, so symlink aliases share history
+while unrelated projects with the same basename do not. Files are not written
+inside the project. The former global `~/.axio_repl_history` is neither read nor
+migrated automatically and remains available for manual inspection.
+
 Press **Escape** to interrupt the turn that was active when the keypress was
 accepted. Escape never submits, clears, or changes the editor. It claims every
 user message previously submitted with Enter and delivers each as a separate

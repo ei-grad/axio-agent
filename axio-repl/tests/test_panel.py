@@ -853,7 +853,9 @@ async def test_escape_interrupts_without_submitting_or_changing_editor(
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", on_interrupt=interrupt)
+            session: Any = _panel.make_session(
+                lambda: "status", on_interrupt=interrupt, history_path=repl_history_path
+            )
 
             pipe.send_text("sent with enter\r")
             assert await session.prompt_async(_panel.PROMPT_MESSAGE) == "sent with enter"
@@ -935,7 +937,9 @@ async def test_up_recalls_all_pending_messages_as_one_editor_value(repl_history_
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", recall_pending=recall_pending)
+            session: Any = _panel.make_session(
+                lambda: "status", recall_pending=recall_pending, history_path=repl_history_path
+            )
 
             prompt = asyncio.create_task(session.prompt_async(_panel.PROMPT_MESSAGE))
             pipe.send_text("\x1b[A")
@@ -962,7 +966,9 @@ async def test_up_falls_back_to_prompt_history_when_pending_is_empty(repl_histor
 
     with create_pipe_input() as pipe:
         with create_app_session(input=pipe, output=DummyOutput()):
-            session: Any = _panel.make_session(lambda: "status", recall_pending=no_pending)
+            session: Any = _panel.make_session(
+                lambda: "status", recall_pending=no_pending, history_path=repl_history_path
+            )
 
             pipe.send_text("history item\r")
             assert await session.prompt_async(_panel.PROMPT_MESSAGE) == "history item"
@@ -976,6 +982,31 @@ async def test_up_falls_back_to_prompt_history_when_pending_is_empty(repl_histor
             _panel.commit_history(session, ("history item edited",))
 
     assert "history item edited" in repl_history_path.read_text()
+
+
+async def test_history_commit_replaces_surrogateescaped_terminal_bytes(repl_history_path: Path) -> None:
+    from typing import Any
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from axio_repl._history import PrivateFileHistory
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            session: Any = _panel.make_session(lambda: "status", history_path=repl_history_path)
+
+            pipe.send_bytes(b"bad-\xff\r")
+            malformed = await session.prompt_async(_panel.PROMPT_MESSAGE)
+            assert malformed == "bad-\udcff"
+            _panel.commit_history(session, (malformed,))
+
+            pipe.send_text("still usable\r")
+            assert await session.prompt_async(_panel.PROMPT_MESSAGE) == "still usable"
+            _panel.commit_history(session, ("still usable",))
+
+    assert list(PrivateFileHistory(repl_history_path).load_history_strings()) == ["still usable", "bad-?"]
 
 
 async def test_unclaimed_enter_is_not_exposed_by_persistent_history() -> None:

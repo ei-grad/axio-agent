@@ -129,7 +129,7 @@ from axio_tools_local.read_file import read_file
 from axio_tools_local.shell import shell
 from axio_tools_local.write_file import write_file
 
-from axio_repl import _agent_config, _journal, _panel, _sandbox, _search, _version
+from axio_repl import _agent_config, _history, _journal, _panel, _sandbox, _search, _version
 from axio_repl._coordinator import (
     ClaimBatch,
     ContextArrival,
@@ -3966,6 +3966,7 @@ async def main() -> None:
             on_empty_eof=_handle_empty_eof,
             capture_target=lambda: renderer.focused_agent,
             reserve_sequence=event_hub.reserve_sequence,
+            history_path=_history.project_history_path(root),
             **prompt_session_options,
         )
         setattr(prompt_session, "_axio_terminal_reset", theme.reset)

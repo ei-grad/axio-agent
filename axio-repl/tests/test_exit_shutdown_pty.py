@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from axio_repl._history import project_history_path
 from axio_repl._journal import SEMANTIC_FILENAME, read_journal
 
 
@@ -26,6 +27,8 @@ class _Harness:
     finalized: Path
     prompt_count: Path
     journal_root: Path
+    project_history: Path
+    legacy_history: Path
 
 
 def _spawn_harness(tmp_path: Path) -> _Harness:
@@ -38,6 +41,12 @@ def _spawn_harness(tmp_path: Path) -> _Harness:
     finalized = tmp_path / "transport-finalized"
     prompt_count = tmp_path / "prompt-count"
     journal_root = tmp_path / "journals"
+    state_home = tmp_path / "state"
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy_history = fake_home / ".axio_repl_history"
+    legacy_history.write_text("sentinel legacy history\n")
+    project_history = project_history_path(tmp_path, state_home=state_home)
     harness_script = Path(__file__).with_name("_exit_harness.py")
     environment = os.environ.copy()
     environment.pop("AXIO_REPL_AGENT", None)
@@ -52,6 +61,8 @@ def _spawn_harness(tmp_path: Path) -> _Harness:
             "AXIO_EXIT_HARNESS_CONFIG_ROOT": str(tmp_path / "config"),
             "AXIO_EXIT_HARNESS_PEER_ROOT": str(tmp_path / "peers"),
             "AXIO_EXIT_HARNESS_PROMPT_COUNT": str(prompt_count),
+            "HOME": str(fake_home),
+            "XDG_STATE_HOME": str(state_home),
         }
     )
     pid = os.fork()
@@ -79,6 +90,8 @@ def _spawn_harness(tmp_path: Path) -> _Harness:
         finalized=finalized,
         prompt_count=prompt_count,
         journal_root=journal_root,
+        project_history=project_history,
+        legacy_history=legacy_history,
     )
 
 
@@ -147,6 +160,12 @@ def _assert_journal_shutdown(harness: _Harness) -> None:
     assert not any("Draining active/pending work" in repr(record) for record in records)
 
 
+def _assert_history_isolated(harness: _Harness) -> None:
+    assert harness.legacy_history.read_text() == "sentinel legacy history\n"
+    assert "run forever" not in harness.legacy_history.read_text()
+    assert "run forever" in harness.project_history.read_text()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX controlling-terminal test")
 @pytest.mark.parametrize("interrupt", ["signal", "terminal"], ids=("external-sigint", "raw-ctrl-c"))
 def test_sigint_after_double_eof_cancels_drain_and_restores_terminal(tmp_path: Path, interrupt: str) -> None:
@@ -184,6 +203,7 @@ def test_sigint_after_double_eof_cancels_drain_and_restores_terminal(tmp_path: P
         assert harness.finalized.exists()
         assert termios.tcgetattr(harness.slave_fd) == harness.original_termios
         _assert_journal_shutdown(harness)
+        _assert_history_isolated(harness)
     finally:
         if not waited:
             waited_pid, _ = os.waitpid(harness.pid, os.WNOHANG)
