@@ -10,6 +10,7 @@ import pytest
 
 from axio.events import ToolFieldDelta, ToolFieldEnd, ToolFieldStart
 from axio.tool_args import ToolArgStream, ToolFieldEvent
+from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -159,6 +160,80 @@ class TestRaw:
         # Braces/brackets inside strings within raw values must not confuse depth
         events = feed('{"x": {"k": "a}b"}}')
         assert events == [S("x"), D("x", '{"k": "a}b"}'), E("x")]
+
+
+class TestEncodedStrings:
+    def test_top_level_frame_streams_original_text_without_protocol_key(self) -> None:
+        content = "          first\n\tsecond          "
+        payload = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: content}})
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events: list[ToolFieldEvent] = []
+        for char in payload:
+            events.extend(stream.feed(char))
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert text == content
+        assert TOOL_ARGUMENT_FRAME_KEY not in text
+        assert any(isinstance(event, ToolFieldEnd) for event in events)
+
+    def test_nested_frames_are_hidden_from_display_json(self) -> None:
+        value = {
+            "path": {TOOL_ARGUMENT_FRAME_KEY: "  nested  "},
+            "items": [{TOOL_ARGUMENT_FRAME_KEY: "\titem"}, 2],
+        }
+        payload = json.dumps({"options": value})
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events = stream.feed(payload)
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert TOOL_ARGUMENT_FRAME_KEY not in text
+        assert json.loads(text) == {"path": "  nested  ", "items": ["\titem", 2]}
+
+    def test_nested_frames_split_across_chunks_are_hidden(self) -> None:
+        value = [{TOOL_ARGUMENT_FRAME_KEY: "  nested  "}]
+        payload = json.dumps({"options": value})
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events: list[ToolFieldEvent] = []
+        for char in payload:
+            events.extend(stream.feed(char))
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert TOOL_ARGUMENT_FRAME_KEY not in text
+        assert json.loads(text) == ["  nested  "]
+
+    def test_literal_frame_key_property_is_not_mistaken_for_outer_frame(self) -> None:
+        value = {
+            TOOL_ARGUMENT_FRAME_KEY: {TOOL_ARGUMENT_FRAME_KEY: "  literal  "},
+        }
+        payload = json.dumps({"metadata": value})
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events = stream.feed(payload)
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert text == "[invalid encoded value]"
+        assert TOOL_ARGUMENT_FRAME_KEY not in text
+
+    def test_malformed_frame_is_hidden_from_display(self) -> None:
+        payload = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: 7}})
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events = stream.feed(payload)
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert text == "[invalid encoded value]"
+        assert TOOL_ARGUMENT_FRAME_KEY not in text
+
+    def test_nested_lone_surrogate_is_replaced_before_display(self) -> None:
+        payload = r'{"options":{"value":"\uD800"}}'
+        stream = ToolArgStream("c1", argument_codec=TOOL_ARGUMENT_CODEC)
+        events = stream.feed(payload)
+
+        text = "".join(event.text for event in events if isinstance(event, ToolFieldDelta))
+        assert json.loads(text) == {"value": "\ufffd"}
+        text.encode("utf-8", errors="strict")
+
+    def test_codec_none_keeps_ordinary_object_preview_unchanged(self) -> None:
+        payload = '{"options": {"content": "value"}}'
+        assert feed(payload) == [S("options"), D("options", '{"content": "value"}'), E("options")]
 
 
 # ── Escape sequences ───────────────────────────────────────────────────────────

@@ -115,6 +115,7 @@ class _TurnCheckpoint:
     parent_tool_use_id: str | None
     text: list[str]
     tool_names: dict[str, str]
+    tool_argument_codecs: dict[str, str]
     tool_arguments: dict[str, list[str]]
     tool_fields: dict[str, dict[str, list[str]]]
     tool_output: dict[str, list[str]]
@@ -123,7 +124,14 @@ class _TurnCheckpoint:
 
     @property
     def dirty(self) -> bool:
-        return bool(self.text or self.tool_names or self.tool_arguments or self.tool_fields or self.tool_output)
+        return bool(
+            self.text
+            or self.tool_names
+            or self.tool_argument_codecs
+            or self.tool_arguments
+            or self.tool_fields
+            or self.tool_output
+        )
 
 
 def default_journal_root(
@@ -605,6 +613,7 @@ class SessionJournal:
                 parent_tool_use_id=parent_tool_use_id,
                 text=[],
                 tool_names={},
+                tool_argument_codecs={},
                 tool_arguments={},
                 tool_fields={},
                 tool_output={},
@@ -615,6 +624,8 @@ class SessionJournal:
             checkpoint.pending_chars += len(event.delta)
         elif isinstance(event, ToolUseStart):
             checkpoint.tool_names[event.tool_use_id] = event.name
+            if event.argument_codec is not None:
+                checkpoint.tool_argument_codecs[event.tool_use_id] = event.argument_codec
             checkpoint.tool_arguments.setdefault(event.tool_use_id, [])
             checkpoint.pending_chars += len(event.tool_use_id) + len(event.name)
         elif isinstance(event, ToolInputDelta):
@@ -770,6 +781,7 @@ class SessionJournal:
         payload = {
             "text": "".join(checkpoint.text),
             "tool_names": checkpoint.tool_names,
+            "tool_argument_codecs": checkpoint.tool_argument_codecs,
             "tool_arguments": {
                 tool_use_id: "".join(parts) for tool_use_id, parts in checkpoint.tool_arguments.items()
             },
@@ -792,6 +804,7 @@ class SessionJournal:
         if accepted:
             checkpoint.text.clear()
             checkpoint.tool_names = {}
+            checkpoint.tool_argument_codecs = {}
             checkpoint.tool_arguments = {}
             checkpoint.tool_fields = {}
             checkpoint.tool_output = {}

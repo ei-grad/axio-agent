@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import io
+import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,6 +27,7 @@ from axio.events import (
 )
 from axio.messages import Message
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 from axio_tools_agents.peers import PeerMessage, run_agent, set_run_agent_factory, set_session_event_hub
 from axio_tools_agents.runtime import (
@@ -957,6 +959,34 @@ async def test_character_chunks_preserve_json_escapes_unicode_and_block_indentat
     assert output == '\n  content:\nalpha 😀\n  beta\t"q"\\tail\n'
     assert output.count("content:") == 1
     assert "(continued)" not in output
+
+
+async def test_encoded_string_chunks_stream_without_exposing_protocol_frame(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    renderer.set_input_active(True)
+    content = "          alpha\n\tbeta          "
+    encoded = json.dumps({"content": {TOOL_ARGUMENT_FRAME_KEY: content}})
+
+    await renderer.render(
+        "main",
+        ToolUseStart(
+            index=0,
+            tool_use_id="call",
+            name="write_file",
+            argument_codec=TOOL_ARGUMENT_CODEC,
+        ),
+    )
+    capsys.readouterr()
+    for character in encoded:
+        await renderer.render("main", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+
+    output = sanitize_terminal_text(capsys.readouterr().out)
+    assert "content:" in output
+    assert "alpha" in output
+    assert "beta" in output
+    assert TOOL_ARGUMENT_FRAME_KEY not in output
 
 
 async def test_strict_utf8_renderer_recovers_malformed_unicode_in_inline_block_and_error_boundaries() -> None:

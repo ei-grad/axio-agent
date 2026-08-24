@@ -13,6 +13,7 @@ from aiohttp import web
 from axio.events import IterationEnd, StreamEvent, TextDelta
 from axio.exceptions import StreamError
 from axio.models import Capability, ModelRegistry, ModelSpec
+from axio.tool_codec import TOOL_ARGUMENT_CODEC
 from axio.types import StopReason, Usage
 
 from axio_transport_openai.nebius import NebiusTransport
@@ -20,6 +21,10 @@ from axio_transport_openai.nebius import NebiusTransport
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
+
+
+def test_tool_argument_codec_defaults_on() -> None:
+    assert NebiusTransport().tool_argument_codec == TOOL_ARGUMENT_CODEC
 
 
 def _sse_chunk(data: dict[str, Any]) -> str:

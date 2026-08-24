@@ -26,6 +26,7 @@ class ToolUseStart:
     index: int
     tool_use_id: ToolCallID
     name: ToolName
+    argument_codec: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

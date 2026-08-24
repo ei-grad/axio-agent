@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -14,6 +15,7 @@ from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, To
 from axio.messages import InputProvenance, Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentStarted,
@@ -302,6 +304,26 @@ async def test_agent_actions_command_reports_discarded_incomplete_payload(
     output = capsys.readouterr().out
     assert "discarded 0 queued frame(s)" in output
     assert f"({retained} bytes)" in output
+
+
+def test_agent_action_tool_call_hides_encoded_string_frames() -> None:
+    mux = ActionMultiplexer(DisplayMode.ALL_ACTIONS)
+    mux.observe(
+        "child",
+        ToolUseStart(
+            index=0,
+            tool_use_id="call",
+            name="send_message",
+            argument_codec=TOOL_ARGUMENT_CODEC,
+        ),
+    )
+    wire = json.dumps({"message": {TOOL_ARGUMENT_FRAME_KEY: "  child text  "}})
+    for character in wire:
+        mux.observe("child", ToolInputDelta(index=0, tool_use_id="call", partial_json=character))
+
+    output = "".join(mux.drain())
+    assert "child text" in output
+    assert TOOL_ARGUMENT_FRAME_KEY not in output
 
 
 async def test_pending_prompt_count_includes_claimed_and_buffered_prompts() -> None:

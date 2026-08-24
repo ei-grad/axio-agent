@@ -11,8 +11,10 @@ from typing import Any
 import aiohttp
 import pytest
 from aiohttp import web
+from axio.agent import Agent
 from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
-from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
+from axio.context import MemoryContextStore
+from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.exceptions import StreamError
 from axio.messages import (
     INPUT_PROVENANCE_FOOTER,
@@ -22,7 +24,9 @@ from axio.messages import (
     input_provenance_header,
 )
 from axio.models import Capability, ModelRegistry, ModelSpec
+from axio.permission import PermissionGuard
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC, TOOL_ARGUMENT_FRAME_KEY
 from axio.types import StopReason, Usage
 
 from axio_transport_openai import OPENAI_MODELS, ChatCompletionsTransport, ThinkTagParser
@@ -34,6 +38,14 @@ from axio_transport_openai import OPENAI_MODELS, ChatCompletionsTransport, Think
 
 async def get_weather(location: str, units: str = "celsius") -> str:
     return f"Weather in {location}: 22{units[0]}"
+
+
+async def verbatim_probe(content: str, nested: list[str]) -> str:
+    return content + "".join(nested)
+
+
+async def untyped_probe(options: dict[str, Any]) -> str:
+    return json.dumps(options)
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +355,168 @@ async def test_tool_call_streaming_preserves_framed_patch_sentinels_and_whitespa
     deltas = [event for event in events if isinstance(event, ToolInputDelta)]
     assert "".join(event.partial_json for event in deltas) == args
     assert json.loads("".join(event.partial_json for event in deltas))["content"] == content
+
+
+async def test_chat_codec_advertises_structural_frames_and_marks_stream(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
+    server, _ = fake_server
+    transport.tool_argument_codec = TOOL_ARGUMENT_CODEC
+    tool: Tool[Any] = Tool(name="verbatim_probe", handler=verbatim_probe)
+    expected = "          first\n\tsecond          "
+    arguments = {
+        "content": {TOOL_ARGUMENT_FRAME_KEY: expected},
+        "nested": [{TOOL_ARGUMENT_FRAME_KEY: ""}, {TOOL_ARGUMENT_FRAME_KEY: "  item  "}],
+    }
+    server.responses.append(_tool_call_chunks("call_codec", "verbatim_probe", json.dumps(arguments)))
+
+    payload = transport.build_payload([], [tool], "")
+    content_schema = payload["tools"][0]["function"]["parameters"]["properties"]["content"]
+    nested_item = payload["tools"][0]["function"]["parameters"]["properties"]["nested"]["items"]
+    assert content_schema["required"] == [TOOL_ARGUMENT_FRAME_KEY]
+    assert content_schema["properties"][TOOL_ARGUMENT_FRAME_KEY] == {"type": "string"}
+    assert nested_item["required"] == [TOOL_ARGUMENT_FRAME_KEY]
+
+    events = await _collect(transport.stream([], [tool], ""))
+    start = next(event for event in events if isinstance(event, ToolUseStart))
+    assert start.argument_codec == TOOL_ARGUMENT_CODEC
+    raw_arguments = "".join(event.partial_json for event in events if isinstance(event, ToolInputDelta))
+    assert json.loads(raw_arguments) == arguments
+
+
+async def test_stream_captures_argument_codec_at_request_boundary(
+    fake_server: tuple[FakeOpenAIServer, str],
+) -> None:
+    server, base_url = fake_server
+    server.responses.append(_tool_call_chunks("call_codec", "verbatim_probe", "{}"))
+
+    class SwitchAfterPayloadTransport(ChatCompletionsTransport):
+        def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
+            payload = super().build_payload(messages, tools, system)
+            self.tool_argument_codec = None
+            return payload
+
+    async with aiohttp.ClientSession() as session:
+        transport = SwitchAfterPayloadTransport(
+            base_url=base_url,
+            api_key="test-key",
+            session=session,
+            tool_argument_codec=TOOL_ARGUMENT_CODEC,
+        )
+        events = await _collect(transport.stream([], [], ""))
+
+    start = next(event for event in events if isinstance(event, ToolUseStart))
+    assert start.argument_codec == TOOL_ARGUMENT_CODEC
+
+
+def test_active_transport_reencodes_canonical_tool_history_per_request() -> None:
+    transport = ChatCompletionsTransport(
+        model=OPENAI_MODELS["gpt-4.1-mini"],
+        tool_argument_codec=TOOL_ARGUMENT_CODEC,
+    )
+    message = Message(
+        role="assistant",
+        content=[
+            ToolUseBlock(
+                id="call_history",
+                name="verbatim_probe",
+                input={"content": "  history  ", "nested": ["\titem"]},
+            )
+        ],
+    )
+
+    tool: Tool[Any] = Tool(name="verbatim_probe", handler=verbatim_probe)
+    encoded_payload = transport.build_payload([message], [tool], "")
+    transport.tool_argument_codec = None
+    plain_payload = transport.build_payload([message], [tool], "")
+    transport.tool_argument_codec = TOOL_ARGUMENT_CODEC
+    encoded_again_payload = transport.build_payload([message], [tool], "")
+    wire = json.loads(encoded_payload["messages"][0]["tool_calls"][0]["function"]["arguments"])
+    plain = json.loads(plain_payload["messages"][0]["tool_calls"][0]["function"]["arguments"])
+    wire_again = json.loads(encoded_again_payload["messages"][0]["tool_calls"][0]["function"]["arguments"])
+
+    assert wire == {
+        "content": {TOOL_ARGUMENT_FRAME_KEY: "  history  "},
+        "nested": [{TOOL_ARGUMENT_FRAME_KEY: "\titem"}],
+    }
+    assert plain == {"content": "  history  ", "nested": ["\titem"]}
+    assert wire_again == wire
+    block = message.content[0]
+    assert isinstance(block, ToolUseBlock)
+    assert block.input == plain
+
+
+def test_history_encoding_follows_active_tool_schema_and_leaves_unknown_leaves_canonical() -> None:
+    transport = ChatCompletionsTransport(
+        model=OPENAI_MODELS["gpt-4.1-mini"],
+        tool_argument_codec=TOOL_ARGUMENT_CODEC,
+    )
+    message = Message(
+        role="assistant",
+        content=[
+            ToolUseBlock(
+                id="call_history",
+                name="untyped_probe",
+                input={"options": {"provider_owned": "  unknown  "}},
+            )
+        ],
+    )
+    tool: Tool[Any] = Tool(name="untyped_probe", handler=untyped_probe)
+
+    with_schema = transport.build_payload([message], [tool], "")
+    without_active_tool = transport.build_payload([message], [], "")
+    with_schema_arguments = json.loads(with_schema["messages"][0]["tool_calls"][0]["function"]["arguments"])
+    without_tool_arguments = json.loads(without_active_tool["messages"][0]["tool_calls"][0]["function"]["arguments"])
+
+    assert with_schema_arguments == {"options": {"provider_owned": "  unknown  "}}
+    assert without_tool_arguments == with_schema_arguments
+
+
+async def test_raw_codec_stream_reaches_guard_handler_and_history_canonical(
+    fake_server: tuple[FakeOpenAIServer, str], transport: ChatCompletionsTransport
+) -> None:
+    server, _ = fake_server
+    transport.tool_argument_codec = TOOL_ARGUMENT_CODEC
+    expected = "          first\n\tsecond          "
+    wire = {
+        "content": {TOOL_ARGUMENT_FRAME_KEY: expected},
+        "nested": [{TOOL_ARGUMENT_FRAME_KEY: ""}, {TOOL_ARGUMENT_FRAME_KEY: "  item  "}],
+    }
+    server.responses.extend(
+        [
+            _tool_call_chunks("call_codec_agent", "verbatim_probe", json.dumps(wire)),
+            _text_chunks("done"),
+        ]
+    )
+    observed: list[tuple[str, str, list[str]]] = []
+
+    class CaptureGuard(PermissionGuard):
+        async def check(self, tool: Tool[Any], **kwargs: Any) -> dict[str, Any]:
+            observed.append(("guard", kwargs["content"], kwargs["nested"]))
+            return kwargs
+
+    async def capture(content: str, nested: list[str]) -> str:
+        observed.append(("handler", content, nested))
+        return "ok"
+
+    tool: Tool[Any] = Tool(name="verbatim_probe", handler=capture, guards=(CaptureGuard(),))
+    context = MemoryContextStore()
+    agent = Agent(system="probe", transport=transport, tools=[tool])
+
+    events = [event async for event in agent.run_stream("go", context)]
+
+    assert observed == [
+        ("guard", expected, ["", "  item  "]),
+        ("handler", expected, ["", "  item  "]),
+    ]
+    result = next(event for event in events if isinstance(event, ToolResult))
+    assert result.input == {"content": expected, "nested": ["", "  item  "]}
+    history = await context.get_history()
+    stored_call = next(block for message in history for block in message.content if isinstance(block, ToolUseBlock))
+    assert stored_call.input == {"content": expected, "nested": ["", "  item  "]}
+
+    second_request_call = server.received_payloads[1]["messages"][2]["tool_calls"][0]
+    assert json.loads(second_request_call["function"]["arguments"]) == wire
 
 
 async def test_chat_completions_never_routes_to_responses(
@@ -1593,6 +1767,14 @@ def test_extra_params_to_dict_round_trip() -> None:
     t2 = ChatCompletionsTransport.from_dict(d)
     assert isinstance(t2.extra_params, MappingProxyType)
     assert t2.extra_params["enable_thinking"] is True
+
+
+def test_tool_argument_codec_to_dict_round_trip() -> None:
+    transport = ChatCompletionsTransport(api_key="k", tool_argument_codec=TOOL_ARGUMENT_CODEC)
+
+    restored = ChatCompletionsTransport.from_dict(transport.to_dict())
+
+    assert restored.tool_argument_codec == TOOL_ARGUMENT_CODEC
 
 
 def test_extra_params_empty_omitted_from_dict() -> None:

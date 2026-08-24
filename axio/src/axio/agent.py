@@ -39,6 +39,7 @@ from .models import Capability
 from .selector import ToolSelector
 from .stream import AgentStream
 from .tool import BACKGROUND_PARAM, CURRENT_TOOL_CALL, Tool, ToolCallContext
+from .tool_codec import ToolArgumentCodecError, decode_framed_values, decode_tool_arguments
 from .transport import CompletionTransport
 from .types import StopReason, Usage
 
@@ -403,20 +404,19 @@ class Agent:
             input=block.input if block else {},
         )
 
-    @staticmethod
     def _finalize_pending_tools(
+        self,
         pending: dict[str, dict[str, Any]],
         usage: Usage,
-    ) -> tuple[list[ToolUseBlock], set[str]]:
+    ) -> tuple[list[ToolUseBlock], dict[str, str]]:
         """Convert streamed tool-call fragments into ToolUseBlocks.
 
-        Returns (blocks, malformed_ids).  Malformed IDs arise when
-        max_tokens truncates the response mid-tool-call, producing
-        incomplete JSON (expected with eager_input_streaming).  The
-        caller is responsible for not executing malformed tools.
+        Returns (blocks, argument_errors). Errors include truncated JSON and
+        provider arguments that do not satisfy their advertised wire codec.
+        The caller is responsible for not executing those calls.
         """
         blocks: list[ToolUseBlock] = []
-        malformed: set[str] = set()
+        argument_errors: dict[str, str] = {}
         for tid, info in pending.items():
             raw = "".join(info["json_parts"])
             if not raw:
@@ -438,10 +438,28 @@ class Agent:
                         exc,
                         raw,
                     )
-                    malformed.add(tid)
+                    argument_errors[tid] = (
+                        f"Malformed JSON arguments for tool {info['name']}. Raw input could not be parsed; "
+                        "retry the tool call with valid JSON."
+                    )
+                    inp = {}
+            codec = info.get("argument_codec")
+            if codec is not None and tid not in argument_errors:
+                try:
+                    tool = self._find_tool(info["name"])
+                    if tool is None:
+                        inp = decode_framed_values(inp, codec)
+                    else:
+                        inp = decode_tool_arguments(inp, tool.input_schema, codec)
+                except ToolArgumentCodecError as exc:
+                    logger.info("Tool %s (id=%s) has invalid encoded arguments: %s", info["name"], tid, exc)
+                    argument_errors[tid] = (
+                        f"Invalid encoded arguments for tool {info['name']}: {exc}. "
+                        "Retry using the exact framing advertised in the tool schema."
+                    )
                     inp = {}
             blocks.append(ToolUseBlock(id=tid, name=info["name"], input=inp))
-        return blocks, malformed
+        return blocks, argument_errors
 
     async def _select_tools(self, history: list[Message], tools: list[Tool[Any]]) -> Iterable[Tool[Any]]:
         if not tools:
@@ -499,7 +517,7 @@ class Agent:
                     content: list[TextBlock | ImageBlock | AudioBlock | VideoBlock | ToolUseBlock] = []
                     pending: dict[str, dict[str, Any]] = {}
                     stop_reason = StopReason.end_turn
-                    malformed: set[str] = set()
+                    argument_errors: dict[str, str] = {}
                     repetition_detected = False
                     text_rep_detector = _RepetitionDetector()
                     reasoning_rep_detector = _RepetitionDetector()
@@ -529,13 +547,17 @@ class Agent:
                                         content.append(ImageBlock(media_type=mt, data=data))
                                     case VideoOutput(data=data, media_type=mt):
                                         content.append(VideoBlock(media_type=mt, data=data))
-                                    case ToolUseStart(tool_use_id=tid, name=name):
-                                        pending[tid] = {"name": name, "json_parts": []}
+                                    case ToolUseStart(tool_use_id=tid, name=name, argument_codec=codec):
+                                        pending[tid] = {
+                                            "name": name,
+                                            "json_parts": [],
+                                            "argument_codec": codec,
+                                        }
                                     case ToolInputDelta(tool_use_id=tid, partial_json=pj):
                                         if tid in pending:
                                             pending[tid]["json_parts"].append(pj)
                                     case IterationEnd(usage=usage, stop_reason=sr):
-                                        blocks, malformed = self._finalize_pending_tools(pending, usage)
+                                        blocks, argument_errors = self._finalize_pending_tools(pending, usage)
                                         content.extend(blocks)
                                         pending.clear()
                                         total_usage = total_usage + usage
@@ -576,19 +598,15 @@ class Agent:
                         # Dispatch tools BEFORE appending to context - cancellation
                         # between here and the two appends below cannot leave orphan
                         # ToolUseBlocks in the persistent context store.
-                        valid = [b for b in tool_blocks if b.id not in malformed]
+                        valid = [b for b in tool_blocks if b.id not in argument_errors]
                         error_results = [
                             ToolResultBlock(
                                 tool_use_id=b.id,
-                                content=(
-                                    f"Malformed JSON arguments for tool {b.name}."
-                                    f" Raw input could not be parsed. Please retry the tool call"
-                                    f" with valid JSON arguments."
-                                ),
+                                content=argument_errors[b.id],
                                 is_error=True,
                             )
                             for b in tool_blocks
-                            if b.id in malformed
+                            if b.id in argument_errors
                         ]
 
                         partial_output: dict[str, list[tuple[float, str, str]]] = {}
@@ -679,7 +697,7 @@ class Agent:
                                         interrupted_results.append(completed)
                                         visible_results.append((b, completed))
                                         continue
-                                    if deferred and b.id not in malformed:
+                                    if deferred and b.id not in argument_errors:
                                         interrupted_results.append(
                                             ToolResultBlock(
                                                 tool_use_id=b.id,

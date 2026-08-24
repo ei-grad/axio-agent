@@ -14,6 +14,7 @@ from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC
 
 from axio_transport_openai import ChatCompletionsTransport, ThinkingMixin
 
@@ -35,6 +36,7 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
     base_url: str = "https://openrouter.ai/api/v1"
     model: ModelSpec = ModelSpec(id="google/gemini-2.5-pro-preview")
     thinking: bool = False
+    tool_argument_codec: str | None = TOOL_ARGUMENT_CODEC
     _reasoning_efforts: dict[str, tuple[str, ...] | None] = field(default_factory=dict, repr=False)
     _reasoning_mandatory: set[str] = field(default_factory=set, repr=False)
 

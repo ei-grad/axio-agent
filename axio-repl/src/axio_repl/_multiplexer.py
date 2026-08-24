@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
+from axio.tool_codec import ToolArgumentCodecError, decode_framed_values, sanitize_presentation_value
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, TurnFinished, TurnStarted
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
@@ -116,6 +117,7 @@ class ActionFrame:
 class _ToolAction:
     call: ToolCallDisplay
     agent_name: str | None = None
+    argument_codec: str | None = None
     arguments: list[str] = field(default_factory=list)
     arguments_bytes: int = 0
     call_emitted: bool = False
@@ -467,7 +469,7 @@ class ActionMultiplexer:
         call_key: ToolCallKey | None = None
         started_call: ToolCallDisplay | None = None
         match event:
-            case ToolUseStart(tool_use_id=tool_use_id, name=name):
+            case ToolUseStart(tool_use_id=tool_use_id, name=name, argument_codec=argument_codec):
                 call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
                 started_call = self._tool_calls.start(call_key, name)
             case ToolResult(tool_use_id=tool_use_id):
@@ -507,12 +509,16 @@ class ActionMultiplexer:
                         agent_name=agent_name,
                     )
                     self._remove_collector(agent_id, suppress_incomplete=True)
-                case ToolUseStart(tool_use_id=tool_use_id, name=name):
+                case ToolUseStart(tool_use_id=tool_use_id, name=name, argument_codec=argument_codec):
                     assert started_call is not None
                     self._remember_tool(
                         agent_id,
                         started_call.key,
-                        _ToolAction(call=started_call, agent_name=agent_name),
+                        _ToolAction(
+                            call=started_call,
+                            agent_name=agent_name,
+                            argument_codec=argument_codec,
+                        ),
                     )
                 case ToolInputDelta(tool_use_id=tool_use_id, partial_json=partial_json):
                     assert call_key is not None
@@ -739,6 +745,12 @@ class ActionMultiplexer:
         except json.JSONDecodeError:
             return
         if isinstance(value, dict):
+            if action.argument_codec is not None:
+                try:
+                    value = decode_framed_values(value, action.argument_codec)
+                except ToolArgumentCodecError:
+                    value = "[invalid encoded arguments]"
+            value = sanitize_presentation_value(value)
             self._emit_call(agent_id, action, arguments=value, retained=True)
 
     def _emit_call(
@@ -754,10 +766,19 @@ class ActionMultiplexer:
         action.call_emitted = True
         if arguments is None and action.arguments:
             raw = "".join(action.arguments)
+            arguments_parsed = False
             try:
                 arguments = json.loads(raw)
+                arguments_parsed = True
             except json.JSONDecodeError:
-                arguments = raw
+                arguments = "[incomplete encoded arguments]" if action.argument_codec is not None else raw
+            if action.argument_codec is not None and arguments_parsed:
+                try:
+                    arguments = decode_framed_values(arguments, action.argument_codec)
+                except ToolArgumentCodecError:
+                    arguments = "[invalid encoded arguments]"
+            if arguments_parsed:
+                arguments = sanitize_presentation_value(arguments)
         if arguments is None:
             body = ""
         elif isinstance(arguments, str):

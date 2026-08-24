@@ -28,6 +28,7 @@ from axio.messages import (
 )
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
+from axio.tool_codec import encode_tool_arguments, encode_tool_schema
 from axio.transport import CompletionTransport, EmbeddingTransport
 from axio.types import CostSource, StopReason, Usage
 
@@ -314,9 +315,15 @@ def _collect_tool_result_images(
     return parts
 
 
-def _convert_messages(messages: list[Message], system: str) -> list[dict[str, Any]]:
+def _convert_messages(
+    messages: list[Message],
+    system: str,
+    tool_argument_codec: str | None = None,
+    tools: list[Tool[Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Convert axio Message list to OpenAI message dicts."""
     result: list[dict[str, Any]] = []
+    tools_by_name = {tool.name: tool for tool in tools or ()}
     if system:
         result.append({"role": "system", "content": system})
 
@@ -377,11 +384,15 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
                 if isinstance(b, TextBlock):
                     text_parts.append(b.text)
                 elif isinstance(b, ToolUseBlock):
+                    tool_input = b.input
+                    tool = tools_by_name.get(b.name)
+                    if tool_argument_codec is not None and tool is not None:
+                        tool_input = encode_tool_arguments(tool_input, tool.input_schema, tool_argument_codec)
                     tool_calls.append(
                         {
                             "id": b.id,
                             "type": "function",
-                            "function": {"name": b.name, "arguments": json.dumps(b.input)},
+                            "function": {"name": b.name, "arguments": json.dumps(tool_input)},
                         }
                     )
 
@@ -395,7 +406,7 @@ def _convert_messages(messages: list[Message], system: str) -> list[dict[str, An
     return result
 
 
-def _convert_tools(tools: list[Tool[Any]]) -> list[dict[str, Any]]:
+def _convert_tools(tools: list[Tool[Any]], tool_argument_codec: str | None = None) -> list[dict[str, Any]]:
     """Convert axio Tool list to OpenAI tool dicts."""
     return [
         {
@@ -403,7 +414,11 @@ def _convert_tools(tools: list[Tool[Any]]) -> list[dict[str, Any]]:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.input_schema,
+                "parameters": (
+                    encode_tool_schema(tool.input_schema, tool_argument_codec)
+                    if tool_argument_codec is not None
+                    else tool.input_schema
+                ),
             },
         }
         for tool in tools
@@ -543,6 +558,13 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
     def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
         raise NotImplementedError
 
+    def _parse_sse_for_request(
+        self,
+        resp: aiohttp.ClientResponse,
+        tool_argument_codec: str | None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self._parse_sse(resp)
+
     def stream(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> AsyncIterator[StreamEvent]:
         return self._do_stream(messages, tools, system)
 
@@ -552,6 +574,7 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
         assert self.session is not None, "session is required for streaming"
         url = f"{self.base_url.rstrip('/')}/{self.stream_path}"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        tool_argument_codec = getattr(self, "tool_argument_codec", None)
         payload = self.build_payload(messages, tools, system)
 
         logger.info(
@@ -574,7 +597,7 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
             try:
                 async with self.session.post(url, json=payload, headers=headers) as resp:
                     if resp.status == 200:
-                        async for event in self._parse_sse(resp):
+                        async for event in self._parse_sse_for_request(resp, tool_argument_codec):
                             yield event
                         return
 
@@ -672,6 +695,8 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
             result["extra_params"] = dict(self.extra_params)
         if self.reasoning_effort is not None:
             result["reasoning_effort"] = self.reasoning_effort
+        if hasattr(self, "tool_argument_codec"):
+            result["tool_argument_codec"] = getattr(self, "tool_argument_codec")
         return result
 
     @classmethod
@@ -705,6 +730,9 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
         model_id = data.get("model")
         if isinstance(model_id, str) and model_id in models:
             kwargs["model"] = models[model_id]
+        if "tool_argument_codec" in data:
+            raw_codec = data["tool_argument_codec"]
+            kwargs["tool_argument_codec"] = str(raw_codec) if raw_codec is not None else None
         return cls(**kwargs)
 
 
@@ -713,6 +741,12 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
     """Transport for the OpenAI-compatible ``/chat/completions`` protocol."""
 
     name: str = "Chat Completions"
+    tool_argument_codec: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.tool_argument_codec is not None:
+            encode_tool_schema({}, self.tool_argument_codec)
 
     def configure_effort(self, requested: str | None) -> EffortState:
         level = parse_effort(requested)
@@ -725,13 +759,13 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
     def build_payload(self, messages: list[Message], tools: list[Tool[Any]], system: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model.id,
-            "messages": _convert_messages(messages, system),
+            "messages": _convert_messages(messages, system, self.tool_argument_codec, tools),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
 
         if tools:
-            payload["tools"] = _convert_tools(tools)
+            payload["tools"] = _convert_tools(tools, self.tool_argument_codec)
 
         payload["max_completion_tokens"] = _fit_output_limit(payload, self.model)
 
@@ -757,7 +791,21 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
             cost_source=cost_source,
         )
 
-    async def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
+    def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
+        return self._parse_sse_with_codec(resp, self.tool_argument_codec)
+
+    def _parse_sse_for_request(
+        self,
+        resp: aiohttp.ClientResponse,
+        tool_argument_codec: str | None,
+    ) -> AsyncIterator[StreamEvent]:
+        return self._parse_sse_with_codec(resp, tool_argument_codec)
+
+    async def _parse_sse_with_codec(
+        self,
+        resp: aiohttp.ClientResponse,
+        tool_argument_codec: str | None,
+    ) -> AsyncIterator[StreamEvent]:
         tool_index_to_id: dict[int, str] = {}
         usage = Usage(0, 0)
         finish_reason: str | None = None
@@ -812,7 +860,12 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
                             fn = tc.get("function") or {}
                             tool_name: str = fn.get("name", "")
                             tool_index_to_id[idx] = tool_id
-                            yield ToolUseStart(index=idx, tool_use_id=tool_id, name=tool_name)
+                            yield ToolUseStart(
+                                index=idx,
+                                tool_use_id=tool_id,
+                                name=tool_name,
+                                argument_codec=tool_argument_codec,
+                            )
                         fn = tc.get("function") or {}
                         if "arguments" in fn:
                             tid = tool_index_to_id.get(idx, "")
@@ -852,7 +905,12 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
                                 tool_id = tc["id"]
                                 tool_name = tc["function"]["name"]
                                 tool_index_to_id[idx] = tool_id
-                                yield ToolUseStart(index=idx, tool_use_id=tool_id, name=tool_name)
+                                yield ToolUseStart(
+                                    index=idx,
+                                    tool_use_id=tool_id,
+                                    name=tool_name,
+                                    argument_codec=tool_argument_codec,
+                                )
                             if "function" in tc and "arguments" in tc["function"]:
                                 tid = tool_index_to_id.get(idx, "")
                                 yield ToolInputDelta(

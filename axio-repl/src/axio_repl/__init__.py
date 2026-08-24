@@ -1742,7 +1742,7 @@ class ReplRenderer:
                 print(f"{self._theme.success.ansi}[video saved: {path}]{self._theme.reset}")
                 self._drain_safe_boundary_locked()
 
-            case ToolUseStart(index=index, tool_use_id=tid, name=name):
+            case ToolUseStart(index=index, tool_use_id=tid, name=name, argument_codec=codec):
                 assert tool_key is not None
                 if isinstance(state.mode, _TextMode):
                     print()
@@ -1761,7 +1761,7 @@ class ReplRenderer:
                 )
                 sys.stdout.write(f"\n{badge}")
                 self._flush()
-                state.arg_streams[tool_key] = ToolArgStream(tid, index)
+                state.arg_streams[tool_key] = ToolArgStream(tid, index, argument_codec=codec)
                 state.active_tool_ids.add(tool_key)
                 state.tool_names[tool_key] = call.name
                 state.tool_calls[tool_key] = call

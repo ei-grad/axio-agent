@@ -32,6 +32,7 @@ from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.testing import make_text_response, make_tool_use_response
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC
 from axio.types import CostSource, StopReason, Usage
 from axio_tools_agents.runtime import (
     AgentEventEnvelope,
@@ -1131,7 +1132,12 @@ async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_
     await _write_runtime_event(journal, base)
     raw_parts = ('{"content":"        first line\\n', '\\tsecond line"}')
     events: tuple[RuntimeEvent, ...] = (
-        ToolUseStart(index=0, tool_use_id="call-1", name="patch_file"),
+        ToolUseStart(
+            index=0,
+            tool_use_id="call-1",
+            name="patch_file",
+            argument_codec=TOOL_ARGUMENT_CODEC,
+        ),
         ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[0]),
         ToolInputDelta(index=0, tool_use_id="call-1", partial_json=raw_parts[1]),
     )
@@ -1149,17 +1155,25 @@ async def test_semantic_journal_preserves_streamed_tool_argument_whitespace(tmp_
 
     records = read_journal(journal.semantic_path).records
     fragments: list[str] = []
+    codecs: list[str] = []
     for record in records:
         if record["kind"] != "turn_checkpoint":
             continue
         payload = record["payload"]
         assert isinstance(payload, dict)
         tool_arguments = payload["tool_arguments"]
+        tool_argument_codecs = payload["tool_argument_codecs"]
         assert isinstance(tool_arguments, dict)
+        assert isinstance(tool_argument_codecs, dict)
         fragment = tool_arguments.get("call-1", "")
         assert isinstance(fragment, str)
         fragments.append(fragment)
+        codec = tool_argument_codecs.get("call-1")
+        if codec is not None:
+            assert isinstance(codec, str)
+            codecs.append(codec)
     assert "".join(fragments) == "".join(raw_parts)
+    assert codecs == [TOOL_ARGUMENT_CODEC]
 
 
 @pytest.mark.parametrize(

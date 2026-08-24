@@ -13,6 +13,7 @@ from aiohttp import web
 from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta
 from axio.exceptions import StreamError
 from axio.models import Capability, ModelRegistry, ModelSpec
+from axio.tool_codec import TOOL_ARGUMENT_CODEC
 from axio.types import CostSource, StopReason, Usage
 
 from axio_transport_openai.openrouter import OpenRouterTransport
@@ -20,6 +21,14 @@ from axio_transport_openai.openrouter import OpenRouterTransport
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
+
+
+def test_tool_argument_codec_defaults_on_and_explicit_off_round_trips() -> None:
+    transport = OpenRouterTransport(tool_argument_codec=None)
+
+    assert OpenRouterTransport().tool_argument_codec == TOOL_ARGUMENT_CODEC
+    restored = OpenRouterTransport.from_dict(transport.to_dict())
+    assert restored.tool_argument_codec is None
 
 
 def _sse_chunk(data: dict[str, Any]) -> str:

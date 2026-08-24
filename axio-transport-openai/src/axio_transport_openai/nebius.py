@@ -13,6 +13,7 @@ from axio.exceptions import StreamError
 from axio.messages import Message
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
+from axio.tool_codec import TOOL_ARGUMENT_CODEC
 
 from axio_transport_openai import ChatCompletionsTransport, ThinkingMixin
 
@@ -56,6 +57,7 @@ class NebiusTransport(ThinkingMixin, ChatCompletionsTransport):
     base_url: str = "https://api.tokenfactory.nebius.com/v1"
     model: ModelSpec = field(default_factory=lambda: _UNSET)
     thinking: bool = False
+    tool_argument_codec: str | None = TOOL_ARGUMENT_CODEC
 
     def configure_effort(self, requested: str | None) -> EffortState:
         self.thinking = False
