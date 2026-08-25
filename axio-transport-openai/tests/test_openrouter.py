@@ -20,6 +20,7 @@ from axio.types import CostSource, StopReason, Usage
 
 from axio_transport_openai.openrouter import (
     OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS,
+    OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS,
     OpenRouterTransport,
 )
 
@@ -675,7 +676,9 @@ def test_provider_exclusion_follows_runtime_model_switch() -> None:
     transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash"))
 
     assert transport.build_payload([], [], "")["provider"] == {
-        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS)
+        "only": list(OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS),
+        "allow_fallbacks": False,
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
     }
     transport.model = ModelSpec(id="deepseek/deepseek-v4-flash@streamlake/fp8")
     with pytest.raises(ValueError, match="provider pin selects excluded"):
@@ -683,8 +686,70 @@ def test_provider_exclusion_follows_runtime_model_switch() -> None:
     transport.model = ModelSpec(id="deepseek/deepseek-v4-flash@deepinfra/fp8")
     assert transport.build_payload([], [], "")["provider"] == {
         "only": ["deepinfra/fp8"],
+        "allow_fallbacks": False,
         "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
     }
+
+
+@pytest.mark.parametrize("field", ["only", "order"])
+def test_deepseek_v4_flash_rejects_unverified_provider_selection(field: str) -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="deepseek/deepseek-v4-flash"),
+        extra_params={"provider": {field: ["siliconflow/fp8"]}},
+    )
+
+    with pytest.raises(ValueError, match=rf"provider\.{field} selects unverified"):
+        transport.build_payload([], [], "")
+
+
+def test_deepseek_v4_flash_rejects_unverified_provider_pin() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash@azure/us"))
+
+    with pytest.raises(ValueError, match="provider pin selects unverified"):
+        transport.build_payload([], [], "")
+
+
+def test_deepseek_v4_flash_preserves_verified_provider_subset() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="deepseek/deepseek-v4-flash"),
+        extra_params={
+            "provider": {
+                "only": ["venice", "deepinfra/fp8"],
+                "order": ["venice"],
+                "allow_fallbacks": True,
+            }
+        },
+    )
+
+    assert transport.build_payload([], [], "")["provider"] == {
+        "only": ["venice", "deepinfra/fp8"],
+        "order": ["venice"],
+        "allow_fallbacks": False,
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
+
+
+def test_deepseek_v4_flash_user_ignore_narrows_default_allowlist() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="deepseek/deepseek-v4-flash"),
+        extra_params={"provider": {"ignore": ["venice"]}},
+    )
+
+    assert transport.build_payload([], [], "")["provider"] == {
+        "only": ["digitalocean", "deepinfra/fp8", "novita/fp8"],
+        "allow_fallbacks": False,
+        "ignore": ["venice", *OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS],
+    }
+
+
+def test_deepseek_v4_flash_rejects_ignoring_every_verified_provider() -> None:
+    transport = OpenRouterTransport(
+        model=ModelSpec(id="deepseek/deepseek-v4-flash"),
+        extra_params={"provider": {"ignore": list(OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS)}},
+    )
+
+    with pytest.raises(ValueError, match="provider.ignore excludes every verified provider"):
+        transport.build_payload([], [], "")
 
 
 def test_tool_schema_and_history_keep_plain_canonical_strings() -> None:

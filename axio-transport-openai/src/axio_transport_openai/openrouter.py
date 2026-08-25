@@ -24,6 +24,15 @@ OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS = (
     "relace/fp4",
     "cloudflare",
 )
+OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS = (
+    "digitalocean",
+    "deepinfra/fp8",
+    "venice",
+    "novita/fp8",
+)
+_MODEL_PROVIDER_ALLOWLISTS = {
+    "deepseek/deepseek-v4-flash": OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS,
+}
 _BROKEN_PROVIDER_IDENTITIES = frozenset(
     {
         "streamlake",
@@ -65,7 +74,7 @@ def _is_known_broken_provider(provider: str) -> bool:
     return provider.casefold() in _BROKEN_PROVIDER_IDENTITIES
 
 
-def _merge_provider_routing(raw: object, pinned_provider: str | None) -> dict[str, Any]:
+def _merge_provider_routing(raw: object, model_id: str, pinned_provider: str | None) -> dict[str, Any]:
     if raw is None:
         routing: dict[str, Any] = {}
     elif isinstance(raw, Mapping):
@@ -76,16 +85,30 @@ def _merge_provider_routing(raw: object, pinned_provider: str | None) -> dict[st
     only = _dedupe_providers(_provider_list(routing["only"], "only")) if "only" in routing else []
     order = _dedupe_providers(_provider_list(routing["order"], "order")) if "order" in routing else []
     ignored = _dedupe_providers(_provider_list(routing["ignore"], "ignore")) if "ignore" in routing else []
+    allowed = _MODEL_PROVIDER_ALLOWLISTS.get(model_id)
+    allowed_ids = {provider.casefold() for provider in allowed or ()}
 
     for field_name, providers in (("only", only), ("order", order)):
         broken = [provider for provider in providers if _is_known_broken_provider(provider)]
         if broken:
             names = ", ".join(broken)
             raise ValueError(f"OpenRouter provider.{field_name} selects excluded provider(s): {names}")
+        unverified = [
+            provider for provider in providers if allowed is not None and provider.casefold() not in allowed_ids
+        ]
+        if unverified:
+            names = ", ".join(unverified)
+            raise ValueError(
+                f"OpenRouter provider.{field_name} selects unverified provider(s) for {model_id}: {names}"
+            )
 
     if pinned_provider is not None:
         if _is_known_broken_provider(pinned_provider):
             raise ValueError(f"OpenRouter model provider pin selects excluded provider: {pinned_provider}")
+        if allowed is not None and pinned_provider.casefold() not in allowed_ids:
+            raise ValueError(
+                f"OpenRouter model provider pin selects unverified provider for {model_id}: {pinned_provider}"
+            )
         if only and [provider.casefold() for provider in only] != [pinned_provider.casefold()]:
             raise ValueError("OpenRouter model provider pin conflicts with provider.only")
         if order and any(provider.casefold() != pinned_provider.casefold() for provider in order):
@@ -94,6 +117,10 @@ def _merge_provider_routing(raw: object, pinned_provider: str | None) -> dict[st
 
     ignored = _dedupe_providers([*ignored, *OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS])
     ignored_ids = {provider.casefold() for provider in ignored}
+    if allowed is not None and pinned_provider is None and not only:
+        only = [provider for provider in allowed if provider.casefold() not in ignored_ids]
+        if not only:
+            raise ValueError(f"OpenRouter provider.ignore excludes every verified provider for {model_id}")
     only_ids = {provider.casefold() for provider in only}
     order_ids = {provider.casefold() for provider in order}
     if conflict := sorted(only_ids & ignored_ids):
@@ -107,6 +134,8 @@ def _merge_provider_routing(raw: object, pinned_provider: str | None) -> dict[st
         routing["only"] = only
     if order:
         routing["order"] = order
+    if allowed is not None:
+        routing["allow_fallbacks"] = False
     routing["ignore"] = ignored
     return routing
 
@@ -176,7 +205,7 @@ class OpenRouterTransport(ThinkingMixin, ChatCompletionsTransport):
             payload["reasoning"] = {"effort": self.reasoning_effort}
         model_id, provider = _split_provider(str(payload.get("model", "")))
         payload["model"] = model_id
-        payload["provider"] = _merge_provider_routing(payload.get("provider"), provider)
+        payload["provider"] = _merge_provider_routing(payload.get("provider"), model_id, provider)
         return payload
 
     def _provider_cost_usd(self, usage: Mapping[str, Any]) -> float | None:
