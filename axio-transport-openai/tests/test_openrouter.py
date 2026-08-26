@@ -20,6 +20,7 @@ from axio.types import CostSource, StopReason, Usage
 
 from axio_transport_openai.openrouter import (
     OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS,
+    OPENROUTER_DEEPSEEK_V4_FLASH_0731_PROVIDERS,
     OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS,
     OpenRouterTransport,
 )
@@ -691,10 +692,11 @@ def test_provider_exclusion_follows_runtime_model_switch() -> None:
     }
 
 
+@pytest.mark.parametrize("model_id", ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-0731"])
 @pytest.mark.parametrize("field", ["only", "order"])
-def test_deepseek_v4_flash_rejects_unverified_provider_selection(field: str) -> None:
+def test_deepseek_v4_flash_rejects_unverified_provider_selection(model_id: str, field: str) -> None:
     transport = OpenRouterTransport(
-        model=ModelSpec(id="deepseek/deepseek-v4-flash"),
+        model=ModelSpec(id=model_id),
         extra_params={"provider": {field: ["siliconflow/fp8"]}},
     )
 
@@ -707,6 +709,26 @@ def test_deepseek_v4_flash_rejects_unverified_provider_pin() -> None:
 
     with pytest.raises(ValueError, match="provider pin selects unverified"):
         transport.build_payload([], [], "")
+
+
+def test_deepseek_v4_flash_0731_uses_probed_provider_allowlist() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash-0731"))
+
+    assert transport.build_payload([], [], "")["provider"] == {
+        "only": list(OPENROUTER_DEEPSEEK_V4_FLASH_0731_PROVIDERS),
+        "allow_fallbacks": False,
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
+
+
+def test_deepseek_v4_flash_0731_canonicalizes_unique_provider_alias() -> None:
+    transport = OpenRouterTransport(model=ModelSpec(id="deepseek/deepseek-v4-flash-0731@deepinfra"))
+
+    assert transport.build_payload([], [], "")["provider"] == {
+        "only": ["deepinfra/fp8"],
+        "allow_fallbacks": False,
+        "ignore": list(OPENROUTER_BROKEN_TOOL_ARGUMENT_PROVIDERS),
+    }
 
 
 def test_deepseek_v4_flash_preserves_verified_provider_subset() -> None:

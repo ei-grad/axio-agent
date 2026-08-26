@@ -264,11 +264,17 @@ for endpoint builds that failed Axio's exact tool-string probe:
 routing to the observed failures; they do not prove that every other endpoint,
 future build, or model preserves exact argument whitespace.
 
-Requests for `deepseek/deepseek-v4-flash` additionally use a strict allowlist
-of endpoint builds that preserved leading whitespace in the probe:
-`digitalocean`, `deepinfra/fp8`, `venice`, and `novita/fp8`. Axio sends these
-as `provider.only` and forces `allow_fallbacks: false`. An explicit provider
-pin or `provider.only`/`provider.order` entry outside this allowlist fails
+Requests for DeepSeek V4 Flash additionally use model-specific strict
+allowlists of endpoint builds that preserved leading whitespace in the probe.
+For `deepseek/deepseek-v4-flash`, the verified builds are `digitalocean`,
+`deepinfra/fp8`, `venice`, and `novita/fp8`. For
+`deepseek/deepseek-v4-flash-0731`, they are `open-inference/fp4`,
+`digitalocean`, `deepinfra/fp8`, `ambient/fp4`, `makora`, `inceptron/fp4`,
+`baidu/fp8`, `gmicloud/fp8`, `together`, `venice`, `phala`, and
+`atlas-cloud/fp4`. Axio sends the applicable list as `provider.only` and
+forces `allow_fallbacks: false`. A unique provider alias such as `deepinfra`
+is resolved to its verified endpoint tag. An explicit provider pin or
+`provider.only`/`provider.order` entry outside the applicable allowlist fails
 before the request is sent.
 
 `extra_params.provider.ignore` is merged with the built-in exclusions and

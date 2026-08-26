@@ -30,8 +30,23 @@ OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS = (
     "venice",
     "novita/fp8",
 )
+OPENROUTER_DEEPSEEK_V4_FLASH_0731_PROVIDERS = (
+    "open-inference/fp4",
+    "digitalocean",
+    "deepinfra/fp8",
+    "ambient/fp4",
+    "makora",
+    "inceptron/fp4",
+    "baidu/fp8",
+    "gmicloud/fp8",
+    "together",
+    "venice",
+    "phala",
+    "atlas-cloud/fp4",
+)
 _MODEL_PROVIDER_ALLOWLISTS = {
     "deepseek/deepseek-v4-flash": OPENROUTER_DEEPSEEK_V4_FLASH_PROVIDERS,
+    "deepseek/deepseek-v4-flash-0731": OPENROUTER_DEEPSEEK_V4_FLASH_0731_PROVIDERS,
 }
 _BROKEN_PROVIDER_IDENTITIES = frozenset(
     {
@@ -74,6 +89,18 @@ def _is_known_broken_provider(provider: str) -> bool:
     return provider.casefold() in _BROKEN_PROVIDER_IDENTITIES
 
 
+def _canonical_allowed_provider(provider: str, allowed: tuple[str, ...]) -> str:
+    identity = provider.casefold()
+    exact = next((candidate for candidate in allowed if candidate.casefold() == identity), None)
+    if exact is not None:
+        return exact
+    if "/" not in provider:
+        matches = [candidate for candidate in allowed if candidate.partition("/")[0].casefold() == identity]
+        if len(matches) == 1:
+            return matches[0]
+    return provider
+
+
 def _merge_provider_routing(raw: object, model_id: str, pinned_provider: str | None) -> dict[str, Any]:
     if raw is None:
         routing: dict[str, Any] = {}
@@ -86,6 +113,11 @@ def _merge_provider_routing(raw: object, model_id: str, pinned_provider: str | N
     order = _dedupe_providers(_provider_list(routing["order"], "order")) if "order" in routing else []
     ignored = _dedupe_providers(_provider_list(routing["ignore"], "ignore")) if "ignore" in routing else []
     allowed = _MODEL_PROVIDER_ALLOWLISTS.get(model_id)
+    if allowed is not None:
+        only = _dedupe_providers([_canonical_allowed_provider(provider, allowed) for provider in only])
+        order = _dedupe_providers([_canonical_allowed_provider(provider, allowed) for provider in order])
+        if pinned_provider is not None:
+            pinned_provider = _canonical_allowed_provider(pinned_provider, allowed)
     allowed_ids = {provider.casefold() for provider in allowed or ()}
 
     for field_name, providers in (("only", only), ("order", order)):
