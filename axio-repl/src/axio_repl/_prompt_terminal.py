@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,8 @@ class _LiveOutput:
     key: tuple[str, int]
     content: str
     rows: int
+    priority: int
+    order: int
 
 
 class PromptToolkitCompatibilityError(RuntimeError):
@@ -27,7 +30,8 @@ class PromptToolkitInlineOutput:
 
     def __init__(self, prompt_session: Any) -> None:
         self._session = prompt_session
-        self._live: _LiveOutput | None = None
+        self._live: OrderedDict[tuple[str, int], _LiveOutput] = OrderedDict()
+        self._next_live_order = 1
 
     @staticmethod
     def redraw_now(app: Any) -> None:
@@ -42,20 +46,25 @@ class PromptToolkitInlineOutput:
     async def write(self, write: Callable[[], None], *, preserve_live: bool = True) -> None:
         app = self._session.app
         if not app.is_running:
-            write()
-            if not preserve_live:
-                self._live = None
+            self._write_without_prompt(app, write, preserve_live=preserve_live)
             return
         self._validate(app)
 
         await self._write_running(app, write, preserve_live=preserve_live)
 
-    async def write_live(self, content: str, *, key: tuple[str, int], is_live: bool) -> None:
+    async def write_live(
+        self,
+        content: str,
+        *,
+        key: tuple[str, int],
+        is_live: bool,
+        priority: int = 0,
+    ) -> None:
         """Replace or finalize one live logical line above the active prompt."""
 
         app = self._session.app
         if not app.is_running:
-            self._write_live_without_prompt(app.output, content, key=key, is_live=is_live)
+            self._write_live_without_prompt(app.output, content, key=key, is_live=is_live, priority=priority)
             return
         self._validate(app)
         self._validate_live_output(app.output)
@@ -64,15 +73,28 @@ class PromptToolkitInlineOutput:
             app.output.enable_autowrap()
             app.output.write_raw(content)
 
-        replacement = (key, content, is_live)
+        replacement = (key, content, is_live, priority)
         await self._write_running(app, write_content, replacement=replacement)
+
+    async def discard_live(self, key: tuple[str, int]) -> None:
+        """Remove one replaceable line without committing it to scrollback."""
+
+        if key not in self._live:
+            return
+        app = self._session.app
+        if not app.is_running:
+            self._write_live_without_prompt(app.output, "", key=key, is_live=False, priority=0)
+            return
+        self._validate(app)
+        self._validate_live_output(app.output)
+        await self._write_running(app, lambda: None, replacement=(key, "", False, 0))
 
     async def _write_running(
         self,
         app: Any,
         write: Callable[[], None],
         *,
-        replacement: tuple[tuple[str, int], str, bool] | None = None,
+        replacement: tuple[tuple[str, int], str, bool, int] | None = None,
         preserve_live: bool = True,
     ) -> None:
         completed = asyncio.get_running_loop().create_future()
@@ -84,39 +106,39 @@ class PromptToolkitInlineOutput:
                 await app.renderer.wait_for_cpr_responses()
             if not app.is_running:
                 if replacement is None:
-                    write()
-                    if not preserve_live:
-                        self._live = None
+                    self._write_without_prompt(app, write, preserve_live=preserve_live)
                 else:
-                    key, content, is_live = replacement
-                    self._write_live_without_prompt(app.output, content, key=key, is_live=is_live)
+                    key, content, is_live, priority = replacement
+                    self._write_live_without_prompt(
+                        app.output,
+                        content,
+                        key=key,
+                        is_live=is_live,
+                        priority=priority,
+                    )
                 return
             app.output.hide_cursor()
             cursor_hidden = True
             app.renderer.erase()
             app._running_in_terminal = True
             rendering_suspended = True
-            previous = self._live
-            if previous is not None:
-                self._erase_live(app.output, previous)
+            self._erase_live(app.output, tuple(self._live.values()))
             if replacement is None:
                 write()
-                if previous is not None and preserve_live:
-                    rows = self._draw_live(app.output, previous.content)
-                    self._live = _LiveOutput(previous.key, previous.content, rows)
-                elif previous is not None:
-                    self._live = None
+                if not preserve_live:
+                    self._live.clear()
             else:
-                key, content, is_live = replacement
-                write()
+                key, content, is_live, priority = replacement
                 if is_live:
-                    rows = self._draw_live_separator(app.output, content)
-                    self._live = _LiveOutput(key, content, rows)
-                elif previous is not None and previous.key != key:
-                    rows = self._draw_live(app.output, previous.content)
-                    self._live = _LiveOutput(previous.key, previous.content, rows)
+                    previous = self._live.get(key)
+                    order = previous.order if previous is not None else self._next_live_order
+                    if previous is None:
+                        self._next_live_order += 1
+                    self._live[key] = _LiveOutput(key, content, 0, priority, order)
                 else:
-                    self._live = None
+                    self._live.pop(key, None)
+                    write()
+            self._draw_live_outputs(app.output)
         finally:
             try:
                 if rendering_suspended:
@@ -131,6 +153,25 @@ class PromptToolkitInlineOutput:
                 if not completed.done():
                     completed.set_result(None)
 
+    def _write_without_prompt(
+        self,
+        app: Any,
+        write: Callable[[], None],
+        *,
+        preserve_live: bool,
+    ) -> None:
+        if not self._live:
+            write()
+            return
+        self._validate_live_output(app.output)
+        self._erase_live(app.output, tuple(self._live.values()))
+        write()
+        if preserve_live:
+            self._draw_live_outputs(app.output)
+        else:
+            self._live.clear()
+        app.output.flush()
+
     def _write_live_without_prompt(
         self,
         output: Any,
@@ -138,15 +179,42 @@ class PromptToolkitInlineOutput:
         *,
         key: tuple[str, int],
         is_live: bool,
+        priority: int,
     ) -> None:
-        previous = self._live
-        visible = content
-        if previous is not None and previous.key == key and content.startswith(previous.content):
-            visible = content[len(previous.content) :]
-        output.enable_autowrap()
-        output.write_raw(visible)
+        previous = self._live.get(key)
+        self._erase_live(output, tuple(self._live.values()))
+        if is_live:
+            order = previous.order if previous is not None else self._next_live_order
+            if previous is None:
+                self._next_live_order += 1
+            self._live[key] = _LiveOutput(key, content, 0, priority, order)
+        else:
+            self._live.pop(key, None)
+            output.enable_autowrap()
+            output.write_raw(content)
+        self._draw_live_outputs(output)
         output.flush()
-        self._live = _LiveOutput(key, content, 0) if is_live else None
+
+    def _draw_live_outputs(self, output: Any) -> None:
+        ordered = sorted(self._live.values(), key=lambda item: (item.priority, item.order))
+        for live in ordered:
+            rows = self._draw_live(output, live.content)
+            self._live[live.key] = _LiveOutput(
+                live.key,
+                live.content,
+                rows,
+                live.priority,
+                live.order,
+            )
+
+    @staticmethod
+    def _erase_live(output: Any, live_outputs: tuple[_LiveOutput, ...]) -> None:
+        rows = sum(live.rows for live in live_outputs)
+        if rows == 0:
+            return
+        output.cursor_up(rows)
+        output.write_raw("\r")
+        output.erase_down()
 
     @classmethod
     def _draw_live(cls, output: Any, content: str) -> int:
@@ -159,12 +227,6 @@ class PromptToolkitInlineOutput:
         output.write_raw("\r\n")
         columns = max(1, int(output.get_size().columns))
         return cls._display_rows(content, columns)
-
-    @staticmethod
-    def _erase_live(output: Any, live: _LiveOutput) -> None:
-        output.cursor_up(live.rows)
-        output.write_raw("\r")
-        output.erase_down()
 
     @staticmethod
     def _display_rows(content: str, columns: int) -> int:

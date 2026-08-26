@@ -48,6 +48,18 @@ def test_consecutive_live_snapshots_collapse_to_the_latest_state() -> None:
     ingress.finish_batch()
 
 
+def test_pending_live_snapshot_can_be_discarded_without_output() -> None:
+    ingress = TerminalIngress(max_pending_chars=1)
+    ingress.submit(OutputFrame("x", live_id=1, is_live=True))
+    discard = OutputFrame("", live_id=1, discard_live=True)
+
+    ingress.submit(discard)
+    ingress.wake_delivered()
+
+    assert ingress.next_batch() == (discard,)
+    ingress.finish_batch()
+
+
 def test_ingress_separates_pre_barrier_late_and_post_close_output() -> None:
     ingress = TerminalIngress()
 
@@ -72,11 +84,14 @@ def test_ingress_bounds_active_and_late_output_with_explicit_markers() -> None:
 
     ingress.submit(OutputFrame("1234"))
     ingress.submit(OutputFrame("5678"))
-    ingress.submit(OutputFrame("drop"))
+    first_drop = ingress.submit(OutputFrame("drop"))
+    second_drop = ingress.submit(OutputFrame("lost"))
+    assert first_drop.discard_producer_live
+    assert second_drop.discard_producer_live
     assert ingress.pending_char_count == 8
     active = _drain_active(ingress)
     assert active.startswith("12345678")
-    assert "terminal output skipped: 1 frame(s), 4 character(s)" in active
+    assert "terminal output skipped: 2 frame(s), 8 character(s)" in active
     assert f"{RESET}\n[terminal output skipped:" in active
 
     assert ingress.seal()

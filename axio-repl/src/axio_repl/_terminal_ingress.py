@@ -24,11 +24,17 @@ class OutputFrame:
     stream: OutputStream = "stdout"
     live_id: int | None = None
     is_live: bool = False
+    discard_live: bool = False
     clear_live: bool = False
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if self.is_live and self.live_id is None:
             raise ValueError("live terminal frames require a live_id")
+        if self.discard_live and self.live_id is None:
+            raise ValueError("discard terminal frames require a live_id")
+        if self.discard_live and (self.is_live or self.content):
+            raise ValueError("discard terminal frames cannot contain output")
         if self.is_live and self.clear_live:
             raise ValueError("live terminal frames cannot clear live output")
 
@@ -49,6 +55,7 @@ class IngressDestination(StrEnum):
 class IngressAdmission:
     destination: IngressDestination
     wake_consumer: bool = False
+    discard_producer_live: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +116,7 @@ class TerminalIngress:
             return self._phase is not IngressPhase.OPEN and self._idle_locked()
 
     def submit(self, frame: OutputFrame) -> IngressAdmission:
-        if not frame.content:
+        if not frame.content and not frame.discard_live:
             return IngressAdmission(IngressDestination.ACTIVE)
         with self._lock:
             if self._phase is IngressPhase.CLOSED:
@@ -117,11 +124,15 @@ class TerminalIngress:
             if self._phase is IngressPhase.SEALED:
                 self._enqueue_late_locked(frame)
                 return IngressAdmission(IngressDestination.LATE)
-            self._enqueue_active_locked(frame)
+            discard_producer_live = self._enqueue_active_locked(frame)
             wake = not self._wake_scheduled
             if wake:
                 self._wake_scheduled = True
-            return IngressAdmission(IngressDestination.ACTIVE, wake_consumer=wake)
+            return IngressAdmission(
+                IngressDestination.ACTIVE,
+                wake_consumer=wake,
+                discard_producer_live=discard_producer_live,
+            )
 
     def wake_delivered(self) -> None:
         with self._lock:
@@ -205,7 +216,7 @@ class TerminalIngress:
             self._late_dropped_chars = 0
             return drain
 
-    def _enqueue_active_locked(self, frame: OutputFrame) -> None:
+    def _enqueue_active_locked(self, frame: OutputFrame) -> bool:
         size = len(frame.content)
         replace_live = (
             bool(self._pending)
@@ -215,14 +226,21 @@ class TerminalIngress:
         )
         replaced_size = len(self._pending[-1].content) if replace_live else 0
         projected_size = self._pending_chars - replaced_size + size
+        if frame.discard_live:
+            if replace_live:
+                self._pending[-1] = frame
+                self._pending_chars = projected_size
+            else:
+                self._pending.append(frame)
+            return False
         if self._dropped_frames or projected_size > self._max_pending_chars:
             self._dropped_frames += 1
             self._dropped_chars += size
-            return
+            return True
         if replace_live:
             self._pending[-1] = frame
             self._pending_chars = projected_size
-            return
+            return False
         if (
             self._pending
             and self._pending[-1].stream == frame.stream
@@ -230,13 +248,20 @@ class TerminalIngress:
             and frame.live_id is None
             and not self._pending[-1].clear_live
             and not frame.clear_live
+            and not self._pending[-1].discard_live
+            and not frame.discard_live
             and len(self._pending[-1].content) + size <= self._max_batch_chars
         ):
             previous = self._pending[-1]
-            self._pending[-1] = OutputFrame(previous.content + frame.content, frame.stream)
+            self._pending[-1] = OutputFrame(
+                previous.content + frame.content,
+                frame.stream,
+                priority=max(previous.priority, frame.priority),
+            )
         else:
             self._pending.append(frame)
         self._pending_chars += size
+        return False
 
     def _enqueue_late_locked(self, frame: OutputFrame) -> None:
         size = len(frame.content)

@@ -141,6 +141,21 @@ class TestToDict:
         d = to_dict(ToolResultBlock(tool_use_id="c1", content="ok"))
         assert d == {"type": "tool_result", "tool_use_id": "c1", "content": "ok", "is_error": False}
 
+    def test_tool_result_execution_timing_is_not_model_context(self) -> None:
+        started_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+        block = ToolResultBlock(
+            tool_use_id="c1",
+            content="ok",
+            started_at=started_at,
+            finished_at=started_at,
+            duration_seconds=0.25,
+        )
+
+        serialized = to_dict(block)
+
+        assert serialized == {"type": "tool_result", "tool_use_id": "c1", "content": "ok", "is_error": False}
+        assert from_dict(serialized) == ToolResultBlock(tool_use_id="c1", content="ok")
+
     def test_tool_result_nested(self) -> None:
         block = ToolResultBlock(
             tool_use_id="c1",

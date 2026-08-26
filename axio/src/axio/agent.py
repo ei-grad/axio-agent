@@ -159,12 +159,22 @@ async def _tool_result_text(tool: Tool[Any], args: dict[str, Any]) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolExecutionTiming:
+    """Wall-clock bounds plus monotonic duration for one actual tool execution."""
+
+    started_at: datetime
+    finished_at: datetime
+    duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class ToolDispatch:
     """One concurrent tool batch whose task can outlive its originating turn."""
 
     blocks: tuple[ToolUseBlock, ...]
     task: asyncio.Task[list[ToolResultBlock]]
     owner: str | None
+    timings: dict[str, ToolExecutionTiming] = field(default_factory=dict)
 
 
 class DeferredToolSink(Protocol):
@@ -304,11 +314,13 @@ class Agent:
         blocks: list[ToolUseBlock],
         iteration: int,
         output_queue: asyncio.Queue[ToolOutputDelta | None],
+        execution_timings: dict[str, ToolExecutionTiming] | None = None,
     ) -> list[ToolResultBlock]:
         """Like dispatch_tools but pushes ToolOutputDelta events for streaming tools."""
         logger.info("Dispatching %d tool(s) with streaming: %r", len(blocks), blocks)
+        timings = execution_timings if execution_timings is not None else {}
 
-        async def _run_one(block: ToolUseBlock) -> ToolResultBlock:
+        async def _execute_one(block: ToolUseBlock) -> ToolResultBlock:
             tool = self._find_tool(block.name)
             if tool is None:
                 logger.warning("Unknown tool requested: %s", block.name)
@@ -354,6 +366,36 @@ class Agent:
                         _log_tool_failure(block.name, exc)
                         return ToolResultBlock(tool_use_id=block.id, content=str(exc), is_error=True)
                 return ToolResultBlock(tool_use_id=block.id, content=content)
+
+        async def _run_one(block: ToolUseBlock) -> ToolResultBlock:
+            tool = self._find_tool(block.name)
+            if tool is None or block.input.get(BACKGROUND_PARAM):
+                return await _execute_one(block)
+            started_at = datetime.now().astimezone()
+            started_monotonic = time.monotonic()
+            try:
+                result = await _execute_one(block)
+            except BaseException:
+                finished_at = datetime.now().astimezone()
+                timings[block.id] = ToolExecutionTiming(
+                    started_at,
+                    finished_at,
+                    time.monotonic() - started_monotonic,
+                )
+                raise
+            finished_at = datetime.now().astimezone()
+            timing = ToolExecutionTiming(
+                started_at,
+                finished_at,
+                time.monotonic() - started_monotonic,
+            )
+            timings[block.id] = timing
+            return dataclasses.replace(
+                result,
+                started_at=timing.started_at,
+                finished_at=timing.finished_at,
+                duration_seconds=timing.duration_seconds,
+            )
 
         tasks = [asyncio.create_task(_run_one(block)) for block in blocks]
         try:
@@ -412,6 +454,9 @@ class Agent:
             is_error=result.is_error,
             content=result_content,
             input=block.input if block else {},
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            duration_seconds=result.duration_seconds,
         )
 
     @staticmethod
@@ -629,39 +674,40 @@ class Agent:
                         dispatch: ToolDispatch | None = None
                         try:
                             if valid:
-                                has_streaming = any(
-                                    (t := self._find_tool(b.name)) is not None and t.supports_streaming for b in valid
-                                )
-                                if has_streaming:
-                                    output_queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
+                                execution_timings: dict[str, ToolExecutionTiming] = {}
+                                output_queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
 
-                                    async def _dispatch_and_signal() -> list[ToolResultBlock]:
-                                        try:
-                                            return await self._dispatch_tools_streaming(valid, iteration, output_queue)
-                                        finally:
-                                            output_queue.put_nowait(None)
+                                async def _dispatch_and_signal() -> list[ToolResultBlock]:
+                                    try:
+                                        return await self._dispatch_tools_streaming(
+                                            valid,
+                                            iteration,
+                                            output_queue,
+                                            execution_timings,
+                                        )
+                                    finally:
+                                        output_queue.put_nowait(None)
 
-                                    dispatch_task = asyncio.create_task(_dispatch_and_signal())
-                                    dispatch = ToolDispatch(tuple(valid), dispatch_task, owner)
-                                    if self.deferred_tool_sink is not None:
-                                        self.deferred_tool_sink.dispatch_started(dispatch)
-                                    while True:
-                                        ev = await output_queue.get()
-                                        if ev is None:
-                                            break
+                                dispatch_task = asyncio.create_task(_dispatch_and_signal())
+                                dispatch = ToolDispatch(tuple(valid), dispatch_task, owner, execution_timings)
+                                if self.deferred_tool_sink is not None:
+                                    self.deferred_tool_sink.dispatch_started(dispatch)
+                                while True:
+                                    ev = await output_queue.get()
+                                    if ev is None:
+                                        break
+                                    if isinstance(ev, ToolOutputDelta):
                                         if ev.tool_use_id not in t0_map:
                                             t0_map[ev.tool_use_id] = time.monotonic()
                                         partial_output.setdefault(ev.tool_use_id, []).append(
                                             (time.monotonic() - t0_map[ev.tool_use_id], ev.key, ev.delta)
                                         )
-                                        yield ev
-                                    dispatched = await asyncio.shield(dispatch_task)
-                                else:
-                                    dispatch_task = asyncio.create_task(self.dispatch_tools(valid, iteration))
-                                    dispatch = ToolDispatch(tuple(valid), dispatch_task, owner)
-                                    if self.deferred_tool_sink is not None:
-                                        self.deferred_tool_sink.dispatch_started(dispatch)
-                                    dispatched = await asyncio.shield(dispatch_task)
+                                    yield ev
+                                await asyncio.sleep(0)
+                                current_task = asyncio.current_task()
+                                if current_task is not None and current_task.cancelling():
+                                    raise asyncio.CancelledError
+                                dispatched = await asyncio.shield(dispatch_task)
                             else:
                                 dispatched = []
                             results = dispatched + error_results
@@ -741,7 +787,15 @@ class Agent:
                                         msg = "".join(text for _, _, text in chunks) + f"\n{cancellation_note}"
                                     else:
                                         msg = cancellation_note
-                                    interrupted = ToolResultBlock(tool_use_id=b.id, content=msg, is_error=True)
+                                    timing = dispatch.timings.get(b.id) if dispatch is not None else None
+                                    interrupted = ToolResultBlock(
+                                        tool_use_id=b.id,
+                                        content=msg,
+                                        is_error=True,
+                                        started_at=timing.started_at if timing is not None else None,
+                                        finished_at=timing.finished_at if timing is not None else None,
+                                        duration_seconds=timing.duration_seconds if timing is not None else None,
+                                    )
                                     interrupted_results.append(interrupted)
                                     visible_results.append((b, interrupted))
                                 await context.append_many(

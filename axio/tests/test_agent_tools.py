@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from axio.agent import Agent
+from axio.agent import Agent, ToolExecutionTiming
 from axio.blocks import ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
@@ -629,6 +629,44 @@ class TestStreamingToolDispatch:
 
         results = [e for e in events if isinstance(e, ToolResult)]
         assert len(results) == 2
+        assert {event.tool_use_id for event in results} == {"c1", "c2"}
+        assert all(event.started_at is not None and event.started_at.tzinfo is not None for event in results)
+        assert all(
+            event.started_at is not None
+            and event.finished_at is not None
+            and event.finished_at >= event.started_at
+            and event.duration_seconds is not None
+            and event.duration_seconds >= 0
+            for event in results
+        )
+
+    async def test_tool_timing_excludes_late_result_consumption(self) -> None:
+        completed = asyncio.Event()
+
+        async def immediate() -> str:
+            completed.set()
+            return "done"
+
+        tool: Tool[object] = Tool(name="immediate", handler=immediate)
+        agent = Agent(system="test", tools=[tool], transport=StubTransport())
+        queue: asyncio.Queue[ToolOutputDelta | None] = asyncio.Queue()
+        timings: dict[str, ToolExecutionTiming] = {}
+        task = asyncio.create_task(
+            agent._dispatch_tools_streaming(
+                [ToolUseBlock(id="c1", name="immediate", input={})],
+                1,
+                queue,
+                timings,
+            )
+        )
+        await completed.wait()
+        await asyncio.sleep(0)
+        measured = timings["c1"].duration_seconds
+
+        await asyncio.sleep(0.05)
+        [result] = await task
+
+        assert result.duration_seconds == measured
 
     @pytest.mark.parametrize("emit_chunk", [False, True])
     async def test_self_cancelled_streaming_tool_closes_dispatch(self, emit_chunk: bool) -> None:
@@ -680,6 +718,9 @@ class TestStreamingToolDispatch:
         assert tool_results[0].is_error
         assert "[interrupted by user]" in str(tool_results[0].content)
         assert ("partial" in str(tool_results[0].content)) is emit_chunk
+        assert tool_results[0].started_at is not None
+        assert tool_results[0].finished_at is not None
+        assert tool_results[0].duration_seconds is not None
 
     async def test_streaming_tool_base_exception_closes_dispatch_without_committing_tool_use(self) -> None:
         class FatalToolError(BaseException):

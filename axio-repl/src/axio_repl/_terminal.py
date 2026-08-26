@@ -6,6 +6,9 @@ import asyncio
 import logging
 import sys
 import threading
+from collections.abc import Hashable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import StrEnum
 from io import TextIOBase
 from typing import Any, TextIO, cast
@@ -43,7 +46,13 @@ class _TerminalStream(TextIOBase):
         self._lock = threading.RLock()
         self._buffers: dict[object, list[str]] = {}
         self._live_ids: dict[object, int] = {}
+        self._priorities: dict[object, int] = {}
         self._next_live_id = 1
+        self._discard_live_requested = threading.Event()
+        self._semantic_context: ContextVar[tuple[Hashable, int] | None] = ContextVar(
+            f"axio_terminal_semantic_stream_{id(self)}",
+            default=None,
+        )
 
     @property
     def encoding(self) -> str:
@@ -75,8 +84,10 @@ class _TerminalStream(TextIOBase):
             raise TypeError(f"write() argument must be str, not {type(data).__name__}")
         if not data:
             return 0
-        writer = self._writer_key()
+        writer, priority = self._writer()
         with self._lock:
+            self._apply_pending_live_discard_locked()
+            self._priorities[writer] = priority
             buffered = self._buffers.setdefault(writer, [])
             if "\n" in data:
                 before, after = data.rsplit("\n", 1)
@@ -90,20 +101,24 @@ class _TerminalStream(TextIOBase):
                         content,
                         self._stream,
                         live_id=self._live_ids.pop(writer, None),
+                        priority=self._priorities.pop(writer, priority),
                     )
                 )
+                self._apply_pending_live_discard_locked()
             else:
                 buffered.append(data)
         return len(data)
 
     def flush(self) -> None:
-        self._flush_writers((self._writer_key(),))
+        writer, _priority = self._writer()
+        self._flush_writers((writer,))
 
     def flush_live_line(self) -> None:
         """Publish a replaceable snapshot without consuming the logical line."""
 
-        writer = self._writer_key()
+        writer, priority = self._writer()
         with self._lock:
+            self._apply_pending_live_discard_locked()
             content = "".join(self._buffers.get(writer, ()))
             if not content:
                 return
@@ -112,36 +127,89 @@ class _TerminalStream(TextIOBase):
                 live_id = self._next_live_id
                 self._next_live_id += 1
                 self._live_ids[writer] = live_id
-            self._owner.submit(OutputFrame(content, self._stream, live_id=live_id, is_live=True))
+            self._priorities[writer] = priority
+            self._owner.submit(OutputFrame(content, self._stream, live_id=live_id, is_live=True, priority=priority))
+            self._apply_pending_live_discard_locked()
 
-    def flush_all(self) -> None:
-        with self._lock:
-            self._flush_writers(tuple(self._buffers))
+    @contextmanager
+    def semantic_stream(self, key: Hashable, *, priority: int = 0) -> Iterator[None]:
+        """Give one producer an independent replaceable live-line buffer."""
 
-    @staticmethod
-    def _writer_key() -> object:
+        hash(key)
+        token = self._semantic_context.set((key, priority))
+        try:
+            yield
+        finally:
+            self._semantic_context.reset(token)
+
+    def discard_semantic_stream(self, key: Hashable) -> None:
+        """Drop one semantic producer's buffered and currently visible output."""
+
+        hash(key)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        if loop is not None:
-            return loop
-        return ("thread", threading.get_ident())
+        owner: object = loop if loop is not None else ("thread", threading.get_ident())
+        writer = (owner, key)
+        with self._lock:
+            self._apply_pending_live_discard_locked()
+            self._buffers.pop(writer, None)
+            self._priorities.pop(writer, None)
+            live_id = self._live_ids.pop(writer, None)
+            if live_id is not None:
+                self._owner.submit(OutputFrame("", self._stream, live_id=live_id, discard_live=True))
+
+    def request_live_buffer_discard(self) -> None:
+        """Request an ordered clear without acquiring this stream's writer lock."""
+
+        self._discard_live_requested.set()
+
+    def flush_all(self) -> None:
+        with self._lock:
+            self._apply_pending_live_discard_locked()
+            self._flush_writers(tuple(self._buffers))
+
+    def _writer(self) -> tuple[object, int]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        owner: object = loop if loop is not None else ("thread", threading.get_ident())
+        semantic = self._semantic_context.get()
+        if semantic is None:
+            return owner, 0
+        key, priority = semantic
+        return (owner, key), priority
 
     def _flush_writers(self, writers: tuple[object, ...]) -> None:
         with self._lock:
+            self._apply_pending_live_discard_locked()
             for writer in writers:
                 content = "".join(self._buffers.pop(writer, ()))
                 if content:
+                    priority = self._priorities.pop(writer, 0)
                     self._owner.submit(
                         OutputFrame(
                             content,
                             self._stream,
                             live_id=self._live_ids.pop(writer, None),
+                            priority=priority,
                         )
                     )
+                    self._apply_pending_live_discard_locked()
                 else:
                     self._live_ids.pop(writer, None)
+                    self._priorities.pop(writer, None)
+
+    def _apply_pending_live_discard_locked(self) -> None:
+        if not self._discard_live_requested.is_set():
+            return
+        self._discard_live_requested.clear()
+        for writer in tuple(self._live_ids):
+            self._buffers.pop(writer, None)
+            self._priorities.pop(writer, None)
+            self._live_ids.pop(writer, None)
 
 
 class TerminalUI:
@@ -234,7 +302,7 @@ class TerminalUI:
                 raise
 
     def submit(self, frame: OutputFrame) -> None:
-        if not frame.content:
+        if not frame.content and not frame.discard_live:
             return
         loop: asyncio.AbstractEventLoop | None
         ingress: TerminalIngress | None
@@ -245,11 +313,17 @@ class TerminalUI:
             fallback = self._fallback_stream_locked(frame.stream)
             active = self._phase in {TerminalPhase.RUNNING, TerminalPhase.FAILED, TerminalPhase.DRAINING}
         if not active or ingress is None or loop is None:
-            self._write_fallback(fallback, frame.content, frame.stream)
+            if frame.content:
+                self._write_fallback(fallback, frame.content, frame.stream)
             return
+        if frame.clear_live:
+            self._discard_producer_live_buffers()
         admission = ingress.submit(frame)
+        if admission.discard_producer_live:
+            self._discard_producer_live_buffers()
         if admission.destination is IngressDestination.FALLBACK:
-            self._write_fallback(fallback, frame.content, frame.stream)
+            if frame.content:
+                self._write_fallback(fallback, frame.content, frame.stream)
             return
         if not admission.wake_consumer:
             return
@@ -410,6 +484,10 @@ class TerminalUI:
             self._output.write_raw(frame.content)
             self._output.flush()
 
+        if frame.discard_live:
+            assert frame.live_id is not None
+            await self._inline_output.discard_live((frame.stream, frame.live_id))
+            return
         if frame.live_id is None:
             await self._inline_output.write(write_and_flush, preserve_live=not frame.clear_live)
             return
@@ -417,7 +495,14 @@ class TerminalUI:
             frame.content,
             key=(frame.stream, frame.live_id),
             is_live=frame.is_live,
+            priority=frame.priority,
         )
+
+    def _discard_producer_live_buffers(self) -> None:
+        if self.stdout is not None:
+            self.stdout.request_live_buffer_discard()
+        if self.stderr is not None:
+            self.stderr.request_live_buffer_discard()
 
     def _flush_late_output(self, ingress: TerminalIngress) -> None:
         assert self._original_stdout is not None

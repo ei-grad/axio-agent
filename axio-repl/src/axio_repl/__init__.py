@@ -168,6 +168,7 @@ from axio_repl._tool_calls import (
     ToolCallDisplay,
     ToolCallKey,
     ToolCallRegistry,
+    format_tool_result_marker,
     tool_badge,
     tool_display_name,
 )
@@ -504,8 +505,8 @@ def build_system_prompt(
                 "stop its own children by id.",
                 "- In axio-repl, the user can switch the active local agent with /agent-focus, list them with "
                 "/agents, interrupt with /agent-interrupt, and stop with /agent-stop. Only the focused agent "
-                "streams fully. /agent-actions on shows framed tool and lifecycle actions from every other agent "
-                "between complete paragraphs or tool calls without exposing their prose or reasoning.",
+                "streams fully. Other agents stream concurrently by default; /agent-actions off hides their live "
+                "prose, reasoning, tools, and lifecycle actions while retaining their final reports.",
             ]
         if parent_peer_id is not None and any(t.name == "send_message" for t in tools):
             lines.append(
@@ -590,6 +591,7 @@ class _AgentRenderState:
         self.arg_streams: dict[ToolCallKey, ToolArgStream] = {}
         self.active_tool_ids: set[ToolCallKey] = set()
         self.streamed_tool_ids: set[ToolCallKey] = set()
+        self.live_tool_ids: set[ToolCallKey] = set()
         self.tool_names: dict[ToolCallKey, str] = {}
         self.tool_calls: dict[ToolCallKey, ToolCallDisplay] = {}
         self.background_text: list[str] = []
@@ -601,6 +603,7 @@ class _AgentRenderState:
         self.tool_output_sanitizers: dict[tuple[ToolCallKey, str], IncrementalTerminalSanitizer] = {}
         self.tool_field_sanitizers: dict[tuple[ToolCallKey, str], IncrementalTerminalSanitizer] = {}
         self.tool_field_modes: dict[ToolCallKey, _ToolFieldMode] = {}
+        self.tool_output_line_start: dict[ToolCallKey, bool] = {}
         self.tool_arg_at_line_start = False
 
 
@@ -620,6 +623,9 @@ class _TurnPresentation:
     header_emitted: bool = False
     stdout_started: bool = False
     error_seen: bool = False
+    text_chars_seen: int = 0
+    visible_text_start: int | None = None
+    displayed_text_ranges: list[tuple[int, int]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -634,6 +640,7 @@ class _BackgroundSummary:
 class _CompletedBackgroundTurn:
     agent_name: str | None
     suppress_display: bool
+    display_text: str | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -770,7 +777,7 @@ class ReplRenderer:
         main_agent_name: str | None = None,
         stats: _panel.SessionStats | None = None,
         current_model: Callable[[], ModelSpec | None] | None = None,
-        display_mode: DisplayMode = DisplayMode.ACTIVE_ONLY,
+        display_mode: DisplayMode = DisplayMode.ALL_ACTIONS,
         action_multiplexer: ActionMultiplexer | None = None,
         suspended_action_multiplexer: ActionMultiplexer | None = None,
         action_boundary_frames: int = 4,
@@ -922,7 +929,37 @@ class ReplRenderer:
 
     async def set_display_mode(self, mode: DisplayMode) -> DisplayModeChange:
         async with self._lock:
-            return self._actions.set_mode(mode)
+            change = self._actions.set_mode(mode)
+            if change.previous is DisplayMode.ALL_ACTIONS and change.current is DisplayMode.ACTIVE_ONLY:
+                self._discard_background_live_streams_locked()
+            return change
+
+    def _discard_background_live_streams_locked(self) -> None:
+        discard = getattr(sys.stdout, "discard_semantic_stream", None)
+        for agent_id, state in self._states.items():
+            turn_key = self._current_turn_by_agent.get(agent_id)
+            presentation = self._turns.get(turn_key) if turn_key is not None else None
+            live = presentation.live if presentation is not None else agent_id == self.foreground_agent
+            if live:
+                continue
+            if callable(discard):
+                discard(self._semantic_stream_key(agent_id, turn_key, None))
+                for tool_key in tuple(state.live_tool_ids):
+                    discard(self._semantic_stream_key(agent_id, turn_key, tool_key))
+            state.live_tool_ids.clear()
+            state.tool_output_line_start.clear()
+            for sanitizer in state.tool_output_sanitizers.values():
+                sanitizer.reset()
+            state.tool_output_sanitizers.clear()
+            state.text_sanitizer.reset()
+            state.reasoning_sanitizer.reset()
+            if presentation is not None:
+                presentation.visible_text_start = None
+            if isinstance(state.mode, _TextMode | _ReasoningMode):
+                state.mode = _BoundaryMode()
+            if presentation is not None:
+                presentation.header_emitted = False
+                presentation.stdout_started = False
 
     async def remember_agent(self, agent_id: str, agent_name: str) -> None:
         async with self._lock:
@@ -1003,6 +1040,10 @@ class ReplRenderer:
                 if presentation.live:
                     completed = _CompletedBackgroundTurn(presentation.agent_name, suppress_display=True)
                 else:
+                    display_text, fully_displayed = self._background_outcome_display_locked(
+                        self._states.get(agent_id),
+                        presentation,
+                    )
                     self._actions.observe(
                         agent_id,
                         event,
@@ -1023,7 +1064,11 @@ class ReplRenderer:
                     self._background_summaries[key] = summary
                     while len(self._background_summaries) > 1024:
                         self._background_summaries.popitem(last=False)
-                    completed = _CompletedBackgroundTurn(presentation.agent_name, suppress_display=False)
+                    completed = _CompletedBackgroundTurn(
+                        presentation.agent_name,
+                        suppress_display=fully_displayed,
+                        display_text=display_text,
+                    )
                 self._completed_background_turns[key] = completed
                 while len(self._completed_background_turns) > 1024:
                     self._completed_background_turns.popitem(last=False)
@@ -1041,12 +1086,12 @@ class ReplRenderer:
         agent_id: str,
         run_id: str,
         turn_id: str,
-    ) -> tuple[str | None, bool]:
+    ) -> tuple[str | None, bool, str | None]:
         async with self._lock:
             completed = self._completed_background_turns.pop(_TurnKey(agent_id, run_id, turn_id), None)
             if completed is None:
-                return self._agent_name(agent_id), False
-            return completed.agent_name, completed.suppress_display
+                return self._agent_name(agent_id), False, None
+            return completed.agent_name, completed.suppress_display, completed.display_text
 
     def defer_tool_calls(
         self,
@@ -1079,7 +1124,12 @@ class ReplRenderer:
             badge = tool_badge(
                 badge_kind,
                 tool_display_name(result.call.name),
-                result.call.marker,
+                format_tool_result_marker(
+                    result.call.marker,
+                    started_at=notification.started_at,
+                    finished_at=notification.finished_at,
+                    duration_seconds=notification.duration_seconds,
+                ),
                 powerline=self._powerline,
                 theme=self._theme,
             )
@@ -1222,14 +1272,13 @@ class ReplRenderer:
         if not self._input_active:
             sys.stdout.flush()
 
-    @staticmethod
-    def _flush_reasoning() -> None:
-        """Keep an unfinished reasoning line live while the editor is visible."""
+    def _flush_live_line(self) -> None:
+        """Keep an unfinished semantic stream line live while the editor is visible."""
 
         flush_live_line = getattr(sys.stdout, "flush_live_line", None)
         if callable(flush_live_line):
             flush_live_line()
-        else:
+        elif not self._input_active:
             sys.stdout.flush()
 
     async def render(
@@ -1252,6 +1301,17 @@ class ReplRenderer:
                 if presentation is not None
                 else execution_mode is ExecutionMode.FOREGROUND or agent_id == self.foreground_agent
             )
+            if (
+                presentation is not None
+                and presentation.execution_mode is ExecutionMode.BACKGROUND
+                and not presentation.live
+                and isinstance(event, TextDelta)
+            ):
+                self._track_background_text_delta_locked(
+                    presentation,
+                    event.delta,
+                    visible=self.display_mode is DisplayMode.ALL_ACTIONS,
+                )
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
                 self._stats.record(agent_id, event.usage, model)
@@ -1261,16 +1321,75 @@ class ReplRenderer:
                     self._observe_suspended_tool_event_locked(agent_id, event, presentation, tool_key)
                     if self._safe_boundary_is_open_locked():
                         self._drain_safe_boundary_locked()
-                elif live:
-                    self._render_locked(agent_id, event, presentation, event_turn_key, tool_key)
-                    if isinstance(event, Error | SessionEndEvent):
-                        self._foreground_streaming = False
-                        if self.display_mode is DisplayMode.ACTIVE_ONLY:
-                            self._flush_background_summaries_locked()
-                    elif not isinstance(event, IterationEnd):
+                elif live or (
+                    self.display_mode is DisplayMode.ALL_ACTIONS
+                    and isinstance(
+                        event,
+                        TextDelta | ReasoningDelta | ToolOutputDelta,
+                    )
+                ):
+                    stream_key = self._semantic_stream_key(agent_id, event_turn_key, tool_key)
+                    priority = self._semantic_stream_priority(agent_id, event, presentation)
+                    semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+                    stream_context = (
+                        semantic_stream(stream_key, priority=priority) if callable(semantic_stream) else suppress()
+                    )
+                    if not live:
+                        if isinstance(event, ToolOutputDelta):
+                            self._actions.observe(
+                                agent_id,
+                                event,
+                                agent_name=(
+                                    presentation.agent_name if presentation is not None else self._agent_name(agent_id)
+                                ),
+                                run_id=run_id or "",
+                                turn_id=turn_id or "",
+                                tool_call_key=tool_key,
+                                retain_tool_output=False,
+                            )
+                            self._drain_safe_boundary_locked()
+                        with stream_context:
+                            assert isinstance(event, TextDelta | ReasoningDelta | ToolOutputDelta)
+                            self._render_background_delta_locked(
+                                agent_id,
+                                event,
+                                presentation,
+                                event_turn_key,
+                                tool_key,
+                            )
+                        self._record_background_event_locked(agent_id, event)
+                    else:
+                        with stream_context:
+                            self._render_locked(agent_id, event, presentation, event_turn_key, tool_key)
+                    if live and isinstance(event, Error | SessionEndEvent):
+                        if live:
+                            self._foreground_streaming = False
+                            if self.display_mode is DisplayMode.ACTIVE_ONLY:
+                                self._flush_background_summaries_locked()
+                    elif live and not isinstance(event, IterationEnd):
                         self._foreground_streaming = True
                 else:
                     agent_name = presentation.agent_name if presentation is not None else self._agent_name(agent_id)
+                    if self.display_mode is DisplayMode.ALL_ACTIONS and isinstance(event, Error | SessionEndEvent):
+                        if isinstance(event, SessionEndEvent) and presentation is not None:
+                            self._commit_background_visible_text_locked(presentation)
+                        self._finalize_background_live_line_locked(agent_id, event_turn_key)
+                    if isinstance(event, ToolResult) and tool_key is not None:
+                        state = self._state(agent_id)
+                        if tool_key in state.live_tool_ids:
+                            stream_key = self._semantic_stream_key(agent_id, event_turn_key, tool_key)
+                            semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+                            stream_context = (
+                                semantic_stream(stream_key, priority=80) if callable(semantic_stream) else suppress()
+                            )
+                            with stream_context:
+                                sys.stdout.write(f"{self._theme.reset}\n")
+                                self._flush()
+                            state.live_tool_ids.discard(tool_key)
+                            state.tool_output_line_start.pop(tool_key, None)
+                            for sanitizer_key in tuple(state.tool_output_sanitizers):
+                                if sanitizer_key[0] == tool_key:
+                                    state.tool_output_sanitizers.pop(sanitizer_key).reset()
                     self._actions.observe(
                         agent_id,
                         event,
@@ -1281,7 +1400,7 @@ class ReplRenderer:
                     )
                     self._record_background_event_locked(agent_id, event)
                     if self.display_mode is DisplayMode.ALL_ACTIONS and self._safe_boundary_is_open_locked():
-                        self._drain_safe_boundary_locked(max_frames=1)
+                        self._drain_safe_boundary_locked()
                     elif self.display_mode is DisplayMode.ACTIVE_ONLY and not self._foreground_streaming:
                         self._flush_background_summaries_locked()
             finally:
@@ -1382,24 +1501,39 @@ class ReplRenderer:
 
     @contextmanager
     def _persistent_insertion_locked(self) -> Iterator[None]:
-        """Bracket an out-of-band scrollback line without tearing stream structure."""
+        """Close the active structure in its owning semantic stream before insertion."""
 
         if self._active_agent is not None:
-            state = self._state(self._active_agent)
+            agent_id = self._active_agent
+            state = self._state(agent_id)
             mode = state.mode
-            if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
-                sys.stdout.write(self._theme.reset)
-                state.mode = _BoundaryMode()
-            elif isinstance(mode, _ToolFieldMode):
-                self._force_tool_field_boundary_locked(state)
-                if not state.tool_arg_at_line_start:
+            tool_key = mode.tool_call_key if isinstance(mode, _ToolFieldMode) else None
+            turn_key = self._current_turn_by_agent.get(agent_id)
+            semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+            priority = 80 if tool_key is not None else 100 if agent_id == self._focused_agent else 60
+            stream_context = (
+                semantic_stream(
+                    self._semantic_stream_key(agent_id, turn_key, tool_key),
+                    priority=priority,
+                )
+                if callable(semantic_stream)
+                else suppress()
+            )
+            with stream_context:
+                if isinstance(mode, _TextMode) and mode.paragraph_boundary_open:
+                    if not callable(semantic_stream):
+                        sys.stdout.write(self._theme.reset)
+                    state.mode = _BoundaryMode()
+                elif isinstance(mode, _ToolFieldMode):
+                    self._force_tool_field_boundary_locked(state)
+                    if not state.tool_arg_at_line_start:
+                        sys.stdout.write(f"{self._theme.reset}\n")
+                        state.tool_arg_at_line_start = True
+                        self._flush()
+                elif not isinstance(mode, _BoundaryMode):
                     sys.stdout.write(f"{self._theme.reset}\n")
-                    state.tool_arg_at_line_start = True
                     self._flush()
-            elif not isinstance(mode, _BoundaryMode):
-                sys.stdout.write(f"{self._theme.reset}\n")
-                self._flush()
-                state.mode = _BoundaryMode()
+                    state.mode = _BoundaryMode()
         yield
 
     def _reset_state_for_turn_locked(self, state: _AgentRenderState) -> None:
@@ -1407,6 +1541,7 @@ class ReplRenderer:
         state.arg_streams.clear()
         state.active_tool_ids.clear()
         state.streamed_tool_ids.clear()
+        state.live_tool_ids.clear()
         state.tool_names.clear()
         state.tool_calls.clear()
         state.background_text.clear()
@@ -1417,6 +1552,7 @@ class ReplRenderer:
         state.reasoning_sanitizer.reset()
         state.tool_output_sanitizers.clear()
         state.tool_field_sanitizers.clear()
+        state.tool_output_line_start.clear()
         for mode in state.tool_field_modes.values():
             mode.pending.close()
         state.tool_field_modes.clear()
@@ -1512,6 +1648,38 @@ class ReplRenderer:
             return tool_key
         return known[0] if isinstance(event, ToolResult) else known[-1]
 
+    @staticmethod
+    def _semantic_stream_key(
+        agent_id: str,
+        turn_key: _TurnKey | None,
+        tool_key: ToolCallKey | None,
+    ) -> tuple[str, ...]:
+        if tool_key is not None:
+            return ("tool", tool_key.agent_id, tool_key.run_id, tool_key.turn_id, tool_key.tool_use_id)
+        if turn_key is not None:
+            return ("agent", agent_id, turn_key.run_id, turn_key.turn_id)
+        return ("agent", agent_id, "direct")
+
+    def _semantic_stream_priority(
+        self,
+        agent_id: str,
+        event: StreamEvent,
+        presentation: _TurnPresentation | None,
+    ) -> int:
+        if agent_id == self._focused_agent:
+            priority = 100
+        elif presentation is not None and presentation.execution_mode is ExecutionMode.FOREGROUND:
+            priority = 90
+        else:
+            priority = 60
+        if isinstance(event, Error | ToolResult):
+            priority += 20
+        elif isinstance(event, ToolOutputDelta):
+            priority += 10
+        elif isinstance(event, ReasoningDelta):
+            priority -= 10
+        return priority
+
     def _release_direct_tool_key_locked(
         self,
         agent_id: str,
@@ -1544,6 +1712,7 @@ class ReplRenderer:
             self._tool_calls.complete(tool_key)
             state.active_tool_ids.discard(tool_key)
             state.streamed_tool_ids.discard(tool_key)
+            state.live_tool_ids.discard(tool_key)
             state.arg_streams.pop(tool_key, None)
             state.tool_names.pop(tool_key, None)
             state.tool_calls.pop(tool_key, None)
@@ -1671,7 +1840,7 @@ class ReplRenderer:
 
     def _switch_agent(self, agent_id: str) -> tuple[_AgentRenderState, bool]:
         switched = self._active_agent != agent_id
-        if switched:
+        if switched and not callable(getattr(sys.stdout, "semantic_stream", None)):
             if self._active_agent is not None:
                 active_state = self._state(self._active_agent)
                 if isinstance(active_state.mode, _ReasoningMode):
@@ -1686,6 +1855,7 @@ class ReplRenderer:
                         sys.stdout.write(f"{self._theme.reset}\n")
                         active_state.tool_arg_at_line_start = True
                         self._flush()
+        if switched:
             self._active_agent = agent_id
         state = self._state(agent_id)
         return state, switched
@@ -1725,7 +1895,7 @@ class ReplRenderer:
                     delta = f"> {delta}"
                     state.mode = _ReasoningMode()
                 sys.stdout.write(_styled(self._theme.reasoning.ansi, delta.replace("\n", "\n> ")))
-                self._flush_reasoning()
+                self._flush_live_line()
 
             case TextDelta(delta=delta):
                 safe_delta = state.text_sanitizer.feed(delta)
@@ -1738,6 +1908,7 @@ class ReplRenderer:
                     self._drain_safe_boundary_locked()
                 else:
                     self._render_text_delta_locked(state, safe_delta)
+                    self._flush_live_line()
 
             case ImageOutput(data=data, media_type=mt):
                 if isinstance(state.mode, _TextMode):
@@ -1811,11 +1982,29 @@ class ReplRenderer:
                 state.streamed_tool_ids.add(tool_key)
                 color = self._theme.stderr.ansi if key == "stderr" else self._theme.stdout.ansi
                 sanitizer = state.tool_output_sanitizers.setdefault((tool_key, key), IncrementalTerminalSanitizer())
-                sys.stdout.write(_styled(color, sanitizer.feed(delta)))
-                self._flush()
+                self._render_tool_output_delta_locked(state, tool_key, sanitizer.feed(delta), color)
+                if state.tool_output_line_start.get(tool_key, True):
+                    state.live_tool_ids.discard(tool_key)
+                else:
+                    state.live_tool_ids.add(tool_key)
+                self._flush_live_line()
 
-            case ToolResult(tool_use_id=tid, name=name, is_error=is_error, content=content):
+            case ToolResult(
+                tool_use_id=tid,
+                name=name,
+                is_error=is_error,
+                content=content,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_seconds=duration_seconds,
+            ):
                 assert tool_key is not None
+                self._tool_calls.record_result_timing(
+                    tool_key,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_seconds=duration_seconds,
+                )
                 self._finish_tool_arg_stream_locked(state, tool_key)
                 self._activate_tool_field_locked(state, tool_key)
                 if isinstance(state.mode, _ToolFieldMode):
@@ -1842,7 +2031,7 @@ class ReplRenderer:
                 badge = tool_badge(
                     badge_kind,
                     badge_name,
-                    result_display.call.marker,
+                    self._tool_calls.result_marker(result_display.call),
                     powerline=self._powerline,
                     theme=self._theme,
                 )
@@ -1896,6 +2085,8 @@ class ReplRenderer:
                 state.arg_streams.pop(tool_key, None)
                 state.tool_names.pop(tool_key, None)
                 state.tool_calls.pop(tool_key, None)
+                state.tool_output_line_start.pop(tool_key, None)
+                state.live_tool_ids.discard(tool_key)
                 if mode := state.tool_field_modes.pop(tool_key, None):
                     mode.pending.close()
                 state.tool_arg_at_line_start = False
@@ -1962,6 +2153,57 @@ class ReplRenderer:
                 self._discard_direct_agent_tool_keys_locked(agent_id)
                 self._drain_safe_boundary_locked()
 
+    @staticmethod
+    def _track_background_text_delta_locked(
+        presentation: _TurnPresentation,
+        delta: str,
+        *,
+        visible: bool,
+    ) -> None:
+        start = presentation.text_chars_seen
+        presentation.text_chars_seen += len(delta)
+        if not visible:
+            presentation.visible_text_start = None
+            return
+        if presentation.visible_text_start is None:
+            presentation.visible_text_start = start
+        last_newline = delta.rfind("\n")
+        if last_newline < 0:
+            return
+        end = start + last_newline + 1
+        visible_start = presentation.visible_text_start
+        if visible_start < end:
+            presentation.displayed_text_ranges.append((visible_start, end))
+        presentation.visible_text_start = end
+
+    @staticmethod
+    def _commit_background_visible_text_locked(presentation: _TurnPresentation) -> None:
+        visible_start = presentation.visible_text_start
+        if visible_start is not None and visible_start < presentation.text_chars_seen:
+            presentation.displayed_text_ranges.append((visible_start, presentation.text_chars_seen))
+        presentation.visible_text_start = None
+
+    @staticmethod
+    def _background_outcome_display_locked(
+        state: _AgentRenderState | None,
+        presentation: _TurnPresentation,
+    ) -> tuple[str | None, bool]:
+        if state is None or not presentation.displayed_text_ranges:
+            return None, False
+        text = "".join(state.background_text)
+        cursor = 0
+        hidden: list[str] = []
+        for start, end in presentation.displayed_text_ranges:
+            start = max(cursor, min(len(text), start))
+            end = max(start, min(len(text), end))
+            hidden.append(text[cursor:start])
+            cursor = end
+        hidden.append(text[cursor:])
+        display_text = "".join(hidden)
+        if display_text.strip():
+            return display_text, False
+        return None, True
+
     def _record_background_event_locked(self, agent_id: str, event: StreamEvent) -> None:
         state = self._state(agent_id)
         match event:
@@ -1976,6 +2218,45 @@ class ReplRenderer:
             case _:
                 pass
 
+    def _render_background_delta_locked(
+        self,
+        agent_id: str,
+        event: TextDelta | ReasoningDelta | ToolOutputDelta,
+        presentation: _TurnPresentation | None,
+        event_turn_key: _TurnKey | None,
+        tool_key: ToolCallKey | None,
+    ) -> None:
+        if isinstance(event, ToolOutputDelta):
+            assert tool_key is not None
+            state = self._state(agent_id)
+            state.streamed_tool_ids.add(tool_key)
+            color = self._theme.stderr.ansi if event.key == "stderr" else self._theme.stdout.ansi
+            sanitizer = state.tool_output_sanitizers.setdefault((tool_key, event.key), IncrementalTerminalSanitizer())
+            self._render_tool_output_delta_locked(state, tool_key, sanitizer.feed(event.delta), color)
+            if state.tool_output_line_start.get(tool_key, True):
+                state.live_tool_ids.discard(tool_key)
+            else:
+                state.live_tool_ids.add(tool_key)
+            self._flush_live_line()
+            return
+        self._render_locked(agent_id, event, presentation, event_turn_key, tool_key)
+
+    def _finalize_background_live_line_locked(
+        self,
+        agent_id: str,
+        turn_key: _TurnKey | None,
+    ) -> None:
+        state = self._state(agent_id)
+        if not isinstance(state.mode, _TextMode | _ReasoningMode):
+            return
+        stream_key = self._semantic_stream_key(agent_id, turn_key, None)
+        semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+        stream_context = semantic_stream(stream_key, priority=60) if callable(semantic_stream) else suppress()
+        with stream_context:
+            sys.stdout.write(f"{self._theme.reset}\n")
+            self._flush()
+        state.mode = _BoundaryMode()
+
     @staticmethod
     def _only_passive_tools_active(state: _AgentRenderState) -> bool:
         return (
@@ -1985,14 +2266,7 @@ class ReplRenderer:
         )
 
     def _safe_boundary_is_open_locked(self) -> bool:
-        if self._active_agent is None:
-            return True
-        state = self._state(self._active_agent)
-        if isinstance(state.mode, _TextMode):
-            return state.mode.paragraph_boundary_open
-        if not isinstance(state.mode, _BoundaryMode):
-            return False
-        return not state.active_tool_ids or self._only_passive_tools_active(state)
+        return True
 
     def _background_summary_locked(
         self,
@@ -2076,12 +2350,47 @@ class ReplRenderer:
         state = self._state(agent_id)
         if isinstance(event, ToolResult):
             self._finish_suspended_tool_field_locked(state, tool_key)
+            if tool_key in state.live_tool_ids:
+                semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+                stream_context = (
+                    semantic_stream(self._semantic_stream_key(agent_id, None, tool_key), priority=80)
+                    if callable(semantic_stream)
+                    else suppress()
+                )
+                with stream_context:
+                    sys.stdout.write(f"{self._theme.reset}\n")
+                    self._flush()
+                state.live_tool_ids.discard(tool_key)
         self._suspended_actions.observe(
             agent_id,
             event,
             agent_name=self._agent_name(agent_id),
             tool_call_key=tool_key,
+            retain_tool_output=not isinstance(event, ToolOutputDelta),
         )
+        if isinstance(event, ToolOutputDelta):
+            self._drain_safe_boundary_locked()
+            semantic_stream = getattr(sys.stdout, "semantic_stream", None)
+            priority = self._semantic_stream_priority(agent_id, event, presentation)
+            stream_context = (
+                semantic_stream(self._semantic_stream_key(agent_id, None, tool_key), priority=priority)
+                if callable(semantic_stream)
+                else suppress()
+            )
+            with stream_context:
+                state.streamed_tool_ids.add(tool_key)
+                color = self._theme.stderr.ansi if event.key == "stderr" else self._theme.stdout.ansi
+                sanitizer = state.tool_output_sanitizers.setdefault(
+                    (tool_key, event.key),
+                    IncrementalTerminalSanitizer(),
+                )
+                self._render_tool_output_delta_locked(state, tool_key, sanitizer.feed(event.delta), color)
+                if state.tool_output_line_start.get(tool_key, True):
+                    state.live_tool_ids.discard(tool_key)
+                else:
+                    state.live_tool_ids.add(tool_key)
+                self._flush_live_line()
+            return
         match event:
             case ToolInputDelta(partial_json=partial_json):
                 stream = state.arg_streams.get(tool_key)
@@ -2093,8 +2402,6 @@ class ReplRenderer:
                             state.mode = _BoundaryMode()
                         if mode := state.tool_field_modes.pop(tool_key, None):
                             mode.pending.close()
-            case ToolOutputDelta():
-                state.streamed_tool_ids.add(tool_key)
             case ToolResult():
                 state.active_tool_ids.discard(tool_key)
                 state.arg_streams.pop(tool_key, None)
@@ -2102,6 +2409,10 @@ class ReplRenderer:
                 state.tool_calls.pop(tool_key, None)
                 if mode := state.tool_field_modes.pop(tool_key, None):
                     mode.pending.close()
+                state.tool_output_line_start.pop(tool_key, None)
+                for sanitizer_key in tuple(state.tool_output_sanitizers):
+                    if sanitizer_key[0] == tool_key:
+                        state.tool_output_sanitizers.pop(sanitizer_key).reset()
                 self._suspended_tool_calls.discard(tool_key)
             case _:
                 pass
@@ -2146,7 +2457,6 @@ class ReplRenderer:
             if character == "\n":
                 if mode.paragraph_newline_pending:
                     sys.stdout.write(delta[start : index + 1])
-                    self._flush()
                     mode = dataclasses.replace(
                         mode,
                         paragraph_newline_pending=False,
@@ -2165,8 +2475,34 @@ class ReplRenderer:
                 )
         if start < len(delta):
             sys.stdout.write(delta[start:])
-            self._flush()
         state.mode = mode
+
+    def _render_tool_output_delta_locked(
+        self,
+        state: _AgentRenderState,
+        tool_key: ToolCallKey,
+        delta: str,
+        color: str,
+    ) -> None:
+        if not delta:
+            return
+        line_start = state.tool_output_line_start.get(tool_key, True)
+        start = 0
+        for index, character in enumerate(delta):
+            if line_start:
+                sys.stdout.write(_styled(self._theme.tool.ansi, "│ "))
+                line_start = False
+            if character != "\n":
+                continue
+            sys.stdout.write(_styled(color, delta[start : index + 1]))
+            line_start = True
+            start = index + 1
+        if start < len(delta):
+            if line_start:
+                sys.stdout.write(_styled(self._theme.tool.ansi, "│ "))
+                line_start = False
+            sys.stdout.write(_styled(color, delta[start:]))
+        state.tool_output_line_start[tool_key] = line_start
 
     def _render_field_event(
         self,
@@ -3315,8 +3651,8 @@ def _build_argument_parser() -> Any:
     parser.add_argument(
         "--agent-actions",
         choices=(DisplayMode.ACTIVE_ONLY.value, DisplayMode.ALL_ACTIONS.value),
-        default=DisplayMode.ACTIVE_ONLY.value,
-        help="Show framed actions from non-active agents (default: off)",
+        default=DisplayMode.ALL_ACTIONS.value,
+        help="Stream actions from non-active agents (default: on)",
     )
     parser.add_argument(
         "--theme",
@@ -3809,7 +4145,7 @@ async def main() -> None:
 
         async def _queue_background_outcome(outcome: TurnOutcome) -> None:
             agent_id = outcome.identity.agent_id
-            agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+            agent_name, suppress_display, unseen_text = await renderer.take_background_outcome_presentation(
                 agent_id,
                 outcome.identity.run_id,
                 outcome.identity.turn_id,
@@ -3817,7 +4153,8 @@ async def main() -> None:
             identity = format_agent_identity(agent_id, agent_name)
             if outcome.succeeded and outcome.text.strip():
                 text = f"Report from background agent {agent_id}:\n\n{outcome.text.strip()}"
-                display_text = f"Report from background agent {identity}:\n\n{outcome.text.strip()}"
+                visible_body = unseen_text.strip() if unseen_text is not None else outcome.text.strip()
+                display_text = f"Report from background agent {identity}:\n\n{visible_body}"
             elif outcome.succeeded:
                 text = f"[agent {agent_id}] finished its turn and is idle."
                 display_text = f"[agent {identity}] finished its turn and is idle."

@@ -487,9 +487,13 @@ async def test_deferred_result_keeps_original_badge_and_renders_once(
     output = sanitize_terminal_text(capsys.readouterr().out)
     expected_body = "deferred failed" if is_error else "deferred succeeded"
     assert output.count(f"{glyph} slow #001") == 1
+    assert "→" in output
     assert output.count(expected_body) == 1
     assert "provider-call-1" not in output
     assert "provider-call-1" in delivered[0].as_user_text()
+    assert delivered[0].started_at is not None
+    assert delivered[0].finished_at is not None
+    assert delivered[0].duration_seconds is not None
     assert renderer.active_tool_call_count == 0
 
     history = await context.get_history()

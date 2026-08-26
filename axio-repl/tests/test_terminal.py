@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 from axio.events import Error, ReasoningDelta, SessionEndEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.types import StopReason, Usage
-from axio_tools_agents.runtime import ExecutionMode, TurnStarted
+from axio_tools_agents.runtime import ExecutionMode, TurnFinished, TurnStarted, TurnStatus
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_input
@@ -27,8 +27,10 @@ from prompt_toolkit.utils import get_cwidth
 
 from axio_repl import ReplRenderer, _panel, _read_input_async
 from axio_repl._input import InputSubmitted, SubmissionDisposition
+from axio_repl._multiplexer import DisplayMode
 from axio_repl._replay import ReplayLog, read_replay, recording_output
 from axio_repl._terminal import MAX_PENDING_CHARS, RESET, OutputFrame, TerminalPhase, TerminalUI
+from axio_repl._terminal_ingress import TerminalIngress
 from axio_repl._terminal_sanitizer import sanitize_terminal_text
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, TerminalTheme
 
@@ -228,6 +230,25 @@ class _VirtualTerminal:
     def _clear_line(self, row: int, start: int, end: int) -> None:
         for column in range(start, end):
             self._cells[row][column] = " "
+
+
+class _VirtualOutput(_RecordingOutput):
+    def __init__(self, screen: _VirtualTerminal) -> None:
+        super().__init__()
+        self._screen = screen
+
+    def write_raw(self, data: str) -> None:
+        super().write_raw(data)
+        self._screen.feed(data.replace("\r\n", "\n").replace("\n", "\r\n"))
+
+    def cursor_up(self, amount: int) -> None:
+        self._screen.feed(f"\x1b[{amount}A")
+
+    def erase_down(self) -> None:
+        self._screen.feed("\x1b[J")
+
+    def get_size(self) -> Size:
+        return Size(rows=self._screen.rows, columns=self._screen.columns)
 
 
 async def test_terminal_ui_serializes_prints_and_logging_through_one_sink() -> None:
@@ -483,7 +504,8 @@ async def test_terminal_stream_facade_validates_writes_and_flushes_partial_text(
 
 
 async def test_live_line_snapshots_preserve_one_logical_stream_outside_prompt() -> None:
-    output = _RecordingOutput()
+    screen = _VirtualTerminal(columns=64, rows=8)
+    output = _VirtualOutput(screen)
     terminal = TerminalUI(_Session(output))
     await terminal.start()
     try:
@@ -500,10 +522,188 @@ async def test_live_line_snapshots_preserve_one_logical_stream_outside_prompt() 
     finally:
         await terminal.close()
 
-    rendered = sanitize_terminal_text("".join(output.raw))
+    rendered = "\n".join(screen.lines)
     assert rendered.count("first") == 1
     assert rendered.count("-tail") == 1
-    assert "first-tail\n" in rendered
+    assert "first-tail" in rendered
+
+
+async def test_semantic_live_lines_keep_partial_streams_independent() -> None:
+    screen = _VirtualTerminal(columns=64, rows=8)
+    output = _VirtualOutput(screen)
+    terminal = TerminalUI(_Session(output))
+    await terminal.start()
+    try:
+        stream = terminal.stdout
+        assert stream is not None
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("main")
+            stream.flush_live_line()
+        with stream.semantic_stream(("tool", "shell", "call"), priority=80):
+            stream.write("tool")
+            stream.flush_live_line()
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("-tail\n")
+        with stream.semantic_stream(("tool", "shell", "call"), priority=80):
+            stream.write("-tail\n")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    rendered = "\n".join(screen.lines)
+    assert rendered.count("main-tail") == 1
+    assert rendered.count("tool-tail") == 1
+
+
+async def test_persistent_writes_between_prompts_preserve_or_clear_multiple_live_rows() -> None:
+    screen = _VirtualTerminal(columns=64, rows=16)
+    output = _VirtualOutput(screen)
+    terminal = TerminalUI(_Session(output))
+    await terminal.start()
+    try:
+        stream = terminal.stdout
+        assert stream is not None
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("main-live")
+            stream.flush_live_line()
+        with stream.semantic_stream(("tool", "shell", "call"), priority=80):
+            stream.write("tool-live")
+            stream.flush_live_line()
+        await terminal.drain()
+
+        print("persistent insertion")
+        await terminal.drain()
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("-updated\n")
+        with stream.semantic_stream(("tool", "shell", "call"), priority=80):
+            stream.write("-updated\n")
+        await terminal.drain()
+
+        with stream.semantic_stream(("agent", "other"), priority=60):
+            stream.write("discarded-live")
+            stream.flush_live_line()
+        await terminal.drain()
+        terminal.submit(OutputFrame("clear marker\n", clear_live=True))
+        with stream.semantic_stream(("agent", "other"), priority=60):
+            stream.write("post-clear")
+            stream.flush_live_line()
+        await terminal.drain()
+        with stream.semantic_stream(("agent", "other"), priority=60):
+            stream.write("\n")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    rendered = "\n".join(screen.lines)
+    assert rendered.count("persistent insertion") == 1
+    assert rendered.count("main-live-updated") == 1
+    assert rendered.count("tool-live-updated") == 1
+    assert rendered.count("clear marker") == 1
+    assert "discarded-live" not in rendered
+    assert rendered.count("post-clear") == 1
+
+
+async def test_overflow_clear_preserves_output_started_after_the_suppression_marker() -> None:
+    screen = _VirtualTerminal(columns=64, rows=16)
+    output = _VirtualOutput(screen)
+    terminal = TerminalUI(_Session(output))
+    await terminal.start()
+    try:
+        stream = terminal.stdout
+        assert stream is not None
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("old-live")
+            stream.flush_live_line()
+        await terminal.drain()
+
+        terminal._ingress = TerminalIngress(max_pending_chars=16, max_batch_chars=16)
+        terminal.submit(OutputFrame("x" * 32))
+        await terminal.drain()
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("new-live")
+            stream.flush_live_line()
+        await terminal.drain()
+        with stream.semantic_stream(("agent", "main"), priority=100):
+            stream.write("\n")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    rendered = "\n".join(screen.lines)
+    assert "old-live" not in rendered
+    assert rendered.count("new-live") == 1
+    assert "terminal output skipped: 1 frame(s), 32 character(s)" in rendered
+
+
+async def test_concurrent_dropped_stdout_and_stderr_cannot_deadlock_stream_locks() -> None:
+    screen = _VirtualTerminal(columns=64, rows=16)
+    output = _VirtualOutput(screen)
+    terminal = TerminalUI(_Session(output))
+    barrier = threading.Barrier(2)
+
+    class BarrierIngress(TerminalIngress):
+        def submit(self, frame: OutputFrame) -> Any:
+            if frame.content in {"drop-out\n", "drop-err\n"}:
+                barrier.wait(timeout=1)
+            return super().submit(frame)
+
+    await terminal.start()
+    try:
+        stdout = terminal.stdout
+        stderr = terminal.stderr
+        assert stdout is not None
+        assert stderr is not None
+        with stdout.semantic_stream(("stdout", "old")):
+            stdout.write("old-out")
+            stdout.flush_live_line()
+        with stderr.semantic_stream(("stderr", "old")):
+            stderr.write("old-err")
+            stderr.flush_live_line()
+        await terminal.drain()
+
+        overflow = BarrierIngress(max_pending_chars=1, max_batch_chars=1)
+        terminal._ingress = overflow
+        overflow.submit(OutputFrame("x"))
+        errors: list[BaseException] = []
+
+        def write(stream: Any, content: str) -> None:
+            try:
+                stream.write(content)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = (
+            threading.Thread(target=write, args=(stdout, "drop-out\n"), daemon=True),
+            threading.Thread(target=write, args=(stderr, "drop-err\n"), daemon=True),
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        terminal._notify_consumer()
+        await terminal.drain()
+        assert not stdout._buffers
+        assert not stderr._buffers
+        assert not stdout._live_ids
+        assert not stderr._live_ids
+
+        terminal._ingress = TerminalIngress()
+        with stdout.semantic_stream(("stdout", "new")):
+            stdout.write("new-out\n")
+        with stderr.semantic_stream(("stderr", "new")):
+            stderr.write("new-err\n")
+        await terminal.drain()
+    finally:
+        await terminal.close()
+
+    rendered = "\n".join(screen.lines)
+    assert "old-out" not in rendered
+    assert "old-err" not in rendered
+    assert rendered.count("new-out") == 1
+    assert rendered.count("new-err") == 1
 
 
 async def test_drain_and_failure_wait_before_start_have_explicit_contracts() -> None:
@@ -984,6 +1184,237 @@ async def test_reasoning_partial_line_reaches_terminal_while_prompt_stays_active
             (first_stage, second_stage, boundary_stage, tab_first_stage, tab_replacement_stage, tab_final_stage)
         )
         assert "\x1b[?1049h" not in combined
+    finally:
+        terminal_input.close()
+        reader.close()
+        writer.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pseudo-terminal concurrent live-stream test")
+async def test_concurrent_partial_streams_remain_live_and_finalize_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    master_fd, slave_fd = os.openpty()
+    reader = TextIOWrapper(os.fdopen(os.dup(slave_fd), "rb", buffering=0), encoding="utf-8", newline="")
+    writer = TextIOWrapper(os.fdopen(os.dup(slave_fd), "wb", buffering=0), encoding="utf-8", newline="")
+    terminal_input = create_input(reader)
+    terminal_output = Vt100_Output(
+        writer,
+        get_size=lambda: Size(rows=80, columns=64),
+        term="xterm-256color",
+        enable_bell=False,
+        enable_cpr=False,
+    )
+    os.set_blocking(master_fd, False)
+    screen = _VirtualTerminal(columns=64, rows=80)
+
+    async def read_stage() -> str:
+        await asyncio.sleep(0.02)
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    try:
+        with create_app_session(input=terminal_input, output=terminal_output):
+            session: Any = _panel.make_session(lambda: "status", theme=DEFAULT_THEME)
+            setattr(session, "_axio_terminal_reset", DEFAULT_THEME.reset)
+            terminal = TerminalUI(session)
+            renderer = ReplRenderer(theme=DEFAULT_THEME, effective_username="tester")
+            await terminal.start()
+            prompt = asyncio.create_task(session.prompt_async(_panel.prompt_message("tester")))
+            try:
+                await asyncio.sleep(0.05)
+                screen.feed(await read_stage())
+                renderer.set_input_active(True)
+                await renderer.start_turn(
+                    "main",
+                    TurnStarted(prompt="main"),
+                    run_id="main-run",
+                    turn_id="main-turn",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.start_turn(
+                    "child",
+                    TurnStarted(prompt="child"),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+
+                await renderer.render(
+                    "main",
+                    ReasoningDelta(index=0, delta="main-partial"),
+                    run_id="main-run",
+                    turn_id="main-turn",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.render(
+                    "child",
+                    TextDelta(index=0, delta="child-completed\nchild-partial"),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                await terminal.drain()
+                first_stage = await read_stage()
+                screen.feed(first_stage)
+
+                prompt_row = max(index for index, line in enumerate(screen.lines) if "tester>" in line)
+                main_row = next(index for index, line in enumerate(screen.lines) if "> main-partial" in line)
+                completed_row = next(index for index, line in enumerate(screen.lines) if "child-completed" in line)
+                child_row = next(index for index, line in enumerate(screen.lines) if "child-partial" in line)
+                assert main_row < prompt_row
+                assert completed_row < prompt_row
+                assert child_row < prompt_row
+
+                await renderer.render(
+                    "main",
+                    ReasoningDelta(index=0, delta="-tail"),
+                    run_id="main-run",
+                    turn_id="main-turn",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await terminal.drain()
+                second_stage = await read_stage()
+                screen.feed(second_stage)
+
+                assert any("> main-partial-tail" in line for line in screen.lines)
+                assert any("child-completed" in line for line in screen.lines)
+                assert any("child-partial" in line for line in screen.lines)
+
+                await renderer.submitted("queued note", datetime(2026, 8, 26, 12, 0, tzinfo=UTC))
+                await terminal.drain()
+                insertion_stage = await read_stage()
+                screen.feed(insertion_stage)
+                assert any("> main-partial-tail" in line for line in screen.lines)
+                assert any("queued note" in line for line in screen.lines)
+
+                await renderer.set_display_mode(DisplayMode.ACTIVE_ONLY)
+                await terminal.drain()
+                disabled_stage = await read_stage()
+                screen.feed(disabled_stage)
+
+                assert any("> main-partial-tail" in line for line in screen.lines)
+                assert any("child-completed" in line for line in screen.lines)
+                assert not any("child-partial" in line for line in screen.lines)
+
+                await renderer.render(
+                    "child",
+                    TextDelta(index=0, delta="-hidden"),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                await renderer.set_display_mode(DisplayMode.ALL_ACTIONS)
+                await terminal.drain()
+                reenabled_stage = await read_stage()
+                screen.feed(reenabled_stage)
+                assert not any("child-partial" in line or "-hidden" in line for line in screen.lines)
+
+                await renderer.render(
+                    "child",
+                    TextDelta(index=0, delta="child-fresh"),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                await terminal.drain()
+                fresh_stage = await read_stage()
+                screen.feed(fresh_stage)
+                assert any("child-fresh" in line for line in screen.lines)
+                assert any("child-completed" in line for line in screen.lines)
+                assert not any("child-partial" in line or "-hidden" in line for line in screen.lines)
+
+                await renderer.render(
+                    "main",
+                    SessionEndEvent(StopReason.end_turn, Usage(1, 1)),
+                    run_id="main-run",
+                    turn_id="main-turn",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.start_turn(
+                    "main",
+                    TurnStarted(prompt="next"),
+                    run_id="main-run-2",
+                    turn_id="main-turn-2",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.render(
+                    "main",
+                    TextDelta(index=0, delta="next-turn"),
+                    run_id="main-run-2",
+                    turn_id="main-turn-2",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.render(
+                    "main",
+                    SessionEndEvent(StopReason.end_turn, Usage(1, 1)),
+                    run_id="main-run-2",
+                    turn_id="main-turn-2",
+                    execution_mode=ExecutionMode.FOREGROUND,
+                )
+                await renderer.render(
+                    "child",
+                    SessionEndEvent(StopReason.end_turn, Usage(1, 1)),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                await renderer.finish_turn(
+                    "child",
+                    TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn),
+                    run_id="child-run",
+                    turn_id="child-turn",
+                    execution_mode=ExecutionMode.BACKGROUND,
+                )
+                agent_name, suppress_display, unseen_text = await renderer.take_background_outcome_presentation(
+                    "child",
+                    "child-run",
+                    "child-turn",
+                )
+                assert not suppress_display
+                assert unseen_text == "child-partial-hidden"
+                await renderer.incoming(
+                    f"Report from background agent child:\n\n{unseen_text}",
+                    agent_id="child",
+                    agent_name=agent_name,
+                    suppress_display=suppress_display,
+                )
+                await terminal.drain()
+                final_stage = await read_stage()
+                screen.feed(final_stage)
+
+                final_plain = sanitize_terminal_text(final_stage)
+                assert "child-fresh" in final_plain
+                assert "child-partial-hidden" in final_plain
+                prompt_row = max(index for index, line in enumerate(screen.lines) if "tester>" in line)
+                persistent = "\n".join(screen.lines[:prompt_row])
+                assert persistent.count("main-partial-tail") == 1
+                assert persistent.count("queued note") == 1
+                assert persistent.count("next-turn") == 1
+                assert persistent.count("child-completed") == 1
+                assert persistent.count("child-fresh") == 1
+                assert persistent.count("child-partial-hidden") == 1
+            finally:
+                renderer.set_input_active(False)
+                if not prompt.done():
+                    prompt.cancel()
+                    await asyncio.gather(prompt, return_exceptions=True)
+                await terminal.close()
+
+        assert "\x1b[?1049h" not in (
+            first_stage + second_stage + insertion_stage + disabled_stage + reenabled_stage + fresh_stage + final_stage
+        )
     finally:
         terminal_input.close()
         reader.close()

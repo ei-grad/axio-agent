@@ -7,7 +7,14 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
-from axio.events import Error, SessionEndEvent, ToolInputDelta, ToolOutputDelta, ToolResult, ToolUseStart
+from axio.events import (
+    Error,
+    SessionEndEvent,
+    ToolInputDelta,
+    ToolOutputDelta,
+    ToolResult,
+    ToolUseStart,
+)
 from axio_tools_agents.runtime import AgentStarted, AgentStopped, RuntimeEvent, TurnFinished, TurnStarted
 
 from axio_repl._powerline import action_frame_footer, action_frame_header
@@ -462,6 +469,7 @@ class ActionMultiplexer:
         run_id: str = "",
         turn_id: str = "",
         tool_call_key: ToolCallKey | None = None,
+        retain_tool_output: bool = True,
     ) -> None:  # noqa: C901
         self._observed_activity = True
         call_key: ToolCallKey | None = None
@@ -470,8 +478,19 @@ class ActionMultiplexer:
             case ToolUseStart(tool_use_id=tool_use_id, name=name):
                 call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
                 started_call = self._tool_calls.start(call_key, name)
-            case ToolResult(tool_use_id=tool_use_id):
+            case ToolResult(
+                tool_use_id=tool_use_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_seconds=duration_seconds,
+            ):
                 call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
+                self._tool_calls.record_result_timing(
+                    call_key,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_seconds=duration_seconds,
+                )
             case ToolInputDelta(tool_use_id=tool_use_id) | ToolOutputDelta(tool_use_id=tool_use_id):
                 call_key = self._resolve_tool_key(agent_id, tool_use_id, run_id, turn_id, tool_call_key)
             case _:
@@ -531,8 +550,9 @@ class ActionMultiplexer:
                         return
                     self._emit_call(agent_id, action, retained=True)
                     action.saw_output = True
-                    self._append_output_buffer(action, key, delta)
-                    self._emit_complete_output(agent_id, action)
+                    if retain_tool_output:
+                        self._append_output_buffer(action, key, delta)
+                        self._emit_complete_output(agent_id, action)
                 case ToolResult(tool_use_id=tool_use_id, name=name, is_error=is_error, content=content):
                     assert call_key is not None
                     action = self._pop_tool(call_key)
@@ -846,7 +866,13 @@ class ActionMultiplexer:
         kind = _fit_utf8(sanitize_terminal_text(kind).replace("\n", " "), 40, suffix="…") or "action"
         clean_body = sanitize_terminal_text(body)
         tool_name = tool_display_name(tool_call.name) if tool_call is not None else None
-        tool_marker = tool_call.marker if tool_call is not None else None
+        tool_marker = (
+            self._tool_calls.result_marker(tool_call)
+            if tool_call is not None and tool_badge_kind in {ToolBadgeKind.SUCCESS, ToolBadgeKind.ERROR}
+            else tool_call.marker
+            if tool_call is not None
+            else None
+        )
         frame = ActionFrame(
             agent_id=agent_id,
             kind=kind,

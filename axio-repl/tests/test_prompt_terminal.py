@@ -132,6 +132,46 @@ async def test_live_output_replaces_wrapped_snapshot_and_finalizes_once() -> Non
     assert "raw:\r\n" not in operations
 
 
+async def test_independent_live_outputs_survive_each_others_updates_and_completion() -> None:
+    operations: list[str] = []
+    app = _App(operations, columns=40)
+    adapter = PromptToolkitInlineOutput(_Session(app))
+
+    await adapter.write_live("main partial", key=("stdout", 1), is_live=True, priority=100)
+    operations.clear()
+    await adapter.write_live("tool partial", key=("stdout", 2), is_live=True, priority=80)
+
+    assert "raw:main partial" in operations
+    assert "raw:tool partial" in operations
+
+    operations.clear()
+    await adapter.write_live("main partial tail\n", key=("stdout", 1), is_live=False, priority=100)
+
+    assert "raw:main partial tail\n" in operations
+    assert "raw:tool partial" in operations
+
+    operations.clear()
+    await adapter.write_live("tool partial tail\n", key=("stdout", 2), is_live=False, priority=80)
+
+    assert "raw:tool partial tail\n" in operations
+
+
+async def test_discard_live_removes_only_the_selected_snapshot() -> None:
+    operations: list[str] = []
+    app = _App(operations)
+    adapter = PromptToolkitInlineOutput(_Session(app))
+    await adapter.write_live("background partial", key=("stdout", 1), is_live=True, priority=60)
+    await adapter.write_live("foreground partial", key=("stdout", 2), is_live=True, priority=100)
+
+    operations.clear()
+    await adapter.discard_live(("stdout", 1))
+
+    assert "raw:background partial" not in operations
+    assert operations.count("raw:foreground partial") == 1
+    assert "up:4" in operations
+    assert "raw:main partial" not in operations
+
+
 async def test_live_output_counts_tab_stops_when_replacing_and_finalizing_wrapped_line() -> None:
     operations: list[str] = []
     app = _App(operations, columns=32)

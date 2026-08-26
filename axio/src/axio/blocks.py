@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+from datetime import datetime
 from functools import singledispatch
 from typing import Any, Literal
 
@@ -77,6 +78,9 @@ class ToolResultBlock(ContentBlock):
     tool_use_id: ToolCallID
     content: str | list[TextBlock | ImageBlock | AudioBlock | VideoBlock]
     is_error: bool = False
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
 
 
 @singledispatch

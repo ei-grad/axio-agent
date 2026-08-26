@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 
 from axio._asyncio import CancellationCause, cancel_tasks_bounded
@@ -30,6 +31,9 @@ class DeferredToolNotification:
     tool_name: str
     text: str
     is_error: bool
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
 
     def as_user_text(self) -> str:
         status = "failed" if self.is_error else "completed"
@@ -253,6 +257,14 @@ class DeferredToolRegistry:
                         is_error=True,
                     ),
                 )
+                timing = record.dispatch.timings.get(block.id)
+                if timing is not None and result.started_at is None:
+                    result = replace(
+                        result,
+                        started_at=timing.started_at,
+                        finished_at=timing.finished_at,
+                        duration_seconds=timing.duration_seconds,
+                    )
                 await self._deliver(
                     DeferredToolNotification(
                         agent_id=record.agent_id,
@@ -262,6 +274,9 @@ class DeferredToolRegistry:
                         tool_name=block.name,
                         text=_result_text(result),
                         is_error=result.is_error,
+                        started_at=result.started_at,
+                        finished_at=result.finished_at,
+                        duration_seconds=result.duration_seconds,
                     )
                 )
             record.phase = DeferredToolPhase.DELIVERED

@@ -198,7 +198,7 @@ async def test_ui_notice_stays_in_panel_and_is_terminal_safe(capsys: pytest.Capt
 async def test_focusing_an_agent_does_not_replay_hidden_prose(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer()
+    renderer = ReplRenderer(display_mode=DisplayMode.ACTIVE_ONLY)
 
     await renderer.render("child", TextDelta(index=0, delta="unique hidden report"))
     await renderer.render(
@@ -643,7 +643,7 @@ async def test_foreground_child_reasoning_and_tool_actions_keep_the_active_strea
     assert "hi" not in response
 
 
-async def test_all_actions_preserves_active_bytes_and_inserts_only_after_a_paragraph(
+async def test_all_actions_preserves_active_bytes_and_inserts_background_action_immediately(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
@@ -653,37 +653,41 @@ async def test_all_actions_preserves_active_bytes_and_inserts_only_after_a_parag
     await renderer.render("main", TextDelta(index=0, delta="\n\nsecond paragraph"))
 
     output = capsys.readouterr().out
-    assert output.index("first paragraph\n\n") < output.index("agent child · tool call")
+    assert output.index("first paragraph") < output.index("agent child · tool call")
     assert output.index("agent child · tool call") < output.index("second paragraph")
-    assert _ACTION_FRAME.sub("", output) == "first paragraph\n\nsecond paragraph"
+    active = _ACTION_FRAME.sub("", output)
+    assert "first paragraph" in active
+    assert "second paragraph" in active
 
 
-async def test_paragraph_boundary_split_across_deltas_is_safe(capsys: pytest.CaptureFixture[str]) -> None:
+async def test_background_action_does_not_wait_for_split_paragraph_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
 
     await renderer.render("main", TextDelta(index=0, delta="first\n"))
     await _queue_background_tool_action(renderer)
-    assert "agent child" not in capsys.readouterr().out
+    first_stage = capsys.readouterr().out
+    assert first_stage.index("first") < first_stage.index("agent child")
 
     await renderer.render("main", TextDelta(index=0, delta="\nsecond"))
     output = capsys.readouterr().out
 
-    assert output.startswith("\n")
-    assert "agent child · tool call" in output
-    assert output.endswith("second")
+    assert "second" in output
 
 
-async def test_background_actions_wait_until_reasoning_closes(capsys: pytest.CaptureFixture[str]) -> None:
+async def test_background_actions_do_not_wait_until_reasoning_closes(capsys: pytest.CaptureFixture[str]) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
 
     await renderer.render("main", ReasoningDelta(index=0, delta="checking"))
     await _queue_background_tool_action(renderer)
-    assert "agent child" not in capsys.readouterr().out
+    first_stage = capsys.readouterr().out
+    assert first_stage.index("checking") < first_stage.index("agent child")
 
     await renderer.render("main", TextDelta(index=0, delta="answer"))
     output = capsys.readouterr().out
 
-    assert output.index("agent child") < output.index("answer")
+    assert "answer" in output
 
 
 async def test_multiline_reasoning_reapplies_dim_after_every_terminal_line(
@@ -1276,7 +1280,10 @@ async def test_multiline_tool_output_reapplies_its_style_after_newlines(
     )
 
     output = capsys.readouterr().out
-    assert f"{DIM}one{RESET}\n{DIM}two{RESET}\n{DIM}three{RESET}" in output
+    assert output.count("│ ") == 3
+    assert f"{DIM}one{RESET}" in output
+    assert f"{DIM}two{RESET}" in output
+    assert f"{DIM}three{RESET}" in output
 
 
 async def test_foreground_tool_output_preserves_channel_order_styles_and_no_success_replay(
@@ -1311,6 +1318,125 @@ async def test_foreground_tool_output_preserves_channel_order_styles_and_no_succ
     assert output.count("first") == output.count("second") == output.count("third") == 1
 
 
+async def test_foreground_shell_output_has_one_rail_and_channel_changes_only_style(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="first"),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stderr", delta="second"),
+    )
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="third\nnext"),
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("│ ") == 2
+    assert "stdout" not in output
+    assert "stderr" not in output
+    assert f"{DIM}first{RESET}" in output
+    assert f"\033[2;33msecond{RESET}" in output
+    assert f"{DIM}third{RESET}" in output
+
+
+async def test_tool_result_badge_shows_execution_start_end_and_duration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer()
+    started_at = datetime(2026, 8, 26, 12, 34, 56, tzinfo=UTC)
+    finished_at = datetime(2026, 8, 26, 12, 35, 1, tzinfo=UTC)
+
+    await renderer.render("main", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render(
+        "main",
+        ToolResult(
+            "call",
+            "shell",
+            False,
+            "done",
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=5.25,
+        ),
+    )
+
+    expected = f"#001 · {started_at.astimezone():%H:%M:%S}→{finished_at.astimezone():%H:%M:%S} · 5.25s"
+    assert expected in capsys.readouterr().out
+
+
+async def test_background_tool_result_frame_shows_execution_timing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    started_at = datetime(2026, 8, 26, 12, 34, 56, tzinfo=UTC)
+    finished_at = datetime(2026, 8, 26, 12, 35, 1, tzinfo=UTC)
+
+    await renderer.render("child", ToolUseStart(index=0, tool_use_id="call", name="shell"))
+    await renderer.render("child", ToolInputDelta(index=0, tool_use_id="call", partial_json="{}"))
+    await renderer.render(
+        "child",
+        ToolResult(
+            "call",
+            "shell",
+            False,
+            "done",
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=5.25,
+        ),
+    )
+
+    expected = f"#001 · {started_at.astimezone():%H:%M:%S}→{finished_at.astimezone():%H:%M:%S} · 5.25s"
+    output = capsys.readouterr().out
+    assert expected in output
+    assert "agent child · tool result" in output
+
+
+async def test_all_actions_streams_background_delta_without_waiting_for_foreground_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
+    await renderer.start_turn(
+        "main",
+        TurnStarted(prompt="main"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.start_turn(
+        "child",
+        TurnStarted(prompt="child"),
+        run_id="child-run",
+        turn_id="child-turn",
+        execution_mode=ExecutionMode.BACKGROUND,
+    )
+    await renderer.render(
+        "main",
+        ReasoningDelta(index=0, delta="main partial"),
+        run_id="main-run",
+        turn_id="main-turn",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    capsys.readouterr()
+
+    await renderer.render(
+        "child",
+        TextDelta(index=0, delta="child partial"),
+        run_id="child-run",
+        turn_id="child-turn",
+        execution_mode=ExecutionMode.BACKGROUND,
+    )
+
+    assert "child partial" in capsys.readouterr().out
+
+
 async def test_background_tool_output_preserves_partial_channel_order(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1338,12 +1464,14 @@ async def test_background_tool_output_preserves_partial_channel_order(
     await renderer.mark_idle()
 
     output = capsys.readouterr().out
-    first = output.index("agent child · shell stdout")
-    second = output.index("agent child · shell stderr")
-    third = output.index("agent child · shell stdout", first + 1)
+    first = output.index("first")
+    second = output.index("second")
+    third = output.index("third")
     completed = output.index("agent child · tool result")
     assert first < second < third < completed
     assert output.count("first") == output.count("second") == output.count("third") == 1
+    assert "shell stdout" not in output
+    assert "shell stderr" not in output
 
 
 async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
@@ -1364,7 +1492,8 @@ async def test_tool_stderr_is_muted_until_the_tool_reports_failure(
     output = capsys.readouterr().out
     muted_amber = "\033[2;33m"
     red = "\033[31m"
-    assert f"{muted_amber}warning one{RESET}\n{muted_amber}warning two{RESET}" in output
+    assert f"{muted_amber}warning one{RESET}" in output
+    assert f"{muted_amber}warning two{RESET}" in output
     assert f"{red}command failed{RESET}" in output
     assert f"{red}warning one" not in output
 
@@ -1458,7 +1587,7 @@ async def test_large_character_sized_single_line_uses_one_completion_boundary(
     assert output == "\n  content: " + value + "\n"
 
 
-async def test_background_actions_wait_for_all_parallel_active_tools(
+async def test_background_actions_do_not_wait_for_parallel_active_tools(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
@@ -1467,7 +1596,7 @@ async def test_background_actions_wait_for_all_parallel_active_tools(
     await renderer.render("main", ToolUseStart(index=1, tool_use_id="two", name="shell"))
     await renderer.render("main", ToolInputDelta(index=1, tool_use_id="two", partial_json='{"command":"two"}'))
     await _queue_background_tool_action(renderer)
-    assert "agent child" not in capsys.readouterr().out
+    assert "agent child · tool call" in capsys.readouterr().out
 
     await renderer.render("main", ToolResult(tool_use_id="one", name="shell", is_error=False, content="one"))
     assert "agent child" not in capsys.readouterr().out
@@ -1479,7 +1608,7 @@ async def test_background_actions_wait_for_all_parallel_active_tools(
     assert "agent child" not in capsys.readouterr().out
 
     await renderer.render("main", ToolResult(tool_use_id="two", name="shell", is_error=False, content="two"))
-    assert "agent child · tool call" in capsys.readouterr().out
+    assert "agent child" not in capsys.readouterr().out
 
 
 async def test_background_actions_stream_while_monitor_is_waiting(
@@ -1504,7 +1633,7 @@ async def test_background_actions_stream_while_monitor_is_waiting(
     assert renderer.queued_action_count == 0
 
 
-async def test_monitor_does_not_open_boundary_for_parallel_foreground_output(
+async def test_background_action_streams_despite_parallel_foreground_output(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer(display_mode=DisplayMode.ALL_ACTIONS)
@@ -1520,11 +1649,11 @@ async def test_monitor_does_not_open_boundary_for_parallel_foreground_output(
     )
     await _queue_background_tool_action(renderer)
 
-    assert "agent child" not in capsys.readouterr().out
+    assert "agent child · tool call" in capsys.readouterr().out
 
     await renderer.render("main", ToolResult(tool_use_id="shell", name="shell", is_error=False, content=""))
 
-    assert "agent child · tool call" in capsys.readouterr().out
+    assert "agent child" not in capsys.readouterr().out
 
 
 async def test_active_stream_is_identical_when_there_are_no_background_actions() -> None:
@@ -1707,7 +1836,7 @@ async def test_foreground_result_suppression_does_not_cross_parent_turns_when_to
     assert "foreground agent" not in output
 
 
-async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exactly_once(
+async def test_parent_sibling_tool_stream_does_not_wait_for_child_paragraph_boundary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     renderer = ReplRenderer()
@@ -1724,20 +1853,30 @@ async def test_parent_sibling_tool_stream_drains_at_child_paragraph_boundary_exa
     await renderer.render("child", TextDelta(index=0, delta="child paragraph"))
     await renderer.render(
         "main",
-        ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="unique sibling line\n"),
+        ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="unique sibling"),
     )
     await renderer.render(
         "main",
-        ToolResult(tool_use_id="shell-call", name="shell", is_error=False, content="unique sibling line\n"),
+        ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stderr", delta=" warning"),
     )
-    assert "unique sibling line" not in capsys.readouterr().out
+    streamed = capsys.readouterr().out
+    assert "child paragraph" in streamed
+    assert streamed.count("unique sibling") == 1
+    assert streamed.count(" warning") == 1
+    assert streamed.count("│ ") == 1
+    assert "shell stdout" not in streamed
+    assert "shell stderr" not in streamed
 
+    await renderer.render(
+        "main",
+        ToolResult(tool_use_id="shell-call", name="shell", is_error=False, content="unique sibling warning"),
+    )
     await renderer.render("child", TextDelta(index=0, delta="\n\nchild continues"))
     output = capsys.readouterr().out
 
-    assert output.index("\n\n") < output.index("agent main · shell stdout")
-    assert output.index("✓ shell #002") < output.index("child continues")
-    assert output.count("unique sibling line") == 1
+    assert "child continues" in output
+    assert "unique sibling" not in output
+    assert " warning" not in output
 
 
 async def test_suspended_sibling_result_finishes_unicode_before_cleanup_without_tearing_child_output(
@@ -1791,17 +1930,24 @@ async def test_suspended_tool_collector_obeys_the_total_retained_byte_cap(
     await renderer.enter_foreground("child", "agent-call")
     capsys.readouterr()
 
-    for _ in range(10_000):
+    await renderer.render(
+        "main",
+        ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="x" * 1024),
+    )
+    retained_after_first_delta = suspended.retained_bytes
+    for _ in range(100):
         await renderer.render(
             "main",
             ToolOutputDelta(tool_use_id="shell-call", name="shell", key="stdout", delta="x" * 1024),
         )
 
     assert suspended.retained_bytes <= retained_limit
-    assert suspended.retained_collector_bytes == 0
-    assert suspended.retained_tool_count == 0
-    assert suspended.retained_suppression_bytes > 0
+    assert suspended.retained_bytes == retained_after_first_delta
+    assert suspended.retained_collector_bytes < 256
+    assert suspended.retained_tool_count == 1
+    assert suspended.retained_suppression_bytes == 0
     assert renderer.retained_action_bytes <= renderer.max_retained_action_bytes
+    assert "suppressed" not in capsys.readouterr().out
 
     await renderer.render(
         "main",
@@ -1902,7 +2048,7 @@ async def test_real_run_agent_and_streaming_sibling_preserve_nearest_safe_bounda
     output = capsys.readouterr().out
     assert outcome.succeeded
     assert output.count("unique concurrent sibling") == 1
-    assert output.index("child paragraph\n\n") < output.index("unique concurrent sibling")
+    assert output.index("child paragraph") < output.index("unique concurrent sibling")
     assert output.index("unique concurrent sibling") < output.index("child continues")
     assert re.search(r"foreground agent [^\n]+ \([^)]+\) returned its result to the parent", output)
 
@@ -1910,7 +2056,7 @@ async def test_real_run_agent_and_streaming_sibling_preserve_nearest_safe_bounda
 async def test_enabling_actions_does_not_replay_events_seen_while_off(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer()
+    renderer = ReplRenderer(display_mode=DisplayMode.ACTIVE_ONLY)
 
     await render_runtime_event(
         renderer,
@@ -2034,7 +2180,7 @@ async def test_focused_final_reply_is_not_replayed_by_incoming_delivery(
         renderer,
         envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
     )
-    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+    agent_name, suppress_display, _display_text = await renderer.take_background_outcome_presentation(
         "child-id", "child-run", "focused-turn"
     )
     await renderer.incoming(
@@ -2052,7 +2198,7 @@ async def test_focused_final_reply_is_not_replayed_by_incoming_delivery(
 async def test_focusing_a_running_hidden_turn_keeps_the_whole_turn_background(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer()
+    renderer = ReplRenderer(display_mode=DisplayMode.ACTIVE_ONLY)
 
     def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
         return AgentEventEnvelope(
@@ -2080,7 +2226,7 @@ async def test_focusing_a_running_hidden_turn_keeps_the_whole_turn_background(
         renderer,
         envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
     )
-    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+    agent_name, suppress_display, _display_text = await renderer.take_background_outcome_presentation(
         "child-id", "child-run", "child-turn"
     )
     await renderer.incoming(
@@ -2146,7 +2292,7 @@ async def test_focusing_away_from_a_running_live_turn_keeps_the_whole_turn_live(
         renderer,
         envelope(TurnFinished(status=TurnStatus.SUCCEEDED, stop_reason=StopReason.end_turn)),
     )
-    agent_name, suppress_display = await renderer.take_background_outcome_presentation(
+    agent_name, suppress_display, _display_text = await renderer.take_background_outcome_presentation(
         "child-id", "child-run", "child-turn"
     )
     await renderer.incoming(
@@ -2193,7 +2339,7 @@ async def test_actions_on_labels_same_named_agents_with_their_distinct_ids(
 async def test_actions_off_failure_uses_one_canonical_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    renderer = ReplRenderer()
+    renderer = ReplRenderer(display_mode=DisplayMode.ACTIVE_ONLY)
 
     def envelope(event: RuntimeEvent) -> AgentEventEnvelope:
         return AgentEventEnvelope(
@@ -2398,7 +2544,8 @@ async def test_action_frame_does_not_force_a_prompt_toolkit_partial_line_flush(
         assert flush.call_count == 0
 
     output = capsys.readouterr().out
-    assert "paragraph\n\n" in output
+    assert output.index("paragraph\n") < output.index("agent child · tool call")
+    assert output.index("agent child · tool call") < output.index("\ncontinued")
     assert output.endswith("continued")
 
 

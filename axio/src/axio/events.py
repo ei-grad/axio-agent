@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from .blocks import AudioMediaType, ImageMediaType, VideoMediaType
@@ -72,6 +73,9 @@ class ToolResult:
     is_error: bool
     content: str = ""
     input: dict[str, Any] = field(default_factory=dict)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

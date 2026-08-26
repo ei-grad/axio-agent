@@ -409,7 +409,10 @@ async def test_one_shot_background_report_is_displayed_exactly_once_without_pros
 
     output = capsys.readouterr().out
     assert output.count(unique_report) == 1
-    assert output.index("incoming") < output.index(unique_report)
+    if agent_actions == "off":
+        assert output.index("incoming") < output.index(unique_report)
+    else:
+        assert "one-shot-child" in output
     if agent_actions == "on":
         assert "agent one-shot-child" in output
 

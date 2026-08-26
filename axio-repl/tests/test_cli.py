@@ -50,10 +50,10 @@ from axio_repl._recovery import materialize_recovery
 from axio_repl._theme import DEFAULT_THEME, MONOCHROME_THEME, NO_COLOR_THEME, TerminalTheme
 
 
-def test_agent_actions_default_to_off() -> None:
+def test_agent_actions_default_to_on() -> None:
     args = _build_argument_parser().parse_args([])
 
-    assert args.agent_actions == "off"
+    assert args.agent_actions == "on"
 
 
 def test_powerline_uses_terminal_default_and_accepts_explicit_overrides() -> None:
@@ -265,7 +265,7 @@ async def test_sandbox_none_reports_restricted_options_as_cli_error(
 
 
 async def test_agent_actions_command_toggles_and_publishes_configuration(capsys: pytest.CaptureFixture[str]) -> None:
-    renderer = ReplRenderer()
+    renderer = ReplRenderer(display_mode=DisplayMode.ACTIVE_ONLY)
     published: list[RuntimeEvent] = []
 
     async def publish(event: RuntimeEvent) -> None:
@@ -285,7 +285,7 @@ async def test_agent_actions_command_reports_invalid_value_without_changing_mode
 
     assert not await _handle_agent_actions(renderer, "verbose")
 
-    assert renderer.display_mode is DisplayMode.ACTIVE_ONLY
+    assert renderer.display_mode is DisplayMode.ALL_ACTIONS
     assert "must be 'on' or 'off'" in capsys.readouterr().out
 
 

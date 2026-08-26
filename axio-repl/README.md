@@ -36,8 +36,9 @@ The system prompt encodes hard-won lessons from watching models cut corners:
   re-evaluated and the system prompt adapts automatically.
 - **Streaming tool arguments** — completed single-line fields render inline;
   multiline fields switch to an unindented block at their first decoded newline.
-- **Streaming tool output** — tagged shell stdout/stderr chunks appear as soon
-  as the executor observes them instead of waiting for completion or a newline.
+- **Streaming tool output** — shell chunks appear as soon as the executor
+  observes them, including inside an unfinished line. A shared rail marks tool
+  output; stdout is dim gray and stderr muted amber without channel headers.
 - **Vision** — `read_file` on images (PNG, JPG, GIF, WebP) and videos returns
   multimodal content blocks. The model sees the actual pixels, not a description.
 - **Image & video generation** — when the Google transport is installed,
@@ -196,8 +197,8 @@ axio-repl --session-replay
 # Resume an interrupted interactive session into a new journal
 axio-repl --resume ~/.local/state/axio/sessions/2026/08/14/<session>/session.jsonl
 
-# Show framed tool and lifecycle actions from background agents
-axio-repl --agent-actions on
+# Hide live actions from background agents
+axio-repl --agent-actions off
 
 # Use the plain presentation instead of the interactive Powerline default
 axio-repl --no-powerline
@@ -343,8 +344,8 @@ turn boundary; it never becomes a pending conversation message.
 | Command              | Description                                    |
 |----------------------|------------------------------------------------|
 | `/help`              | Show available tools and commands               |
-| `/agent-actions`     | Show whether other agents' actions are visible  |
-| `/agent-actions on\|off` | Toggle framed actions from other agents    |
+| `/agent-actions`     | Show whether other agents' live streams are visible |
+| `/agent-actions on\|off` | Toggle live streams from other agents      |
 | `/agents`            | List local background agents                    |
 | `/agent-focus <id>`  | Change the input target                         |
 | `/agent-interrupt [id]` | Interrupt a background agent's current turn |
@@ -371,19 +372,30 @@ without a header. When an agent has a human name, headers, action frames,
 summaries, errors, and incoming reports identify it as `name (agent_id)`;
 otherwise they show the authoritative agent id.
 
-If another parent tool streams concurrently with the foreground child, its
-labelled output is inserted at the child's next safe boundary. This active
-parent work remains visible even when agent actions are off, without splitting
-the child's paragraph, reasoning, arguments, or tool output.
+If another agent or parent tool streams concurrently, it no longer waits for a
+paragraph, reasoning, or tool boundary. Each agent/turn/tool owns an independent
+replaceable live-line buffer above the active editor. Updating one buffer does
+not finalize, erase, or duplicate the others; completed lines move into ordinary
+primary-buffer scrollback exactly once. A static importance score keeps focused
+agent output and tool activity nearest the editor while every stream remains
+visible.
 
-`spawn_agent` starts a persistent background peer. By default, its prose and
-actions stay out of the active stream and the REPL prints a completion summary.
-Use `/agent-actions on` (or start with `--agent-actions on`) to show its complete
-tool calls, ordered channel-tagged tool output, results, errors, and lifecycle
-changes.
-These labelled frames appear only after a complete active paragraph, after
-reasoning closes, after media, or after every active parallel tool call has
-finished. Background prose and reasoning remain hidden.
+`spawn_agent` starts a persistent background peer. Its prose, reasoning, tool
+calls, output, results, errors, and lifecycle changes stream by default. Tool
+output uses one rail per physical line; stdout/stderr transitions change only
+the text colour and preserve executor-observed order. `/agent-actions off`
+hides this live presentation, immediately removes unfinished background rows,
+and restores completion summaries without changing execution or final-report
+delivery. Turning it on again starts with new activity instead of replaying the
+discarded rows. A background final report already shown live is not printed
+again as an incoming report. If a mode change splits one response, the incoming
+report displays only the portions that never reached scrollback; the complete
+report still enters model context.
+
+Tool result badges include the local execution start/end times and a monotonic
+duration. These are measured inside the dispatcher and stay attached when a
+result is delivered after turn preemption; model streaming and UI-consumer
+delays are excluded.
 
 The action toggle changes terminal presentation only. It neither changes which
 agent receives input nor affects execution, outcome delivery, context, or the

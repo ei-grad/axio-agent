@@ -345,7 +345,7 @@ axio-repl --transport openai "write tests for src/auth.py"
 | `--max-iterations` | 1000 | Max agent iterations |
 | `--debug` | off | Log raw request/response bodies |
 | `--no-debug` | off | Explicitly disable debug logging after config resolution |
-| `--agent-actions` | off | Show framed actions from non-active agents (`on` or `off`) |
+| `--agent-actions` | on | Stream actions from non-active agents (`on` or `off`) |
 | `--theme` | `default` | Terminal palette: `default` or `monochrome` |
 | `--powerline` | interactive TTY | Explicitly use Powerline segments for the prompt, tool names, and agent frames |
 | `--no-powerline` | — | Explicitly disable Powerline presentation after config resolution |
@@ -559,10 +559,10 @@ The user's input target remains unchanged. When the child finishes, its full
 answer is returned to the parent as a single tool result and is not printed a
 second time.
 
-When a sibling parent tool streams while `run_agent` owns the foreground, the
-REPL queues that sibling action separately and inserts it at the child's nearest
-safe boundary. These frames remain visible with `/agent-actions off` because
-they belong to the active parent turn, not a background agent.
+When a sibling parent tool streams while `run_agent` owns the foreground, its
+output is rendered immediately through an independent semantic live line. It
+remains visible with `/agent-actions off` because it belongs to the active
+parent turn, not a background agent.
 
 Each live-streamed turn starts with a source header. The root answer in
 single-prompt mode is the exception: it keeps its plain stdout projection
@@ -570,19 +570,26 @@ without a header. When an agent has a human name, headers, action frames,
 summaries, errors, and incoming reports identify it as `name (agent_id)`;
 otherwise they show the authoritative agent id.
 
-`spawn_agent` creates a persistent background agent. `/agent-actions on` makes
-its tool and lifecycle activity visible without mixing its free-form prose or
-reasoning into the active answer. Every background action is a labelled,
-newline-terminated frame. Frames are inserted only at safe boundaries: after a
-complete active paragraph, after reasoning or media, or after all parallel
-active tool calls complete. They never split streamed tool JSON or active tool
-output.
+`spawn_agent` creates a persistent background agent. Its prose, reasoning,
+tools, and lifecycle stream by default. Each agent/turn/tool has an independent
+replaceable live-line buffer above the editor, so an unfinished line from one
+source neither blocks nor gets finalized by another source. A static importance
+score orders active live lines, keeping focused output nearest the editor while
+all streams remain visible. Completed lines enter primary-buffer scrollback
+exactly once.
 
-The queues are bounded and drained round-robin, so a noisy agent cannot block
-the active stream or monopolize a boundary. Overflow produces an explicit
-suppression marker. Switching the mode off discards queued presentation frames;
-switching it on does not replay old activity. Display mode is independent of
-input focus, scheduling, parent delivery, context, and the JSONL session log.
+Shell output has one shared rail per physical line. stdout is dim gray and
+stderr muted amber; a channel transition changes only text colour and never
+adds a heading. Result badges show local execution start/end timestamps plus a
+monotonic duration. `/agent-actions off` hides background live streams and uses
+completion summaries instead. It removes unfinished background rows
+immediately while leaving foreground rows intact. Switching it back on does not
+replay old activity. When a toggle splits one response, normal outcome delivery
+prints only ranges that never entered scrollback while its full text remains in
+model context. Timing is measured around the actual dispatcher execution,
+survives deferred delivery, and excludes model-stream and UI-consumer delays.
+Display mode remains independent of input focus, scheduling, parent delivery,
+context, and the JSONL session log.
 
 For a single-prompt invocation, spawned background agents are joined before the
 process exits. Their final reports use the normal incoming-outcome path exactly

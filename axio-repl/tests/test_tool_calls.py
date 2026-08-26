@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from axio_repl._theme import DEFAULT_THEME, NO_COLOR_THEME
 from axio_repl._tool_calls import (
     ToolBadgeKind,
@@ -28,6 +30,24 @@ def test_registry_correlates_concurrent_calls_and_never_reuses_ordinals() -> Non
     reused = registry.start(ToolCallKey("main", "next-run", "next-turn", "provider-a"), "shell")
     other_agent = registry.start(ToolCallKey("child", "run", "turn", "provider-a"), "shell")
     assert (reused.marker, other_agent.marker) == ("#003", "#004")
+
+
+def test_registry_formats_completed_execution_timing_in_result_marker() -> None:
+    registry = ToolCallRegistry()
+    key = ToolCallKey("main", "run", "turn", "provider")
+    call = registry.start(key, "shell")
+    started_at = datetime(2026, 8, 26, 12, 34, 56, tzinfo=UTC)
+    finished_at = datetime(2026, 8, 26, 12, 35, 1, tzinfo=UTC)
+
+    registry.record_result_timing(
+        key,
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=5.25,
+    )
+
+    expected = f"#001 · {started_at.astimezone():%H:%M:%S}→{finished_at.astimezone():%H:%M:%S} · 5.25s"
+    assert registry.result_marker(call) == expected
 
 
 def test_registry_labels_orphans_and_bounds_cleanup_without_reusing_numbers() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from axio_repl._powerline import PowerlineBadge, PowerlineSegment
@@ -49,6 +50,13 @@ class ToolResultDisplay:
     name_mismatch: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ToolExecutionTiming:
+    started_at: datetime
+    finished_at: datetime | None = None
+    duration_seconds: float | None = None
+
+
 class ToolBadgeKind(StrEnum):
     CALL = "call"
     SUCCESS = "success"
@@ -70,6 +78,7 @@ class ToolCallRegistry:
         self._next_ordinal = 1
         self._active: OrderedDict[ToolCallKey, ToolCallDisplay] = OrderedDict()
         self._deferred: OrderedDict[ToolCallKey, ToolCallDisplay] = OrderedDict()
+        self._timings: dict[ToolCallKey, ToolExecutionTiming] = {}
 
     @property
     def active_count(self) -> int:
@@ -107,6 +116,34 @@ class ToolCallRegistry:
 
     def complete(self, key: ToolCallKey) -> None:
         self._active.pop(key, None)
+        self._timings.pop(key, None)
+
+    def record_result_timing(
+        self,
+        key: ToolCallKey,
+        *,
+        started_at: datetime | None,
+        finished_at: datetime | None,
+        duration_seconds: float | None,
+    ) -> None:
+        if (
+            started_at is not None
+            and finished_at is not None
+            and duration_seconds is not None
+            and (key in self._active or key in self._deferred)
+        ):
+            self._timings[key] = ToolExecutionTiming(started_at, finished_at, max(0.0, duration_seconds))
+
+    def result_marker(self, call: ToolCallDisplay) -> str:
+        timing = self._timings.get(call.key)
+        if timing is None or timing.finished_at is None or timing.duration_seconds is None:
+            return call.marker
+        return format_tool_result_marker(
+            call.marker,
+            started_at=timing.started_at,
+            finished_at=timing.finished_at,
+            duration_seconds=timing.duration_seconds,
+        )
 
     def defer(self, key: ToolCallKey) -> ToolCallDisplay | None:
         call = self._active.pop(key, None)
@@ -118,6 +155,7 @@ class ToolCallRegistry:
         call = self._deferred.pop(key, None)
         if call is None:
             return None
+        self._timings.pop(key, None)
         return ToolResultDisplay(
             call=call,
             event_name=tool_display_name(event_name),
@@ -127,16 +165,25 @@ class ToolCallRegistry:
 
     def discard_deferred(self) -> None:
         self._deferred.clear()
+        self._timings = {key: timing for key, timing in self._timings.items() if key in self._active}
 
     def discard_turn(self, *, agent_id: str, run_id: str, turn_id: str) -> None:
+        discarded = {
+            key for key in self._active if key.agent_id == agent_id and key.run_id == run_id and key.turn_id == turn_id
+        }
         self._active = OrderedDict(
             (key, call)
             for key, call in self._active.items()
             if not (key.agent_id == agent_id and key.run_id == run_id and key.turn_id == turn_id)
         )
+        for key in discarded:
+            self._timings.pop(key, None)
 
     def discard_agent(self, agent_id: str) -> None:
+        discarded = {key for key in self._active if key.agent_id == agent_id}
         self._active = OrderedDict((key, call) for key, call in self._active.items() if key.agent_id != agent_id)
+        for key in discarded:
+            self._timings.pop(key, None)
 
     def _allocate(self, key: ToolCallKey, name: str) -> ToolCallDisplay:
         ordinal = self._next_ordinal
@@ -166,6 +213,23 @@ def tool_badge(
         return PowerlineBadge((PowerlineSegment(f" {label} ", badge_style.foreground, badge_style.background),)).ansi()
     text_style = _text_style(kind, theme)
     return f"{text_style.ansi}{label}{theme.reset}"
+
+
+def format_tool_result_marker(
+    marker: str,
+    *,
+    started_at: datetime | None,
+    finished_at: datetime | None,
+    duration_seconds: float | None,
+) -> str:
+    """Add execution bounds to a result marker when the dispatch measured them."""
+
+    if started_at is None or finished_at is None or duration_seconds is None:
+        return marker
+    start = started_at.astimezone().strftime("%H:%M:%S")
+    finish = finished_at.astimezone().strftime("%H:%M:%S")
+    duration = f"{duration_seconds * 1000:.0f}ms" if duration_seconds < 1 else f"{duration_seconds:.2f}s"
+    return f"{marker} · {start}→{finish} · {duration}"
 
 
 def tool_display_name(value: object) -> str:
