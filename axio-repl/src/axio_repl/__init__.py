@@ -436,9 +436,12 @@ def build_system_prompt(
             "- For compound requests, build a checklist of all items and verify each is addressed before finishing.",
             "- Don't narrate your tool calls — the user sees their full output.",
             "- After completing work, summarize what changed briefly.",
-            "- Not tested — not done. Always run tests or builds to verify your changes. "
-            "Re-read edited files, observe actual results — don't assume success "
-            "from exit codes alone.",
+            "- Not tested — not done. Run relevant tests or builds; a bare exit code "
+            "without an observable result is not proof.",
+            "- A successful, complete patch_file diff directly observes the changed lines. "
+            "Do not immediately read_file the same ranges only to confirm the edit. Re-read "
+            "when the diff is absent, truncated, or ambiguous; when context outside its hunks "
+            "is needed; or when a later operation may have changed the file.",
             "- After any test or build that produces images or video, you MUST read_file "
             "every output file to actually see the results. Never describe visual output "
             "you haven't viewed. 'Tests passed' is not the same as 'I looked at the "

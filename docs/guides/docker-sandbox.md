@@ -51,7 +51,7 @@ requires changing only the tool list passed to `Agent`.
 | Tool | Description |
 |------|-------------|
 | `shell` | Run a shell command with streaming stdout/stderr in Docker-observed order. Supports `timeout`, `cwd`, and `stdin`. |
-| `write_file` | Create or overwrite a file with UTF-8 text. Parent directories are created automatically. Accepts `file_path`, `content`, and optional `mode`. |
+| `write_file` | Create or overwrite a file with UTF-8 text. Parent directories are created automatically. Accepts `path`, `content`, and optional `mode`. |
 | `read_file` | Read a file with optional `start_line`/`end_line`, `line_numbers`, and `max_chars` truncation. Binary files return hex. |
 | `list_files` | List immediate directory entries without reading descendant contents. Directories appear first with a trailing `/`. |
 | `run_python` | Execute a Python snippet in a subprocess inside the container. Supports `timeout`, `cwd`, and `stdin`. |

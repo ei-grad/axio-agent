@@ -10,12 +10,15 @@ The system prompt encodes hard-won lessons from watching models cut corners:
 
 - **Keep evidence aligned.** Tool arguments, stdout/stderr, images, and exit
   codes reach the model through the tool/context path instead of being silently
-  replaced by a more convenient story. Presentation-only suppression is marked
-  explicitly in the terminal. Background prose may be hidden from the active
-  stream, but its final report and relevant events still use the normal context
-  path.
-- **Not tested — not done.** The agent must run tests, re-read edited files,
-  and observe actual results instead of assuming success from exit codes.
+  replaced by a more convenient story. Presentation-only compaction and
+  suppression never rewrite model context or the journal. Background prose may
+  be hidden from the active stream, but its final report and relevant events
+  still use the normal context path.
+- **Not tested — not done.** The agent must run tests or builds and observe
+  actual results instead of treating a bare exit code as proof. A successful,
+  complete `patch_file` diff is direct evidence of its changed lines, so the
+  agent does not redundantly re-read the same ranges unless the diff is absent,
+  truncated, ambiguous, lacks needed surrounding context, or may be stale.
 - **Iterative UI review.** When building or modifying UI, the agent captures
   real screenshots at multiple viewport sizes (desktop, tablet, mobile) via
   Playwright/Puppeteer, reads every screenshot through the model's vision, and

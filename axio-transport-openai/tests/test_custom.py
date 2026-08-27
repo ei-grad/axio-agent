@@ -153,7 +153,7 @@ def test_roundtrip_explicit_empty_connection_fields_do_not_use_openai_environmen
     monkeypatch.setenv("OPENAI_BASE_URL", "https://unrelated.example/v1")
     data = _make_provider(name="local", base_url="", api_key="").to_dict()
 
-    restored = OpenAICompatibleTransport.from_dict(data)
+    restored = CustomChatCompletionsTransport.from_dict(data)
 
     assert restored.api_key == ""
     assert restored.base_url == ""

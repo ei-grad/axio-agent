@@ -23,7 +23,6 @@ from axio.tool import Tool
 from axio.types import StopReason, Usage
 
 from axio_tools_local.patch_file import patch_file
-from axio_tools_local.read_file import read_file
 
 
 @pytest.fixture()
@@ -350,33 +349,33 @@ class TestValidation:
     async def test_from_line_zero_rejected(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")
-        with pytest.raises(ValueError, match="from_line=0"):
+        with pytest.raises(HandlerError, match="from_line=0"):
             await patch(f, 0, 1, "x")
 
     async def test_from_line_negative_rejected(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")
-        with pytest.raises(ValueError, match="from_line=-1"):
+        with pytest.raises(HandlerError, match="from_line=-1"):
             await patch(f, -1, 1, "x")
 
     async def test_from_line_beyond_end_rejected(self, tmp_cwd: Path) -> None:
         """from_line > N+1 is not allowed (N+1 is valid for append-insert)."""
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")  # 3 lines
-        with pytest.raises(ValueError, match="from_line=5"):
+        with pytest.raises(HandlerError, match="from_line=5"):
             await patch(f, 5, 5, "x")
 
     async def test_to_line_beyond_end_rejected(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")  # 3 lines
-        with pytest.raises(ValueError, match="to_line=4"):
+        with pytest.raises(HandlerError, match="to_line=4"):
             await patch(f, 2, 4, "x")
 
     async def test_gap_range_rejected(self, tmp_cwd: Path) -> None:
         """from_line > to_line + 1 is a gap range and must be rejected."""
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\nd\ne\n")
-        with pytest.raises(ValueError, match="to_line=2"):
+        with pytest.raises(HandlerError, match="to_line=2"):
             await patch(f, 4, 2, "x")
 
     async def test_file_unchanged_on_validation_error(self, tmp_cwd: Path) -> None:
@@ -384,7 +383,7 @@ class TestValidation:
         f = tmp_cwd / "f.txt"
         original = "a\nb\nc\n"
         f.write_text(original)
-        with pytest.raises(ValueError):
+        with pytest.raises(HandlerError):
             await patch(f, 0, 1, "x")
         assert f.read_text() == original
 
@@ -468,53 +467,31 @@ class TestEdgeCases:
         assert f.read_text() == "hello\nмир\n"
 
 
-class TestDoublePatching:
-    async def test_second_patch_rejected(self, tmp_cwd: Path) -> None:
-        """Patching the same file twice without re-reading must raise RuntimeError."""
+class TestSequentialPatching:
+    async def test_second_patch_uses_current_file_state(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")
         await patch(f, 1, 1, "A\n")
-        with pytest.raises(RuntimeError, match="already patched"):
-            await patch(f, 2, 2, "B\n")
-
-    async def test_read_clears_block(self, tmp_cwd: Path) -> None:
-        """Re-reading the file after a patch allows patching again."""
-        f = tmp_cwd / "f.txt"
-        f.write_text("a\nb\nc\n")
-        await patch(f, 1, 1, "A\n")
-        await read_file(filename=f.name)
         await patch(f, 2, 2, "B\n")
         assert f.read_text() == "A\nB\nc\n"
 
-    async def test_failed_patch_does_not_block(self, tmp_cwd: Path) -> None:
-        """A patch that fails validation must not consume the single-patch slot."""
+    async def test_failed_patch_does_not_block_later_valid_patch(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\nc\n")
-        with pytest.raises(ValueError):
+        with pytest.raises(HandlerError):
             await patch(f, 0, 1, "x")
-        # No error — file was never successfully patched.
         await patch(f, 1, 1, "A\n")
         assert f.read_text() == "A\nb\nc\n"
 
     async def test_different_files_independent(self, tmp_cwd: Path) -> None:
-        """Patching different files does not interfere with each other's slots."""
         a = tmp_cwd / "a.txt"
         b = tmp_cwd / "b.txt"
         a.write_text("a1\na2\n")
         b.write_text("b1\nb2\n")
-        await patch_file(file_path=a.name, from_line=1, to_line=1, content="A1\n")
-        await patch_file(file_path=b.name, from_line=1, to_line=1, content="B1\n")
+        await patch_file(path=a.name, from_line=1, to_line=1, content="A1\n")
+        await patch_file(path=b.name, from_line=1, to_line=1, content="B1\n")
         assert a.read_text() == "A1\na2\n"
         assert b.read_text() == "B1\nb2\n"
-
-    async def test_rejected_second_patch_leaves_file_with_only_first_patch(self, tmp_cwd: Path) -> None:
-        """When the second patch is rejected, the file must contain exactly the first patch result."""
-        f = tmp_cwd / "f.txt"
-        f.write_text("a\nb\nc\n")
-        await patch(f, 1, 1, "A\n")
-        with pytest.raises(RuntimeError):
-            await patch(f, 2, 2, "B\n")
-        assert f.read_text() == "A\nb\nc\n"
 
 
 class TestNullBytesAndBinaryFiles:
@@ -532,7 +509,7 @@ class TestNullBytesAndBinaryFiles:
         f = tmp_cwd / "f.bin"
         f.write_bytes(bytes(range(128, 200)))
         original = f.read_bytes()
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(HandlerError, match="not valid UTF-8"):
             await patch(f, 1, 1, "hello\n")
         assert f.read_bytes() == original, "binary file was modified despite decode error"
 
@@ -544,5 +521,35 @@ class TestSymlinks:
         link = tmp_cwd / "link.txt"
         target.write_text("a\nb\nc\n")
         link.symlink_to(target)
-        await patch_file(file_path=link.name, from_line=2, to_line=2, content="B\n")
+        await patch_file(path=link.name, from_line=2, to_line=2, content="B\n")
         assert target.read_text() == "a\nB\nc\n"
+        assert link.is_symlink()
+
+
+class TestAtomicWrite:
+    async def test_invalid_utf8_content_leaves_no_temporary_file(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        original = b"a\nb\nc\n"
+        f.write_bytes(original)
+
+        with pytest.raises(HandlerError, match="content is not valid UTF-8"):
+            await patch(f, 2, 2, "\ud800")
+
+        assert f.read_bytes() == original
+        assert sorted(item.name for item in tmp_cwd.iterdir()) == ["f.txt"]
+
+    async def test_replace_failure_leaves_original_file(self, tmp_cwd: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        f = tmp_cwd / "f.txt"
+        original = b"a\nb\nc\n"
+        f.write_bytes(original)
+
+        def fail_replace(source: str, destination: Path) -> None:
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        with pytest.raises(HandlerError, match="replace failed"):
+            await patch(f, 2, 2, "B\n")
+
+        assert f.read_bytes() == original
+        assert sorted(item.name for item in tmp_cwd.iterdir()) == ["f.txt"]

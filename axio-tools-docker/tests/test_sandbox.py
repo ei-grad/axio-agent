@@ -301,6 +301,18 @@ async def test_tools_returns_six_tools() -> None:
     assert {t.name for t in tools} == EXPECTED_TOOL_NAMES
 
 
+async def test_tools_are_built_fresh_and_bound_to_the_sandbox() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            first = sb.tools
+            second = sb.tools
+
+    assert first is not second
+    assert all(tool.context is sb for tool in first)
+    assert all(tool.context is sb for tool in second)
+
+
 async def test_tools_names_match_axio_tools_local() -> None:
     """Tool names must be identical to axio-tools-local for drop-in use."""
     cls, client, container = mock_docker_factory()
@@ -417,6 +429,35 @@ async def test_container_id_inside_context() -> None:
         async with DockerSandbox() as sb:
             cid = sb.container_id
     assert cid == "abc123def456"
+
+
+async def test_public_runtime_state_reflects_active_context() -> None:
+    cls, client, container = mock_docker_factory()
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            assert sb.client is client
+            assert sb.container is container
+            assert not sb.attached
+
+        assert sb.client is None
+        assert sb.container is None
+        assert not sb.attached
+
+
+async def test_ensure_running_restarts_stopped_container() -> None:
+    cls, client, container = mock_docker_factory()
+    container.show = AsyncMock(
+        side_effect=[
+            {"State": {"Running": True}, "Config": {"Env": [f"PATH={sandbox_module._DEFAULT_CONTAINER_PATH}"]}},
+            {"State": {"Running": False}},
+        ]
+    )
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            container.start.reset_mock()
+            await sb.ensure_running()
+
+    container.start.assert_awaited_once_with()
 
 
 async def test_container_id_raises_outside_context() -> None:
@@ -715,6 +756,25 @@ async def test_write_file_tar_contains_content() -> None:
         f = tar.extractfile(member)
         assert f is not None
         assert f.read() == b"print('hi')"
+
+
+async def test_write_bytes_tar_contains_binary_content() -> None:
+    cls, client, container = mock_docker_factory()
+    payload = bytes(range(256))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            await sb.write_bytes("/workspace/blob.bin", payload, mode=0o600)
+
+    call_kwargs = container.put_archive.call_args
+    tar_bytes: bytes = call_kwargs.kwargs.get("data") or call_kwargs.args[1]
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tar:
+        member = tar.next()
+        assert member is not None
+        assert member.name == "blob.bin"
+        assert member.mode == 0o600
+        extracted = tar.extractfile(member)
+        assert extracted is not None
+        assert extracted.read() == payload
 
 
 async def test_write_file_tar_uses_numeric_runtime_owner() -> None:
@@ -1235,6 +1295,39 @@ async def test_patch_file_handler_reports_final_newline_changes_exactly(
     member = tarfile.open(fileobj=io.BytesIO(written)).extractfile("f.txt")
     assert member is not None
     assert member.read() == after
+
+
+@pytest.mark.parametrize(
+    ("from_line", "to_line", "message"),
+    [
+        (0, 1, "from_line=0"),
+        (-1, 1, "from_line=-1"),
+        (5, 5, "from_line=5"),
+        (2, 4, "to_line=4"),
+        (4, 2, "to_line=2"),
+    ],
+)
+async def test_patch_file_handler_rejects_invalid_ranges(
+    from_line: int,
+    to_line: int,
+    message: str,
+) -> None:
+    cls, client, container = mock_docker_factory(archive_content=make_tar_file("f.txt", b"a\nb\nc\n"))
+    with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
+        async with DockerSandbox() as sb:
+            token = _bind_context(sb)
+            try:
+                with pytest.raises(HandlerError, match=message):
+                    await sandbox_module.patch_file(
+                        path="f.txt",
+                        from_line=from_line,
+                        to_line=to_line,
+                        content="x",
+                    )
+            finally:
+                CONTEXT.reset(token)
+
+    container.put_archive.assert_not_awaited()
 
 
 async def test_write_file_handler_diffs_only_when_replacing_text() -> None:

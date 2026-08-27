@@ -171,6 +171,20 @@ class TestToolRules:
         assert "Read files before editing" in prompt
         assert "destructive shell commands" in prompt
 
+    def test_patch_diff_is_direct_edit_evidence_without_weakening_tests(self) -> None:
+        model = ModelSpec(id="test", capabilities=_CHAT_CAPS)
+
+        prompt = build_system_prompt(_ROOT, model, [_tool("patch_file"), _tool("shell")])
+
+        assert "Run relevant tests or builds" in prompt
+        assert "bare exit code without an observable result is not proof" in prompt
+        assert "successful, complete patch_file diff directly observes the changed lines" in prompt
+        assert "Do not immediately read_file the same ranges only to confirm the edit" in prompt
+        assert "diff is absent, truncated, or ambiguous" in prompt
+        assert "context outside its hunks is needed" in prompt
+        assert "later operation may have changed the file" in prompt
+        assert "Re-read edited files" not in prompt
+
     def test_tool_rules_absent_without_tool_use(self) -> None:
         model = ModelSpec(id="test", capabilities=_NO_TOOLS_CAPS)
         prompt = build_system_prompt(_ROOT, model, [_tool("shell")])
