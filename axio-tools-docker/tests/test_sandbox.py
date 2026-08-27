@@ -310,14 +310,24 @@ async def test_tools_names_match_axio_tools_local() -> None:
     assert names == EXPECTED_TOOL_NAMES
 
 
-async def test_patch_file_tool_schema_uses_literal_content_without_indent_workaround() -> None:
+async def test_patch_file_tool_schema_describes_exact_replacement_range() -> None:
     cls, client, container = mock_docker_factory()
     with patch("axio_tools_docker.sandbox.aiodocker.Docker", cls):
         async with DockerSandbox() as sb:
             tool = next(item for item in sb.tools if item.name == "patch_file")
 
     assert "first_line_indent" not in tool.schema["properties"]
-    content = tool.schema["properties"]["content"]
+    properties = tool.schema["properties"]
+    assert "1-indexed start of the edit" in properties["from_line"]["description"]
+    assert "not merely the first line whose logic changes" in properties["from_line"]["description"]
+    assert "new content is inserted before this line" in properties["from_line"]["description"]
+    assert "inclusive last old physical line removed" in properties["to_line"]["description"]
+    assert "selected old range empty" in properties["to_line"]["description"]
+    content = properties["content"]
+    assert "inserted in place of the selected old range" in content["description"]
+    assert "Do not include unchanged source" in content["description"]
+    assert "include that line in the selected range" in content["description"]
+    assert "may intentionally duplicate adjacent source" in content["description"]
     assert "applied literally" in content["description"]
     assert "exact leading and trailing whitespace" in content["description"]
     assert "L<number>" in content["description"]
@@ -1125,6 +1135,7 @@ async def test_patch_file_handler_literal_empty_line_is_not_a_deletion(
     ("before", "from_line", "to_line", "content", "after"),
     [
         (b"after\n", 1, 0, "   inserted", b"   inserted\nafter\n"),
+        (b"a\nb\nc\n", 2, 1, "b\n", b"a\nb\nb\nc\n"),
         (b"old\n", 1, 1, "last", b"last"),
         (b"old\n", 1, 1, "│literal\n", "│literal\n".encode()),
         (b"old\n", 1, 1, "L12│source\n", "L12│source\n".encode()),

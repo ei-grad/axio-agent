@@ -86,6 +86,14 @@ class TestPatchInsertDelete:
         await patch(f, 2, 1, "inserted\n")
         assert f.read_text() == "a\ninserted\nb\nc\n"
 
+    async def test_insert_can_intentionally_duplicate_adjacent_source(self, tmp_cwd: Path) -> None:
+        f = tmp_cwd / "f.txt"
+        f.write_text("a\nb\nc\n")
+
+        await patch(f, 2, 1, "b\n")
+
+        assert f.read_text() == "a\nb\nb\nc\n"
+
     async def test_insert_at_start(self, tmp_cwd: Path) -> None:
         f = tmp_cwd / "f.txt"
         f.write_text("a\nb\n")
@@ -180,11 +188,21 @@ class TestLiteralContent:
 
         assert f.read_text() == content
 
-    def test_schema_describes_literal_content_and_has_no_indent_workaround(self) -> None:
+    def test_schema_describes_exact_replacement_range_and_has_no_indent_workaround(self) -> None:
         tool: Tool[Any] = Tool(name="patch_file", handler=patch_file)
 
         assert "first_line_indent" not in tool.schema["properties"]
-        content = tool.schema["properties"]["content"]
+        properties = tool.schema["properties"]
+        assert "1-indexed start of the edit" in properties["from_line"]["description"]
+        assert "not merely the first line whose logic changes" in properties["from_line"]["description"]
+        assert "new content is inserted before this line" in properties["from_line"]["description"]
+        assert "inclusive last old physical line removed" in properties["to_line"]["description"]
+        assert "selected old range empty" in properties["to_line"]["description"]
+        content = properties["content"]
+        assert "inserted in place of the selected old range" in content["description"]
+        assert "Do not include unchanged source" in content["description"]
+        assert "include that line in the selected range" in content["description"]
+        assert "may intentionally duplicate adjacent source" in content["description"]
         assert "applied literally" in content["description"]
         assert "exact leading and trailing whitespace" in content["description"]
         assert "L<number>" in content["description"]

@@ -23,9 +23,22 @@ CONTEXT_LINES = 3
 MAX_DIFF_LINES = 400
 MAX_DIFF_CHARS = 8192
 MAX_DIFF_SOURCE_BYTES = 1 << 20
+PATCH_FROM_LINE_DESCRIPTION = (
+    "1-indexed start of the edit. For replacement, this is the first old physical line removed, not merely the first "
+    "line whose logic changes. For insertion (to_line = from_line - 1), new content is inserted before this line; "
+    "line_count + 1 appends."
+)
+PATCH_TO_LINE_DESCRIPTION = (
+    "For replacement, the 1-indexed inclusive last old physical line removed. For insertion, set to from_line - 1, "
+    "which makes the selected old range empty."
+)
 PATCH_CONTENT_DESCRIPTION = (
-    "Replacement source text applied literally. Preserve exact leading and trailing whitespace, tabs, empty lines, "
-    "and newlines. Do not copy the L<number>│ metadata prefix from numbered read_file output."
+    "Complete text inserted in place of the selected old range. For replacement, it may contain a different number "
+    "of lines. Do not include unchanged source immediately before or after the range as context. If replacement "
+    "content retains an old source line, include that line in the selected range. For insertion, the selected range "
+    "is empty and content may intentionally duplicate adjacent source. Content is applied literally: preserve exact "
+    "leading and trailing whitespace, tabs, empty lines, and newlines. Do not copy the L<number>│ metadata prefix "
+    "from numbered read_file output."
 )
 
 _TRUNCATION_MARKER = "...[diff truncated]\n"
