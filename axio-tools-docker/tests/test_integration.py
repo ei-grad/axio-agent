@@ -141,6 +141,20 @@ async def test_write_file_mode(sandbox: DockerSandbox) -> None:
     assert "755" in result
 
 
+async def test_write_bytes(sandbox: DockerSandbox) -> None:
+    payload = bytes(range(256))
+    await sandbox.write_bytes("/workspace/blob.bin", payload, mode=0o600)
+    assert await sandbox.read_file_bytes("/workspace/blob.bin") == payload
+    assert "600" in await sandbox.exec("stat -c '%a' /workspace/blob.bin")
+
+
+async def test_ensure_running_restarts_stopped_container(sandbox: DockerSandbox) -> None:
+    assert sandbox.container is not None
+    await sandbox.container.stop()
+    await sandbox.ensure_running()
+    assert await sandbox.exec("echo alive") == "alive"
+
+
 async def test_read_file_line_range(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/lines.txt", "a\nb\nc\nd\ne\n")
     tool = next(t for t in sandbox.tools if t.name == "read_file")
@@ -212,6 +226,33 @@ async def test_patch_file_insert(sandbox: DockerSandbox) -> None:
     await tool(path="/workspace/insert_me.txt", from_line=2, to_line=1, content="line2")
     raw = await sandbox.read_file_bytes("/workspace/insert_me.txt")
     assert raw == b"line1\nline2\nline3\n"
+
+
+@pytest.mark.parametrize(
+    ("from_line", "to_line", "message"),
+    [
+        (0, 1, "from_line=0"),
+        (-1, 1, "from_line=-1"),
+        (5, 5, "from_line=5"),
+        (2, 4, "to_line=4"),
+        (4, 2, "to_line=2"),
+    ],
+)
+async def test_patch_file_rejects_invalid_ranges(
+    sandbox: DockerSandbox,
+    from_line: int,
+    to_line: int,
+    message: str,
+) -> None:
+    target = "/workspace/invalid-range.txt"
+    original = b"a\nb\nc\n"
+    await sandbox.write_file(target, original.decode())
+    tool = next(t for t in sandbox.tools if t.name == "patch_file")
+
+    with pytest.raises(HandlerError, match=message):
+        await tool(path=target, from_line=from_line, to_line=to_line, content="x")
+
+    assert await sandbox.read_file_bytes(target) == original
 
 
 async def test_run_python(sandbox: DockerSandbox) -> None:

@@ -25,6 +25,8 @@ from axio._asyncio import shield_until_done
 from axio.diff import (
     MAX_DIFF_SOURCE_BYTES,
     PATCH_CONTENT_DESCRIPTION,
+    PATCH_FROM_LINE_DESCRIPTION,
+    PATCH_TO_LINE_DESCRIPTION,
     describe_patch,
     describe_write,
 )
@@ -382,16 +384,19 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
 
 async def patch_file(
     path: str,
-    from_line: int,
-    to_line: int,
+    from_line: Annotated[int, Field(description=PATCH_FROM_LINE_DESCRIPTION)],
+    to_line: Annotated[int, Field(description=PATCH_TO_LINE_DESCRIPTION)],
     content: Annotated[str, Field(description=PATCH_CONTENT_DESCRIPTION)],
     mode: int = 0o644,
 ) -> str:
     """Replace a range of lines in an existing UTF-8 text file. Lines are
     1-indexed: from_line and to_line are both inclusive (from_line=2, to_line=4
     replaces lines 2, 3, 4). To insert without deleting, set
-    to_line = from_line - 1. Always read the file first with line_numbers=True
-    to get correct line numbers. content is applied literally: include exact
+    to_line = from_line - 1; this selects an empty old range and inserts before
+    from_line. For replacement, the range names every old physical line removed,
+    including unchanged lines retained in content; it is not merely the lines
+    whose logic changes. Always read the file first with line_numbers=True to get
+    correct line numbers. content is applied literally: include exact
     leading whitespace on the first and every following line, and do not copy
     read_file's ``L<number>│`` metadata prefix. Use this for surgical edits
     instead of rewriting the whole file with write_file. The result reports a
@@ -408,6 +413,13 @@ async def patch_file(
         lines = before.splitlines(keepends=True)
     except UnicodeDecodeError as exc:
         raise HandlerError(f"File is not valid UTF-8: {resolved}") from exc
+    line_count = len(lines)
+    if not 1 <= from_line <= line_count + 1:
+        raise HandlerError(
+            f"from_line={from_line} out of range; file has {line_count} lines (valid: 1..{line_count + 1})"
+        )
+    if not from_line - 1 <= to_line <= line_count:
+        raise HandlerError(f"to_line={to_line} out of range (valid: {from_line - 1}..{line_count})")
     content_lines = content.splitlines(keepends=True)
     if content_lines and not content_lines[-1].endswith("\n") and to_line < len(lines):
         content_lines[-1] += "\n"
@@ -554,7 +566,6 @@ class DockerSandbox:
         self._container: aiodocker.containers.DockerContainer | None = None
         self._attached: bool = False  # True when we reused an existing container
         self._shells: tuple[_ShellExecutable, ...] | None = None
-        self._tools: list[Tool[Any]] | None = None
 
     async def __aenter__(self) -> DockerSandbox:
         self._client = aiodocker.Docker(url=self.url)
@@ -598,7 +609,7 @@ class DockerSandbox:
 
         if not self._attached:
             try:
-                await self._ensure_image()
+                await self.ensure_image()
             except Exception:  # inspection and pull failures can originate in Docker, HTTP, or the socket
                 self._verified_network_id = None
                 await self._client.close()
@@ -683,14 +694,6 @@ class DockerSandbox:
 
         try:
             self._shells = await self._discover_shells()
-            self._tools = [
-                self._make_shell_tool(),
-                Tool(name="write_file", handler=write_file, context=self),
-                Tool(name="read_file", handler=read_file, context=self),
-                Tool(name="list_files", handler=list_files, context=self),
-                Tool(name="run_python", handler=run_python, context=self),
-                Tool(name="patch_file", handler=patch_file, context=self),
-            ]
         except BaseException:
             # Discovery is part of startup: no failure may leave its unpublished container running.
             try:
@@ -722,14 +725,35 @@ class DockerSandbox:
             await self._client.close()
             self._client = None
         self._shells = None
-        self._tools = None
 
     @property
     def tools(self) -> list[Tool[Any]]:
-        """Return the axio Tool instances for this sandbox. Only valid inside `async with`."""
-        if self._tools is None:
+        """Return fresh axio tools bound to this running sandbox."""
+        if self._container is None or self._shells is None:
             raise RuntimeError("DockerSandbox must be used as an async context manager")
-        return list(self._tools)
+        return [
+            self._make_shell_tool(),
+            Tool(name="write_file", handler=write_file, context=self),
+            Tool(name="read_file", handler=read_file, context=self),
+            Tool(name="list_files", handler=list_files, context=self),
+            Tool(name="run_python", handler=run_python, context=self),
+            Tool(name="patch_file", handler=patch_file, context=self),
+        ]
+
+    @property
+    def client(self) -> aiodocker.Docker | None:
+        """Return the Docker client while the sandbox context is active."""
+        return self._client
+
+    @property
+    def container(self) -> aiodocker.containers.DockerContainer | None:
+        """Return the Docker container while the sandbox context is active."""
+        return self._container
+
+    @property
+    def attached(self) -> bool:
+        """Whether the sandbox reused a named container."""
+        return self._attached
 
     @property
     def container_id(self) -> str:
@@ -744,6 +768,14 @@ class DockerSandbox:
         if self._shells is None:
             raise RuntimeError("DockerSandbox must be used as an async context manager")
         return tuple(item.name for item in self._shells)
+
+    async def ensure_running(self) -> None:
+        """Start the container when it exists but is not currently running."""
+        if self._container is None:
+            return
+        info = await self._container.show()
+        if not info.get("State", {}).get("Running", False):
+            await self._container.start()
 
     def _make_shell_tool(self) -> Tool[Any]:
         assert self._shells is not None
@@ -808,7 +840,7 @@ class DockerSandbox:
                     break
         return tuple(available)
 
-    async def _ensure_image(self) -> None:
+    async def ensure_image(self) -> None:
         """Pull the image if it is not present locally."""
         assert self._client is not None
         try:
@@ -905,10 +937,9 @@ class DockerSandbox:
             records.append((0.0, key, text))
         return _format_shell_records(records)
 
-    async def write_file(self, path: str, content: str, mode: int = 0o644) -> str:
-        """Write a string to a file inside the container."""
+    async def write_bytes(self, path: str, data: bytes, mode: int = 0o644) -> str:
+        """Write raw bytes to a file inside the container."""
         assert self._container is not None
-        data = content.encode()
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:") as tar:
             info = tarfile.TarInfo(name=os.path.basename(path))
@@ -926,6 +957,10 @@ class DockerSandbox:
             data=buf.getvalue(),
         )
         return f"Wrote {len(data)} bytes to {path}"
+
+    async def write_file(self, path: str, content: str, mode: int = 0o644) -> str:
+        """Write UTF-8 text to a file inside the container."""
+        return await self.write_bytes(path, content.encode(), mode=mode)
 
     async def get_archive(self, path: str) -> tarfile.TarFile:
         """Fetch a path from the container as a TarFile object."""
