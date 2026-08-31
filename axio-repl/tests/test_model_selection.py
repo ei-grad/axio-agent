@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from typing import Any, cast
 import pytest
 from axio.models import Capability, ModelRegistry, ModelSpec
 
+import axio_repl
 from axio_repl import (
     _adopt_catalogue_metadata,
     _apply_iterations,
@@ -37,6 +39,36 @@ class _VariantTransport:
         if sep and base_id in self.models:
             return replace(self.models[base_id], id=model_id)
         return self.models[model_id]
+
+
+class _BrokenTransportEntryPoint:
+    name = "openrouter"
+
+    @staticmethod
+    def load() -> object:
+        raise ModuleNotFoundError("No module named 'axio_responses'")
+
+
+class _WorkingTransportEntryPoint:
+    name = "nebius"
+    factory = object()
+
+    @classmethod
+    def load(cls) -> object:
+        return cls.factory
+
+
+class _FalseyLoadError(Exception):
+    def __bool__(self) -> bool:
+        return False
+
+
+class _FalseyTransportEntryPoint:
+    name = "openrouter"
+
+    @staticmethod
+    def load() -> object:
+        raise _FalseyLoadError("broken")
 
 
 def test_resolve_model_arg_uses_transport_resolver() -> None:
@@ -114,6 +146,90 @@ def test_naming_a_transport_without_its_key_says_which_key(
 
     assert exc_info.value.code == 1
     assert "NEBIUS_API_KEY" in capsys.readouterr().err
+
+
+def test_requested_transport_load_failure_reports_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(axio_repl, "entry_points", lambda *, group: [_BrokenTransportEntryPoint()])
+
+    with pytest.raises(SystemExit) as exc_info:
+        _select_transport("openrouter", credential_override=True)
+
+    assert exc_info.value.code == 1
+    error = capsys.readouterr().err
+    assert error == ("Failed to load transport 'openrouter': ModuleNotFoundError: No module named 'axio_responses'\n")
+    assert "Unknown transport" not in error
+
+
+def test_falsey_transport_load_failure_is_not_mislabeled_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(axio_repl, "entry_points", lambda *, group: [_FalseyTransportEntryPoint()])
+
+    with pytest.raises(SystemExit):
+        _select_transport("openrouter", credential_override=True)
+
+    assert capsys.readouterr().err == "Failed to load transport 'openrouter': _FalseyLoadError: broken\n"
+
+
+def test_transport_load_failure_keeps_traceback_for_debug_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(axio_repl, "entry_points", lambda *, group: [_BrokenTransportEntryPoint()])
+
+    with caplog.at_level(logging.DEBUG, logger="axio_repl"), pytest.raises(SystemExit):
+        _select_transport("openrouter", credential_override=True)
+
+    [record] = [record for record in caplog.records if record.message == "Failed to load transport 'openrouter'"]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is ModuleNotFoundError
+
+
+def test_broken_auto_detected_transport_reports_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(axio_repl, "entry_points", lambda *, group: [_BrokenTransportEntryPoint()])
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    with pytest.raises(SystemExit) as exc_info:
+        _select_transport(None)
+
+    assert exc_info.value.code == 1
+    assert "Failed to load transport 'openrouter': ModuleNotFoundError" in capsys.readouterr().err
+
+
+def test_broken_plugin_does_not_hide_a_working_requested_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        axio_repl,
+        "entry_points",
+        lambda *, group: [_BrokenTransportEntryPoint(), _WorkingTransportEntryPoint()],
+    )
+
+    factory, _ = _select_transport("nebius", credential_override=True)
+
+    assert factory is _WorkingTransportEntryPoint.factory
+
+
+def test_truly_unknown_transport_still_lists_working_plugins(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        axio_repl,
+        "entry_points",
+        lambda *, group: [_BrokenTransportEntryPoint(), _WorkingTransportEntryPoint()],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _select_transport("missing", credential_override=True)
+
+    assert exc_info.value.code == 1
+    assert capsys.readouterr().err == "Unknown transport 'missing'. Available: nebius\n"
 
 
 def test_naming_a_transport_with_its_key_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:

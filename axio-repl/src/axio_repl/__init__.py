@@ -179,6 +179,8 @@ from axio_repl._tool_calls import (
 )
 from axio_repl._tool_result_display import is_write_file_result, parse_patch_result
 
+logger = logging.getLogger(__name__)
+
 LAST_ITERATION_HINT = Message(
     role="system",
     content=[
@@ -270,14 +272,34 @@ TOOLS: list[Tool[Any]] = [
 # ── Transport auto-detection ─────────────────────────────────────────
 
 
-def _discover_transports() -> dict[str, Callable[..., Any]]:
-    result: dict[str, Callable[..., Any]] = {}
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TransportDiscovery:
+    available: dict[str, Callable[..., Any]]
+    failures: dict[str, Exception]
+
+
+def _discover_transports() -> _TransportDiscovery:
+    available: dict[str, Callable[..., Any]] = {}
+    failures: dict[str, Exception] = {}
     for ep in entry_points(group="axio.transport"):
         try:
-            result[ep.name] = ep.load()
-        except Exception:
-            pass
-    return result
+            factory = ep.load()
+        except Exception as exc:
+            # Entry points execute arbitrary plugin imports, so their import-time exception types
+            # cannot be enumerated. Keep discovery isolated while retaining the exact failure.
+            logger.debug("Failed to load transport %r", ep.name, exc_info=True)
+            if ep.name not in available:
+                failures[ep.name] = exc
+        else:
+            available[ep.name] = factory
+            failures.pop(ep.name, None)
+    return _TransportDiscovery(available=available, failures=failures)
+
+
+def _transport_load_error(name: str, error: Exception) -> str:
+    detail = str(error)
+    suffix = f": {detail}" if detail else ""
+    return f"Failed to load transport {name!r}: {type(error).__name__}{suffix}"
 
 
 _TRANSPORT_ENV_VARS: dict[str, list[str]] = {
@@ -296,9 +318,14 @@ def _transport_has_credentials(name: str) -> bool:
 
 
 def _select_transport(name: str | None, credential_override: bool = False) -> tuple[Callable[..., Any], str]:
-    available = _discover_transports()
+    discovery = _discover_transports()
+    available = discovery.available
     if name:
         if name not in available:
+            error = discovery.failures.get(name)
+            if error is not None:
+                print(_transport_load_error(name, error), file=sys.stderr)
+                sys.exit(1)
             print(
                 f"Unknown transport {name!r}. Available: {', '.join(sorted(available))}",
                 file=sys.stderr,
@@ -316,6 +343,17 @@ def _select_transport(name: str | None, credential_override: bool = False) -> tu
     for transport_name, cls in available.items():
         if _transport_has_credentials(transport_name):
             return cls, ""
+
+    for transport_name, error in discovery.failures.items():
+        if _transport_has_credentials(transport_name):
+            print(_transport_load_error(transport_name, error), file=sys.stderr)
+            sys.exit(1)
+
+    if not available and discovery.failures:
+        print("No transports could be loaded:", file=sys.stderr)
+        for transport_name, error in sorted(discovery.failures.items()):
+            print(f"  {_transport_load_error(transport_name, error)}", file=sys.stderr)
+        sys.exit(1)
 
     print("No API key found. Set one of:", file=sys.stderr)
     for transport_name in available:
