@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import dataclasses
 import json
 import logging
@@ -11,21 +10,13 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 import aiohttp
-from axio.blocks import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from axio.effort import EFFORT_LEVELS, EffortLevel, EffortMechanism, EffortState, PromptEffortAdapter, parse_effort
-from axio.events import IterationEnd, ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta, ToolUseStart
+from axio.events import StreamEvent
 from axio.exceptions import StreamError
-from axio.messages import (
-    INPUT_PROVENANCE_FOOTER,
-    InputProvenance,
-    Message,
-    effective_input_provenance,
-    input_provenance_header,
-    model_visible_content,
-)
+from axio.messages import Message
 from axio.models import Capability, ModelRegistry, ModelSpec
 from axio.tool import Tool
 from axio.transport import CompletionTransport, EmbeddingTransport
@@ -286,113 +277,11 @@ def _strip_title(schema: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _extract_tool_result_text(tr: ToolResultBlock) -> str:
-    """Extract text content from a ToolResultBlock (for APIs that don't support images in tool results)."""
-    if isinstance(tr.content, str):
-        return tr.content
-    return "\n".join(b.text for b in tr.content if isinstance(b, TextBlock))
-
-
-def _collect_tool_result_images(
-    tool_results: list[ToolResultBlock],
-    provenance: InputProvenance | None,
-) -> list[dict[str, Any]]:
-    """Collect image parts from tool results to inject as a follow-up user message."""
-    parts: list[dict[str, Any]] = []
-    for tr in tool_results:
-        if isinstance(tr.content, list):
-            images = [b for b in tr.content if isinstance(b, ImageBlock)]
-            if images:
-                parts.append({"type": "text", "text": f"[Image from tool call {tr.tool_use_id}]"})
-                for img in images:
-                    encoded = base64.b64encode(img.data).decode("ascii")
-                    data_uri = f"data:{img.media_type};base64,{encoded}"
-                    parts.append({"type": "image_url", "image_url": {"url": data_uri}})
-    if parts and provenance is not None:
-        parts.insert(0, {"type": "text", "text": input_provenance_header(provenance)})
-        parts.append({"type": "text", "text": INPUT_PROVENANCE_FOOTER})
-    return parts
-
-
 def _convert_messages(messages: list[Message], system: str) -> list[dict[str, Any]]:
-    """Convert axio Message list to OpenAI message dicts."""
-    result: list[dict[str, Any]] = []
-    if system:
-        result.append({"role": "system", "content": system})
+    """Use the same message converter as the primary exported chat path."""
+    from axio_transport_openai import _chat_messages
 
-    for msg in messages:
-        if msg.role == "user":
-            tool_results = [b for b in msg.content if isinstance(b, ToolResultBlock)]
-            if tool_results:
-                for tr in tool_results:
-                    result.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tr.tool_use_id,
-                            "content": _extract_tool_result_text(tr),
-                        }
-                    )
-                # Chat Completions API doesn't support images in tool messages,
-                # so inject them as a follow-up user message.
-                image_parts = _collect_tool_result_images(tool_results, effective_input_provenance(msg))
-                if image_parts:
-                    result.append({"role": "user", "content": image_parts})
-                remaining_blocks = [b for b in model_visible_content(msg) if not isinstance(b, ToolResultBlock)]
-            else:
-                remaining_blocks = model_visible_content(msg)
-
-            if remaining_blocks:
-                has_images = any(isinstance(b, ImageBlock) for b in remaining_blocks)
-                if has_images:
-                    content_parts: list[dict[str, Any]] = []
-                    for b in remaining_blocks:
-                        if isinstance(b, TextBlock):
-                            content_parts.append({"type": "text", "text": b.text})
-                        elif isinstance(b, ImageBlock):
-                            encoded = base64.b64encode(b.data).decode("ascii")
-                            data_uri = f"data:{b.media_type};base64,{encoded}"
-                            content_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
-                    if content_parts:
-                        result.append({"role": "user", "content": content_parts})
-                else:
-                    text_parts_u: list[str] = []
-                    for b in remaining_blocks:
-                        if isinstance(b, TextBlock):
-                            text_parts_u.append(b.text)
-                    if text_parts_u:
-                        result.append({"role": "user", "content": "".join(text_parts_u)})
-
-        elif msg.role == "system":
-            result.append(
-                {
-                    "role": "system",
-                    "content": "".join(b.text for b in msg.content if isinstance(b, TextBlock)),
-                }
-            )
-
-        elif msg.role == "assistant":
-            text_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
-            for b in msg.content:
-                if isinstance(b, TextBlock):
-                    text_parts.append(b.text)
-                elif isinstance(b, ToolUseBlock):
-                    tool_calls.append(
-                        {
-                            "id": b.id,
-                            "type": "function",
-                            "function": {"name": b.name, "arguments": json.dumps(b.input)},
-                        }
-                    )
-
-            entry: dict[str, Any] = {"role": "assistant"}
-            if text_parts:
-                entry["content"] = "".join(text_parts)
-            if tool_calls:
-                entry["tool_calls"] = tool_calls
-            result.append(entry)
-
-    return result
+    return _chat_messages(messages, system)
 
 
 def _convert_tools(tools: list[Tool[Any]]) -> list[dict[str, Any]]:
@@ -511,6 +400,7 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
     """Shared HTTP, retry, embedding, and configuration implementation."""
 
     name: str = "OpenAI-compatible"
+    api: Literal["chat"] = field(default="chat", kw_only=True)
     base_url: str = field(default_factory=lambda: os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
     api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     model: ModelSpec = field(default_factory=lambda: OPENAI_MODELS["gpt-5.6-terra"])
@@ -672,6 +562,7 @@ class _OpenAIHTTPTransport(CompletionTransport, EmbeddingTransport):
         serialized_models.append(self.model)
         result: dict[str, Any] = {
             "name": self.name,
+            "api": self.api,
             "base_url": self.base_url,
             "api_key": self.api_key,
             "model": self.model.id,
@@ -778,131 +669,12 @@ class ChatCompletionsTransport(_OpenAIHTTPTransport):
         )
 
     async def _parse_sse(self, resp: aiohttp.ClientResponse) -> AsyncIterator[StreamEvent]:
-        tool_index_to_id: dict[int, str] = {}
-        usage = Usage(0, 0)
-        finish_reason: str | None = None
-        error_message: str | None = None
-        think_parser = ThinkTagParser()
+        # Reuse the canonical chat reader added upstream while retaining this
+        # transport's request fitting, effort controls, and provider-cost hooks.
+        from axio_transport_openai import OpenAITransport
 
-        buffer = b""
-        async for chunk in resp.content.iter_any():
-            buffer += chunk
-            while b"\n" in buffer:
-                line_bytes, buffer = buffer.split(b"\n", 1)
-                line = line_bytes.decode("utf-8").strip()
-                if not line or line == "data: [DONE]" or not line.startswith("data: "):
-                    continue
-
-                data: dict[str, Any] = json.loads(line[6:])
-
-                if "error" in data and data["error"] is not None:
-                    err = data["error"]
-                    error_message = err.get("message") or str(err) if isinstance(err, dict) else str(err)
-
-                if "usage" in data and data["usage"] is not None:
-                    usage = self._parse_usage(data["usage"], usage)
-
-                choices: list[dict[str, Any]] = data.get("choices", [])
-                if not choices:
-                    continue
-
-                choice = choices[0]
-                delta: dict[str, Any] = choice.get("delta") or {}
-
-                # llama.cpp and DeepSeek-style servers hand thoughts over in
-                # their own field instead of wrapping them in <think> tags, so
-                # ThinkTagParser never sees them. The field is spelled
-                # reasoning_content by llama.cpp and DeepSeek, plain reasoning
-                # by OpenRouter.
-                if reasoning := (delta.get("reasoning_content") or delta.get("reasoning")):
-                    yield ReasoningDelta(index=0, delta=reasoning)
-
-                if "content" in delta and delta["content"] is not None:
-                    for kind, text in think_parser.feed(delta["content"]):
-                        if kind == "reasoning":
-                            yield ReasoningDelta(index=0, delta=text)
-                        else:
-                            yield TextDelta(index=0, delta=text)
-
-                if "tool_calls" in delta and delta["tool_calls"] is not None:
-                    for tc in delta["tool_calls"]:
-                        idx: int = tc["index"]
-                        if "id" in tc and tc["id"]:
-                            tool_id: str = tc["id"]
-                            fn = tc.get("function") or {}
-                            tool_name: str = fn.get("name", "")
-                            tool_index_to_id[idx] = tool_id
-                            yield ToolUseStart(index=idx, tool_use_id=tool_id, name=tool_name)
-                        fn = tc.get("function") or {}
-                        if "arguments" in fn:
-                            tid = tool_index_to_id.get(idx, "")
-                            yield ToolInputDelta(index=idx, tool_use_id=tid, partial_json=fn["arguments"])
-
-                if "finish_reason" in choice and choice["finish_reason"] is not None:
-                    finish_reason = choice["finish_reason"]
-
-        # Flush remaining SSE buffer (streams that don't end with \n)
-        if buffer:
-            line = buffer.decode("utf-8").strip()
-            if line and line != "data: [DONE]" and line.startswith("data: "):
-                data = json.loads(line[6:])
-
-                if "usage" in data and data["usage"] is not None:
-                    usage = self._parse_usage(data["usage"], usage)
-
-                choices = data.get("choices", [])
-                if choices:
-                    choice = choices[0]
-                    delta = choice.get("delta", {})
-
-                    if reasoning := (delta.get("reasoning_content") or delta.get("reasoning")):
-                        yield ReasoningDelta(index=0, delta=reasoning)
-
-                    if "content" in delta and delta["content"] is not None:
-                        for kind, text in think_parser.feed(delta["content"]):
-                            if kind == "reasoning":
-                                yield ReasoningDelta(index=0, delta=text)
-                            else:
-                                yield TextDelta(index=0, delta=text)
-
-                    if "tool_calls" in delta:
-                        for tc in delta["tool_calls"]:
-                            idx = tc["index"]
-                            if "id" in tc and tc["id"]:
-                                tool_id = tc["id"]
-                                tool_name = tc["function"]["name"]
-                                tool_index_to_id[idx] = tool_id
-                                yield ToolUseStart(index=idx, tool_use_id=tool_id, name=tool_name)
-                            if "function" in tc and "arguments" in tc["function"]:
-                                tid = tool_index_to_id.get(idx, "")
-                                yield ToolInputDelta(
-                                    index=idx,
-                                    tool_use_id=tid,
-                                    partial_json=tc["function"]["arguments"],
-                                )
-
-                    if "finish_reason" in choice and choice["finish_reason"] is not None:
-                        finish_reason = choice["finish_reason"]
-
-        for kind, text in think_parser.flush():
-            if kind == "reasoning":
-                yield ReasoningDelta(index=0, delta=text)
-            else:
-                yield TextDelta(index=0, delta=text)
-
-        stop = _STOP_REASON_MAP.get(finish_reason or "", StopReason.error)
-        if finish_reason and finish_reason not in _STOP_REASON_MAP:
-            logger.warning("Unknown finish_reason %r, mapped to %s", finish_reason, stop)
-        logger.info(
-            "Stream complete: stop_reason=%s, input_tokens=%d, output_tokens=%d",
-            stop,
-            usage.input_tokens,
-            usage.output_tokens,
-        )
-        if stop == StopReason.error:
-            msg = error_message or f"finish_reason={finish_reason!r}"
-            raise StreamError(f"Provider error during streaming: {msg}")
-        yield IterationEnd(iteration=0, stop_reason=stop, usage=usage)
+        async for event in OpenAITransport._parse_chat(self, resp):  # type: ignore[arg-type]
+            yield event
 
     stream_path: ClassVar[str] = "chat/completions"
 

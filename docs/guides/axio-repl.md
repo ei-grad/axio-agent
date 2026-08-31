@@ -130,12 +130,15 @@ The REPL picks the first transport whose environment variable is set:
 | `nebius` | `NEBIUS_API_KEY` | `axio-transport-openai` |
 | `openrouter` | `OPENROUTER_API_KEY` | `axio-transport-openai` |
 
-Override with `--transport <name>`:
+Override with `--transport <name>`. `--model` is looked up in that transport's registry by
+exact id, so an id it does not carry raises `KeyError` rather than being passed through:
 
 ```bash
-axio-repl --transport anthropic --model claude-sonnet-4-20250514
+axio-repl --transport anthropic --model claude-sonnet-4-6
 axio-repl --transport google --model gemini-3.1-pro-preview
 ```
+
+(persistent-configuration-and-agent-bundles)=
 
 ## Persistent configuration and agent bundles
 
@@ -280,7 +283,7 @@ sandbox:
 ```
 
 The network/cache architecture and concrete devpi, Nexus, and Artifactory
-recipes are documented in [Docker sandbox](docker-sandbox.md#restricted-packages-and-datasets).
+recipes are documented in {ref}`Docker sandbox <restricted-packages-and-datasets>`.
 
 ### Resolution and validation
 
@@ -655,7 +658,7 @@ networking is off. Run `make sandbox-image` before its first use; the REPL does
 not try to pull that local-only tag. Explicit alternative image names retain
 pull-on-missing behavior. Fail-closed support for an internal Docker network,
 policy proxy, registry caches, and read-only dataset snapshots is described in
-[Docker Sandbox](docker-sandbox.md#from-axio-repl).
+{ref}`Docker Sandbox <docker-sandbox-from-axio-repl>`.
 
 ## AGENTS.md
 

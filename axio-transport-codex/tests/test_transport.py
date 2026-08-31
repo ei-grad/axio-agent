@@ -28,6 +28,7 @@ from axio.messages import (
     Message,
     input_provenance_header,
 )
+from axio.testing import assert_stream_contract
 from axio.tool import Tool
 from axio.types import StopReason, Usage
 
@@ -235,7 +236,10 @@ async def transport(fake_server: tuple[FakeCodexServer, str]) -> AsyncIterator[C
 
 
 async def _collect(stream: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
-    return [event async for event in stream]
+    """Every event the stream produced, checked against what any transport must produce."""
+    made = [event async for event in stream]
+    assert_stream_contract(made)
+    return made
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +501,7 @@ def test_convert_tool_results() -> None:
     assert items[0]["output"] == "22C"
 
 
-def test_convert_tool_result_image_uses_framed_user_fallback() -> None:
+def test_convert_tool_result_image_stays_inside_function_output() -> None:
     provenance = InputProvenance(human_authored=False, source="tool-result", author="read_file")
     messages = [
         Message(
@@ -518,15 +522,11 @@ def test_convert_tool_result_image_uses_framed_user_fallback() -> None:
 
     items = _convert_messages(messages, "")[1]
 
-    assert items[1] == {"type": "function_call_output", "call_id": "call-image", "output": "diagram"}
-    assert items[2]["role"] == "user"
-    assert items[2]["content"][0] == {
-        "type": "input_text",
-        "text": input_provenance_header(provenance),
-    }
-    assert items[2]["content"][1] == {"type": "input_text", "text": "[Image from tool call call-image]"}
-    assert items[2]["content"][2]["type"] == "input_image"
-    assert items[2]["content"][3] == {"type": "input_text", "text": INPUT_PROVENANCE_FOOTER}
+    assert items[1]["type"] == "function_call_output"
+    assert items[1]["call_id"] == "call-image"
+    assert items[1]["output"][0] == {"type": "input_text", "text": "diagram"}
+    assert items[1]["output"][1]["type"] == "input_image"
+    assert len(items) == 2
 
 
 def test_convert_tool_result_mixed_with_text_emits_both_in_order() -> None:
@@ -574,7 +574,9 @@ def test_convert_assistant_text() -> None:
     _, items = _convert_messages(messages, "")
     assert len(items) == 1
     assert items[0]["role"] == "assistant"
-    assert items[0]["content"] == [{"type": "output_text", "text": "Sure, I can help."}]
+    # A plain string, not an `output_text` part: that part belongs to an output message, which the
+    # API also requires to carry `id`, `type` and `status`. Both transports share this conversion.
+    assert items[0]["content"] == "Sure, I can help."
 
 
 def test_convert_assistant_tool_use() -> None:

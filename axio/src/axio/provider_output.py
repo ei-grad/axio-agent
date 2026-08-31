@@ -7,13 +7,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .events import ReasoningDelta, StreamEvent, TextDelta, ToolInputDelta
+from .events import ReasoningDelta, Refusal, StreamEvent, TextDelta, ToolInputDelta
 from .exceptions import ProviderOutputLimitError
 from .messages import Message
 from .tool import Tool
 from .transport import CompletionTransport, OutputTokenLimitSource
 
-type _SemanticStreamKey = tuple[Literal["text", "reasoning"], int] | tuple[Literal["tool-input"], int, str]
+type _SemanticStreamKey = tuple[Literal["text", "reasoning", "refusal"], int] | tuple[Literal["tool-input"], int, str]
 
 
 def snapshot_output_token_limit(
@@ -236,6 +236,8 @@ class ProviderOutputGuard:
             return event.delta, ("text", event.index)
         if isinstance(event, ReasoningDelta):
             return event.delta, ("reasoning", event.index)
+        if isinstance(event, Refusal):
+            return event.text, ("refusal", event.index)
         if isinstance(event, ToolInputDelta):
             return event.partial_json, ("tool-input", event.index, event.tool_use_id)
         return None

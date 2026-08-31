@@ -11,6 +11,8 @@ name: test_agent_dataclass
 -->
 ```python
 from dataclasses import dataclass, field
+from typing import Any
+
 from axio import CompletionTransport, ProviderOutputPolicy, Tool, ToolSelector
 from axio.agent import DeferredToolSink
 from axio.messages import Message
@@ -20,7 +22,7 @@ from axio.messages import Message
 class Agent:
     system: str
     transport: CompletionTransport
-    tools: list[Tool] = field(default_factory=list)
+    tools: list[Tool[Any]] = field(default_factory=list)
     selector: ToolSelector | None = field(default=None)
     max_iterations: int = field(default=50)
     last_iteration_message: Message | None = field(default=None)
@@ -93,24 +95,118 @@ flowchart TD
     E -- Yes --> F[Dispatch tools concurrently]
     F --> G[Append results to context]
     G --> C
-    E -- No --> H{Stop reason?}
-    H -- end_turn --> I[SessionEndEvent]
-    H -- max_tokens / error --> J[Error event]
+    E -- No --> H[Append assistant turn to context]
+    H --> I{Stop reason}
+    I -- end_turn --> J[SessionEndEvent end_turn]
+    I -- refusal --> K[SessionEndEvent refusal]
+    I -- pause_turn --> C
+    I -- anything else --> L[Error, then SessionEndEvent error]
 ```
 
-1. The user message is appended to the context store.
-2. The agent retrieves the full conversation history and streams it to the
-   transport along with the tool definitions and system prompt.
-3. As `StreamEvent` values arrive, the agent checks provider-owned deltas
-   before yielding or retaining them, then accumulates text and buffers pending
-   tool calls.
-4. When the transport yields an `IterationEnd` event:
-   - If tool-use blocks were collected, the agent dispatches **all tool calls
-     concurrently** via `asyncio.gather`, appends the assistant message and
-     tool results to context, and loops back to step 2.
-   - If only text was produced and the stop reason is `end_turn`, the agent
-     emits a `SessionEndEvent` and returns.
-5. If `max_iterations` is exceeded, the loop terminates with an error.
+1. The user message is appended to the context store, prefixed with a local
+   timestamp. The stored text is `[2026-08-27 14:03:11 CEST] your message`, not
+   the string you passed. The model needs to know when it was asked. The
+   history is the only place to say it.
+2. The agent retrieves the full conversation history - including the message
+   just appended - and streams it to the transport along with the tool
+   definitions and system prompt. On the final iteration only,
+   `last_iteration_message` is appended to the history handed to the transport.
+   It is never written to the store.
+3. Provider-owned text, reasoning, and tool-input deltas first pass through the
+   configured output circuit breaker. Accepted events are passed through to the
+   consumer unchanged. The agent also folds text, refusal text, reasoning and
+   signatures, provider-owned items, and inline media into the turn it is
+   building. Tool-call fragments are buffered until the iteration ends.
+4. When the transport yields `IterationEnd`, the buffered fragments are parsed
+   into `ToolUseBlock`s. The turn's token usage is then added to the running
+   total and reported to the context store.
+   - If tool-use blocks were collected and the stop reason vouches for them,
+     the agent dispatches **all tool calls concurrently**, atomically appends
+     the assistant message and tool results, and loops back to step 2.
+   - Calls produced by a refused, cancelled, truncated, unknown, or failed turn
+     are not executed. They receive explicit error results instead.
+   - Otherwise the assistant turn is appended to context. The stop reason
+     then decides what happens next.
+5. If `max_iterations` is exceeded, the loop emits `Error` and then a
+   `SessionEndEvent` carrying `StopReason.error`.
+
+## Stop reasons and how the loop ends
+
+The assistant turn is stored **before** the stop reason is examined, so a
+refusal, a pause and an unrecognised reason all keep the content the model
+produced.
+
+| Stop reason | What the loop does |
+|---|---|
+| `tool_use` | Dispatches the calls and iterates. |
+| `end_turn` | Ends with `SessionEndEvent(stop_reason=end_turn)`. |
+| `refusal` | Ends with `SessionEndEvent(stop_reason=refusal)`. Not an `Error`. |
+| `max_tokens`, `context_window_exceeded`, `cancelled`, `unknown` | Ends with a `SessionEndEvent` preserving that reason. |
+| `repetition` | Stores the partial turn and ends with `SessionEndEvent(stop_reason=repetition)`. |
+| `pause_turn` | **Resumes**: the loop goes round again. |
+| `error` or any future unmatched reason | Yields `Error`, then `SessionEndEvent(stop_reason=error)`. |
+
+`refusal` is terminal and deliberately not reported as an error. The model
+declined. The decline is stored as the turn's content. The same prompt sent
+again will be declined again. Reported as an error, the decline is
+indistinguishable from a broken connection. A caller then retries something
+that can never work. The decline itself reaches `run()` as the returned text.
+See {doc}`events`.
+
+`pause_turn` is the one reason that does not end the run. The provider stopped
+its own server-side tool loop and expects the assistant content back so it can
+finish. That content was appended a line earlier, so going round again *is* the
+resume. The resume takes the same code path as any other iteration, bounded by
+the same `max_iterations`.
+
+The final wildcard covers `error` and any member added to `StopReason` later.
+It is there on purpose: an unhandled reason must terminate the run instead of
+falling through and re-prompting the model with unchanged history until
+`max_iterations`.
+
+## What the agent stores
+
+The assistant message written to context holds more than text and tool calls:
+
+`TextBlock`
+: Accumulated `TextDelta`s, plus the text of any `Refusal`. A refusal is what
+  the assistant said. Left out, the stored turn is empty. The next request
+  then carries a blank assistant message the provider rejects.
+
+`ReasoningBlock`
+: Accumulated `ReasoningDelta`s, with the `ReasoningSignature` that proves them
+  attached. This is what makes the turn replayable. Anthropic refuses a
+  returned thinking block whose signature is missing or changed. Google reports
+  `MISSING_THOUGHT_SIGNATURE` for the same failure.
+
+  A signed block is finished. A reasoning delta arriving after a signature
+  starts a **new** `ReasoningBlock` rather than extending the signed one,
+  because the provider computed that signature over the text it had.
+
+  A signature repeating the index of the one before it is the rest of the same
+  proof, and is appended to it. Transports index a signature by the block it
+  proves, so a repeated index cannot be a second proof. Stored apart, the block
+  replays with half a signature. The turn after it is then refused.
+
+`ImageBlock` / `VideoBlock`
+: Media the model generated inline, so a later turn still has it in view.
+
+`ToolUseBlock`
+: One per parsed tool call, added when the iteration ends.
+
+A context store that round-trips these through `to_dict`/`from_dict` must keep
+`ReasoningBlock.signature` intact. Dropping it fails on the *next* turn, not on
+the one that dropped it.
+
+## When the model repeats itself
+
+The agent watches accumulated text for a model stuck in a loop - a repeated
+token, phrase, or paragraph. When it fires, the agent stops reading the stream,
+appends `[Output truncated: repetitive content detected]` to the turn, yields
+that note as a `TextDelta`, stores the turn, and ends the session with
+`StopReason.repetition`. The stream was abandoned before `IterationEnd`, so no
+usage arrived with it. The agent reads `transport.last_usage` if the transport
+keeps one, and adds it, rather than reporting the turn as free.
 
 ## Streaming API
 
@@ -122,7 +218,10 @@ flowchart TD
   as they happen.
 
 `run(user_message, context) -> str`
-: Convenience wrapper that consumes the stream and returns the final text.
+: Convenience wrapper that consumes the stream and returns the final text. The
+  text of a `Refusal` counts as final text, so a declined turn returns the
+  decline rather than the empty string it used to. Raises `StreamError` on an
+  `Error` event.
 
 `run_stream_messages(messages, context, *, on_input_committed=None) -> AgentStream`
 : Appends an ordered batch of distinct `Message` objects, then starts one model
@@ -157,7 +256,7 @@ async def dispatch_tools(
 
 Each tool call goes through the full guard chain before execution. If a tool
 raises an exception, the agent catches it and wraps it in a `ToolResultBlock`
-with `is_error=True` - the model sees the error and can react accordingly.
+with `is_error=True`. The model sees the error and can react accordingly.
 
 If a tool's JSON arguments could not be parsed from the stream, the agent
 returns a `ToolResultBlock` with `is_error=True` and a message asking the
@@ -197,7 +296,7 @@ iteration. This is useful for reducing noise in the model's context, enforcing
 capability restrictions, or implementing dynamic tool routing.
 
 ```python
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 from collections.abc import Iterable
 from axio.messages import Message
 from axio import Tool
@@ -206,8 +305,8 @@ from axio import Tool
 @runtime_checkable
 class ToolSelector(Protocol):
     async def select(
-        self, messages: Iterable[Message], tools: Iterable[Tool]
-    ) -> Iterable[Tool]: ...
+        self, messages: Iterable[Message], tools: Iterable[Tool[Any]]
+    ) -> Iterable[Tool[Any]]: ...
 ```
 
 Pass a `ToolSelector` via the `selector` field when constructing an `Agent`.

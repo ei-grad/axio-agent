@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from axio.blocks import TextBlock
-from axio.events import ReasoningDelta, TextDelta, ToolInputDelta, ToolOutputDelta, ToolUseStart
+from axio.blocks import ProviderBlock, ReasoningBlock, TextBlock, ToolUseBlock
+from axio.events import ReasoningDelta, Refusal, TextDelta, ToolInputDelta, ToolOutputDelta, ToolUseStart
 from axio.messages import InputProvenance, Message
 from axio_tools_agents.runtime import (
     EditorSnapshot,
@@ -87,6 +87,62 @@ async def test_resume_accepts_legacy_events_jsonl_schema_v1(tmp_path: Path) -> N
 
     assert recovered.source_session_id == "legacy-source"
     assert recovered.messages == (message,)
+
+
+async def test_recovery_preserves_provider_replay_blocks_and_signatures(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(session_id="provider-replay", root=tmp_path)
+    message = Message(
+        role="assistant",
+        content=[
+            TextBlock(text="answer", signature="text-proof", provider="google"),
+            ReasoningBlock(
+                text="summary",
+                signature="reasoning-proof",
+                id="rs_1",
+                provider="openai",
+            ),
+            ProviderBlock(
+                provider="openai",
+                kind="web_search_call",
+                data={"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                id="ws_1",
+            ),
+            ToolUseBlock(
+                id="call_1",
+                name="lookup",
+                input={"query": "value"},
+                signature="tool-proof",
+                provider="google",
+            ),
+        ],
+    )
+    await _publish_message(journal, message, 1, "turn-1")
+    await journal.close()
+
+    recovered = materialize_recovery(journal.semantic_path)
+
+    assert recovered.messages == (message,)
+
+
+async def test_recovery_preserves_partial_refusal_text(tmp_path: Path) -> None:
+    journal = await SessionJournal.open(session_id="partial-refusal", root=tmp_path)
+    await _publish_event(journal, "turn_started", TurnStarted("work"), 1, "unfinished")
+    assert journal.observe_stream_event(
+        Refusal(index=0, text="policy refusal"),
+        agent_id="main",
+        parent_agent_id=None,
+        turn_id="unfinished",
+        context_id="context",
+        execution_mode="foreground",
+        parent_tool_use_id=None,
+    )
+    await journal.close()
+
+    recovered = materialize_recovery(journal.semantic_path)
+
+    partial = recovered.messages[-2].content[0]
+    assert isinstance(partial, TextBlock)
+    assert partial.text == "policy refusal"
 
 
 async def test_recovery_restores_messages_pending_editor_and_partial_turn(tmp_path: Path) -> None:

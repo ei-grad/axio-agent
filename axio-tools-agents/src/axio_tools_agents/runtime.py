@@ -17,7 +17,7 @@ from axio._asyncio import shield_until_done
 from axio.agent import Agent
 from axio.blocks import TextBlock
 from axio.context import ContextStore, SessionInfo
-from axio.events import Error, SessionEndEvent, StreamEvent, TextDelta, ToolResult
+from axio.events import Error, Refusal, SessionEndEvent, StreamEvent, TextDelta, ToolResult
 from axio.messages import InputProvenance, Message
 from axio.types import StopReason
 
@@ -245,6 +245,14 @@ class TurnOutcome:
     @property
     def succeeded(self) -> bool:
         return self.status is TurnStatus.SUCCEEDED
+
+
+def format_turn_failure(outcome: TurnOutcome) -> str:
+    """Preserve provider text beside the typed failure summary."""
+
+    detail = outcome.error or "unknown error"
+    response = outcome.text.strip()
+    return f"{detail}\n\nResponse:\n\n{response}" if response else detail
 
 
 EventSubscriber = Callable[[AgentEventEnvelope], Awaitable[None]]
@@ -648,9 +656,10 @@ async def _observe_agent_turn_current(
 
     try:
         async for event in stream:
-            if isinstance(event, TextDelta):
-                text.append(event.delta)
-                current_iteration_text.append(event.delta)
+            if isinstance(event, TextDelta | Refusal):
+                value = event.delta if isinstance(event, TextDelta) else event.text
+                text.append(value)
+                current_iteration_text.append(value)
             elif isinstance(event, ToolResult):
                 current_iteration_text.clear()
             elif isinstance(event, Error):

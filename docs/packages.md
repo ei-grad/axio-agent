@@ -1,8 +1,7 @@
 # Packages
 
-The Axio monorepo contains 14 packages, each with a focused responsibility.
-Each package is a top-level directory in the monorepo root (e.g., `axio/`, `axio-tui/`)
-and all are managed as a uv workspace.
+The Axio packages documented here each have a focused responsibility. They are
+top-level directories in the monorepo. A uv workspace manages them.
 
 ## Overview
 
@@ -10,8 +9,10 @@ and all are managed as a uv workspace.
 |---------|---------|-------------------|
 | `axio` | Core framework | - |
 | `axio-context-sqlite` | SQLite-backed persistent context store | - |
+| `axio-sse` | `text/event-stream` decoder and payload reader | - |
+| `axio-responses` | OpenAI Responses API: request items and stream events | - |
 | `axio-transport-anthropic` | Anthropic Claude transport | `axio.transport`, `axio.transport.settings` |
-| `axio-transport-openai` | OpenAI Responses plus Chat Completions transports | `axio.transport`, `axio.transport.settings` |
+| `axio-transport-openai` | OpenAI Responses transport, plus the compatible chat endpoints (Nebius, OpenRouter, custom) | `axio.transport`, `axio.transport.realtime`, `axio.transport.settings` |
 | `axio-transport-codex` | ChatGPT (Codex) OAuth transport | `axio.transport`, `axio.transport.settings` |
 | `axio-transport-google` | Google Gemini transport + Gemini Live realtime | `axio.transport`, `axio.transport.realtime`, `axio.transport.settings`, `axio.tools` |
 | `axio-audio` | Microphone and speaker helpers for realtime agents | - |
@@ -19,19 +20,67 @@ and all are managed as a uv workspace.
 | `axio-tools-local` | Filesystem & shell tools | `axio.tools` |
 | `axio-tools-mcp` | MCP tool loader | `axio.tools.settings` |
 | `axio-tools-docker` | Docker sandbox tools | - |
-| `axio-tui` | Textual-based TUI app | `axio.tools` |
-| `axio-tui-guards` | Permission guard plugins | `axio.guards` |
 | `axio-repl` | Interactive terminal coding assistant | - |
+| `axio-tui` | Textual chat application | `axio.tools` |
+| `axio-tui-guards` | Path and LLM guards for the TUI | `axio.guards` |
 
 ## Core
 
 ### axio
 
 The foundation. Defines the agent loop, all protocols (`CompletionTransport`,
-`ContextStore`, `PermissionGuard`), the tool system, stream events, and
-testing helpers. Has no entry points - other packages depend on it.
+`ContextStore`, `PermissionGuard`), the tool system, stream events, and testing
+helpers. Has no entry points. Other packages depend on it.
 
 Dependencies: none (stdlib only)
+
+## Wire formats
+
+### axio-sse
+
+Reads `text/event-stream`. `Decoder` is the format as a synchronous state machine.
+Feed it chunks cut anywhere, and take the events they completed. `events()` and
+`payloads()` are the async skin over it.
+
+A stream whose events are all one shape needs nothing above `payloads()`. A stream
+that names each event subclasses `Reader` and writes one `@on(...)` method per
+event. `Wire` says what one payload looks like. Fields are read by declared name
+and type, so a misspelled key is a type error at the place that uses it, rather
+than a default quietly standing in for the value.
+
+A `Reader` names only the events it interprets. Everything else reaches
+`unmatched()`, which returns nothing by default. A reader overrides it to forward
+instead of drop. The reason is that an endpoint which runs tools publishes one
+event family per tool. That set therefore depends on which tools exist and which
+the caller declared, not on the protocol. Named one by one, the list is stale the
+day a tool is added. A new tool then reads as news about the protocol when it is
+news about the tools. `strict=True` still raises `UnknownEvent` for any name no
+method claims. A test can therefore hold `names()` against the schema the provider
+publishes, without the reader carrying a list it cannot keep true.
+
+The package takes chunks and never lines. `aiohttp`'s `readuntil` raises
+`LineTooLong` past 131072 bytes. `LineTooLong` is not a `ClientError`. One large
+reasoning event kills a turn with no answer.
+
+Dependencies: none (stdlib only)
+
+### axio-responses
+
+The OpenAI Responses API as axio speaks it. `convert_messages` and `convert_tools`
+build the request. `Responses` is an `axio_sse.Reader` that turns the stream into
+`StreamEvent`s.
+
+The claim `names()` supports runs one way only: every name the reader claims is
+one the schema publishes. That is what catches a typo in a claimed name. The
+reverse does not hold, and deliberately. The reader does not name the hosted-tool
+event families. It forwards them through `unmatched()` as
+`ProviderEvent(provider="openai", ...)`.
+
+Both halves live here rather than in a transport because two transports speak this
+API: `axio-transport-openai` against `/v1/responses`, and `axio-transport-codex`
+against the ChatGPT backend.
+
+Dependencies: `axio`, `axio-sse`
 
 ## Context Stores
 
@@ -54,20 +103,28 @@ Dependencies: `axio`, `aiosqlite>=0.20`
 
 ### axio-transport-anthropic
 
-Anthropic Claude transport using `aiohttp` and SSE parsing. Supports all
-Claude models with prompt caching (`cache_control`) and automatic retry on
-rate-limit (429) and overload (529) responses.
+Anthropic Claude transport. It posts with `aiohttp`. It reads the stream through
+`axio-sse`: an `axio_sse.Reader` keyed on the format's own `event:` field, with
+one `@on(...)` method per event. It supports all Claude models with prompt caching
+(`cache_control`). It retries automatically on rate-limit (429) and overload (529)
+responses.
+
+Its `input_tokens` are converted into the axio rule before they leave. The API
+counts only the tokens after the last cache breakpoint. The cache read and cache
+write counts are therefore added back, and reported as slices of an inclusive
+total.
 
 Entry points:
 - `axio.transport` → `AnthropicTransport`
 - `axio.transport.settings` → `AnthropicSettingsScreen`
 
-Dependencies: `axio`, `aiohttp>=3.11`
+Dependencies: `axio`, `axio-sse`, `aiohttp>=3.11`
 
 ### axio-transport-openai
 
-OpenAI Responses and OpenAI-compatible Chat Completions transports using
-`aiohttp` and SSE parsing. Includes five transports registered as entry points:
+OpenAI HTTP streaming transports. They post with `aiohttp` and read the stream
+through `axio-sse`. The Responses vocabulary itself lives in `axio-responses`.
+Five transports are registered as entry points:
 
 | Entry point name | Class | Provider |
 |---|---|---|
@@ -78,27 +135,40 @@ OpenAI Responses and OpenAI-compatible Chat Completions transports using
 | `openai-custom` | `OpenAICompatibleTransport` | Any Chat Completions endpoint |
 
 Settings screens are registered under `axio.transport.settings` for each.
+`OpenAIRealtimeTransport` is registered under `axio.transport.realtime` as
+`openai`.
 
-`OpenAITransport` always streams through `/v1/responses`. The other four
-transports always use `/v1/chat/completions`; endpoint selection is explicit.
+`api: Literal["responses", "chat"]` selects the endpoint. `OpenAITransport`
+defaults to `"responses"` and posts to `/v1/responses`, because
+`/v1/chat/completions` refuses function tools beside any reasoning effort other
+than `"none"` for a model that reasons. A request carrying tools fails there with
+a 400 naming a parameter the caller never sent. The four compatible subclasses
+say `"chat"`, since compatible servers rarely implement `/v1/responses`. See
+{ref}`the troubleshooting entry <tools-and-reasoning-400>`.
 
-`LlamaCppTransport` performs
-side-effect-free discovery through llama.cpp's native `/props` plus `/models`
-(router mode) or `/v1/models` (single-model mode). Router entries must already
-be loaded or sleeping; refresh never autoloads, unloads, downloads, or reloads
-models.
+`extra_params` is folded into the request. Its `tools` are merged rather than
+substituted. A caller adding a hosted tool would otherwise take away the function
+declarations the agent needs dispatched. The turn would then read as the model
+simply choosing to call nothing. A declaration whose name matches one already
+there wins.
 
-Dependencies: `axio`, `aiohttp>=3.11`
+`LlamaCppTransport` performs side-effect-free discovery through llama.cpp's
+native `/props` plus `/models` in router mode or `/v1/models` in single-model
+mode. Refresh never autoloads, unloads, downloads, or reloads models.
+
+Dependencies: `axio`, `axio-responses`, `axio-sse`, `aiohttp>=3.11`
 
 ### axio-transport-codex
 
-ChatGPT (Codex) transport using the Responses API with OAuth authentication.
+ChatGPT (Codex) transport, speaking the Responses API against the ChatGPT backend
+with OAuth authentication. It shares `axio-responses` with
+`axio-transport-openai`, so it depends on `axio-sse` only through it.
 
 Entry points:
 - `axio.transport` → `CodexTransport`
 - `axio.transport.settings` → `CodexSettingsScreen`
 
-Dependencies: `axio`, `aiohttp>=3.11`
+Dependencies: `axio`, `axio-responses`, `aiohttp>=3.11`
 
 ### axio-transport-google
 
@@ -108,13 +178,23 @@ video generation tools when installed.
 
 Entry points:
 - `axio.transport` → `GoogleTransport`, `VertexAITransport`
-- `axio.transport.realtime` → `GeminiLiveTransport`, `VertexLiveTransport`
+- `axio.transport.realtime` → `GeminiLiveTransport` (`gemini`), `VertexLiveTransport` (`vertex`)
 - `axio.transport.settings` → `GoogleSettingsScreen`, `VertexSettingsScreen`
 - `axio.tools` → `generate_image`, `generate_video`
 
+Gemini's stream carries no per-event discriminator, so this transport reads it
+with `axio_sse.payloads()` and `Wire` shapes rather than with a `Reader`. Its
+token counts are converted into the axio rule on the way out. Tool-use prompt
+tokens are not inside `promptTokenCount`, and thinking is not inside
+`candidatesTokenCount`, so both are added.
+
 See the {doc}`guides/google-transport` guide.
 
-Dependencies: `axio`, `axio-transport-anthropic[vertexai]`, `google-auth[urllib3]>=2.0`, `aiohttp>=3.11`
+Dependencies: `axio`, `axio-sse`, `axio-transport-anthropic[vertexai]`, `google-auth[urllib3]>=2.0`
+
+`aiohttp` is not declared here. The HTTP client arrives through
+`axio-transport-anthropic`, which this package builds on for Vertex AI
+authentication.
 
 ## Audio
 
@@ -164,14 +244,17 @@ Dependencies: `axio`
 Dynamic tool provider that loads tools from MCP (Model Context Protocol)
 servers. Registered as a `ToolsPlugin` under `axio.tools.settings`.
 
+Entry points:
+- `axio.tools.settings` → `MCPPlugin`
+
 Dependencies: `axio`, `mcp>=1.6`
 
 ### axio-tools-docker
 
 Docker sandbox environment as an async context manager. Spins up an isolated
-container via `aiodocker` and exposes six tools that mirror `axio-tools-local`:
-`shell`, `write_file`, `read_file`, `list_files`, `run_python`, `patch_file`.
-No entry points - used directly in code via `DockerSandbox`.
+container via `aiodocker`. Exposes six tools that mirror `axio-tools-local`:
+`shell`, `write_file`, `read_file`, `list_files`, `run_python`, `patch_file`. No
+entry points. Use `DockerSandbox` directly in code.
 
 ```python
 async with DockerSandbox(image="python:3.12-slim") as sandbox:
@@ -180,31 +263,32 @@ async with DockerSandbox(image="python:3.12-slim") as sandbox:
 
 Dependencies: `axio`, `aiodocker>=0.26`
 
-## TUI & Plugins
+## Applications
 
 ### axio-tui
 
-Terminal UI application built with Textual. Provides the `axio` console
-command, plugin discovery, transport management, and session persistence
-via SQLite.
+Textual chat application. Stores conversations with `axio-context-sqlite`. Keeps
+per-project configuration in a database of its own. Discovers transports, tools,
+guards and settings screens through the entry-point groups above. Optional extras
+name the transports and tool packages it can drive: `anthropic`, `openai`,
+`codex`, `local`, `mcp`, `guards`, and `all` for the lot.
 
-Tools registered under `axio.tools`:
-- `status_line` - Update the TUI status bar
-- `confirm` - Ask user for confirmation
-- `subagent` - Spawn a sub-agent
-- `vision` - Analyze images
+Entry points:
+- `axio.tools` → `status_line`, `confirm`, `subagent`, `vision`
 
 Console script: `axio = "axio_tui.__main__:main"`
 
-Dependencies: `axio`, `textual>=2.1.0`, `aiosqlite>=0.20`
+Dependencies: `axio`, `axio-context-sqlite`, `textual>=2.1.0`, `textual-serve>=1.1`, `argclass>=1.6`
 
 ### axio-tui-guards
 
-Permission guard plugins for the TUI.
+The TUI offers two guards. `PathGuard` asks before a tool touches a path, and
+remembers the answer for that directory. `LLMGuard` puts the decision to an agent,
+and feeds the user's overrides back into its context. Both are registered as entry
+points, so the TUI can list them without importing them.
 
-Guards registered under `axio.guards`:
-- `path` - `PathGuard` - Validates file paths against allowed directories
-- `llm` - `LLMGuard` - Uses LLM to assess tool call safety
+Entry points:
+- `axio.guards` → `path` (`PathGuard`), `llm` (`LLMGuard`)
 
 Dependencies: `axio`, `axio-tui`
 

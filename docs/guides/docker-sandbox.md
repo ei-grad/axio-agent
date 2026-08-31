@@ -1,11 +1,11 @@
 # Docker Sandbox
 
 The `axio-tools-docker` package provides an isolated Docker container for
-running agent-generated code and commands. `DockerSandbox` is an async context
-manager: it creates a container on entry and removes it on exit. Inside the
-context it exposes six tools that are drop-in replacements for
-`axio-tools-local` - the agent gets the same `shell`, `write_file`,
-`read_file`, `list_files`, `run_python`, and `patch_file` tools, but every
+running agent-generated code and commands. `DockerSandbox` is an async
+context manager. It creates a container on entry and removes it on exit.
+Inside the context it exposes six tools that are drop-in replacements for
+`axio-tools-local`. The agent gets the same `shell`, `write_file`,
+`read_file`, `list_files`, `run_python`, and `patch_file` tools. Every
 operation runs inside the container, not on the host.
 
 ## Installation
@@ -70,6 +70,8 @@ than guessing. `write_file` retains a full unified diff.
 replace one but reports no diff for it, and none for a new file either. The
 container round-trip that reads the previous content is also what detects
 whether the file exists, so an overwrite costs one archive fetch, not two.
+
+(docker-sandbox-from-axio-repl)=
 
 ## From axio-repl
 
@@ -204,6 +206,8 @@ them. An exact collision with `/tmp/axio-home`, or mounting `/` as the project,
 is rejected before container creation. Project paths containing `:` are also
 rejected because Docker's bind-string representation cannot encode them safely.
 
+(restricted-packages-and-datasets)=
+
 ### Restricted packages and datasets
 
 Axio does not deploy a proxy, registry cache, or dataset broker. It validates
@@ -228,7 +232,7 @@ docker network create --internal axio-agent-egress
 
 A typical deployment connects these components:
 
-```mermaid
+```{mermaid}
 flowchart LR
     A[agent sandbox] -->|HTTP_PROXY| M[mitmania policy proxy]
     A -->|registry endpoints| C[Nexus or Artifactory cache]
@@ -273,7 +277,7 @@ axio-repl --sandbox docker \
 For repeated use, put the same values in a named REPL agent bundle and run
 `axio-repl --agent <name>`. The full manifest schema, environment overrides,
 and precedence rules are in
-[Persistent configuration and agent bundles](axio-repl.md#persistent-configuration-and-agent-bundles).
+{ref}`Persistent configuration and agent bundles <persistent-configuration-and-agent-bundles>`.
 
 `axio-repl` verifies that the named Docker network has `Internal=true` before
 creating the container, then creates it against that verified network ID rather
@@ -708,9 +712,10 @@ asyncio.run(main())
 ## Named containers and reuse
 
 Pass `name=` to give the container a stable identity. When a container with
-that name already exists, the sandbox attaches to it instead of creating a new
-one, starts it if necessary, and skips removal on exit regardless of `remove`.
-This is how a new harness process reconnects to a session's existing sandbox:
+that name already exists, the sandbox attaches to it instead of creating a
+new one. It starts the container if necessary. It skips removal on exit,
+regardless of `remove`. This is how a new harness process reconnects to a
+session's existing sandbox:
 
 <!-- name: test_docker_named_reuse; fixtures: docker -->
 ```python
@@ -738,8 +743,8 @@ asyncio.run(second_session())
 ```
 
 If no container with the given name exists, a new one is created normally.
-For a harness, a server-issued UUID or ULID session ID can be used directly as
-`name`; no separate container-ID mapping is required. Re-entering
+For a harness, a server-issued UUID or ULID session ID can be used directly
+as `name`. No separate container-ID mapping is required. Re-entering
 `DockerSandbox` creates a new tool list bound to the recovered container. Map
 arbitrary client-provided IDs to validated internal IDs before using them as
 Docker names.
@@ -847,9 +852,9 @@ sandbox = DockerSandbox(
 )
 ```
 
-With this configuration the agent can only write to `/tmp` and `/workspace`,
-has no network access, no Linux capabilities, and cannot exceed the memory or
-process limits.
+With this configuration the agent can only write to `/tmp` and `/workspace`.
+It has no network access and no Linux capabilities. It cannot exceed the
+memory or process limits.
 
 ## All parameters
 

@@ -515,7 +515,7 @@ async def test_one_shot_background_failure_reason_has_one_visible_delivery_and_r
 ) -> None:
     import axio_repl
 
-    unique_failure = "Stopped after 2 iterations without finishing"
+    unique_failure = "Transport asked for a tool but produced no call"
     parent_prompts: list[str] = []
 
     class BackgroundFailureTransport(_OneShotTransport):
@@ -1444,6 +1444,9 @@ async def test_serializer_handles_events_dataclasses_enums_usage_and_exceptions(
         "output_tokens": 3,
         "cost_usd": 0.001,
         "cost_source": "provider",
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
     }
     assert serialized["reason"] == "end_turn"
     assert serialized["event"] == {
@@ -1456,7 +1459,11 @@ async def test_serializer_handles_events_dataclasses_enums_usage_and_exceptions(
             "output_tokens": 1,
             "cost_usd": None,
             "cost_source": None,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
         },
+        "raw": "",
     }
     assert serialized["failure"] == {
         "exception_type": "RuntimeError",

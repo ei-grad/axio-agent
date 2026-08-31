@@ -9,7 +9,7 @@ from typing import Any, Literal
 from axio.agent import Agent
 from axio.blocks import ImageBlock, TextBlock
 from axio.context import ContextStore
-from axio.events import TextDelta
+from axio.events import Refusal, TextDelta
 from axio.exceptions import ProviderOutputLimitError
 from axio.messages import InputProvenance, Message
 from axio.provider_output import ProviderOutputGuard, ProviderOutputPolicy, snapshot_output_token_limit
@@ -149,6 +149,8 @@ async def vision_analyze(
                 raise output_limit_error
             if isinstance(event, TextDelta):
                 text_parts.append(event.delta)
+            elif isinstance(event, Refusal):
+                text_parts.append(event.text)
     finally:
         if output_limit_error is not None:
             close_provider_stream = getattr(provider_stream, "aclose", None)

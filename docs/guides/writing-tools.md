@@ -66,8 +66,8 @@ assert "limit" not in schema.get("required", [])
 ```
 
 Parameters with a `default` value are omitted from `required` in the schema.
-When the LLM omits an optional parameter, the default is applied automatically
-before the handler is called - no `None` check needed.
+When the LLM omits an optional parameter, the default is applied
+automatically before the handler is called. No `None` check is needed.
 
 ### Numeric constraints
 

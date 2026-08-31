@@ -20,6 +20,7 @@ from types import TracebackType
 from typing import cast
 
 from axio.events import (
+    Refusal,
     TextDelta,
     ToolFieldDelta,
     ToolFieldEnd,
@@ -590,7 +591,16 @@ class SessionJournal:
 
         if turn_id is None or not isinstance(
             event,
-            (TextDelta, ToolUseStart, ToolInputDelta, ToolFieldStart, ToolFieldDelta, ToolFieldEnd, ToolOutputDelta),
+            (
+                TextDelta,
+                Refusal,
+                ToolUseStart,
+                ToolInputDelta,
+                ToolFieldStart,
+                ToolFieldDelta,
+                ToolFieldEnd,
+                ToolOutputDelta,
+            ),
         ):
             return True
         key = (agent_id, turn_id)
@@ -610,9 +620,10 @@ class SessionJournal:
                 tool_output={},
             )
             self._checkpoints[key] = checkpoint
-        if isinstance(event, TextDelta):
-            checkpoint.text.append(event.delta)
-            checkpoint.pending_chars += len(event.delta)
+        if isinstance(event, TextDelta | Refusal):
+            value = event.delta if isinstance(event, TextDelta) else event.text
+            checkpoint.text.append(value)
+            checkpoint.pending_chars += len(value)
         elif isinstance(event, ToolUseStart):
             checkpoint.tool_names[event.tool_use_id] = event.name
             checkpoint.tool_arguments.setdefault(event.tool_use_id, [])

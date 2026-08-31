@@ -10,11 +10,12 @@ from typing import Any
 import pytest
 from axio.agent import Agent
 from axio.context import MemoryContextStore
-from axio.events import StreamEvent, TextDelta
+from axio.events import IterationEnd, Refusal, StreamEvent, TextDelta
 from axio.exceptions import ProviderOutputLimitError
 from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
 from axio.tool import Tool
+from axio.types import StopReason, Usage
 
 import axio_tui.tools as _tools
 from axio_tui.app import AgentApp
@@ -212,6 +213,20 @@ class TestVisionAnalyze:
             os.chdir(tmp_path)
             result = await vision_analyze(path="photo.png", prompt="What is this?")
             assert result == "A red pixel"
+        finally:
+            os.chdir(old_cwd)
+            _tools.vision_transport = None
+
+    async def test_returns_vision_refusal_text(self, tmp_path: Path) -> None:
+        (tmp_path / "photo.png").write_bytes(_TINY_PNG)
+        _tools.vision_transport = StubTransport(
+            [[Refusal(index=0, text="vision blocked"), IterationEnd(1, StopReason.refusal, Usage(0, 0))]]
+        )
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            result = await vision_analyze(path="photo.png")
+            assert result == "vision blocked"
         finally:
             os.chdir(old_cwd)
             _tools.vision_transport = None

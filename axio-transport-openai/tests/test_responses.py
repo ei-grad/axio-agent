@@ -88,11 +88,11 @@ def test_tools_are_flat_not_nested() -> None:
 
 
 def test_reasoning_effort_is_sent_only_when_supported() -> None:
-    assert "reasoning" not in _transport().build_payload([], [], "")
+    assert _transport().build_payload([], [], "")["reasoning"] == {"summary": "auto"}
     transport = _transport()
     state = transport.configure_effort("high")
     payload = transport.build_payload([], [], "")
-    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["reasoning"] == {"summary": "auto", "effort": "high"}
     assert state.mechanism.value == "native-effort"
 
     plain = ModelSpec(id="gpt-4o", capabilities=frozenset({Capability.text, Capability.tool_use}))
@@ -213,7 +213,7 @@ def test_unanswered_call_gets_a_placeholder_output() -> None:
 
 class _FakeContent:
     def __init__(self, events: list[dict[str, Any]], *, trailing_newline: bool = True) -> None:
-        separator = "\n"
+        separator = "\n\n"
         body = separator.join(f"data: {json.dumps(e)}" for e in events)
         if trailing_newline:
             body += separator
@@ -263,7 +263,10 @@ async def test_text_and_reasoning_deltas_are_separated() -> None:
         [
             {"type": "response.reasoning_text.delta", "delta": "thinking"},
             {"type": "response.output_text.delta", "delta": "hello"},
-            {"type": "response.completed", "response": {"usage": {"input_tokens": 3, "output_tokens": 4}}},
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "usage": {"input_tokens": 3, "output_tokens": 4}},
+            },
         ]
     )
     kinds = [type(e).__name__ for e in events]
@@ -282,7 +285,10 @@ async def test_argument_deltas_are_joined_to_the_call_id() -> None:
                 "item": {"type": "function_call", "id": "item-1", "call_id": "call-1", "name": "echo"},
             },
             {"type": "response.function_call_arguments.delta", "item_id": "item-1", "delta": '{"text"'},
-            {"type": "response.completed", "response": {"output": [{"type": "function_call"}]}},
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [{"type": "function_call"}]},
+            },
         ]
     )
     start, delta, end = events
@@ -293,16 +299,19 @@ async def test_argument_deltas_are_joined_to_the_call_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_terminal_event_without_trailing_newline_is_parsed() -> None:
+async def test_terminal_event_without_a_complete_sse_frame_is_rejected() -> None:
     response = _FakeResponse(
-        [{"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 2}}}],
+        [
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "usage": {"input_tokens": 1, "output_tokens": 2}},
+            }
+        ],
         trailing_newline=False,
     )
 
-    events = [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
-
-    assert isinstance(events[-1], IterationEnd)
-    assert events[-1].usage.input_tokens == 1
+    with pytest.raises(StreamError, match="without response.completed"):
+        [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -311,7 +320,11 @@ async def test_incomplete_response_with_null_usage_is_max_tokens() -> None:
         [
             {
                 "type": "response.incomplete",
-                "response": {"usage": None, "output": [{"type": "function_call"}]},
+                "response": {
+                    "usage": None,
+                    "output": [{"type": "function_call"}],
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
             }
         ]
     )
@@ -329,14 +342,14 @@ async def test_incomplete_response_with_null_usage_is_max_tokens() -> None:
 async def test_stream_requires_a_terminal_event() -> None:
     response = _FakeResponse([{"type": "response.output_text.delta", "delta": "partial"}])
 
-    with pytest.raises(StreamError, match="without a terminal response event"):
+    with pytest.raises(StreamError, match="without response.completed"):
         [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
 async def test_malformed_sse_is_an_error() -> None:
     response = _FakeResponse([])
-    response.content._body = b"data: {not json}\n"
+    response.content._body = b"data: {not json}\n\n"
 
     with pytest.raises(StreamError, match="Invalid OpenAI Responses SSE payload"):
         [event async for event in _transport()._parse_sse(response)]  # type: ignore[arg-type]
@@ -384,11 +397,10 @@ def test_output_limit_leaves_room_for_responses_instructions() -> None:
     assert transport.build_payload([], [], "x" * 60_000)["max_output_tokens"] <= 80_000
 
 
-def test_reserved_extra_params_cannot_replace_responses_contract() -> None:
+def test_extra_params_can_explicitly_replace_responses_fields() -> None:
     transport = _transport(extra_params={"input": []})
 
-    with pytest.raises(ValueError, match="cannot override.*input"):
-        transport.build_payload([], [], "")
+    assert transport.build_payload([], [], "")["input"] == []
 
 
 def test_active_model_round_trips() -> None:
@@ -414,13 +426,19 @@ async def test_agent_tool_round_trip_uses_responses_items() -> None:
                 "item_id": "item-1",
                 "delta": '{"text":"hello"}',
             },
-            {"type": "response.completed", "response": {"output": [{"type": "function_call"}]}},
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [{"type": "function_call"}]},
+            },
         ]
     )
     second = _FakeResponse(
         [
             {"type": "response.output_text.delta", "delta": "done"},
-            {"type": "response.completed", "response": {"output": [{"type": "message"}]}},
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [{"type": "message"}]},
+            },
         ]
     )
     session = _FakeSession([first, second])
@@ -444,7 +462,10 @@ async def test_agent_returns_refusal_text() -> None:
     response = _FakeResponse(
         [
             {"type": "response.refusal.delta", "delta": "I cannot help with that."},
-            {"type": "response.completed", "response": {"output": [{"type": "message"}]}},
+            {
+                "type": "response.completed",
+                "response": {"status": "completed", "output": [{"type": "message"}]},
+            },
         ]
     )
     session = _FakeSession([response])

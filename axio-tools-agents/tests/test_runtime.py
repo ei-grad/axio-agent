@@ -9,6 +9,7 @@ from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     IterationEnd,
+    Refusal,
     SessionEndEvent,
     StreamEvent,
     TextDelta,
@@ -274,6 +275,30 @@ async def test_observed_turn_forwards_full_stream_and_finishes_with_typed_outcom
         stop_reason=StopReason.end_turn,
         error=None,
     )
+
+
+async def test_observed_turn_preserves_refusal_text_in_failed_outcome() -> None:
+    hub = SessionEventHub(session_id="session-1")
+    identity = new_turn_identity(
+        agent_id="child",
+        parent_agent_id="parent",
+        execution_mode=ExecutionMode.BACKGROUND,
+    )
+    transport = StubTransport(
+        [[Refusal(index=0, text="policy refusal"), IterationEnd(1, StopReason.refusal, Usage(0, 0))]]
+    )
+
+    outcome = await observe_agent_turn(
+        agent=Agent(system="child", transport=transport),
+        context=MemoryContextStore(),
+        prompt="work",
+        identity=identity,
+        hub=hub,
+    )
+
+    assert outcome.status is TurnStatus.FAILED
+    assert outcome.stop_reason is StopReason.refusal
+    assert outcome.text == "policy refusal"
 
 
 async def test_observed_turn_preserves_a_distinct_ordered_input_batch() -> None:

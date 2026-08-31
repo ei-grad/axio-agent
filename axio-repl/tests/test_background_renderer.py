@@ -15,6 +15,7 @@ from axio.context import MemoryContextStore
 from axio.events import (
     Error,
     IterationEnd,
+    IterationStart,
     ReasoningDelta,
     SessionEndEvent,
     StreamEvent,
@@ -25,6 +26,7 @@ from axio.events import (
     ToolUseStart,
 )
 from axio.messages import Message
+from axio.models import ModelSpec
 from axio.provider_output import ProviderOutputPolicy
 from axio.tool import Tool
 from axio.types import StopReason, Usage
@@ -39,6 +41,7 @@ from axio_tools_agents.runtime import (
     RuntimeEvent,
     SessionEventHub,
     TurnFinished,
+    TurnOutcome,
     TurnStarted,
     TurnStatus,
     new_turn_identity,
@@ -51,6 +54,7 @@ from axio_repl import (
     RED,
     RESET,
     ReplRenderer,
+    _failed_background_outcome_text,
     _peer_incoming_prompt,
     render_runtime_event,
     run_prompt,
@@ -2592,3 +2596,104 @@ async def test_a_finished_iteration_leaves_nothing_to_keep() -> None:
     await renderer.render("main", IterationEnd(iteration=1, stop_reason=_StopReason.end_turn, usage=Usage(1, 1)))
 
     assert renderer.take_pending_text("main") == ""
+
+
+async def test_iteration_cost_uses_the_model_that_served_the_request() -> None:
+    from axio_repl import _panel
+
+    cheap = ModelSpec(id="cheap", input_cost=0.1, output_cost=0.2)
+    expensive = ModelSpec(id="expensive", input_cost=1.0, output_cost=2.0)
+    stats = _panel.SessionStats()
+    models = {model.id: model for model in (cheap, expensive)}
+    renderer = ReplRenderer(
+        stats=stats,
+        current_model=lambda: cheap,
+        resolve_model=models.get,
+    )
+
+    await renderer.render("main", IterationStart(iteration=1, model="expensive"))
+    await renderer.render(
+        "main",
+        IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(1_000_000, 1_000_000)),
+    )
+
+    assert stats.cost == pytest.approx(3.0)
+    assert stats.per_model == {"expensive": Usage(1_000_000, 1_000_000)}
+
+
+async def test_unknown_served_model_marks_estimated_cost_incomplete() -> None:
+    from axio_repl import _panel
+
+    configured = ModelSpec(id="configured", input_cost=1.0, output_cost=2.0)
+    stats = _panel.SessionStats()
+    renderer = ReplRenderer(
+        stats=stats,
+        current_model=lambda: configured,
+        resolve_model=lambda _model_id: None,
+    )
+
+    await renderer.render("main", IterationStart(iteration=1, model="unknown-snapshot"))
+    await renderer.render(
+        "main",
+        IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(10, 20)),
+    )
+
+    assert stats.cost == 0.0
+    assert stats.cost_is_complete is False
+
+
+async def test_new_turn_clears_served_model_from_unfinished_prior_turn() -> None:
+    from axio_repl import _panel
+
+    cheap = ModelSpec(id="cheap", input_cost=0.1, output_cost=0.2)
+    expensive = ModelSpec(id="expensive", input_cost=1.0, output_cost=2.0)
+    stats = _panel.SessionStats()
+    models = {model.id: model for model in (cheap, expensive)}
+    renderer = ReplRenderer(stats=stats, current_model=lambda: cheap, resolve_model=models.get)
+
+    await renderer.start_turn(
+        "main",
+        TurnStarted("first"),
+        run_id="run-1",
+        turn_id="turn-1",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render("main", IterationStart(iteration=1, model="expensive"))
+    await renderer.start_turn(
+        "main",
+        TurnStarted("second"),
+        run_id="run-2",
+        turn_id="turn-2",
+        execution_mode=ExecutionMode.FOREGROUND,
+    )
+    await renderer.render(
+        "main",
+        IterationEnd(iteration=1, stop_reason=StopReason.end_turn, usage=Usage(1_000_000, 1_000_000)),
+    )
+
+    assert stats.cost == pytest.approx(0.3)
+    assert stats.per_model == {"cheap": Usage(1_000_000, 1_000_000)}
+
+
+def test_failed_background_outcome_text_preserves_provider_response() -> None:
+    identity = new_turn_identity(
+        agent_id="child",
+        parent_agent_id="main",
+        execution_mode=ExecutionMode.BACKGROUND,
+    )
+    outcome = TurnOutcome(
+        identity=identity,
+        status=TurnStatus.FAILED,
+        text="policy refusal",
+        stop_reason=StopReason.refusal,
+        error="agent stopped with refusal",
+    )
+
+    model_text, display_text = _failed_background_outcome_text(
+        outcome,
+        agent_id="child",
+        identity="analyst (child)",
+    )
+
+    assert "policy refusal" in model_text
+    assert "policy refusal" in display_text

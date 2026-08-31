@@ -14,6 +14,8 @@ from axio.blocks import (
     ContentBlock,
     ImageBlock,
     ImageMediaType,
+    ProviderBlock,
+    ReasoningBlock,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -399,6 +401,8 @@ def _apply_stream_event(fragments: _TurnFragments, event: dict[str, Any]) -> Non
     record_type = event.get("record_type")
     if record_type == "TextDelta":
         fragments.text.append(_string(event.get("delta"), "TextDelta.delta"))
+    elif record_type == "Refusal":
+        fragments.text.append(_string(event.get("text"), "Refusal.text"))
     elif record_type == "ReasoningDelta":
         fragments.reasoning.append(_string(event.get("delta"), "ReasoningDelta.delta"))
     elif record_type == "ToolUseStart":
@@ -518,7 +522,11 @@ def _decode_message(data: dict[str, Any], session_dir: Path) -> Message:
 def _decode_block(data: dict[str, Any], session_dir: Path) -> ContentBlock:
     record_type = data.get("record_type")
     if record_type == "TextBlock":
-        return TextBlock(text=_string(data.get("text"), "TextBlock.text"))
+        return TextBlock(
+            text=_string(data.get("text"), "TextBlock.text"),
+            signature=_optional_string(data.get("signature"), "TextBlock.signature"),
+            provider=_optional_string(data.get("provider"), "TextBlock.provider"),
+        )
     if record_type in {"ImageBlock", "AudioBlock", "VideoBlock"}:
         media_type = _string(data.get("media_type"), f"{record_type}.media_type")
         binary = _read_attachment(_mapping(data.get("data"), f"{record_type}.data"), session_dir)
@@ -535,6 +543,29 @@ def _decode_block(data: dict[str, Any], session_dir: Path) -> ContentBlock:
             id=_string(data.get("id"), "ToolUseBlock.id"),
             name=_string(data.get("name"), "ToolUseBlock.name"),
             input=cast(dict[str, Any], raw_input),
+            signature=_optional_string(data.get("signature"), "ToolUseBlock.signature"),
+            provider=_optional_string(data.get("provider"), "ToolUseBlock.provider"),
+        )
+    if record_type == "ReasoningBlock":
+        redacted = data.get("redacted", False)
+        if not isinstance(redacted, bool):
+            raise RecoveryError("ReasoningBlock.redacted is not a boolean")
+        return ReasoningBlock(
+            text=_optional_string(data.get("text"), "ReasoningBlock.text"),
+            signature=_optional_string(data.get("signature"), "ReasoningBlock.signature"),
+            redacted=redacted,
+            id=_optional_string(data.get("id"), "ReasoningBlock.id"),
+            provider=_optional_string(data.get("provider"), "ReasoningBlock.provider"),
+        )
+    if record_type == "ProviderBlock":
+        raw_data = data.get("data")
+        if not isinstance(raw_data, dict):
+            raise RecoveryError("ProviderBlock.data is not an object")
+        return ProviderBlock(
+            provider=_string(data.get("provider"), "ProviderBlock.provider"),
+            kind=_string(data.get("kind"), "ProviderBlock.kind"),
+            data=cast(dict[str, Any], raw_data),
+            id=_optional_string(data.get("id"), "ProviderBlock.id"),
         )
     if record_type == "ToolResultBlock":
         raw_content = data.get("content")
@@ -639,6 +670,12 @@ def _string(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise RecoveryError(f"{label} is not a string")
     return value
+
+
+def _optional_string(value: object, label: str) -> str:
+    if value is None:
+        return ""
+    return _string(value, label)
 
 
 def _timestamp(value: object, label: str) -> datetime:

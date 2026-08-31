@@ -15,6 +15,8 @@ members = [
     "axio-docs",
     "axio-repl",
     "axio-tools-agents",
+    "axio-responses",
+    "axio-sse",
     "axio-tools-docker",
     "axio-tools-local",
     "axio-tools-mcp",
@@ -419,6 +421,8 @@ dependencies = [
     { name = "axio-audio" },
     { name = "axio-context-sqlite" },
     { name = "axio-repl" },
+    { name = "axio-responses" },
+    { name = "axio-sse" },
     { name = "axio-tools-docker" },
     { name = "axio-tools-local" },
     { name = "axio-tools-mcp" },
@@ -447,6 +451,8 @@ requires-dist = [
     { name = "axio-audio", editable = "axio-audio" },
     { name = "axio-context-sqlite", editable = "axio-context-sqlite" },
     { name = "axio-repl", editable = "axio-repl" },
+    { name = "axio-responses", editable = "axio-responses" },
+    { name = "axio-sse", editable = "axio-sse" },
     { name = "axio-tools-docker", editable = "axio-tools-docker" },
     { name = "axio-tools-local", editable = "axio-tools-local" },
     { name = "axio-tools-mcp", editable = "axio-tools-mcp" },
@@ -537,6 +543,68 @@ dev = [
 
 [package.metadata]
 requires-dist = [{ name = "axio", editable = "axio" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "markdown-pytest", specifier = ">=0.6.0" },
+    { name = "mypy", specifier = ">=1.14" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "ruff", specifier = ">=0.9" },
+]
+
+[[package]]
+name = "axio-responses"
+version = "0.1.0"
+source = { editable = "axio-responses" }
+dependencies = [
+    { name = "axio" },
+    { name = "axio-sse" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "markdown-pytest" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "axio", editable = "axio" },
+    { name = "axio-sse", editable = "axio-sse" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "markdown-pytest", specifier = ">=0.6.0" },
+    { name = "mypy", specifier = ">=1.14" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "ruff", specifier = ">=0.9" },
+]
+
+[[package]]
+name = "axio-sse"
+version = "0.1.0"
+source = { editable = "axio-sse" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "markdown-pytest" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
 
 [package.metadata.requires-dev]
 dev = [
@@ -660,6 +728,7 @@ source = { editable = "axio-transport-anthropic" }
 dependencies = [
     { name = "aiohttp" },
     { name = "axio" },
+    { name = "axio-sse" },
 ]
 
 [package.optional-dependencies]
@@ -667,7 +736,7 @@ tui = [
     { name = "textual" },
 ]
 vertexai = [
-    { name = "google-auth" },
+    { name = "google-auth", extra = ["requests"] },
 ]
 
 [package.dev-dependencies]
@@ -684,7 +753,8 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.11" },
     { name = "axio", editable = "axio" },
-    { name = "google-auth", marker = "extra == 'vertexai'", specifier = ">=2.49" },
+    { name = "axio-sse", editable = "axio-sse" },
+    { name = "google-auth", extras = ["requests"], marker = "extra == 'vertexai'", specifier = ">=2.49" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=2.1.0" },
 ]
 provides-extras = ["vertexai", "tui"]
@@ -706,6 +776,7 @@ source = { editable = "axio-transport-codex" }
 dependencies = [
     { name = "aiohttp" },
     { name = "axio" },
+    { name = "axio-responses" },
 ]
 
 [package.optional-dependencies]
@@ -728,6 +799,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.11" },
     { name = "axio", editable = "axio" },
+    { name = "axio-responses", editable = "axio-responses" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=2.1.0" },
 ]
 provides-extras = ["tui"]
@@ -749,6 +821,7 @@ version = "0.1.0"
 source = { editable = "axio-transport-google" }
 dependencies = [
     { name = "axio" },
+    { name = "axio-sse" },
     { name = "axio-transport-anthropic", extra = ["vertexai"] },
     { name = "google-auth", extra = ["urllib3"] },
 ]
@@ -770,6 +843,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "axio", editable = "axio" },
+    { name = "axio-sse", editable = "axio-sse" },
     { name = "axio-transport-anthropic", extras = ["vertexai"], editable = "axio-transport-anthropic" },
     { name = "google-auth", extras = ["urllib3"], specifier = ">=2.0" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=2.1.0" },
@@ -792,6 +866,8 @@ source = { editable = "axio-transport-openai" }
 dependencies = [
     { name = "aiohttp" },
     { name = "axio" },
+    { name = "axio-responses" },
+    { name = "axio-sse" },
 ]
 
 [package.optional-dependencies]
@@ -817,6 +893,8 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.11" },
     { name = "axio", editable = "axio" },
+    { name = "axio-responses", editable = "axio-responses" },
+    { name = "axio-sse", editable = "axio-sse" },
     { name = "partial-json-parser", marker = "extra == 'examples'", specifier = ">=0.2" },
     { name = "textual", marker = "extra == 'tui'", specifier = ">=2.1.0" },
 ]
@@ -1429,6 +1507,9 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+requests = [
+    { name = "requests" },
+]
 urllib3 = [
     { name = "packaging" },
     { name = "urllib3" },

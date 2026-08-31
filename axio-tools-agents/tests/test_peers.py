@@ -9,7 +9,7 @@ from axio import notify
 from axio.agent import Agent
 from axio.blocks import TextBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
-from axio.events import IterationEnd, StreamEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
+from axio.events import IterationEnd, Refusal, StreamEvent, TextDelta, ToolInputDelta, ToolResult, ToolUseStart
 from axio.exceptions import HandlerError
 from axio.messages import InputProvenance, Message
 from axio.testing import StubTransport, make_text_response, make_tool_use_response
@@ -730,6 +730,29 @@ async def test_a_failed_child_turn_carries_the_error_to_its_parent(tmp_path: Pat
 
         assert "turn failed" in received[0]
         assert "2 iterations" in received[0]
+    finally:
+        await parent.close()
+
+
+async def test_a_refused_child_turn_carries_the_provider_text_to_its_parent(tmp_path: Path) -> None:
+    parent = await _start_parent(tmp_path)
+    received: list[str] = []
+    notify.add_listener(parent.id, received.append)
+
+    async def factory(inherit_context: bool) -> tuple[Agent, MemoryContextStore]:
+        del inherit_context
+        transport = StubTransport(
+            [[Refusal(index=0, text="policy refusal"), IterationEnd(1, StopReason.refusal, Usage(0, 0))]]
+        )
+        return Agent(system="child", transport=transport), MemoryContextStore()
+
+    set_spawn_agent_factory(factory)
+    try:
+        _spawn_id(await spawn_agent(task="go"))
+        await _wait_for(lambda: len(received) == 1)
+
+        assert "turn failed" in received[0]
+        assert "policy refusal" in received[0]
     finally:
         await parent.close()
 

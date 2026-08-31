@@ -77,6 +77,7 @@ def _make_transport(**kwargs: Any) -> ChatCompletionsTransport:
     transport = ChatCompletionsTransport(
         api_key="test-key",
         **kwargs,
+        api="chat",
     )
     transport.session = MagicMock(spec=aiohttp.ClientSession)
     return transport

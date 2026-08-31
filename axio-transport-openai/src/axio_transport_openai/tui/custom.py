@@ -248,7 +248,7 @@ class ProviderEditScreen(ModalScreen["CustomChatCompletionsTransport | _DeleteSe
 class CustomHubScreen(ModalScreen["dict[str, str] | None"]):
     """Hub: list configured OpenAI-compatible providers; add / edit / delete them.
 
-    On close, if providers were changed the hub saves the JSON config and
+    On close, the hub saves the JSON config if providers were changed. It then
     re-registers per-provider transport instances in the app's transport
     registry under the names ``openai-custom.<provider-name>``.
     """

@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from axio.agent import Agent, ToolExecutionTiming
-from axio.blocks import ToolResultBlock, ToolUseBlock
+from axio.blocks import ImageBlock, ToolResultBlock, ToolUseBlock
 from axio.context import MemoryContextStore
 from axio.events import (
     IterationEnd,
@@ -24,6 +24,7 @@ from axio.events import (
     ToolUseStart,
 )
 from axio.exceptions import GuardError, HandlerError
+from axio.messages import InputProvenance, Message
 from axio.permission import PermissionGuard
 from axio.testing import StubTransport, make_echo_tool, make_text_response, make_tool_use_response
 from axio.tool import CURRENT_TOOL_CALL, Tool, ToolCallContext
@@ -535,6 +536,89 @@ class TestStopReasonOverride:
         assert session_ends[0].stop_reason == StopReason.end_turn
 
 
+class TestRefusedDispatch:
+    async def test_a_refused_call_is_kept_in_history_with_a_result_saying_why(self) -> None:
+        """A turn whose reason does not vouch for its calls still has to say so to the model.
+
+        Stripped from the history instead, the next request cannot tell the attempt from a turn
+        that called nothing, and the model makes the same call again.
+        """
+        ran: list[str] = []
+
+        async def handler(msg: str) -> str:
+            ran.append(msg)
+            return msg
+
+        tool: Tool[Any] = Tool(name="echo", description="echo", handler=handler)
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "c1", "echo"),
+                    ToolInputDelta(0, "c1", json.dumps({"msg": "hi"})),
+                    IterationEnd(1, StopReason.max_tokens, Usage(10, 5)),
+                ]
+            ]
+        )
+        context = MemoryContextStore()
+        agent = Agent(system="test", tools=[tool], transport=transport)
+        events = [e async for e in agent.run_stream("go", context)]
+
+        assert ran == [], "a turn that does not vouch for its calls must not run them"
+
+        history = await context.get_history()
+        calls = [b for m in history for b in m.content if isinstance(b, ToolUseBlock)]
+        results = [b for m in history for b in m.content if isinstance(b, ToolResultBlock)]
+        assert [b.id for b in calls] == ["c1"], "the attempted call is what the next turn reads"
+        assert [b.tool_use_id for b in results] == ["c1"], "a stored call with no result is refused next"
+        assert results[0].is_error
+        assert "max_tokens" in str(results[0].content)
+        result_message = next(m for m in history if results[0] in m.content)
+        assert result_message.provenance == InputProvenance(
+            human_authored=False,
+            source="tool-result",
+            author="axio",
+        )
+
+        # The call was reported as started, so a caller with no result for it waits forever.
+        reported = [e for e in events if isinstance(e, ToolResult)]
+        assert [(e.tool_use_id, e.is_error) for e in reported] == [("c1", True)]
+        assert [e.stop_reason for e in events if isinstance(e, SessionEndEvent)] == [StopReason.max_tokens]
+
+    async def test_refused_call_and_result_share_one_atomic_store_boundary(self) -> None:
+        class FailRefusalBatchStore(MemoryContextStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.batches = 0
+
+            async def append_many(self, messages: list[Message]) -> None:
+                self.batches += 1
+                if self.batches == 2:
+                    raise OSError("refusal batch failed")
+                await super().append_many(messages)
+
+        transport = StubTransport(
+            [
+                [
+                    ToolUseStart(0, "c1", "echo"),
+                    ToolInputDelta(0, "c1", json.dumps({"msg": "hi"})),
+                    IterationEnd(1, StopReason.refusal, Usage(10, 5)),
+                ]
+            ]
+        )
+        context = FailRefusalBatchStore()
+        agent = Agent(system="test", tools=[make_echo_tool()], transport=transport)
+
+        with pytest.raises(OSError, match="refusal batch failed"):
+            async for _ in agent.run_stream("go", context):
+                pass
+
+        history = await context.get_history()
+        assert [message.role for message in history] == ["user"]
+        assert not any(
+            isinstance(block, ToolUseBlock | ToolResultBlock) for message in history for block in message.content
+        )
+
+
 class TestStreamingToolDispatch:
     async def test_streaming_handler_emits_keyed_output_deltas(self) -> None:
         """A tool with .stream attribute emits ToolOutputDelta events with key per field."""
@@ -758,3 +842,87 @@ class TestStreamingToolDispatch:
         assert not any(
             isinstance(block, ToolUseBlock | ToolResultBlock) for message in history for block in message.content
         )
+
+
+class TestDispatchThatBreaksInsteadOfFinishing:
+    """A streaming dispatch talks to the reader through a queue, ended by one sentinel."""
+
+    async def test_a_dispatch_that_raises_does_not_hang_the_turn(self) -> None:
+        # Put only on the way out of a normal return, the sentinel never arrived when the dispatch
+        # raised, and the reader waited on a queue nothing would fill again.
+        async def _stream(msg: str) -> AsyncGenerator[tuple[str, str], None]:
+            yield ("stdout", msg)
+
+        async def streaming_handler(msg: str) -> str:
+            return msg
+
+        streaming_handler.stream = _stream  # type: ignore[attr-defined]
+        tool: Tool[object] = Tool(name="streamer", description="streams", handler=streaming_handler)
+
+        class _Broken(Agent):
+            async def _dispatch_tools_streaming(
+                self,
+                blocks: list[ToolUseBlock],
+                iteration: int,
+                output_queue: asyncio.Queue[Any],
+                execution_timings: dict[str, ToolExecutionTiming] | None = None,
+            ) -> list[ToolResultBlock]:
+                del execution_timings
+                raise RuntimeError("the dispatch itself broke")
+
+        agent = _Broken(
+            system="",
+            tools=[tool],
+            transport=StubTransport([make_tool_use_response("streamer", "c1", {"msg": "hi"})]),
+        )
+
+        events: list[StreamEvent] = []
+        # The timeout is the assertion: the reader waited on a queue nothing would fill again, and
+        # the turn hung with no error and no timeout of its own.
+        async with asyncio.timeout(5):
+            with pytest.raises(RuntimeError, match="the dispatch itself broke"):
+                async for event in agent.run_stream("go", MemoryContextStore()):
+                    events.append(event)
+
+        assert [e.stop_reason for e in events if isinstance(e, SessionEndEvent)] == [StopReason.error]
+
+
+class TestTheMediaNudge:
+    """Gemini ends a turn holding media in about twenty tokens, so the agent asks it to go on."""
+
+    @staticmethod
+    async def _stored() -> list[Message]:
+        async def picture() -> list[ImageBlock]:
+            return [ImageBlock(media_type="image/png", data=b"\x89PNG")]
+
+        tool: Tool[Any] = Tool(name="picture", description="a picture", handler=picture)
+
+        class _Nudging(StubTransport):
+            nudge_on_media_tool_result = True
+
+        transport = _Nudging(
+            [
+                make_tool_use_response("picture", "c1", {}),
+                make_text_response("done"),
+            ]
+        )
+        context = MemoryContextStore()
+        async for _ in Agent(system="", tools=[tool], transport=transport).run_stream("go", context):
+            pass
+        return await context.get_history()
+
+    async def test_it_travels_in_the_message_the_results_are_in(self) -> None:
+        # Appended as a message of its own it made two user turns in a row, which Anthropic
+        # refuses outright and Gemini survives only because its converter merges them.
+        history = await self._stored()
+
+        user_turns = [m for m in history if m.role == "user"]
+        results = [m for m in user_turns if any(isinstance(b, ToolResultBlock) for b in m.content)]
+        assert len(results) == 1
+        assert [type(b).__name__ for b in results[0].content] == ["ToolResultBlock", "TextBlock"]
+
+    async def test_no_two_user_turns_ever_land_in_a_row(self) -> None:
+        history = await self._stored()
+
+        roles = [m.role for m in history]
+        assert all(a != b or a != "user" for a, b in zip(roles, roles[1:], strict=False))

@@ -40,10 +40,13 @@ from axio.context import ContextStore, MemoryContextStore
 from axio.effort import EFFORT_LEVELS, EffortRuntime, EffortState
 from axio.events import (
     AudioOutput,
+    Citation,
     Error,
     ImageOutput,
     IterationEnd,
+    IterationStart,
     ReasoningDelta,
+    Refusal,
     SessionEndEvent,
     StreamEvent,
     TextDelta,
@@ -62,6 +65,7 @@ from axio.messages import INPUT_PROVENANCE_SYSTEM_INSTRUCTION, InputProvenance, 
 from axio.models import Capability, ModelSpec
 from axio.tool import Tool
 from axio.tool_args import ToolArgStream
+from axio.types import INCOMPLETE
 from axio_tools_agents.monitoring import monitor
 from axio_tools_agents.peers import (
     PeerMessage,
@@ -119,6 +123,7 @@ from axio_tools_agents.runtime import (
     TurnStarted,
     TurnStatus,
     current_turn_identity,
+    format_turn_failure,
     new_turn_identity,
     observe_agent_turn,
     observe_agent_turn_messages,
@@ -601,6 +606,8 @@ class _AgentRenderState:
         self.pending_text: list[str] = []
         self.background_tools: list[str] = []
         self.background_errors: list[str] = []
+        self.declined = False
+        self.served_model_id: str | None = None
         self.text_sanitizer = IncrementalTerminalSanitizer()
         self.reasoning_sanitizer = IncrementalTerminalSanitizer()
         self.tool_output_sanitizers: dict[tuple[ToolCallKey, str], IncrementalTerminalSanitizer] = {}
@@ -773,6 +780,16 @@ def _peer_incoming_prompt(message: PeerMessage) -> _IncomingPrompt:
     )
 
 
+def _failed_background_outcome_text(
+    outcome: TurnOutcome,
+    *,
+    agent_id: str,
+    identity: str,
+) -> tuple[str, str]:
+    detail = format_turn_failure(outcome)
+    return f"[agent {agent_id}] turn failed: {detail}", f"[agent {identity}] turn failed: {detail}"
+
+
 class ReplRenderer:
     def __init__(
         self,
@@ -780,6 +797,7 @@ class ReplRenderer:
         main_agent_name: str | None = None,
         stats: _panel.SessionStats | None = None,
         current_model: Callable[[], ModelSpec | None] | None = None,
+        resolve_model: Callable[[str], ModelSpec | None] | None = None,
         display_mode: DisplayMode = DisplayMode.ALL_ACTIONS,
         action_multiplexer: ActionMultiplexer | None = None,
         suspended_action_multiplexer: ActionMultiplexer | None = None,
@@ -797,6 +815,7 @@ class ReplRenderer:
         # that sees the whole session's spend.
         self._stats = stats
         self._current_model = current_model
+        self._resolve_model = resolve_model
         self._states: dict[str, _AgentRenderState] = {"main": _AgentRenderState()}
         self._agent_names: OrderedDict[str, str] = OrderedDict()
         self._max_identity_cache = max_identity_cache
@@ -1315,9 +1334,18 @@ class ReplRenderer:
                     event.delta,
                     visible=self.display_mode is DisplayMode.ALL_ACTIONS,
                 )
+            state = self._state(agent_id)
+            if isinstance(event, IterationStart):
+                state.served_model_id = event.model
             if isinstance(event, IterationEnd) and self._stats is not None:
                 model = self._current_model() if self._current_model is not None else None
+                if state.served_model_id is not None:
+                    if self._resolve_model is not None:
+                        model = self._resolve_model(state.served_model_id)
+                    elif model is None or model.id != state.served_model_id:
+                        model = None
                 self._stats.record(agent_id, event.usage, model)
+                state.served_model_id = None
             try:
                 if self._is_suspended_tool_event(tool_key):
                     assert tool_key is not None
@@ -1551,6 +1579,8 @@ class ReplRenderer:
         state.pending_text.clear()
         state.background_tools.clear()
         state.background_errors.clear()
+        state.declined = False
+        state.served_model_id = None
         state.text_sanitizer.reset()
         state.reasoning_sanitizer.reset()
         state.tool_output_sanitizers.clear()
@@ -1746,7 +1776,7 @@ class ReplRenderer:
                 return bool(delta)
             case ReasoningDelta(delta=delta):
                 return bool(delta.lstrip("\n"))
-            case IterationEnd() | Error():
+            case IterationStart() | IterationEnd() | Error():
                 return False
             case SessionEndEvent():
                 return not presentation.error_seen
@@ -1912,6 +1942,27 @@ class ReplRenderer:
                 else:
                     self._render_text_delta_locked(state, safe_delta)
                     self._flush_live_line()
+
+            case Refusal(text=text, category=category, blocked_input=blocked):
+                safe_text = state.text_sanitizer.feed(text)
+                if isinstance(state.mode, _TextMode):
+                    print()
+                    state.mode = _BoundaryMode()
+                state.pending_text.append(text)
+                if not state.declined:
+                    state.declined = True
+                    what = "prompt blocked" if blocked else "declined"
+                    tail = f" ({category})" if category else ""
+                    sys.stdout.write(_styled(self._theme.error.ansi, f"[{what}{tail}] "))
+                sys.stdout.write(_styled(self._theme.error.ansi, safe_text))
+                self._flush_live_line()
+
+            case Citation(cited_text=cited, title=title, url=url):
+                if isinstance(state.mode, _TextMode):
+                    print()
+                    state.mode = _BoundaryMode()
+                source = sanitize_terminal_text(url or title or cited or "source")
+                print(_styled(self._theme.reasoning.ansi, f"[cited: {source}]"))
 
             case ImageOutput(data=data, media_type=mt):
                 if isinstance(state.mode, _TextMode):
@@ -2108,6 +2159,7 @@ class ReplRenderer:
                 state.pending_text.clear()
                 state.text_sanitizer.reset()
                 state.reasoning_sanitizer.reset()
+                state.declined = False
                 self._purge_legacy_foreground_parent_locked(agent_id)
 
             case Error(exception=exc):
@@ -2129,7 +2181,9 @@ class ReplRenderer:
                 )
                 self._drain_safe_boundary_locked()
 
-            case SessionEndEvent():
+            case SessionEndEvent(stop_reason=reason):
+                if reason in INCOMPLETE:
+                    self.show_panel(f"incomplete response: {reason}")
                 self._purge_legacy_foreground_parent_locked(agent_id)
                 cleanup_key = presentation.key if presentation is not None else event_turn_key
                 if cleanup_key is not None:
@@ -4162,9 +4216,11 @@ async def main() -> None:
                 text = f"[agent {agent_id}] finished its turn and is idle."
                 display_text = f"[agent {identity}] finished its turn and is idle."
             else:
-                detail = outcome.error or "unknown error"
-                text = f"[agent {agent_id}] turn failed: {detail}"
-                display_text = f"[agent {identity}] turn failed: {detail}"
+                text, display_text = _failed_background_outcome_text(
+                    outcome,
+                    agent_id=agent_id,
+                    identity=identity,
+                )
             await _admit_incoming(
                 _IncomingPrompt(
                     text=text,
@@ -4184,6 +4240,7 @@ async def main() -> None:
             main_agent_name=AGENT_NAME,
             stats=stats,
             current_model=lambda: transport.model,
+            resolve_model=lambda model_id: transport.models.get(model_id),
             display_mode=DisplayMode.parse(args.agent_actions),
             powerline=args.powerline,
             theme=theme,

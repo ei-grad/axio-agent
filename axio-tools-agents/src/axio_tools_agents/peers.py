@@ -55,6 +55,7 @@ from axio_tools_agents.runtime import (
     TurnStarted,
     TurnStatus,
     current_turn_identity,
+    format_turn_failure,
     new_turn_identity,
     observe_agent_turn,
     observe_agent_turn_messages,
@@ -299,7 +300,7 @@ async def _deliver_background_turn(
         return
     peer = background.peer
     if outcome is not None and outcome.status is TurnStatus.FAILED:
-        text = f"[agent {peer.name} ({peer.id})] turn failed: {outcome.error or 'unknown error'}"
+        text = f"[agent {peer.name} ({peer.id})] turn failed: {format_turn_failure(outcome)}"
     elif background.last_error:
         text = f"[agent {peer.name} ({peer.id})] turn failed: {background.last_error}"
     elif outcome is not None and outcome.text.strip():

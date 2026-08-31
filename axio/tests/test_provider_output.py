@@ -15,6 +15,7 @@ from axio.events import (
     Error,
     IterationEnd,
     ReasoningDelta,
+    Refusal,
     SessionEndEvent,
     StreamEvent,
     TextDelta,
@@ -61,6 +62,13 @@ def test_guard_counts_model_wire_text_but_not_tool_execution_output() -> None:
     assert guard.inspect(ToolOutputDelta(tool_use_id="call", name="shell", key="stdout", delta="x" * 10_000)) is None
     assert guard.accepted_bytes == 10
     assert isinstance(guard.inspect(TextDelta(index=0, delta="!")), ProviderOutputLimitError)
+
+
+def test_guard_counts_refusal_text() -> None:
+    policy = ProviderOutputPolicy(max_response_bytes=4, sustained_rate_bytes_per_second=None)
+    guard = ProviderOutputGuard(policy, effective_output_tokens=None)
+
+    assert isinstance(guard.inspect(Refusal(index=0, text="block")), ProviderOutputLimitError)
 
 
 def test_guard_detects_growing_snapshots_only_within_one_semantic_stream() -> None:
